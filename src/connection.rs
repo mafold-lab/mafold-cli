@@ -262,7 +262,7 @@ async fn auto_approve_pending(client: &Client, umk: &Key, key_id: &str) {
         if id.is_empty() || public.is_empty() {
             continue;
         }
-        let Ok(wrapped) = vault::wrap_umk_for(&public, umk) else {
+        let Ok(wrapped) = vault::wrap_key_for(&public, umk) else {
             continue;
         };
         // Best effort per device: one that fails is not a reason to abandon the
@@ -304,7 +304,7 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
         // vault starts here.
         let umk = Key::random();
         let key_id = vault::new_key_id();
-        let wrapped = vault::wrap_umk_for(&dev.public, &umk)?;
+        let wrapped = vault::wrap_key_for(&dev.public, &umk)?;
         client
             .call(
                 "approveVaultDevice",
@@ -330,7 +330,7 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
         Ok(v) => {
             let wrapped = s(&v, "sealed_umk");
             let key_id = s(&v, "key_id");
-            let umk = vault::unwrap_umk(&dev.secret, &wrapped).map_err(|e| anyhow!("{e}"))?;
+            let umk = vault::unwrap_key(&dev.secret, &wrapped).map_err(|e| anyhow!("{e}"))?;
             vault::cache_umk(&umk, &dev, &key_id)?;
             auto_approve_pending(client, &umk, &key_id).await;
             Ok((umk, key_id, dev))
@@ -1870,7 +1870,7 @@ async fn approve(
         }
     }
 
-    let wrapped = vault::wrap_umk_for(&public_key, &umk)?;
+    let wrapped = vault::wrap_key_for(&public_key, &umk)?;
     client
         .call(
             "approveVaultDevice",
@@ -1959,7 +1959,7 @@ async fn rotate(client: &Client, sess: &session::Session) -> Result<()> {
             continue;
         }
         let public_key = s(d, "public_key");
-        let wrapped = vault::wrap_umk_for(&public_key, &new_umk)?;
+        let wrapped = vault::wrap_key_for(&public_key, &new_umk)?;
         client
             .call(
                 "approveVaultDevice",
@@ -2037,7 +2037,7 @@ async fn recover(client: &Client, sess: &session::Session) -> Result<()> {
     // Recovering proves possession of the passphrase, not of an approved
     // device — so enrol this machine properly rather than leaving it working
     // off a cache that `devices` would never list.
-    let wrapped = vault::wrap_umk_for(&dev.public, &umk)?;
+    let wrapped = vault::wrap_key_for(&dev.public, &umk)?;
     client
         .call(
             "approveVaultDevice",

@@ -56,6 +56,13 @@ pub const TOOL: &str = "permission";
 pub const ALLOW: &str = "Allow";
 pub const DENY: &str = "Deny";
 
+/// The card action a tap on this prompt sends. The server prefix-dispatches it
+/// to a RELAY (`events.permissionAnswer` → this daemon), where the default
+/// `ask:answer` would have posted a chat message instead. Kept next to the
+/// labels because the three of them are one contract: the card offers ALLOW or
+/// DENY, sends them under this action, and [`decide`] reads them back.
+pub const ACTION: &str = "perm:answer";
+
 /// How long a pending permission question stays open. Matches `ask_hook`: the
 /// person being asked is reading a chat, not watching a terminal.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -244,6 +251,12 @@ pub fn ask_card_input(record: &Value) -> Value {
         format!("{detail} — your Claude Code settings say this one needs your OK.")
     };
     json!({
+        // NOT the default `ask:answer`: that one is defined to become a real
+        // user message, which is right for a question the model asked and wrong
+        // here — it put a stray "Allow" bubble in the room on every guarded
+        // command. `perm:answer` is relayed by the server straight to this
+        // daemon (`events.permissionAnswer`) and posts nothing.
+        "action": ACTION,
         "questions": [{
             "header": tool,
             "multiSelect": false,

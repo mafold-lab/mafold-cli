@@ -131,18 +131,39 @@ pub fn generating_tag(started_ms: u64, beat: u64, beat_at_ms: u64, tokens: u64, 
 }
 
 /// Stamp the user's answer into the pending (last unanswered) `{% mafold/ask %}` card
-/// in `full` by rewriting its opening tag to `{% mafold/ask answered="…" %}`. The
-/// message content itself is the durable record — a reloaded page or another
-/// device renders the card answered instead of re-offering the buttons. A
-/// stamped opener no longer matches the bare `{% mafold/ask %}` needle, so an
-/// already-answered card can never be re-stamped. Returns false when no
+/// in `full` by adding `answered="…"` to its opening tag. The message content
+/// itself is the durable record — a reloaded page or another device renders the
+/// card answered instead of re-offering the buttons. Returns false when no
 /// unanswered ask card is present.
+///
+/// Scans openers rather than matching the bare `{% mafold/ask %}` literal,
+/// because an ask may now carry attributes of its own: the permission prompt
+/// ships `action="perm:answer"` so its verdict is relayed to the daemon instead
+/// of posted as a message. Against the old literal needle that card was simply
+/// invisible — it would have been answered and then sat there still offering
+/// its buttons. "Already answered" is therefore a question about the tag's
+/// attributes (`answered=` present), not about its exact spelling, which is
+/// also what keeps a settled card from being re-stamped.
 pub fn stamp_ask_answered(full: &mut String, answer: &str) -> bool {
-    const OPEN: &str = "{% mafold/ask %}";
-    let Some(pos) = full.rfind(OPEN) else { return false };
-    let val = answered_attr(answer);
-    full.replace_range(pos..pos + OPEN.len(), &format!("{{% mafold/ask answered=\"{val}\" %}}"));
-    true
+    const OPEN: &str = "{% mafold/ask";
+    let mut search_from = full.len();
+    while let Some(pos) = full[..search_from].rfind(OPEN) {
+        search_from = pos;
+        // The opener runs to its `%}`; a container's closer (`{% /mafold/ask %}`)
+        // starts with a slash and never matches OPEN.
+        let Some(rel_end) = full[pos..].find("%}") else { continue };
+        let end = pos + rel_end + 2;
+        let attrs = &full[pos + OPEN.len()..end - 2];
+        if attrs.contains("answered=") {
+            continue; // settled already — keep looking further back
+        }
+        let val = answered_attr(answer);
+        let spaced = attrs.trim_end();
+        let rebuilt = format!("{{% mafold/ask{spaced} answered=\"{val}\" %}}");
+        full.replace_range(pos..end, &rebuilt);
+        return true;
+    }
+    false
 }
 
 /// Finalized-message variant of [`stamp_ask_answered`] — for asks the model
@@ -438,7 +459,16 @@ fn ask_tag(input: &Value) -> String {
             }
         }
     }
-    format!("\n{{% mafold/ask %}}\n{}{{% /mafold/ask %}}\n", block_esc(&body))
+    // `action` (optional) redirects the tap. Absent — every ask the MODEL raises
+    // — the answer becomes a real user message, because that exchange is part of
+    // the conversation. The permission prompt sets `perm:answer` instead: its
+    // verdict is a switch on a blocked process, not something anyone wants to
+    // read in the room tomorrow.
+    let action = match input["action"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => format!(" action=\"{}\"", attr_esc(a)),
+        None => String::new(),
+    };
+    format!("\n{{% mafold/ask{action} %}}\n{}{{% /mafold/ask %}}\n", block_esc(&body))
 }
 
 /// One pipe-delimited cell: newlines/tabs/pipes collapse to spaces (the `|`
@@ -1006,6 +1036,43 @@ mod stamp_tests {
         let mut full = CARD.to_string();
         assert!(stamp_ask_answered(&mut full, "  \n "));
         assert!(full.contains("{% mafold/ask answered=\"✓\" %}"));
+    }
+
+    /// THE BUG this rewrite fixes: a permission prompt carries
+    /// `action="perm:answer"`, so the old bare-literal needle never found it.
+    /// It would have been answered — and gone on showing its buttons forever.
+    #[test]
+    fn an_ask_with_attributes_still_stamps_and_keeps_them() {
+        let card = "{% mafold/ask action=\"perm:answer\" %}\nq|Bash|0|rm x\no|Allow|once\n{% /mafold/ask %}\n";
+        let mut full = card.to_string();
+        assert!(stamp_ask_answered(&mut full, "Allow"), "{full}");
+        assert!(full.contains("{% mafold/ask action=\"perm:answer\" answered=\"Allow\" %}"), "{full}");
+        assert!(full.contains("{% /mafold/ask %}"), "closer intact: {full}");
+    }
+
+    /// A settled card is never re-stamped — with or without other attributes,
+    /// which is the property the old literal needle got for free.
+    #[test]
+    fn an_already_answered_card_is_skipped() {
+        let done = "{% mafold/ask action=\"perm:answer\" answered=\"Allow\" %}\nq|Bash|0|rm x\n{% /mafold/ask %}\n";
+        let mut only_settled = done.to_string();
+        assert!(!stamp_ask_answered(&mut only_settled, "Deny"));
+        assert_eq!(only_settled, done);
+
+        // Settled card LAST, an open one before it → the open one gets it.
+        let mut mixed = format!("{CARD}{done}");
+        assert!(stamp_ask_answered(&mut mixed, "Hold"));
+        assert!(mixed.ends_with(done), "settled card untouched: {mixed}");
+        assert!(mixed.contains("{% mafold/ask answered=\"Hold\" %}"), "{mixed}");
+    }
+
+    /// The closer must never be mistaken for an opener — it would produce
+    /// `{% /mafold/ask answered="…" %}` and break the card open.
+    #[test]
+    fn the_closing_tag_is_not_an_opener() {
+        let mut orphan = "{% /mafold/ask %}\n".to_string();
+        assert!(!stamp_ask_answered(&mut orphan, "Yes"));
+        assert_eq!(orphan, "{% /mafold/ask %}\n");
     }
 
     #[test]

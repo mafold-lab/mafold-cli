@@ -2585,6 +2585,29 @@ async fn connect_and_run(
             }
             continue;
         }
+        // A permission verdict tapped on the ask card of a turn that is parked
+        // mid-tool-call (relayed by the API as events.permissionAnswer — NOT a
+        // chat message, which is the entire point: the room stays clean).
+        //
+        // Authorization is the same rule the message road uses and it lives in
+        // `deliver_ask_answer`: only the person the question was put to may
+        // answer it. A verdict for a turn we don't hold, or from anyone else,
+        // is simply not delivered.
+        if method == "events.permissionAnswer" {
+            let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
+            let from = env["params"]["from"].as_str().unwrap_or("").to_lowercase();
+            let answer = env["params"]["answer"].as_str().unwrap_or("").trim().to_string();
+            let Some(msg_id) = env["params"]["message_id"].as_str().map(str::to_string) else {
+                continue;
+            };
+            if answer.is_empty() {
+                continue;
+            }
+            if deliver_ask_answer(chat_states, &conv_id, &msg_id, &from, &answer).await {
+                println!("← permission {answer} from @{from} on {msg_id}");
+            }
+            continue;
+        }
         // In-card refresh: re-run the card's own command and rewrite THAT message,
         // so the card updates under the finger instead of a second one appearing
         // below it. The command re-executes in full — there is no separate refresh
@@ -3000,29 +3023,11 @@ async fn connect_and_run(
         // target (message_id) picks the exact turn, so two concurrent asks never
         // cross. Only the turn's own triggering sender may answer it. `/stop`
         // falls through to cancel instead.
-        let pending_ask: Option<(String, String, tokio::sync::mpsc::UnboundedSender<AgentEvent>)> =
-            if let Some(rid) = m.reply_to_id.as_deref() {
-                let states = chat_states.lock().await;
-                states
-                    .get(&m.conversation_id)
-                    .and_then(|s| s.turns.get(rid))
-                    .and_then(|t| match &t.ask_file {
-                        Some(f) if t.owner == sender_lc => Some((rid.to_string(), f.clone(), t.events.clone())),
-                        _ => None,
-                    })
-            } else {
-                None
-            };
-        if let Some((rid, ask_file, events)) = pending_ask {
-            if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
-                // Stamp first, THEN unblock the hook: the stamp event must enter
-                // the renderer channel ahead of whatever the resumed agent
-                // streams next, so the card flips to "answered" immediately.
-                let _ = events.send(AgentEvent::AskAnswered(m.content.trim().to_string()));
-                let _ = std::fs::write(&ask_file, m.content.trim());
-                if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) {
-                    if let Some(t) = s.turns.get_mut(&rid) { t.ask_file = None; }
-                }
+        if let Some(rid) = m.reply_to_id.as_deref() {
+            // `/stop` falls through to cancel instead of being read as an answer.
+            if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel"))
+                && deliver_ask_answer(chat_states, &m.conversation_id, rid, &sender_lc, trimmed).await
+            {
                 continue;
             }
         }
@@ -3348,6 +3353,50 @@ async fn has_turn(chat_states: &ChatStates, chat_id: &str, msg_id: Option<&str>)
             None => !s.turns.is_empty(),
         },
     }
+}
+
+/// Hand an answer to the turn parked on `draft_id` — the ONE place a blocked
+/// turn is unblocked, whichever road the answer arrived by.
+///
+/// Two roads reach it, and they differ only in what the person's tap produced
+/// on the way in. A `{% mafold/ask %}` the MODEL raised posts a real message
+/// (the answer is part of the conversation) and lands here as that message's
+/// reply. A permission verdict is not conversation — it is a switch on a
+/// process that is already mid-sentence — so it is relayed straight from the
+/// server as `events.permissionAnswer` and posts nothing. Past this point the
+/// two are the same event, which is why the stamp/unblock/disarm sequence lives
+/// here once instead of being written out at each caller.
+///
+/// Order matters: the stamp goes into the renderer channel BEFORE the answer
+/// file, so the card flips to "answered" ahead of whatever the resumed agent
+/// streams next. Returns false when nobody is parked here, or when `from` is
+/// not the person the question was put to — a bystander may not answer someone
+/// else's prompt.
+async fn deliver_ask_answer(
+    chat_states: &ChatStates,
+    chat_id: &str,
+    draft_id: &str,
+    from: &str,
+    answer: &str,
+) -> bool {
+    let parked = {
+        let g = chat_states.lock().await;
+        g.get(chat_id)
+            .and_then(|s| s.turns.get(draft_id))
+            .and_then(|t| match &t.ask_file {
+                Some(f) if t.owner == from => Some((f.clone(), t.events.clone())),
+                _ => None,
+            })
+    };
+    let Some((ask_file, events)) = parked else { return false };
+    let _ = events.send(AgentEvent::AskAnswered(answer.to_string()));
+    let _ = std::fs::write(&ask_file, answer);
+    if let Some(s) = chat_states.lock().await.get_mut(chat_id) {
+        if let Some(t) = s.turns.get_mut(draft_id) {
+            t.ask_file = None;
+        }
+    }
+    true
 }
 
 /// Cancel EVERY in-flight turn in a conversation, all channels. Only the legacy
@@ -6473,6 +6522,77 @@ async fn render_loop(
     let out = tx.finish_folded();
     let _ = client.edit_draft(&msg_id, &out).await;
     *final_md.lock().unwrap() = out;
+}
+
+/// The one gate both answer roads pass through — a chat reply to the draft, and
+/// a `perm:answer` verdict relayed from the server. The server deliberately does
+/// NOT decide who may answer (the daemon owns the turn and knows who it was put
+/// to), so if this is wrong a bystander can approve someone else's `rm`.
+#[cfg(test)]
+mod deliver_ask_answer_tests {
+    use super::*;
+
+    fn parked(owner: &str, ask_file: &str) -> (ChatStates, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut st = ChatState::default();
+        st.turns.insert(
+            "draft-1".into(),
+            TurnHandle {
+                cancel: Arc::new(Notify::new()),
+                ask_file: Some(ask_file.to_string()),
+                owner: owner.into(),
+                channel: None,
+                events: tx,
+                steer_file: String::new(),
+                can_steer: true,
+            },
+        );
+        let states: ChatStates = Arc::new(Mutex::new(HashMap::from([("conv-1".to_string(), st)])));
+        (states, rx)
+    }
+
+    fn scratch(tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("mafold-deliver-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_bystander_cannot_answer_someone_elses_prompt() {
+        let f = scratch("bystander");
+        let (states, _rx) = parked("alice", &f);
+        assert!(!deliver_ask_answer(&states, "conv-1", "draft-1", "bob", "Allow").await);
+        assert!(!std::path::Path::new(&f).exists(), "bob's Allow must not reach the agent");
+        // Still armed — alice can still answer it.
+        assert!(deliver_ask_answer(&states, "conv-1", "draft-1", "alice", "Allow").await);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "Allow");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// Answering stamps the card BEFORE unblocking, and disarms the turn so a
+    /// second tap (a double-click, two devices) can't answer it twice.
+    #[tokio::test]
+    async fn answering_stamps_then_disarms() {
+        let f = scratch("once");
+        let (states, mut rx) = parked("alice", &f);
+        assert!(deliver_ask_answer(&states, "conv-1", "draft-1", "alice", "Deny").await);
+        match rx.try_recv() {
+            Ok(AgentEvent::AskAnswered(a)) => assert_eq!(a, "Deny"),
+            other => panic!("expected the card stamp first, got {other:?}"),
+        }
+        assert!(!deliver_ask_answer(&states, "conv-1", "draft-1", "alice", "Allow").await);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "Deny", "the second tap must not overwrite");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[tokio::test]
+    async fn a_verdict_for_a_turn_we_do_not_hold_is_dropped() {
+        let f = scratch("nosuch");
+        let (states, _rx) = parked("alice", &f);
+        assert!(!deliver_ask_answer(&states, "conv-1", "other-draft", "alice", "Allow").await);
+        assert!(!deliver_ask_answer(&states, "other-conv", "draft-1", "alice", "Allow").await);
+        assert!(!std::path::Path::new(&f).exists());
+    }
 }
 
 #[cfg(test)]

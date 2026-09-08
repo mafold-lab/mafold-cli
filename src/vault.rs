@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub use mafold_core::vault::{
-    fingerprint, new_key_id, open_payload, seal_payload, unwrap_umk, unwrap_umk_with_passphrase,
-    wrap_umk_for, wrap_umk_with_passphrase, Key, RecoveryBlob,
+    fingerprint, new_key_id, open_payload, seal_payload, unwrap_key, unwrap_umk_with_passphrase,
+    wrap_key_for, wrap_umk_with_passphrase, Key, RecoveryBlob,
 };
 
 /// This machine's long-lived X25519 keypair.
@@ -91,7 +91,7 @@ fn restrict(_path: &PathBuf) {}
 /// in memory only. A long-lived daemon and a browser tab have different threat
 /// models, and this is the one place they legitimately diverge.
 pub fn cache_umk(umk: &Key, dev: &DeviceKey, key_id: &str) -> Result<()> {
-    let wrapped = wrap_umk_for(&dev.public, umk).map_err(|e| anyhow!("{e}"))?;
+    let wrapped = wrap_key_for(&dev.public, umk).map_err(|e| anyhow!("{e}"))?;
     let path = umk_cache_path();
     std::fs::write(&path, format!("{key_id}\n{wrapped}"))
         .with_context(|| format!("write {}", path.display()))?;
@@ -103,7 +103,7 @@ pub fn cache_umk(umk: &Key, dev: &DeviceKey, key_id: &str) -> Result<()> {
 pub fn cached_umk(dev: &DeviceKey) -> Option<(Key, String)> {
     let raw = std::fs::read_to_string(umk_cache_path()).ok()?;
     let (key_id, wrapped) = raw.split_once('\n')?;
-    let key = unwrap_umk(&dev.secret, wrapped.trim()).ok()?;
+    let key = unwrap_key(&dev.secret, wrapped.trim()).ok()?;
     Some((key, key_id.trim().to_string()))
 }
 
@@ -122,9 +122,9 @@ mod tests {
     fn the_cli_uses_the_shared_hierarchy() {
         let d = mafold_core::vault::generate_device();
         let umk = Key::random();
-        let wrapped = wrap_umk_for(&d.public, &umk).unwrap();
+        let wrapped = wrap_key_for(&d.public, &umk).unwrap();
         // Opened through the CORE's function, sealed through the cli's re-export.
-        let back = mafold_core::vault::unwrap_umk(&d.secret, &wrapped).unwrap();
+        let back = mafold_core::vault::unwrap_key(&d.secret, &wrapped).unwrap();
         assert_eq!(back.0, umk.0);
 
         let sealed = seal_payload(&umk, r#"{"token":"t"}"#);

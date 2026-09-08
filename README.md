@@ -25,7 +25,22 @@ you close the shell), in the current folder (add `--workdir /path` for another),
 `mafold status` and `mafold stop`. Drop `--detach` to run in the
 foreground. Or build from source: `cargo build --release`.
 
-**Windows:**
+**Windows** (PowerShell — `irm | iex` is the `curl | bash` of this side):
+
+```powershell
+irm https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.ps1 | iex
+mafold login
+```
+
+Arguments can't cross a `| iex` pipe, so the second command is its own line. To
+pass them in one go the way the `bash` form does:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.ps1))) agent --detach --token mb_xxxx
+```
+
+`install.ps1` drops the binary in `~\.mafold`, verifies its published SHA256,
+and puts it on PATH (this session included). Or, from the package manager:
 
 ```powershell
 winget install Mafold.CLI

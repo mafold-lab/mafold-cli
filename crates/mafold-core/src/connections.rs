@@ -72,15 +72,40 @@ pub type Executor = std::sync::Arc<
         + Sync,
 >;
 
+/// What key material this runtime holds, which is the same question as **how
+/// much of the account it can open**.
+///
+/// Two answers, and the difference is the whole of pairing:
+///
+///   * [`Keyring::Vault`] — the user master key. Every row, because this
+///     process runs on a machine its owner enrolled: their laptop, their
+///     browser, a box they signed into.
+///   * [`Keyring::Row`] — one row's DEK, handed over by
+///     [`vault::seal_payload_for`] when its owner approved a pairing. It opens
+///     that connection and provably nothing else: the other rows are sealed
+///     under DEKs this process was never given, and the wrapper that would
+///     unwrap them never left the vault.
+///
+/// A `Row` runtime is what runs on a machine you do NOT trust. There is no
+/// third state and no flag — a host either holds the vault or holds one key,
+/// and every method below reads that off this enum rather than off who the
+/// caller claims to be.
+pub enum Keyring {
+    Vault(Key),
+    Row { connection: String, dek: Key },
+}
+
 /// A device's view of its owner's connections.
 pub struct Runtime {
     base: String,
-    /// The person's Mafold session token. Not a bot token: the api refuses
-    /// those here, because a daemon being able to enumerate its owner's
-    /// credentials just by running on their machine is the conflation this
-    /// layer exists to prevent.
+    /// The credential this runtime speaks to the api with: a person's Mafold
+    /// session (never a bot token — the api refuses those here, because a
+    /// daemon being able to enumerate its owner's credentials just by running
+    /// on their machine is the conflation this layer exists to prevent), or a
+    /// paired machine's `connection.answer:<name>` token, which can reach
+    /// exactly the five routes answering one connection needs.
     token: String,
-    umk: Key,
+    keys: Keyring,
     catalogs: HashMap<String, Cached>,
     /// Set only on a host that can actually run a shell — see [`ComputerHost`].
     computer: Option<ComputerHost>,
@@ -91,7 +116,27 @@ impl Runtime {
         Self {
             base: base.to_string(),
             token: token.to_string(),
-            umk,
+            keys: Keyring::Vault(umk),
+            catalogs: HashMap::new(),
+            computer: None,
+        }
+    }
+
+    /// A runtime for a machine that was PAIRED rather than enrolled: one
+    /// connection, one key, and a token that cannot ask for anything else.
+    ///
+    /// Everything downstream — `can_serve`, the claim, `call_any`,
+    /// `handle_event` — is the same code the enrolled path runs. That is the
+    /// point: an untrusted machine is not a second implementation of answering
+    /// a call, it is the same implementation holding less.
+    pub fn for_row(base: &str, token: &str, connection: &str, dek: Key) -> Self {
+        Self {
+            base: base.to_string(),
+            token: token.to_string(),
+            keys: Keyring::Row {
+                connection: connection.to_string(),
+                dek,
+            },
             catalogs: HashMap::new(),
             computer: None,
         }
@@ -157,8 +202,27 @@ impl Runtime {
 
     fn open(&self, conn: &Value) -> Result<Map<String, Value>> {
         let blob = conn.get("blob").and_then(Value::as_str).unwrap_or("");
-        let dek = conn.get("wrapped_dek").and_then(Value::as_str).unwrap_or("");
-        let plain = vault::open_payload(&self.umk, blob, dek).map_err(|e| e.to_string())?;
+        let plain = match &self.keys {
+            Keyring::Vault(umk) => {
+                let wrapped = conn.get("wrapped_dek").and_then(Value::as_str).unwrap_or("");
+                vault::open_payload(umk, blob, wrapped).map_err(|e| e.to_string())?
+            }
+            // The row's own key, and only for the row it was issued for. The
+            // name check is not what keeps the other rows shut — the DEK does
+            // that, and would simply fail — it is what makes the refusal SAY
+            // so, instead of reporting a decrypt error that reads like
+            // corruption.
+            Keyring::Row { connection, dek } => {
+                let name = conn.get("name").and_then(Value::as_str).unwrap_or("");
+                if !name.is_empty() && name != connection {
+                    return Err(format!(
+                        "this machine was paired for `{connection}` — it holds no key for \
+                         `{name}`, and the vault it would need is not on it"
+                    ));
+                }
+                vault::open_with_dek(dek, blob).map_err(|e| e.to_string())?
+            }
+        };
         serde_json::from_str(&plain).map_err(|e| format!("connection payload is not JSON: {e}"))
     }
 
@@ -601,7 +665,23 @@ impl Runtime {
         payload: &Map<String, Value>,
     ) -> Result<()> {
         let kept = filter_payload(spec, payload);
-        let sealed = vault::seal_payload(&self.umk, &Value::Object(kept).to_string());
+        let Keyring::Vault(umk) = &self.keys else {
+            // A paired machine holds one row's key and no wrapper for it, so it
+            // cannot write a row back — and this is the only place that wants
+            // to, on the renewal path of a provider whose token expires.
+            //
+            // Named rather than silently skipped: skipping would mean the
+            // machine renews at the provider on every call, forever, and never
+            // records the result. Today nothing reaches here (a `computer` row
+            // has no token to renew); the day a renewable row is paired, the
+            // answer is to let it re-seal under the SAME dek and pass
+            // `wrapped_dek` back verbatim, not to hand it the vault.
+            return Err(format!(
+                "`{name}` needs its credential renewed, which only a machine holding the \
+                 vault can store — open Mafold on one of your own devices"
+            ));
+        };
+        let sealed = vault::seal_payload(umk, &Value::Object(kept).to_string());
         self.rpc(
             "putConnection",
             serde_json::json!({
@@ -1497,5 +1577,121 @@ mod tests {
         );
         assert!(m.contains("X-Figma-Token"), "{m}");
         assert!(m.contains("mafold connection add design --provider figma"), "{m}");
+    }
+
+    // ── a computer you do NOT trust (§9.3) ──
+
+    /// A row sealed for the vault AND for one machine, the way an approval in
+    /// the browser writes it. Returns the wire row and the DEK that machine
+    /// gets — which is all it ever gets.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn paired_row(umk: &Key, machine: &vault::DeviceKeypair) -> (String, Key) {
+        let s = vault::seal_payload_for(
+            umk,
+            &machine.public,
+            // `device_id` IS the machine's public key: the string its owner
+            // compared before approving, and the one thing the machine can
+            // prove it holds.
+            &json!({ "device_id": machine.public, "machine": "gpu-box" }).to_string(),
+        )
+        .expect("seal");
+        let row = json!({ "items": [{
+            "name": "box1",
+            "provider": "computer",
+            "label": "gpu-box",
+            "blob": s.blob,
+            "wrapped_dek": s.wrapped_dek,
+            "key_id": "k1",
+        }]})
+        .to_string();
+        // Opened with the machine's own secret, exactly as `mafold pair` does.
+        let dek = vault::unwrap_key(&machine.secret, &s.sealed_dek)
+            .expect("the machine can open the key addressed to it");
+        (row, dek)
+    }
+
+    /// A paired machine runs the SAME `handle_event` a signed-in daemon runs,
+    /// holding one row's DEK and no master key. This is the whole feature in
+    /// one assertion.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_paired_machine_answers_with_only_its_own_rows_key() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let umk = Key::random();
+        let machine = vault::generate_device();
+        let (row, dek) = paired_row(&umk, &machine);
+
+        // In the order the runtime asks: can_serve reads the row, the claim,
+        // then `call_any` re-reads the row before running it, then the answer.
+        let mock = spawn_mock(vec![ok(&row), ok(r#"{"claimed":true}"#), ok(&row), ok("null")]);
+        let mut rt = Runtime::for_row(&mock.base, "mp_machine_token", "box1", dek);
+        let (exec, seen) = recording_executor();
+        rt.attach_computer(&machine.public, exec);
+
+        let handled = handle_event(
+            &mut rt,
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-9","connection":"box1","method":"shell.exec","params":{"cmd":"cargo test"}}}"#,
+        )
+        .await;
+        assert!(handled);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "it holds the key to this row, so it must actually run the command"
+        );
+        let reqs = mock.requests.lock().unwrap();
+        assert!(
+            reqs.iter().any(|r| r.path == "/claimConnectionCall"),
+            "a machine that can serve must claim: {reqs:?}"
+        );
+        assert!(
+            reqs.iter().any(|r| r.path == "/answerConnectionCall"),
+            "and answer, or the caller just times out: {reqs:?}"
+        );
+    }
+
+    /// The same machine, offered a DIFFERENT connection. It declines before
+    /// the claim — its key opens one row, and the refusal says so rather than
+    /// reporting a decrypt failure that reads like corruption.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_paired_machine_declines_a_row_it_holds_no_key_for() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let umk = Key::random();
+        let machine = vault::generate_device();
+        let (_, dek) = paired_row(&umk, &machine);
+
+        // What the server hands back names a row this machine was NOT paired
+        // for — the case that must fail closed, not by accident of decryption.
+        let other = vault::seal_payload(&umk, r#"{"device_id":"other","machine":"laptop"}"#);
+        let row = json!({ "items": [{
+            "name": "laptop",
+            "provider": "computer",
+            "label": "laptop",
+            "blob": other.blob,
+            "wrapped_dek": other.wrapped_dek,
+            "key_id": "k1",
+        }]})
+        .to_string();
+
+        let mock = spawn_mock(vec![ok(&row), ok(&row)]);
+        let mut rt = Runtime::for_row(&mock.base, "mp_machine_token", "box1", dek);
+        let (exec, seen) = recording_executor();
+        rt.attach_computer(&machine.public, exec);
+
+        handle_event(
+            &mut rt,
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-9","connection":"laptop","method":"shell.exec","params":{"cmd":"rm -rf /"}}}"#,
+        )
+        .await;
+
+        assert!(seen.lock().unwrap().is_empty(), "nothing may run here");
+        let reqs = mock.requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|r| r.path == "/claimConnectionCall"),
+            "declining happens before the claim: {reqs:?}"
+        );
     }
 }

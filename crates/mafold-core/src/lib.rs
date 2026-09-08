@@ -694,7 +694,7 @@ mod web {
     /// public key would produce, so this failing is the design working.
     #[wasm_bindgen(js_name = vaultUnlock)]
     pub fn vault_unlock(device_secret: String, wrapped_umk: String, key_id: String) -> Result<Vault, JsValue> {
-        let umk = crate::vault::unwrap_umk(&device_secret, &wrapped_umk)
+        let umk = crate::vault::unwrap_key(&device_secret, &wrapped_umk)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(Vault { umk, key_id })
     }
@@ -717,7 +717,7 @@ mod web {
         /// Wrap this master key for a device's public key — the approval step.
         #[wasm_bindgen(js_name = wrapFor)]
         pub fn wrap_for(&self, recipient_public: String) -> Result<String, JsValue> {
-            crate::vault::wrap_umk_for(&recipient_public, &self.umk)
+            crate::vault::wrap_key_for(&recipient_public, &self.umk)
                 .map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
@@ -726,6 +726,30 @@ mod web {
         pub fn seal_payload(&self, payload_json: String) -> String {
             let s = crate::vault::seal_payload(&self.umk, &payload_json);
             serde_json::json!({ "blob": s.blob, "wrapped_dek": s.wrapped_dek }).to_string()
+        }
+
+        /// Seal a payload for the vault AND for one machine → `{blob,
+        /// wrapped_dek, sealed_dek}`.
+        ///
+        /// The pairing half of `wrapFor`, and deliberately a different verb:
+        /// that one hands a machine the master key because it is one of yours,
+        /// this one hands it **one row's key** because it is not. The browser
+        /// is where this happens — approving a pairing is a tap in Settings,
+        /// and the key it wraps must never reach the server.
+        #[wasm_bindgen(js_name = sealPayloadFor)]
+        pub fn seal_payload_for(
+            &self,
+            recipient_public: String,
+            payload_json: String,
+        ) -> Result<String, JsValue> {
+            let s = crate::vault::seal_payload_for(&self.umk, &recipient_public, &payload_json)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            Ok(serde_json::json!({
+                "blob": s.blob,
+                "wrapped_dek": s.wrapped_dek,
+                "sealed_dek": s.sealed_dek,
+            })
+            .to_string())
         }
 
         /// Open one → the payload JSON.

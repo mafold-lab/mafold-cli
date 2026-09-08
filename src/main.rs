@@ -25,6 +25,7 @@ mod harness;
 mod install;
 mod langpack;
 mod mcp_link;
+mod pair;
 mod permission_mcp;
 mod platform;
 mod room;
@@ -132,6 +133,19 @@ enum Cmd {
     Connection {
         #[command(subcommand)]
         cmd: connection::ConnectionCmd,
+    },
+    /// Lend THIS machine to a Mafold account without signing in: it gets one
+    /// connection's key and may answer for that, and holds no session, no
+    /// master key and no socket. For a box you don't trust with your account.
+    Pair {
+        /// What to call this machine in the approval screen. Defaults to its
+        /// hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// Forget the pairing stored on this machine. Does NOT revoke it on
+        /// the account — that is `deleteConnection`, or the key in Settings.
+        #[arg(long)]
+        forget: bool,
     },
     /// Token wallet: balances / transfer / convert / rates / history / grants.
     Wallet {
@@ -339,6 +353,12 @@ async fn main() -> Result<()> {
     if let Cmd::Connection { cmd } = cli.cmd {
         return connection::run(&cli.base, cmd).await;
     }
+    // Pairing runs on NO credential of the account's — that is what it is for.
+    // It must sit above the token gate below, or the one command meant for a
+    // machine that has nothing would demand a bot token first.
+    if let Cmd::Pair { name, forget } = cli.cmd {
+        return pair::run(&cli.base, name, forget).await;
+    }
     // Machine setup — no account or token involved at all.
     if let Cmd::Install { tool, yes } = &cli.cmd {
         return install::run(tool.as_deref().unwrap_or(""), *yes);
@@ -418,7 +438,7 @@ async fn main() -> Result<()> {
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
-        | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
+        | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
         | Cmd::SteerHook | Cmd::PermissionMcp => unreachable!(),

@@ -167,30 +167,47 @@ pub fn generate_device() -> DeviceKeypair {
     }
 }
 
+/// Is this the shape of a device public key?
+///
+/// Lives here so that "what a public key looks like" has one answer. The api
+/// relays these without ever using one, and a malformed key that reaches an
+/// approval screen produces a pairing that cannot complete — a failure four
+/// steps away from its cause.
+pub fn is_device_public_key(b64: &str) -> bool {
+    decode32(b64, "public key").is_ok()
+}
+
 pub fn public_from_secret(secret_b64: &str) -> Result<String> {
     let secret = x25519_dalek::StaticSecret::from(decode32(secret_b64, "device secret")?);
     Ok(B64.encode(x25519_dalek::PublicKey::from(&secret).as_bytes()))
 }
 
-// ── wrapping the master key to a device ────────────────────────────────────
+// ── wrapping a key to a device ─────────────────────────────────────────────
 
-/// Seal `umk` **to** a device's public key: ephemeral X25519 → HKDF → AEAD.
+/// Seal a 32-byte key **to** a device's public key: ephemeral X25519 → HKDF →
+/// AEAD.
 ///
 /// The ephemeral public key travels with the ciphertext, so the recipient needs
 /// nothing but its own secret. A fresh ephemeral per wrap means approving the
 /// same device twice never reuses a key stream.
-pub fn wrap_umk_for(recipient_public_b64: &str, umk: &Key) -> Result<String> {
+///
+/// **Which key** is the caller's business, and there are two: enrolling a
+/// device of your own wraps the UMK (it may open everything), while pairing a
+/// machine you do NOT trust wraps a single row's DEK ([`seal_payload_for`]) —
+/// it may open exactly that row. One function for both, because the difference
+/// is what you hand over, not how it travels.
+pub fn wrap_key_for(recipient_public_b64: &str, key: &Key) -> Result<String> {
     let recipient = x25519_dalek::PublicKey::from(decode32(recipient_public_b64, "public key")?);
     let eph = x25519_dalek::EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let eph_pub = x25519_dalek::PublicKey::from(&eph);
     let shared = eph.diffie_hellman(&recipient);
     let wrapping = derive(shared.as_bytes(), eph_pub.as_bytes(), recipient.as_bytes());
-    let sealed = seal(&wrapping, &umk.0);
+    let sealed = seal(&wrapping, &key.0);
     Ok(format!("{}.{}", B64.encode(eph_pub.as_bytes()), sealed))
 }
 
 /// Open a wrap addressed to this device.
-pub fn unwrap_umk(device_secret_b64: &str, wrapped: &str) -> Result<Key> {
+pub fn unwrap_key(device_secret_b64: &str, wrapped: &str) -> Result<Key> {
     let (eph_b64, sealed) = wrapped.split_once('.').context("malformed wrapped key")?;
     let secret = x25519_dalek::StaticSecret::from(decode32(device_secret_b64, "device secret")?);
     let my_pub = x25519_dalek::PublicKey::from(&secret);
@@ -241,8 +258,55 @@ pub fn open_payload(umk: &Key, blob: &str, wrapped_dek: &str) -> Result<String> 
     let dek = Key(dek_raw
         .try_into()
         .map_err(|_| anyhow_lite::Error("stored DEK has the wrong length".into()))?);
-    let plain = open(&dek, blob).context("open connection payload")?;
+    open_with_dek(&dek, blob)
+}
+
+/// Open a payload with the row's OWN key, no master key in sight.
+///
+/// This is what a paired machine holds: one DEK, handed to it by
+/// [`seal_payload_for`], good for one row and useless against every other one
+/// in the account — the same bytes `open_payload` arrives at after unwrapping,
+/// reached by a device that was never given the wrapper.
+pub fn open_with_dek(dek: &Key, blob: &str) -> Result<String> {
+    let plain = open(dek, blob).context("open connection payload")?;
     String::from_utf8(plain).context("connection payload is not UTF-8")
+}
+
+/// A row sealed for the vault **and** for one machine that must open only it.
+///
+/// `blob` + `wrapped_dek` are the row as [`seal_payload`] would have written
+/// it — every device of the user's opens it through the UMK, and nothing about
+/// the stored shape changes. `sealed_dek` is the extra copy: the same DEK,
+/// wrapped to one recipient's public key.
+pub struct SharedPayload {
+    pub blob: String,
+    pub wrapped_dek: String,
+    /// For the recipient's [`unwrap_key`]. Never stored on the row — the
+    /// server relays it once, to the machine that is waiting for it.
+    pub sealed_dek: String,
+}
+
+/// Seal a payload so that the vault can open it AND one named machine can.
+///
+/// **Why a DEK and not the UMK.** Enrolling a device of your own hands over the
+/// master key, because that device is you. Pairing a machine you do not trust
+/// hands over the key to one row: it can answer for that connection and cannot
+/// read — cannot even ask for — any other credential in the account, and losing
+/// it costs you one row rather than the vault.
+///
+/// The row still lives under the UMK too, so revocation stays what §6 says it
+/// is: rotate, re-seal, and the copy on that machine opens nothing.
+pub fn seal_payload_for(
+    umk: &Key,
+    recipient_public_b64: &str,
+    payload_json: &str,
+) -> Result<SharedPayload> {
+    let dek = Key::random();
+    Ok(SharedPayload {
+        blob: seal(&dek, payload_json.as_bytes()),
+        wrapped_dek: seal(umk, &dek.0),
+        sealed_dek: wrap_key_for(recipient_public_b64, &dek)?,
+    })
 }
 
 // ── recovery passphrase ────────────────────────────────────────────────────
@@ -331,8 +395,8 @@ mod tests {
     fn a_device_can_open_a_wrap_addressed_to_it() {
         let d = generate_device();
         let umk = Key::random();
-        let wrapped = wrap_umk_for(&d.public, &umk).unwrap();
-        assert_eq!(unwrap_umk(&d.secret, &wrapped).unwrap().0, umk.0);
+        let wrapped = wrap_key_for(&d.public, &umk).unwrap();
+        assert_eq!(unwrap_key(&d.secret, &wrapped).unwrap().0, umk.0);
     }
 
     /// Enrollment goes through the server, so a wrap meant for one machine must
@@ -341,8 +405,8 @@ mod tests {
     fn another_device_cannot_open_someone_elses_wrap() {
         let (a, b) = (generate_device(), generate_device());
         let umk = Key::random();
-        let for_a = wrap_umk_for(&a.public, &umk).unwrap();
-        assert!(unwrap_umk(&b.secret, &for_a).is_err());
+        let for_a = wrap_key_for(&a.public, &umk).unwrap();
+        assert!(unwrap_key(&b.secret, &for_a).is_err());
     }
 
     #[test]
@@ -350,8 +414,8 @@ mod tests {
         let d = generate_device();
         let umk = Key::random();
         assert_ne!(
-            wrap_umk_for(&d.public, &umk).unwrap(),
-            wrap_umk_for(&d.public, &umk).unwrap()
+            wrap_key_for(&d.public, &umk).unwrap(),
+            wrap_key_for(&d.public, &umk).unwrap()
         );
     }
 
@@ -362,13 +426,13 @@ mod tests {
     fn a_payload_sealed_by_one_device_opens_on_another() {
         let umk = Key::random();
         let (web, cli) = (generate_device(), generate_device());
-        let for_web = wrap_umk_for(&web.public, &umk).unwrap();
-        let for_cli = wrap_umk_for(&cli.public, &umk).unwrap();
+        let for_web = wrap_key_for(&web.public, &umk).unwrap();
+        let for_cli = wrap_key_for(&cli.public, &umk).unwrap();
 
-        let web_umk = unwrap_umk(&web.secret, &for_web).unwrap();
+        let web_umk = unwrap_key(&web.secret, &for_web).unwrap();
         let sealed = seal_payload(&web_umk, r#"{"token":"ntn_from_the_browser"}"#);
 
-        let cli_umk = unwrap_umk(&cli.secret, &for_cli).unwrap();
+        let cli_umk = unwrap_key(&cli.secret, &for_cli).unwrap();
         let out = open_payload(&cli_umk, &sealed.blob, &sealed.wrapped_dek).unwrap();
         assert_eq!(out, r#"{"token":"ntn_from_the_browser"}"#);
     }

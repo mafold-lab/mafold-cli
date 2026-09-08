@@ -934,7 +934,14 @@ mod permission_tests {
         // 300ms render batch.
         assert!(matches!(advance, Advance::Immediate), "{advance:?}");
         let md = tx.finish();
-        assert!(md.contains("{% mafold/ask %}"), "{md}");
+        // Carries its OWN action: the tap is relayed to this daemon rather than
+        // posted as a chat message (which is what the bare card's default
+        // `ask:answer` does). A bare opener here would mean a stray "Allow"
+        // bubble in the room on every guarded command.
+        assert!(
+            md.contains(&format!("{{% mafold/ask action=\"{}\" %}}", crate::permission_mcp::ACTION)),
+            "{md}"
+        );
         assert!(md.contains("rm .obsidian/app.json.bak"), "{md}");
         assert!(md.contains(&format!("o|{}|", crate::permission_mcp::ALLOW)), "{md}");
         assert!(md.contains(&format!("o|{}|", crate::permission_mcp::DENY)), "{md}");
