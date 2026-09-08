@@ -1780,9 +1780,14 @@ async fn publish_commands(client: &Client, workdir: &str, harness: &Arc<dyn Harn
 /// - OUR stock seed (any harness / revision) that's stale for this harness →
 ///   republish (a claude-code-fallback daemon can mis-seed a codex bot's sheet
 ///   with the Claude fields; that mistake must not stick forever);
-/// - owner-authored schema → never replaced, only topped up with a missing
-///   `cwd` field (the daemon consumes the working directory, and a sheet
-///   without that field can never express it).
+/// - owner-authored schema → never replaced, only TOPPED UP with the fields
+///   this daemon consumes and the sheet therefore has to be able to express
+///   ([`topped_up`]): the working directory, and — for Claude Code — which
+///   login turns run on. A value with no field behind it is
+///   applied-but-invisible, and the server refuses a one-tap
+///   `{% mafold/customize %}` for an undeclared field for exactly that reason,
+///   so a sheet missing one of these can neither show the setting nor let a
+///   card set it.
 async fn ensure_customize_fields(client: &Client, my_username: &str, owner_username: Option<&str>, harness_id: &str) {
     let (stock, stock_desc) = customize_fields(harness_id);
     let mut fields = stock.clone();
@@ -1797,20 +1802,15 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
                     }
                     // Stale / mis-seeded stock → republish this harness's stock.
                 } else {
-                    // Owner-authored: preserve it; only top up a missing cwd.
-                    let has_cwd = schema.iter().any(|f| {
-                        matches!(f["key"].as_str(), Some("cwd") | Some("workdir"))
-                    });
-                    if has_cwd {
-                        return;
+                    // Owner-authored: preserve it, top up only what the daemon
+                    // consumes (see this function's doc comment).
+                    match topped_up(schema, harness_id) {
+                        Some((a, what)) => {
+                            fields = Value::Array(a);
+                            desc = format!("incl. {what}");
+                        }
+                        None => return, // nothing missing — leave their sheet alone
                     }
-                    let mut a = schema;
-                    a.push(serde_json::json!({
-                        "key": "cwd", "label": "Working directory", "kind": "string",
-                        "placeholder": "~/project — per-chat here = that chat only; All chats = the default"
-                    }));
-                    fields = Value::Array(a);
-                    desc = "incl. working directory".into();
                 }
             }
         }
@@ -1833,6 +1833,58 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
         Ok(_) => println!("✓ published Customize fields for @{my_username} ({desc})"),
         Err(e) => println!("note: couldn't publish Customize fields for @{my_username}: {e}"),
     }
+}
+
+/// An OWNER-AUTHORED schema plus the fields this daemon consumes that it was
+/// missing — `Some((schema, what_changed))`, or None when it already declares
+/// all of them and must be left exactly as it is.
+///
+/// Two fields qualify, on the same grounds: the daemon reads them, so a sheet
+/// without them can neither show what is in effect nor let the owner (or a
+/// one-tap card) change it.
+/// - `cwd` — the working directory a turn runs in.
+/// - `account` — WHICH Claude login it runs on (`crate::accounts`), Claude
+///   Code only: no other harness keys several logins on one machine.
+///
+/// `account` is also REFRESHED when the machine's login list has changed,
+/// because its options ARE that list — an account added by `/login <name>`
+/// after the field was seeded would otherwise never become selectable. Only a
+/// field we ourselves seeded is refreshed (fingerprinted by `label_key`); one
+/// the owner wrote by hand is theirs, options and all.
+fn topped_up(schema: Vec<Value>, harness_id: &str) -> Option<(Vec<Value>, String)> {
+    let mut a = schema;
+    let mut what: Vec<&str> = vec![];
+    let declares = |a: &[Value], keys: &[&str]| {
+        a.iter().any(|f| f["key"].as_str().is_some_and(|k| keys.contains(&k)))
+    };
+    if !declares(&a, &["cwd", "workdir"]) {
+        a.push(serde_json::json!({
+            "key": "cwd", "label": "Working directory", "kind": "string",
+            "placeholder": "~/project — per-chat here = that chat only; All chats = the default"
+        }));
+        what.push("working directory");
+    }
+    if harness_id == "claude-code" {
+        let field = serde_json::json!({
+            "key": "account", "label": "Claude account", "label_key": "botField.account.label",
+            "kind": "select", "default": "", "options": account_options(),
+        });
+        match a.iter_mut().find(|f| f["key"] == "account") {
+            None => {
+                a.push(field);
+                what.push("Claude account");
+            }
+            // Ours, and the machine's logins have changed since we seeded it.
+            Some(cur)
+                if cur["label_key"] == "botField.account.label" && cur["options"] != field["options"] =>
+            {
+                *cur = field;
+                what.push("the Claude account list");
+            }
+            Some(_) => {}
+        }
+    }
+    (!what.is_empty()).then(|| (a, what.join(" + ")))
 }
 
 /// Is this schema one of OUR stock seeds (any harness, any revision) — as
@@ -2022,6 +2074,12 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
 fn account_options() -> Vec<Value> {
     let mut opts = vec![serde_json::json!({ "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" })];
     for a in crate::accounts::load().accounts {
+        // `default` IS "Agent default" — pinning to it and leaving the field
+        // unset resolve to the same seat, so listing it twice offers the
+        // reader a choice that isn't one.
+        if a.is_default() {
+            continue;
+        }
         let label = match &a.email {
             Some(e) => format!("{} · {e}", a.name),
             None => a.name.clone(),
@@ -6595,8 +6653,98 @@ mod bgtasks_tests {
 
 #[cfg(test)]
 mod inbound_file_tests {
-    use super::{attachment_label, file_cache_name, human_size, mafold_preamble};
+    use super::{account_options, attachment_label, file_cache_name, human_size, mafold_preamble, topped_up};
     use serde_json::json;
+
+    /// An owner-authored sheet is preserved, but the fields the DAEMON reads
+    /// are topped up — otherwise the value is applied-but-invisible, and the
+    /// server refuses a one-tap card for an undeclared field, so the setting
+    /// becomes unreachable from every surface at once.
+    ///
+    /// This is the exact shape that bit @opsdu:claude-code on 2026-09-06: a
+    /// hand-written sheet that already had `cwd`, so the old code returned
+    /// early and `account` could never be declared — the card came back
+    /// "field \"account\" isn't declared in this bot's Customize fields".
+    #[test]
+    fn an_owner_sheet_that_already_has_cwd_still_gets_the_account_field() {
+        let owner = vec![
+            json!({ "key": "greeting", "label": "Introduction", "kind": "string" }),
+            json!({ "key": "cwd", "label": "Working directory", "kind": "string" }),
+        ];
+        let (out, what) = topped_up(owner, "claude-code").expect("account was missing");
+        assert_eq!(
+            out.iter().filter_map(|f| f["key"].as_str()).collect::<Vec<_>>(),
+            vec!["greeting", "cwd", "account"],
+        );
+        assert_eq!(what, "Claude account");
+        // …and it is a real select, carrying the machine's login list.
+        let acct = out.iter().find(|f| f["key"] == "account").unwrap();
+        assert_eq!(acct["kind"], "select");
+        assert_eq!(acct["options"], serde_json::Value::Array(account_options()));
+    }
+
+    #[test]
+    fn a_sheet_missing_both_gets_both_and_says_so() {
+        let owner = vec![json!({ "key": "model", "label": "Model", "kind": "string" })];
+        let (out, what) = topped_up(owner, "claude-code").unwrap();
+        assert_eq!(
+            out.iter().filter_map(|f| f["key"].as_str()).collect::<Vec<_>>(),
+            vec!["model", "cwd", "account"],
+        );
+        assert_eq!(what, "working directory + Claude account");
+    }
+
+    /// Nothing missing ⇒ don't touch their sheet at all.
+    #[test]
+    fn a_complete_owner_sheet_is_left_exactly_alone() {
+        let owner = vec![
+            json!({ "key": "workdir", "label": "Dir", "kind": "string" }), // the accepted alias
+            json!({ "key": "account", "label": "Claude account", "label_key": "botField.account.label",
+                    "kind": "select", "default": "", "options": account_options() }),
+        ];
+        assert!(topped_up(owner, "claude-code").is_none());
+    }
+
+    /// Only Claude Code keys several logins by directory — a codex or kimi
+    /// sheet must never sprout a field its daemon ignores.
+    #[test]
+    fn no_other_harness_gets_an_account_field() {
+        let owner = vec![json!({ "key": "cwd", "label": "Dir", "kind": "string" })];
+        assert!(topped_up(owner.clone(), "codex").is_none());
+        assert!(topped_up(owner, "kimi-code").is_none());
+    }
+
+    /// The options ARE the machine's login list, so a `/login <name>` after
+    /// the field was seeded has to refresh them — otherwise the new account
+    /// exists and is simply not selectable, forever.
+    #[test]
+    fn a_stale_account_list_is_refreshed_but_a_hand_written_one_is_not() {
+        let stale = json!({ "key": "account", "label": "Claude account",
+                            "label_key": "botField.account.label", "kind": "select", "default": "",
+                            "options": [{ "label": "Agent default", "value": "" }] });
+        let (out, what) = topped_up(vec![json!({ "key": "cwd" }), stale], "claude-code")
+            .expect("our own field with a stale list must be refreshed");
+        assert_eq!(what, "the Claude account list");
+        let acct = out.iter().find(|f| f["key"] == "account").unwrap();
+        assert_eq!(acct["options"], serde_json::Value::Array(account_options()));
+
+        // No `label_key` ⇒ the owner wrote it. Their options are theirs.
+        let theirs = json!({ "key": "account", "label": "Which seat", "kind": "select",
+                             "options": [{ "label": "只用公司号", "value": "work" }] });
+        assert!(topped_up(vec![json!({ "key": "cwd" }), theirs], "claude-code").is_none());
+    }
+
+    /// `default` and "Agent default" resolve to the same seat, so the menu
+    /// must not offer both — a choice that changes nothing reads as a bug.
+    #[test]
+    fn the_account_menu_never_lists_default_twice() {
+        let opts = account_options();
+        assert_eq!(opts[0]["value"], "", "the unset row comes first");
+        assert!(
+            !opts.iter().skip(1).any(|o| o["value"] == "default"),
+            "`default` is already the unset row: {opts:?}",
+        );
+    }
 
     /// The name the agent reads must carry the sender's own filename — the url
     /// is a bare uuid, and for an `.html` the server stores it WITHOUT an

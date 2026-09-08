@@ -268,6 +268,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "startConnectionLink",
     "startIdentityLink",
     "stopRun",
+    "stripeWebhook",
     "terminateOtherSessions",
     "terminateSession",
     "transferGroupOwner",
