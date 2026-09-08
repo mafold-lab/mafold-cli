@@ -70,11 +70,31 @@ struct ConvMeta {
     last_message: Option<CoreMessage>,
 }
 
+/// The instant a message is ORDERED by, in microseconds.
+///
+/// Milliseconds tie far too often to be the ordering resolution: a bot's reply
+/// draft is inserted microseconds after the message it answers, and a tie hands
+/// the decision to the uuid tiebreak below — which is random. See
+/// [`CoreMessage::created_at_us`].
+///
+/// Falls back to the millisecond field scaled up, so a cache written before the
+/// field existed — or a producer not yet taught to fill it — keeps its old
+/// ordering rather than collapsing onto the epoch. Both branches are the same
+/// unit, so a mixed store still sorts as one timeline.
+fn sort_us(m: &CoreMessage) -> i64 {
+    let us = if m.created_at_us > 0 {
+        m.created_at_us
+    } else {
+        m.created_at_ms.saturating_mul(1_000)
+    };
+    us.max(0)
+}
+
 /// True if `a` is newer than `b` in the SAME total order the message key sorts by
 /// (time, then id) — so the denormalized last-message tracks the same "newest" the
 /// key-ordered scan would have picked.
 fn is_newer(a: &CoreMessage, b: &CoreMessage) -> bool {
-    (a.created_at_ms.max(0), &a.id) > (b.created_at_ms.max(0), &b.id)
+    (sort_us(a), &a.id) > (sort_us(b), &b.id)
 }
 
 /// The timeline a message lives on: its forum channel when set, else the
@@ -86,9 +106,10 @@ fn timeline(m: &CoreMessage) -> &str {
 }
 
 /// Composite message key → BTree/index order == time order; re-putting the same
-/// (timeline, ts, id) overwrites (dedup). ts clamped ≥0 so the zero-pad sorts right.
+/// (timeline, ts, id) overwrites (dedup). ts is MICROseconds ([`sort_us`], clamped
+/// ≥0 so the zero-pad sorts right); 20 digits still hold any i64 µs value.
 fn msg_key(m: &CoreMessage) -> String {
-    format!("{}|{:020}|{}", timeline(m), m.created_at_ms.max(0), m.id)
+    format!("{}|{:020}|{}", timeline(m), sort_us(m), m.id)
 }
 
 fn ser<T: Serialize>(v: &T) -> Vec<u8> { serde_json::to_vec(v).unwrap_or_default() }
@@ -681,9 +702,65 @@ mod tests {
         CoreMessage {
             id: id.into(), conversation_id: conv.into(), sender: acct(),
             content: format!("m-{id}"), created_at_ms: ts, finalized_at_ms: Some(ts),
+            // Deliberately 0: every existing ordering test below then exercises
+            // the millisecond FALLBACK, which is what a pre-field cache and a
+            // not-yet-updated native client will keep producing.
+            created_at_us: 0,
             client_msg_id: cid.map(String::from), thread_root_id: None,
             channel_id: channel.map(String::from), payload: None,
         }
+    }
+
+    /// The same message with a real microsecond stamp — what every current
+    /// producer fills in.
+    fn msg_us(id: &str, conv: &str, us: i64) -> CoreMessage {
+        let mut m = msg(id, conv, None, us / 1_000, None);
+        m.created_at_us = us;
+        m
+    }
+
+    /// THE REGRESSION THIS EXISTS FOR. An api-side bot's reply draft is inserted,
+    /// in the same process, microseconds after the message it answers — measured
+    /// at 203µs on 2026-09-06 — so both truncate to the SAME millisecond. Ordered
+    /// by milliseconds the key tied, and the tiebreak is the message's uuid:
+    /// `01828254…` beat `b0048639…`, so @mafold's answer rendered ABOVE the
+    /// question it was answering. Real ids and real timestamps from that chat.
+    #[test]
+    fn a_reply_in_the_same_millisecond_still_sorts_after_its_question() {
+        let s = store();
+        pollster::block_on(async {
+            // 2026-09-06T13:15:11.509488341Z and …509691292Z.
+            let question = msg_us("b0048639", "conv1", 1_788_700_511_509_488);
+            let answer = msg_us("01828254", "conv1", 1_788_700_511_509_691);
+            assert_eq!(
+                question.created_at_ms, answer.created_at_ms,
+                "the premise: the two land in one millisecond"
+            );
+            // Upserted answer-first, so passing can't come from insertion order.
+            s.upsert_message(&answer).await;
+            s.upsert_message(&question).await;
+            let ids: Vec<String> = s.messages("conv1").await.into_iter().map(|m| m.id).collect();
+            assert_eq!(ids, vec!["b0048639", "01828254"], "the answer follows its question");
+            // …and the dialog preview agrees, because it shares this order.
+            assert!(is_newer(&answer, &question), "last_message must pick the answer");
+        });
+    }
+
+    /// A producer that never fills the microsecond field keeps its old ordering
+    /// rather than collapsing every message onto the epoch — the fallback that
+    /// lets an older cache and a paused native client stay readable.
+    #[test]
+    fn messages_without_microseconds_still_order_by_milliseconds() {
+        let s = store();
+        pollster::block_on(async {
+            s.upsert_message(&msg("late", "conv1", None, 200, None)).await;
+            s.upsert_message(&msg("early", "conv1", None, 100, None)).await;
+            // Mixed store: a µs-stamped message sorts among ms-only ones by the
+            // same clock, because the fallback is the same unit.
+            s.upsert_message(&msg_us("middle", "conv1", 150_000)).await;
+            let ids: Vec<String> = s.messages("conv1").await.into_iter().map(|m| m.id).collect();
+            assert_eq!(ids, vec!["early", "middle", "late"]);
+        });
     }
 
     // A channel message lives in ITS timeline bucket — invisible to the #all

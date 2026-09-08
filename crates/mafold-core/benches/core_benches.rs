@@ -28,7 +28,8 @@ fn msg(id: &str, conv: &str, ts: i64, cid: Option<&str>) -> CoreMessage {
     CoreMessage {
         id: id.into(), conversation_id: conv.into(), sender: acct("ops"),
         content: format!("message body {id} — 一条常规长度的聊天消息,用于基准测试。"),
-        created_at_ms: ts, finalized_at_ms: Some(ts), client_msg_id: cid.map(String::from),
+        created_at_ms: ts, created_at_us: ts.saturating_mul(1_000),
+        finalized_at_ms: Some(ts), client_msg_id: cid.map(String::from),
         thread_root_id: None, channel_id: None,
         payload: Some(format!("{{\"id\":\"{id}\",\"content\":\"payload blob for {id}\"}}")),
     }

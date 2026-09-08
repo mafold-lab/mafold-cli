@@ -153,6 +153,15 @@ pub struct Account {
     /// API. Clients render a badge next to the display name; never self-serve.
     #[serde(default)]
     pub verified: bool,
+    /// Mafold Premium, a paid subscription. Orthogonal to `verified` — that one
+    /// says "this identity was checked", this one says "this person pays". Both
+    /// can be true and clients render both.
+    ///
+    /// **DERIVED, never stored.** The server computes it from the Stripe
+    /// subscription row and the clock at every egress, so a missed webhook
+    /// cannot leave a badge outliving the money. Nothing sets it by hand.
+    #[serde(default)]
+    pub premium: bool,
 }
 
 /// A slash command a bot advertises — shown in the chat's command panel when

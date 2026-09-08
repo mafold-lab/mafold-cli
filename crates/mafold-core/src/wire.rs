@@ -30,6 +30,11 @@ impl From<&wire::Message> for CoreMessage {
             sender: (&m.sender).into(),
             content: m.content.clone(),
             created_at_ms: m.created_at.timestamp_millis(),
+            // Sub-millisecond, because the timeline is ordered by it — see
+            // `CoreMessage::created_at_us`. The wire carries the server's full
+            // precision; truncating it here is what let a reply sort above the
+            // message it answered.
+            created_at_us: m.created_at.timestamp_micros(),
             finalized_at_ms: m.finalized_at.map(|d| d.timestamp_millis()),
             client_msg_id: m.client_msg_id.clone(),
             thread_root_id: m.thread_root_id.map(|u| u.to_string()),

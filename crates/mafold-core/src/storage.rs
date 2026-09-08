@@ -18,7 +18,13 @@ pub trait Storage {
 /// Native SQLite and browser IndexedDB must move together: both persist the
 /// same opaque `CoreMessage.payload`, so a wire-shape change (for example the
 /// file-id attachment cutover) invalidates both stores equally.
-const SCHEMA_VERSION: u32 = 101;
+///
+/// 102: the message key went from milliseconds to MICROseconds
+/// (`store::msg_key`). Entries written by 101 carry a ms-scale number in their
+/// KEY, and zero-padded to 20 digits every one of those sorts before every
+/// µs-scale key — the whole cached history would stack above anything new. The
+/// cache is rebuildable, so the bump wipes it rather than migrating keys.
+const SCHEMA_VERSION: u32 = 102;
 
 // ───────────────────────── native: SQLite as a KV table ─────────────────────────
 #[cfg(not(target_arch = "wasm32"))]

@@ -25,6 +25,7 @@ mod harness;
 mod install;
 mod langpack;
 mod mcp_link;
+mod permission_mcp;
 mod platform;
 mod room;
 mod session;
@@ -222,6 +223,11 @@ enum Cmd {
     /// Not for humans.
     #[command(hide = true)]
     SteerHook,
+    /// (internal) The stdio MCP server claude asks when a permission RULE says a
+    /// human has to approve a tool call — puts the question in the chat as an
+    /// ask card and blocks on the tap. Not for humans.
+    #[command(hide = true)]
+    PermissionMcp,
 }
 
 #[tokio::main]
@@ -246,6 +252,9 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::SteerHook) {
         return steer_hook::run();
+    }
+    if matches!(cli.cmd, Cmd::PermissionMcp) {
+        return permission_mcp::run();
     }
 
     // Daemon control + self-update need no auth.
@@ -412,7 +421,7 @@ async fn main() -> Result<()> {
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
-        | Cmd::SteerHook => unreachable!(),
+        | Cmd::SteerHook | Cmd::PermissionMcp => unreachable!(),
     }
     Ok(())
 }

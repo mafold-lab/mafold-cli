@@ -107,6 +107,11 @@ impl Harness for ClaudeCode {
             .unwrap_or_else(|| "mafold".into());
         let mut pre: Vec<serde_json::Value> = Vec::new();
         let mut post: Vec<serde_json::Value> = Vec::new();
+        // Watches the permission mailbox for as long as this turn runs (see
+        // `permission_watcher`). Bound, never read: it is held for its Drop, so
+        // that all five of `run`'s exit paths stop the watcher without any of
+        // them having to remember to.
+        let mut _perm_watch: Option<PermWatch> = None;
         if let Some(af) = &ask_file {
             cmd.env("MAFOLD_ASK_FILE", af);
             pre.push(serde_json::json!({
@@ -121,6 +126,19 @@ impl Harness for ClaudeCode {
                 "matcher": "Bash",
                 "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
             }));
+            // The user's OWN `ask` rules (`ask: ["Bash(rm *)"]`) mean "a person
+            // must say yes". They outrank `--dangerously-skip-permissions`, an
+            // `allow` rule, and a PreToolUse hook's `allow` — all three verified
+            // against claude 2.1.260 — and headless there is nobody to ask, so
+            // claude denied them outright. Point it at a person instead: this
+            // server puts the question in the reply as the ask card and blocks on
+            // the tap. `--strict-mcp-config` stays, so the user's global MCP
+            // servers still don't load — this config names ours and nothing else.
+            let perm_file = format!("{af}.perm");
+            cmd.env("MAFOLD_PERM_FILE", &perm_file);
+            cmd.arg("--mcp-config").arg(permission_mcp_config(&exe));
+            cmd.arg("--permission-prompt-tool").arg(crate::permission_mcp::TOOL_REF);
+            _perm_watch = Some(permission_watcher(perm_file, sink.clone()));
         }
         // Mid-turn steering: what the user says while this turn runs reaches the
         // model at the next tool-result boundary. PostToolUse, matching every
@@ -633,6 +651,85 @@ impl Harness for ClaudeCode {
     }
 }
 
+/// The `--mcp-config` that mounts our permission server and nothing else.
+///
+/// Its own function so a test can prove the server KEY here and the
+/// `mcp__server__tool` reference passed to `--permission-prompt-tool` still name
+/// the same thing. If they ever disagree claude finds no such tool, and the
+/// failure mode is not an error — it is every gated call hanging until it times
+/// out ten minutes later.
+fn permission_mcp_config(exe: &str) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            crate::permission_mcp::SERVER: { "command": exe, "args": ["permission-mcp"] }
+        }
+    })
+    .to_string()
+}
+
+/// Stops the permission watcher and clears its mailbox when the turn ends,
+/// whichever way it ended. A guard rather than five `abort()` calls: the watcher
+/// polls forever by construction, and `run` returns from five different places
+/// (spawn error, cancel, clean exit, non-zero exit, stream error) — one of them
+/// forgetting would leak a task per turn, forever.
+struct PermWatch {
+    task: tokio::task::JoinHandle<()>,
+    file: String,
+}
+
+impl Drop for PermWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.file);
+    }
+}
+
+/// Turn each permission question `permission_mcp` publishes into the same
+/// `AskUserQuestion` event the model's own interactive asks produce.
+///
+/// The reason this is a FILE watcher and not a stream reader: claude does not
+/// put the permission-prompt tool call on its output stream at all (verified —
+/// the stream shows only the `Bash` call it is asking about, and the MCP tool
+/// isn't even in the session's tool list). So the question has to arrive out of
+/// band. Emitting it as `AskUserQuestion` is what makes the rest free: the
+/// renderer already draws that name as `{% mafold/ask %}`, and the daemon
+/// already arms the turn's answer mailbox on it. Nothing downstream needed a new
+/// concept for "a permission question" — it IS a question.
+fn permission_watcher(file: String, sink: UnboundedSender<AgentEvent>) -> PermWatch {
+    let path = file.clone();
+    let task = tokio::spawn(async move {
+        // Requests are strictly sequential (the turn is blocked on each one), so
+        // "how many lines have I already drawn" is enough to never draw twice.
+        let mut drawn = 0usize;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // `std::fs` on purpose: a few hundred bytes out of the temp dir, and
+            // tokio's `fs` feature isn't enabled in this crate.
+            let Ok(body) = std::fs::read_to_string(&path) else { continue };
+            for line in body.lines().skip(drawn) {
+                drawn += 1;
+                let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+                let id = record["tool_use_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("perm-{drawn}"));
+                if sink
+                    .send(AgentEvent::ToolCall {
+                        id,
+                        name: "AskUserQuestion".into(),
+                        input: crate::permission_mcp::ask_card_input(&record),
+                    })
+                    .is_err()
+                {
+                    return; // renderer is gone — the turn is over
+                }
+            }
+        }
+    });
+    PermWatch { task, file }
+}
+
 /// The context size a `compact_boundary` event says it compacted. Its own
 /// function so the JSON path is pinned by a test against a real captured event —
 /// a silently-wrong path here reads exactly like no compaction at all.
@@ -757,6 +854,108 @@ fn is_queued_receipt(v: &Value, produced: bool) -> bool {
     !produced
         && usage_tokens(v) == 0
         && v["result"].as_str().map(str::trim).is_none_or(str::is_empty)
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use mafold_transcript::{Advance, Transcript};
+
+    /// The flag and the config have to agree on the server's name. They are
+    /// written in two different files, and disagreeing costs a ten-minute hang
+    /// per gated call rather than an error anyone would notice.
+    #[test]
+    fn the_mounted_server_is_the_one_the_flag_names() {
+        let cfg: Value = serde_json::from_str(&permission_mcp_config("/usr/local/bin/mafold")).unwrap();
+        let servers = cfg["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1, "only ours may be mounted: {cfg}");
+        let (name, spec) = servers.iter().next().unwrap();
+        assert_eq!(
+            crate::permission_mcp::TOOL_REF,
+            format!("mcp__{name}__{}", crate::permission_mcp::TOOL),
+        );
+        assert_eq!(spec["command"], "/usr/local/bin/mafold");
+        assert_eq!(spec["args"][0], "permission-mcp");
+    }
+
+    /// The watcher's whole job: a line `permission_mcp` appended becomes an
+    /// interactive ask on the sink, carrying the command it is asking about.
+    #[tokio::test]
+    async fn a_published_question_becomes_an_ask_event() {
+        let file = std::env::temp_dir()
+            .join(format!("mafold-permwatch-{}.jsonl", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&file);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = permission_watcher(file.clone(), tx);
+
+        std::fs::write(
+            &file,
+            "{\"tool_name\":\"Bash\",\"input\":{\"command\":\"rm -rf build\"},\"tool_use_id\":\"toolu_9\"}\n",
+        )
+        .unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the watcher never drew the question")
+            .expect("sink closed");
+        let AgentEvent::ToolCall { id, name, input } = ev else {
+            panic!("expected a tool call, got {ev:?}");
+        };
+        // Named for the tool the renderer already draws as an ask card, and
+        // that the daemon already arms the answer mailbox on.
+        assert_eq!(name, "AskUserQuestion");
+        // Carries claude's own id, so the question is traceable to the call.
+        assert_eq!(id, "toolu_9");
+        assert!(
+            input["questions"][0]["question"].as_str().unwrap().contains("rm -rf build"),
+            "{input}"
+        );
+        drop(watch);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The event has to survive the real renderer as a TAPPABLE card — if it
+    /// came out as a plain tool card, the turn would block on a question with
+    /// no buttons on it.
+    #[test]
+    fn the_ask_event_renders_as_a_tappable_card() {
+        let mut tx = Transcript::new();
+        let advance = tx.push(&AgentEvent::ToolCall {
+            id: "toolu_9".into(),
+            name: "AskUserQuestion".into(),
+            input: crate::permission_mcp::ask_card_input(&serde_json::json!({
+                "tool_name": "Bash",
+                "input": { "command": "rm .obsidian/app.json.bak" },
+            })),
+        });
+        // Immediate: nobody can answer a question that is still sitting in a
+        // 300ms render batch.
+        assert!(matches!(advance, Advance::Immediate), "{advance:?}");
+        let md = tx.finish();
+        assert!(md.contains("{% mafold/ask %}"), "{md}");
+        assert!(md.contains("rm .obsidian/app.json.bak"), "{md}");
+        assert!(md.contains(&format!("o|{}|", crate::permission_mcp::ALLOW)), "{md}");
+        assert!(md.contains(&format!("o|{}|", crate::permission_mcp::DENY)), "{md}");
+    }
+
+    /// The watcher stops with the turn. It polls forever by construction, so a
+    /// leak here is one live task per reply for the life of the daemon.
+    #[tokio::test]
+    async fn dropping_the_guard_stops_the_watcher_and_clears_the_mailbox() {
+        let file = std::env::temp_dir()
+            .join(format!("mafold-permdrop-{}.jsonl", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&file, "").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = permission_watcher(file.clone(), tx);
+        let task = watch.task.abort_handle();
+        drop(watch);
+        assert!(task.is_finished() || { tokio::task::yield_now().await; task.is_finished() });
+        assert!(!std::path::Path::new(&file).exists(), "mailbox left behind");
+    }
 }
 
 #[cfg(test)]

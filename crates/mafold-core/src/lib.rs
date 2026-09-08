@@ -140,6 +140,28 @@ pub struct CoreMessage {
     pub sender: CoreAccount,
     pub content: String,
     pub created_at_ms: i64,
+    /// The same instant in MICROSECONDS — the resolution the timeline is
+    /// actually ORDERED by (`store::msg_key`). `created_at_ms` above stays what
+    /// it says it is and remains what every display path reads.
+    ///
+    /// Milliseconds are not fine enough to order a chat. An api-side bot's
+    /// reply draft is inserted, in the same process, microseconds after the
+    /// message it answers — measured at 203µs on 2026-09-06 — so both truncate
+    /// to the same millisecond, the key ties, and the tiebreak (the message's
+    /// random uuid) decides. Half the time it puts the ANSWER above the
+    /// QUESTION; that is what "我发的消息反而在他的回复后面" was. A daemon bot
+    /// rarely hit it only because its reply crosses a websocket first.
+    ///
+    /// MICROseconds and not nanoseconds because this number crosses a
+    /// JavaScript boundary: µs since the epoch is exact in a `number`
+    /// (1.8e15 < 2^53) for another two centuries; ns is not.
+    ///
+    /// `0` = a producer that predates the field (a cache from an older build, a
+    /// native client not yet taught to fill it). The key then falls back to
+    /// `created_at_ms × 1000` — exactly today's behaviour, never the epoch.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub created_at_us: i64,
     /// None while a streaming message is still being written.
     pub finalized_at_ms: Option<i64>,
     /// Echoed client id for optimistic-send reconciliation.
@@ -1031,11 +1053,11 @@ mod tests {
         }).unwrap();
         core.upsert_message(CoreMessage {
             id: "m1".into(), conversation_id: "c1".into(), sender: acct("alice"),
-            content: "hello".into(), created_at_ms: 50, finalized_at_ms: Some(50), client_msg_id: None, thread_root_id: None, channel_id: None, payload: None,
+            content: "hello".into(), created_at_ms: 50, created_at_us: 0, finalized_at_ms: Some(50), client_msg_id: None, thread_root_id: None, channel_id: None, payload: None,
         }).unwrap();
         core.upsert_message(CoreMessage {
             id: "m2".into(), conversation_id: "c1".into(), sender: acct("bob"),
-            content: "world".into(), created_at_ms: 150, finalized_at_ms: Some(150), client_msg_id: None, thread_root_id: None, channel_id: None, payload: None,
+            content: "world".into(), created_at_ms: 150, created_at_us: 0, finalized_at_ms: Some(150), client_msg_id: None, thread_root_id: None, channel_id: None, payload: None,
         }).unwrap();
 
         let msgs = core.messages("c1".into()).unwrap();
@@ -1134,6 +1156,9 @@ mod tests {
         assert_eq!(cm.sender.kind, "human");
         assert_eq!(cm.content, "hello");
         assert_eq!(cm.created_at_ms, 1782172800000);          // 2026-06-23T00:00:00Z
+        // …and the sub-millisecond twin the timeline is ordered by, carried at
+        // the wire's own precision instead of being truncated away.
+        assert_eq!(cm.created_at_us, 1782172800000000);
         assert_eq!(cm.finalized_at_ms, Some(1782172801000));  // +1s
         assert_eq!(cm.client_msg_id.as_deref(), Some("cmid-9"));
         assert!(cm.payload.as_deref().unwrap().contains("\"content\":\"hello\""));
@@ -1145,7 +1170,7 @@ mod tests {
         for (id, ts) in [("a", 10i64), ("b", 20), ("c", 30)] {
             core.upsert_message(CoreMessage {
                 id: id.into(), conversation_id: "k".into(), sender: acct("x"),
-                content: id.into(), created_at_ms: ts, finalized_at_ms: Some(ts),
+                content: id.into(), created_at_ms: ts, created_at_us: 0, finalized_at_ms: Some(ts),
                 client_msg_id: None, thread_root_id: None, channel_id: None, payload: None,
             }).unwrap();
         }
@@ -1162,13 +1187,13 @@ mod tests {
         // client_msg_id, with an optimistic payload.
         core.upsert_message(CoreMessage {
             id: "temp-1".into(), conversation_id: "c".into(), sender: acct("me"),
-            content: "hi".into(), created_at_ms: 100, finalized_at_ms: None,
+            content: "hi".into(), created_at_ms: 100, created_at_us: 0, finalized_at_ms: None,
             client_msg_id: Some("cmid-1".into()), thread_root_id: None, channel_id: None, payload: Some("{\"optimistic\":1}".into()),
         }).unwrap();
         // Server echo: REAL id + server ts, SAME client_msg_id, payload present.
         core.upsert_message(CoreMessage {
             id: "real-1".into(), conversation_id: "c".into(), sender: acct("me"),
-            content: "hi".into(), created_at_ms: 105, finalized_at_ms: Some(105),
+            content: "hi".into(), created_at_ms: 105, created_at_us: 0, finalized_at_ms: Some(105),
             client_msg_id: Some("cmid-1".into()), thread_root_id: None, channel_id: None, payload: Some("{\"server\":1}".into()),
         }).unwrap();
 
@@ -1182,12 +1207,12 @@ mod tests {
         // payload forward rather than blanking it.
         core.upsert_message(CoreMessage {
             id: "real-2".into(), conversation_id: "c".into(), sender: acct("me"),
-            content: "yo".into(), created_at_ms: 200, finalized_at_ms: None,
+            content: "yo".into(), created_at_ms: 200, created_at_us: 0, finalized_at_ms: None,
             client_msg_id: Some("cmid-2".into()), thread_root_id: None, channel_id: None, payload: Some("{\"opt2\":1}".into()),
         }).unwrap();
         core.upsert_message(CoreMessage {
             id: "real-2b".into(), conversation_id: "c".into(), sender: acct("me"),
-            content: "yo".into(), created_at_ms: 205, finalized_at_ms: Some(205),
+            content: "yo".into(), created_at_ms: 205, created_at_us: 0, finalized_at_ms: Some(205),
             client_msg_id: Some("cmid-2".into()), thread_root_id: None, channel_id: None, payload: None,
         }).unwrap();
         let msgs = core.messages("c".into()).unwrap();
@@ -1291,7 +1316,7 @@ mod tests {
         let core = MafoldCore::open(":memory:".into()).unwrap();
         let mut m = CoreMessage {
             id: "m".into(), conversation_id: "c".into(), sender: acct("a"),
-            content: "hi".into(), created_at_ms: 10, finalized_at_ms: None,
+            content: "hi".into(), created_at_ms: 10, created_at_us: 0, finalized_at_ms: None,
             client_msg_id: None, thread_root_id: None, channel_id: None, payload: Some("{\"full\":1}".into()),
         };
         core.upsert_message(m.clone()).unwrap();
@@ -1310,7 +1335,7 @@ mod tests {
         let core = MafoldCore::open(":memory:".into()).unwrap();
         let msg = |id: &str, ts: i64, content: &str, root: Option<&str>| CoreMessage {
             id: id.into(), conversation_id: "c".into(), sender: acct("bot"),
-            content: content.into(), created_at_ms: ts, finalized_at_ms: None,
+            content: content.into(), created_at_ms: ts, created_at_us: 0, finalized_at_ms: None,
             client_msg_id: None, thread_root_id: root.map(|s| s.into()), channel_id: None, payload: None,
         };
         core.upsert_conversation(CoreConversation {
