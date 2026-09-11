@@ -82,6 +82,30 @@ pub(crate) fn spawn_mock(responses: Vec<(u16, String)>) -> MockApi {
     MockApi { base, requests }
 }
 
+/// A server that ACCEPTS the connection and then says nothing, ever.
+///
+/// This is the half-open socket — a captive portal, a phone that changed cell
+/// mid-request, a proxy that swallows the connection — and it is a different
+/// failure from a REFUSED connect, which fails fast on its own and needs no
+/// deadline. Only this shape hangs a client that has no timeout, so only this
+/// shape can prove one is wired.
+pub(crate) fn spawn_blackhole() -> MockApi {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blackhole");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    let base = format!("http://{}", std_listener.local_addr().unwrap());
+    let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+    tokio::spawn(async move {
+        // HOLD every accepted socket. Dropping one would send FIN, the client
+        // would see a clean EOF, and the test would pass on the wrong error.
+        let mut held = Vec::new();
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            held.push(sock);
+        }
+    });
+    MockApi { base, requests: Arc::new(Mutex::new(Vec::new())) }
+}
+
 async fn serve_one(
     sock: &mut tokio::net::TcpStream,
     status: u16,

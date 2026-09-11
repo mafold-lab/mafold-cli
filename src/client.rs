@@ -252,6 +252,66 @@ impl Client {
         self.post("getChatHistory", body).await
     }
 
+    /// Recent messages, optionally on someone else's `chat.read` ticket.
+    ///
+    /// The `on_behalf_of` arm is what `mafold read` uses for a room the caller
+    /// is not in; the page then comes back as the LENDER sees it. Kept separate
+    /// from `get_chat_history` because that one is the daemon's hot path (four
+    /// call sites, always the caller's own room) and should not grow a
+    /// parameter every one of them passes `None` to.
+    pub async fn chat_history(
+        &self,
+        chat_id: &str,
+        limit: usize,
+        channel_id: Option<&str>,
+        on_behalf_of: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "limit": limit });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        if let Some(u) = on_behalf_of {
+            body["on_behalf_of"] = json!(u);
+        }
+        self.post("getChatHistory", body).await
+    }
+
+    /// Ask a room's people for a `chat.read` ticket (.docs/chat-record-sharing-v1.md).
+    pub async fn request_chat_access(
+        &self,
+        chat_id: &str,
+        from: &str,
+        days: i64,
+        for_account: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({
+            "conversation_id": chat_id,
+            "ttl_days": days,
+            // A participant to address the card to. The server will not pick
+            // one for you: choosing would mean telling the asker who is in a
+            // room they cannot see.
+            "user": from.trim_start_matches('@'),
+        });
+        if let Some(f) = for_account {
+            body["for"] = json!(f.trim_start_matches('@'));
+        }
+        self.post("requestChatAccess", body).await
+    }
+
+    /// Both directions of chat.read at once: `granted` (mine, lent out),
+    /// `held` (what I may read), `pending` (asks nobody has answered).
+    pub async fn list_chat_grants(&self) -> Result<Value> {
+        self.post("listChatGrants", json!({})).await
+    }
+
+    pub async fn revoke_chat_grant(&self, chat_id: &str, grantee: &str) -> Result<Value> {
+        self.post(
+            "revokeChatGrant",
+            json!({ "conversation_id": chat_id, "grantee": grantee.trim_start_matches('@') }),
+        )
+        .await
+    }
+
     /// A thread's messages (root + replies) — used to rebuild context when the
     /// bot is @-mentioned INSIDE a thread (thread replies aren't in the channel's
     /// main timeline, so getChatHistory alone misses them).

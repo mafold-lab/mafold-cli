@@ -14,6 +14,7 @@ mod bash_hook;
 mod cards;
 mod cardtags;
 mod channels;
+mod chat;
 mod client;
 mod commands;
 mod computer;
@@ -99,6 +100,35 @@ enum Cmd {
     },
     /// List your conversations.
     Chats,
+    /// Read a conversation's recent messages. `mafold read` with no argument
+    /// reads the room this turn is in; naming a room you are NOT in asks its
+    /// people for a ticket instead of failing (exit 3 = waiting on their tap).
+    ///
+    /// The counterpart to `send`: until this existed the CLI could write to any
+    /// conversation it could name and read none of them.
+    Read {
+        /// Conversation id, @username, or a name from `mafold chats`.
+        chat: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Read a forum channel instead of the main timeline.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Download the transcript's photos and files to ~/.mafold/attachments
+        /// and print each one's path, so the agent can actually open them.
+        /// Off by default: a long page of a photo-heavy room is a lot of bytes
+        /// to fetch for a question about the text.
+        #[arg(long)]
+        media: bool,
+        /// Machine-readable page, for code rather than for a model.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Chat-history tickets: ask for one, see what you hold, revoke one you gave.
+    Access {
+        #[command(subcommand)]
+        cmd: chat::AccessCmd,
+    },
     /// Send a message. <chat> is a conversation id or a @username.
     Send {
         chat: String,
@@ -418,6 +448,14 @@ async fn main() -> Result<()> {
             supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
+        Cmd::Read { chat: c, limit, channel, media, json } => {
+            chat::read(
+                &Client::new(cli.base, token),
+                chat::ReadArgs { chat: c, limit, channel, json, media },
+            )
+            .await?
+        }
+        Cmd::Access { cmd } => chat::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Send {
             chat,
             channel,
@@ -650,18 +688,41 @@ async fn chats(client: &Client) -> Result<()> {
         return Ok(());
     }
     for c in items {
-        let title = c["title"].as_str().map(str::to_string).unwrap_or_else(|| {
-            // DM → the other participant's display name.
-            c["participants"]
-                .as_array()
-                .and_then(|ps| {
-                    ps.iter()
-                        .find(|p| p["username"].as_str().map(str::to_lowercase) != Some(my.clone()))
-                })
-                .and_then(|p| p["display_name"].as_str())
-                .unwrap_or("Chat")
-                .to_string()
-        });
+        // Three things this row used to drop, each of which is the difference
+        // between two rows a reader can tell apart and two they cannot:
+        //
+        //   • the KIND. The old fallback ("title, else the first participant
+        //     who isn't me") ran without looking at it, so an untitled GROUP
+        //     took one member's display name and sat here looking exactly like
+        //     a DM with that person. On @opsdu's list that printed «ops» twice
+        //     (a DM with `opsdu:claude-code`, display-named "ops", and a
+        //     3-person group) and «fei_pota» twice. The ids were never reused
+        //     — every conversation id is a fresh v4 uuid — the printer was
+        //     throwing away what told them apart.
+        //   • the HANDLE. Two accounts may share a display name; usernames are
+        //     the unique key, so a DM prints one.
+        //   • the ID. It was read nowhere, which left the list unusable as
+        //     input to anything: `mafold read`/`send` take a uuid or an
+        //     @username and this printed neither.
+        let title = chat::label_of(&c, &my);
+        let shape = chat::shape_of(
+            c["kind"].as_str().unwrap_or(""),
+            c["participants"].as_array().map_or(0, |p| p.len()),
+        );
+        // The handle only earns its place on a DM: on a group it would be the
+        // arbitrary first member's, which is the very confusion being fixed.
+        let handle = (c["kind"].as_str() == Some("direct"))
+            .then(|| {
+                c["participants"]
+                    .as_array()?
+                    .iter()
+                    .find(|p| p["username"].as_str().map(str::to_lowercase) != Some(my.clone()))?
+                    ["username"]
+                    .as_str()
+                    .map(|u| format!("  @{u}"))
+            })
+            .flatten()
+            .unwrap_or_default();
         let preview = c["last_message"]["content"].as_str().unwrap_or("—");
         let unread = c["unread_count"].as_u64().unwrap_or(0);
         let badge = if unread > 0 {
@@ -675,7 +736,8 @@ async fn chats(client: &Client) -> Result<()> {
         } else {
             oneline
         };
-        println!("• {title}{badge}\n  {oneline}");
+        let id = c["id"].as_str().unwrap_or("");
+        println!("• {title}{handle}{badge}\n  {shape} · {id}\n  {oneline}");
     }
     Ok(())
 }

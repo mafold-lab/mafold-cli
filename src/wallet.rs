@@ -1,5 +1,8 @@
 //! `mafold wallet` — the token wallet from the CLI. Currency = model id
-//! ("claude-fable-5"); 1 unit = 1 output-equivalent token of that model.
+//! ("claude-fable-5"); 1 unit = 1 output-equivalent unit of that model, which
+//! is a token for everything billed per token and whatever the vendor actually
+//! meters otherwise — `rates` prints each currency's own unit rather than
+//! captioning the whole column "tokens".
 //! Amounts accept 1M/2.5B/1000 shorthand. Account-symmetric: `mint` works for
 //! anyone to TYPE but only the @mafold first-party account passes the server
 //! check — there is no privileged client path.
@@ -30,7 +33,7 @@ pub enum WalletCmd {
         from: String,
         to: String,
     },
-    /// Show the official price table (USD / 1M tokens).
+    /// Show the official price table (USD / 1M units, per currency).
     Rates,
     /// Show your ledger (newest first).
     History {
@@ -90,6 +93,18 @@ fn items(v: &Value) -> Vec<Value> {
     v["items"].as_array().cloned().unwrap_or_default()
 }
 
+/// A unit as a plural noun: "token" → "tokens", "second" → "seconds".
+///
+/// Add an "s" unless there already is one. The unit vocabulary is open by
+/// design (the server takes any word), so there is nothing to look the answer
+/// up IN — and an English pluralisation table would be a hardcoded list of the
+/// exact kind the open vocabulary exists to avoid. This is wrong for an
+/// irregular noun; no vendor bills in one, and a wrong plural is a typo where a
+/// wrong UNIT would be a lie about what somebody holds.
+fn plural(unit: &str) -> String {
+    if unit.ends_with('s') { unit.to_string() } else { format!("{unit}s") }
+}
+
 pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
     match cmd {
         WalletCmd::Balance => {
@@ -139,13 +154,20 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
         }
         WalletCmd::Rates => {
             let r = client.call("walletRates", json!({})).await?;
-            println!("official prices (USD / 1M tokens):");
+            // "USD / 1M units" in the header, and each row names its own unit,
+            // because they are no longer all the same word: a currency the
+            // vendor bills per second of video prices per 1M SECONDS through
+            // this same table. Printing "tokens" over that column would be the
+            // one thing this field exists to stop.
+            println!("official prices (USD / 1M units):");
             for row in items(&r) {
+                let unit = row["unit"].as_str().unwrap_or("token");
                 println!(
-                    "  {:<22} in ${:<7} out ${}",
+                    "  {:<22} in ${:<7} out ${:<9} per 1M {}",
                     row["currency"].as_str().unwrap_or("?"),
                     row["usd_in"].as_f64().unwrap_or(0.0),
-                    row["usd_out"].as_f64().unwrap_or(0.0)
+                    row["usd_out"].as_f64().unwrap_or(0.0),
+                    plural(unit)
                 );
             }
         }

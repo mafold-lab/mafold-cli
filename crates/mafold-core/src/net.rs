@@ -99,15 +99,16 @@ pub async fn rpc(base: &str, token: &str, method: &str, body: &str) -> Result<St
     rpc_ex(base, token, method, body).await.map_err(|e| e.to_string())
 }
 
-/// How long a browser RPC may go without an answer before we call it dead.
+/// How long an RPC may go without an answer before we call it dead. ONE number
+/// for every platform — a native client that waits longer than the browser does
+/// isn't more patient, it's differently broken.
 ///
 /// Generous on purpose. The longest legitimate synchronous hold anywhere in this
 /// API is the 8s RPC-ack path (`mafold-api/src/main.rs`); inline queries cap at
 /// 3s. Past a minute there is no server still thinking — there is a socket that
 /// will never speak. Large transfers are NOT at risk: media upload uses a raw
 /// multipart `fetch`, not this path.
-#[cfg(target_arch = "wasm32")]
-const WEB_RPC_TIMEOUT_MS: u32 = 60_000;
+const RPC_TIMEOUT_MS: u64 = 60_000;
 
 #[cfg(target_arch = "wasm32")]
 pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result<String, RpcError> {
@@ -122,7 +123,7 @@ pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result
     // flipped to a pending state on the way in never gets the error that would
     // let it flip back. That is how a tapped Stop button stayed on "Stopping…"
     // indefinitely with nothing on screen to say the request had died. The
-    // native client bounds its connect phase; this is the web's equivalent.
+    // native arm bounds the same window with a per-request `.timeout()`.
     let controller = web_sys::AbortController::new()
         .map_err(|_| RpcError::Transport("AbortController unavailable".into()))?;
     let signal = controller.signal();
@@ -144,7 +145,7 @@ pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result
         let text = resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?;
         unwrap_envelope_ex(status, &method_for_err, text)
     });
-    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(WEB_RPC_TIMEOUT_MS));
+    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(RPC_TIMEOUT_MS as u32));
 
     match select(work, deadline).await {
         Either::Left((out, _)) => out,
@@ -154,7 +155,7 @@ pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result
             controller.abort();
             Err(RpcError::Transport(format!(
                 "{method}: no response in {}s — the connection appears to be down",
-                WEB_RPC_TIMEOUT_MS / 1000
+                RPC_TIMEOUT_MS / 1000
             )))
         }
     }
@@ -162,8 +163,19 @@ pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result
 
 // One shared client across all RPCs so connection/TLS sessions POOL (a fresh
 // `Client::new()` per call throws the pool away and re-does the TLS handshake).
-// Bound only the CONNECT phase: an overall timeout would cut off long streams
-// (self-update downloads) that callers tunnel through the same client.
+//
+// The CLIENT bounds only the connect phase, because the long streams that share
+// it (`http_post_streaming`, self-update downloads) must not be cut off. The
+// per-request deadline therefore lives on the REQUEST, in `rpc_ex` — which is
+// the only builder here that gets one, and reaches none of those streams.
+//
+// It has to live SOMEWHERE: with a connect-only bound, a half-open socket (a
+// captive portal, a phone that changed cell mid-flight, a proxy that swallows
+// the connection) leaves the future neither resolved nor rejected. On mobile
+// that is not an abstract hazard — `getMe` on the boot path used to hold the
+// first frame, so an app opened on a bad radio painted a blank screen with no
+// timeout to end it, forever. (RN MafoldApp no longer gates the first paint on
+// a network call at all, but every other RPC still needed the floor.)
 #[cfg(not(target_arch = "wasm32"))]
 fn client() -> &'static reqwest::Client {
     use std::sync::OnceLock;
@@ -178,26 +190,56 @@ fn client() -> &'static reqwest::Client {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result<String, RpcError> {
+    rpc_ex_within(base, token, method, body, RPC_TIMEOUT_MS).await
+}
+
+/// `rpc_ex` with the deadline spelled out. Exists so the timeout is TESTABLE:
+/// the shipping budget is a minute, and a test that actually waited one would
+/// never be run. Nothing else should call this — pick the budget by fixing
+/// `RPC_TIMEOUT_MS`, not per call site.
+#[cfg(not(target_arch = "wasm32"))]
+async fn rpc_ex_within(
+    base: &str,
+    token: &str,
+    method: &str,
+    body: &str,
+    budget_ms: u64,
+) -> Result<String, RpcError> {
+    // BOTH the send and the body read map through here: the per-request
+    // deadline fires on whichever of the two was still outstanding, so mapping
+    // only the first would let a stall mid-body come back as a bare
+    // "operation timed out".
+    let to_err = |e: reqwest::Error| {
+        if e.is_connect() {
+            RpcError::Connect(e.to_string())
+        } else if e.is_timeout() {
+            // Say what happened in words. reqwest's own Display for a timeout
+            // is "operation timed out" — no method, no budget — which reads
+            // like a server fault rather than "this socket never spoke", and
+            // these strings land in user-facing toasts.
+            RpcError::Transport(format!(
+                "{method}: no response in {}s — the connection appears to be down",
+                budget_ms / 1000
+            ))
+        } else {
+            RpcError::Transport(e.to_string())
+        }
+    };
     let resp = client()
         .post(format!("{base}/{method}"))
         .bearer_auth(token)
         .header("content-type", "application/json")
+        // Covers the whole request — connect, headers AND body. A reply that
+        // starts and then stalls mid-body hangs exactly as hard as one that
+        // never arrives, which is why reqwest's total `timeout` (not
+        // `read_timeout`) is the right knob. Same number as the browser arm.
+        .timeout(std::time::Duration::from_millis(budget_ms))
         .body(body.to_string())
         .send()
         .await
-        .map_err(|e| {
-            if e.is_connect() {
-                RpcError::Connect(e.to_string())
-            } else {
-                RpcError::Transport(e.to_string())
-            }
-        })?;
+        .map_err(&to_err)?;
     let status = resp.status().as_u16();
-    unwrap_envelope_ex(
-        status,
-        method,
-        resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?,
-    )
+    unwrap_envelope_ex(status, method, resp.text().await.map_err(&to_err)?)
 }
 
 // ── plain HTTP, for hosts that are not the Mafold API ──────────────────────
@@ -286,7 +328,7 @@ pub async fn http_post(
         let body = resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?;
         Ok(HttpReply { status, headers, body })
     });
-    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(WEB_RPC_TIMEOUT_MS));
+    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(RPC_TIMEOUT_MS as u32));
 
     match select(work, deadline).await {
         Either::Left((out, _)) => out,
@@ -294,7 +336,7 @@ pub async fn http_post(
             controller.abort();
             Err(RpcError::Transport(format!(
                 "no response in {}s from {url}",
-                WEB_RPC_TIMEOUT_MS / 1000
+                RPC_TIMEOUT_MS / 1000
             )))
         }
     }
@@ -386,7 +428,44 @@ pub async fn http_post_streaming(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::testutil::{ok, spawn_mock};
+    use crate::testutil::{ok, spawn_blackhole, spawn_mock};
+
+    // ── the deadline ──
+
+    /// The regression: with a connect-only bound, a socket that connects and
+    /// then goes silent left this future pending forever. On mobile that was a
+    /// blank first frame with nothing to end it.
+    #[tokio::test]
+    async fn a_socket_that_never_speaks_times_out_instead_of_hanging_forever() {
+        let hole = spawn_blackhole();
+        let started = std::time::Instant::now();
+        let err = rpc_ex_within(&hole.base, "tok", "getMe", "{}", 400)
+            .await
+            .expect_err("a silent socket must not resolve");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the DEADLINE has to be what ended this, not the test runner"
+        );
+        match err {
+            // Transport, not Connect: the request did leave the machine, so a
+            // blind retry of a non-idempotent call is NOT safe. Callers key
+            // their retry decision off exactly this distinction.
+            RpcError::Transport(m) => {
+                assert!(m.contains("getMe"), "must name the method: {m}");
+                assert!(m.contains("no response"), "must say what happened: {m}");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    /// The deadline must not fire on a reply that simply took a while — the
+    /// api's own RPC-ack path legitimately holds for seconds.
+    #[tokio::test]
+    async fn a_slow_but_real_reply_still_lands() {
+        let mock = spawn_mock(vec![ok(r#"{"language":"zh-Hans"}"#)]);
+        let out = rpc_ex_within(&mock.base, "tok", "getMe", "{}", 10_000).await.expect("getMe");
+        assert_eq!(out, r#"{"language":"zh-Hans"}"#);
+    }
 
     // ── envelope unwrap (pure) ──
 
