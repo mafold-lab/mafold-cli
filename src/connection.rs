@@ -505,9 +505,9 @@ fn collect(spec: &ProviderInfo, import: bool, from_env: bool)
             .with_context(|| format!("{} is not JSON", full.display()))?;
         // Vendors nest their bag differently; search rather than hard-code a
         // path per vendor, so a layout change costs nothing here.
-        for f in &spec.fields {
-            if let Some(v) = find_key(&parsed, &f.key) {
-                out.insert(f.key.to_string(), v);
+        for key in &spec.payload_keys {
+            if let Some(v) = find_key(&parsed, key) {
+                out.insert(key.to_string(), v);
             }
         }
         if out.is_empty() {
@@ -548,7 +548,13 @@ fn collect(spec: &ProviderInfo, import: bool, from_env: bool)
 fn find_key(v: &Value, key: &str) -> Option<Value> {
     match v {
         Value::Object(m) => {
-            if let Some(found) = m.get(key) {
+            let camel = key.split('_').enumerate().map(|(i, part)| {
+                if i == 0 { part.to_string() } else {
+                    let mut chars = part.chars();
+                    chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+                }
+            }).collect::<String>();
+            if let Some(found) = m.get(key).or_else(|| m.get(&camel)) {
                 if !found.is_null() && !found.is_object() && !found.is_array() {
                     return Some(found.clone());
                 }
@@ -1409,6 +1415,19 @@ pub async fn handle_link_event(
             let _ = client.call("reportConnectionLink", body).await;
             return true;
         }
+        Some(sp) if sp.import_path.is_some() && sp.oauth_fixed.is_none() => {
+            let outcome = import_for_link(client, umk, key_id, &sp).await;
+            match &outcome {
+                Ok(name) => { let _ = answer(json!({ "authorize_url": "", "device": sess.device_name, "connection": name }), None).await; }
+                Err(e) => { let _ = answer(Value::Null, Some(format!("{e:#}"))).await; }
+            }
+            let body = match outcome {
+                Ok(name) => json!({ "link_id": link_id, "connection": name }),
+                Err(e) => json!({ "link_id": link_id, "error": format!("{e:#}") }),
+            };
+            let _ = client.call("reportConnectionLink", body).await;
+            return true;
+        }
         Some(sp) if sp.oauth_fixed.is_some() => sp,
         Some(sp) => {
             let _ = answer(
@@ -1494,11 +1513,25 @@ async fn bind_for_link(
                 "label": sess.device_name,
                 "blob": blob,
                 "wrapped_dek": wrapped_dek,
-                "key_id": key_id,
+                "key_id": key_id, "create_only": true,
             }),
         )
         .await
         .context("putConnection failed")?;
+    Ok(name)
+}
+
+/// Import the provider's declared local login into one new sealed connection.
+/// The same collection path as `connection add --import`, callable from a card.
+async fn import_for_link(client: &Client, umk: &Key, key_id: &str, spec: &ProviderInfo) -> Result<String> {
+    let mut fields = collect(spec, true, false)?;
+    enrich_oauth_payload(spec, &mut fields);
+    let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
+    let name = free_name(client, &spec.id).await;
+    client.call("putConnection", json!({
+        "name": name, "provider": spec.id, "label": spec.display,
+        "blob": blob, "wrapped_dek": wrapped_dek, "key_id": key_id, "create_only": true,
+    })).await.context("putConnection failed")?;
     Ok(name)
 }
 
@@ -1531,7 +1564,7 @@ async fn finish_linking(
                 "label": label,
                 "blob": blob,
                 "wrapped_dek": wrapped_dek,
-                "key_id": key_id,
+                "key_id": key_id, "create_only": true,
             }),
         )
         .await
@@ -2084,6 +2117,14 @@ mod tests {
         assert_eq!(find_key(&v, "access_token"), Some(Value::String("tok".into())));
         assert_eq!(find_key(&v, "expires_at"), Some(Value::Number(123.into())));
         assert_eq!(find_key(&v, "refresh_token"), None);
+    }
+
+    #[test]
+    fn import_reads_camel_case_token_bags_without_provider_specific_paths() {
+        let value = json!({ "login": { "accessToken": "access", "refreshToken": "refresh", "expiresAt": 123 } });
+        assert_eq!(find_key(&value, "access_token"), Some(json!("access")));
+        assert_eq!(find_key(&value, "refresh_token"), Some(json!("refresh")));
+        assert_eq!(find_key(&value, "expires_at"), Some(json!(123)));
     }
 
     /// A container must never be mistaken for a value — that would store `{…}`

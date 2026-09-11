@@ -417,6 +417,7 @@ async fn store(
     endpoint: &str,
     mut fields: Map<String, Value>,
     label: &str,
+    create_only: bool,
 ) -> Result<()> {
     fields.insert("endpoint".into(), Value::String(endpoint.to_string()));
     let kept = mafold_core::connections::filter_payload(spec, &fields);
@@ -431,6 +432,7 @@ async fn store(
                 "blob": blob,
                 "wrapped_dek": wrapped_dek,
                 "key_id": key_id,
+                "create_only": create_only,
             }),
         )
         .await
@@ -487,7 +489,7 @@ pub(crate) async fn add_server(
 
     let (umk, key_id, _) = unlock(client, sess).await?;
     let label = label.unwrap_or_else(|| host.clone());
-    store(client, &umk, &key_id, spec, name, &endpoint, fields, &label).await?;
+    store(client, &umk, &key_id, spec, name, &endpoint, fields, &label, false).await?;
     println!("✓ linked {name} → {host} ({label})");
     println!("  the server stored ciphertext it cannot open; only your enrolled devices can.");
     println!("  its methods:  mafold connection methods {name}");
@@ -557,7 +559,7 @@ pub(crate) async fn serve_link(
         // so the answer carries the connection rather than a URL.
         Ok(Probe::Open) => {
             let name = free_name_from(client, &wanted).await;
-            let outcome = store(client, umk, key_id, spec, &name, &endpoint, Map::new(), &label).await;
+            let outcome = store(client, umk, key_id, spec, &name, &endpoint, Map::new(), &label, true).await;
             match &outcome {
                 Ok(()) => {
                     let _ = answer(
@@ -605,7 +607,7 @@ pub(crate) async fn serve_link(
                 let outcome: Result<String> = async {
                     let (bag, _) = oauth_exchange(&oc, leg).await?;
                     let name = free_name_from(&client, &wanted).await;
-                    store(&client, &umk, &key_id, &spec, &name, &endpoint, bag, &label).await?;
+                    store(&client, &umk, &key_id, &spec, &name, &endpoint, bag, &label, true).await?;
                     Ok(name)
                 }
                 .await;
