@@ -98,7 +98,13 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
     let log = dir.join(format!("{tag}.{ts}.log"));
     let pidf = dir.join(format!("{tag}.{ts}.pid"));
     let meta = dir.join(format!("{tag}.{ts}.meta"));
-    std::fs::write(&script, format!("#!/bin/bash\n{command}\n")).ok()?;
+    // The Bash tool's own `timeout` (ms), which detaching used to throw away —
+    // the model would ask for a 20-minute cap and get a task that could run
+    // until the monitor gave up two hours later. Honoured only when the model
+    // set one EXPLICITLY: claude's 2-minute default is for foreground commands,
+    // and quietly applying it here would shoot every build in the head.
+    let timeout_secs = ti["timeout"].as_u64().map(|ms| (ms / 1000).max(1));
+    std::fs::write(&script, script_body(command, timeout_secs)).ok()?;
 
     // The tool call's cwd (claude passes it in the hook input); fall back to
     // the hook's own cwd (claude spawns hooks in the session cwd).
@@ -110,9 +116,14 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
     std::fs::write(
         &meta,
         serde_json::json!({
-            "version": 2,
+            "version": 3,
             "surface": tag,
             "cwd": cwd,
+            // The command VERBATIM. The card used to reconstruct it by stripping
+            // the shebang off the `.sh`, which stopped being the command the
+            // moment the timeout watchdog joined it in there.
+            "cmd": command,
+            "timeout_secs": timeout_secs,
         })
         .to_string(),
     )
@@ -120,11 +131,16 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
     let pid = spawn_detached(&script, &log, &cwd)?;
     std::fs::write(&pidf, pid.to_string()).ok()?;
 
+    let cap = match timeout_secs {
+        Some(s) => format!(" It is capped at {s}s (the timeout you passed) and killed if it runs over."),
+        None => String::new(),
+    };
     let msg = format!(
         "[mafold] Background task detached (pid {pid}) — it runs in its own session and \
-         SURVIVES this turn and daemon restarts. Its output streams to {} — do NOT wait \
-         for it or poll it this turn: when every detached task finishes, the daemon opens \
-         a NEW turn for you to read that log and report the results.",
+         SURVIVES this turn and daemon restarts.{cap} Its output streams to {} — do NOT wait \
+         for it or poll it this turn: THIS task finishes on its own schedule and the daemon \
+         opens a NEW turn for you to read that log and report the results. (If the user asks \
+         how it is going before then, just read that file — it is the live log.)",
         log.display()
     );
     let mut updated = ti.clone();
@@ -140,6 +156,45 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
             }
         })
         .to_string(),
+    )
+}
+
+/// The script a detached task actually runs: the command, plus a self-kill
+/// watchdog when the Bash call carried a `timeout`.
+///
+/// It works off process GROUPS, twice over:
+///   - `spawn_detached` setsid's this script, so its pgid is its own pid and
+///     `kill -- -$$` from the watchdog reaches exactly this task's tree —
+///     children, grandchildren, anything that didn't run away to a new session.
+///   - the watchdog itself is started under `set -m`, which puts it in a group
+///     of its OWN. That keeps it out of the TERM it sends (no `trap` needed),
+///     so it can escalate to KILL five seconds later for a command that won't
+///     take the hint — and it lets the ordinary exit path `kill -- -$wd` take
+///     the watchdog AND its pending `sleep` down together. Killing the subshell
+///     alone left that `sleep` orphaned, which for a four-hour cap meant a
+///     four-hour stray process after a task that finished in ten seconds.
+/// `set +m` goes back on before the command runs, so the command's own
+/// background jobs behave exactly as they would in any other shell.
+#[cfg(unix)]
+fn script_body(command: &str, timeout_secs: Option<u64>) -> String {
+    let Some(secs) = timeout_secs else {
+        return format!("#!/bin/bash\n{command}\n");
+    };
+    format!(
+        "#!/bin/bash\n\
+         # [mafold] Bash 工具带了 timeout，这里把它兑现：超时就端掉整棵任务树。\n\
+         set -m\n\
+         ( sleep {secs}\n\
+         \x20 echo \"[mafold] 超时：{secs} 秒到了，终止这个后台任务\" >&2\n\
+         \x20 kill -TERM -- -$$ 2>/dev/null\n\
+         \x20 sleep 5\n\
+         \x20 kill -KILL -- -$$ 2>/dev/null\n\
+         ) & __mf_wd=$!\n\
+         set +m\n\
+         {command}\n\
+         __mf_rc=$?\n\
+         kill -KILL -- -\"$__mf_wd\" 2>/dev/null\n\
+         exit \"$__mf_rc\"\n"
     )
 }
 
@@ -193,5 +248,49 @@ fn sweep_old(dir: &Path) {
         if stale {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// No timeout on the call → the script is exactly what it always was.
+    /// A watchdog nobody asked for would kill long builds.
+    #[test]
+    fn no_timeout_means_no_watchdog() {
+        let s = script_body("cargo build --release", None);
+        assert_eq!(s, "#!/bin/bash\ncargo build --release\n");
+        assert!(!s.contains("__mf_wd"));
+    }
+
+    /// The timeout the model passed is honoured, in SECONDS, against the whole
+    /// process group — and the command is still in there verbatim.
+    #[test]
+    fn timeout_wraps_the_command_in_a_group_killing_watchdog() {
+        let s = script_body("sleep 900", Some(30));
+        assert!(s.contains("sleep 30"), "{s}");
+        assert!(s.contains("kill -TERM -- -$$"), "{s}");
+        assert!(s.contains("kill -KILL -- -$$"), "{s}");
+        assert!(s.contains("sleep 900"), "{s}");
+        assert!(s.contains("exit \"$__mf_rc\""), "the task's own exit code wins: {s}");
+        // The watchdog gets its own process group (`set -m`) — that is what
+        // keeps it out of the TERM it sends, and what lets the exit path take
+        // its pending `sleep` down with it instead of orphaning one.
+        assert!(s.contains("set -m"), "{s}");
+        assert!(s.contains("kill -KILL -- -\"$__mf_wd\""), "{s}");
+        assert!(
+            s.find("set +m") < s.find("sleep 900"),
+            "job control must be back off before the command runs: {s}"
+        );
+    }
+
+    /// ms → s, and a sub-second timeout still gets a whole second rather than
+    /// `sleep 0` (which would kill the task before it started).
+    #[test]
+    fn sub_second_timeouts_round_up_to_one() {
+        let ti = serde_json::json!({ "timeout": 400 });
+        let secs = ti["timeout"].as_u64().map(|ms| (ms / 1000).max(1));
+        assert_eq!(secs, Some(1));
     }
 }

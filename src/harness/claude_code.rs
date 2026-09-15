@@ -112,19 +112,24 @@ impl Harness for ClaudeCode {
         // that all five of `run`'s exit paths stop the watcher without any of
         // them having to remember to.
         let mut _perm_watch: Option<PermWatch> = None;
+        // Detach run_in_background Bash tasks into their own session (registered
+        // under ~/.mafold/bgtasks by MAFOLD_SURFACE) — claude kills its own
+        // background shells the moment it exits, so without this they can never
+        // outlive the turn. See bash_hook.
+        //
+        // Unconditional, NOT nested under the ask-file arm it used to share:
+        // background detaching has nothing to do with interactive questions, and
+        // tying them together meant a turn with no ask-file silently lost its
+        // background tasks to claude's exit-time killpg.
+        pre.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
+        }));
         if let Some(af) = &ask_file {
             cmd.env("MAFOLD_ASK_FILE", af);
             pre.push(serde_json::json!({
                 "matcher": "AskUserQuestion",
                 "hooks": [{ "type": "command", "command": format!("\"{exe}\" ask-hook") }]
-            }));
-            pre.push(serde_json::json!({
-                // Detach run_in_background Bash tasks into their own session
-                // (registered under ~/.mafold/bgtasks by MAFOLD_CONV) — claude
-                // kills its own background shells the moment it exits, so
-                // without this they can never outlive the turn. See bash_hook.
-                "matcher": "Bash",
-                "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
             }));
             // The user's OWN `ask` rules (`ask: ["Bash(rm *)"]`) mean "a person
             // must say yes". They outrank `--dangerously-skip-permissions`, an
