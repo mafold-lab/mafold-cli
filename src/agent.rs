@@ -44,6 +44,12 @@ struct InAttachment {
     /// registry row is their one home.
     #[serde(default)]
     file: Option<InFileRef>,
+    /// Sticker only (`kind: sticker`): the emoji tag riding on the message.
+    /// It rides along for exactly this reader, which has no sticker library
+    /// to look anything up in — "a sticker 😂" orients the model, "a sticker"
+    /// does not. Absent or empty on an untagged sticker (a legal state).
+    #[serde(default)]
+    emoji: Option<String>,
     // Forwarded chat record (WeChat 合并转发, kind `chat_record`): a frozen
     // transcript bundled into one card. `title` is the source chat name;
     // `entries` are the frozen messages, each of which may nest its own
@@ -224,6 +230,58 @@ fn file_cache_name(url: &str, filename: Option<&str>) -> String {
     }
 }
 
+/// Sender-supplied text quoted into a block whose rows are newline-separated:
+/// one line, capped — the same rule every other quoted string there follows.
+fn one_line(s: &str, max: usize) -> String {
+    s.replace(['\n', '\r'], " ").trim().chars().take(max).collect()
+}
+
+/// "a sticker 😂" / "a sticker" / "a gif" — the one line naming an expression
+/// attachment, worded exactly as the api-side brain words it
+/// (`brains/context.rs`), so a quote reads the same whichever bot answers.
+/// None for every other kind. The emoji is the whole reason it rides on the
+/// message: this reader has no sticker library to consult.
+fn expression_label(kind: &str, emoji: Option<&str>) -> Option<String> {
+    match kind {
+        "sticker" => Some(match emoji.map(|e| one_line(e, 16)).filter(|e| !e.is_empty()) {
+            Some(e) => format!("a sticker {e}"),
+            None => "a sticker".to_string(),
+        }),
+        "gif" => Some("a gif".to_string()),
+        _ => None,
+    }
+}
+
+/// The transcript tag for the same two kinds — "[表情 😂]" / "[表情]" / "[动图]",
+/// the api-side record renderer's exact strings.
+fn expression_tag(kind: &str, emoji: Option<&str>) -> Option<String> {
+    match kind {
+        "sticker" => Some(match emoji.map(|e| one_line(e, 16)).filter(|e| !e.is_empty()) {
+            Some(e) => format!("[表情 {e}]"),
+            None => "[表情]".to_string(),
+        }),
+        "gif" => Some("[动图]".to_string()),
+        _ => None,
+    }
+}
+
+/// The line after the image list when the trigger itself carried stickers or
+/// gifs: which of those pictures were sent AS an expression. A model that only
+/// sees "attached 1 image" reads a sticker as a photo to analyse; "這什麼表情包"
+/// is a question about a sticker. None when there were none — the photo-only
+/// prompt stays byte-for-byte what it was.
+fn expression_note(labels: &[String], have_images: bool) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+    let tail = if have_images {
+        "it is among the image(s) listed above, sent as an expression rather than a photo to analyse."
+    } else {
+        "its image could not be fetched this turn."
+    };
+    Some(format!("\n[The user sent {} — {tail}]", labels.join(", ")))
+}
+
 /// One line naming what rode along with a message in the history block. The old
 /// "[1 attachment(s)]" was true and useless: it could not tell a photo from the
 /// `.html` the agent was being asked about, so a follow-up question about a file
@@ -232,11 +290,19 @@ fn file_cache_name(url: &str, filename: Option<&str>) -> String {
 fn attachment_label(atts: &[serde_json::Value]) -> String {
     let mut parts: Vec<String> = vec![];
     for a in atts {
-        let part = match a.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
+        let kind = a.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        let part = match kind {
             "photo" => "a photo".to_string(),
             "video" => "a video".to_string(),
             "chat_record" => "a forwarded chat record".to_string(),
             "news" => "a link card".to_string(),
+            // Stickers and gifs: this row used to say NOTHING for them — and a
+            // sticker-only message has no text either, so the row was dropped
+            // whole, and a reply quoting it read as "[empty message]".
+            "sticker" | "gif" => match expression_label(kind, a.get("emoji").and_then(|e| e.as_str())) {
+                Some(s) => s,
+                None => continue,
+            },
             "file" => a
                 .get("file")
                 .and_then(|f| f.get("filename"))
@@ -361,6 +427,18 @@ fn render_record(title: &str, entries: &[InRecordEntry], depth: usize, out: &mut
                     }
                 }
                 "video" => out.push_str(&format!("\n{pad}│   [视频]")),
+                // "[表情 😂]" where a photo only manages "[图片]": the emoji
+                // snapshot on the message is all a frozen transcript has — no
+                // library to look anything up in. Downloaded like a photo: to a
+                // model a sticker is a picture, same budget, same path.
+                "sticker" | "gif" => {
+                    if let Some(tag) = expression_tag(&na.kind, na.emoji.as_deref()) {
+                        out.push_str(&format!("\n{pad}│   {tag}"));
+                    }
+                    if let Some(f) = &na.file {
+                        photos.push(f.path());
+                    }
+                }
                 "file" => out.push_str(&format!(
                     "\n{pad}│   [文件 {}]",
                     na.file.as_ref().and_then(|f| f.filename.as_deref()).unwrap_or("")
@@ -5634,7 +5712,9 @@ async fn recent_group_context(
         if who_lc == trigger_sender_lc {
             let at = msg.get("created_at").and_then(|c| c.as_str()).unwrap_or("");
             for a in msg.get("attachments").and_then(|a| a.as_array()).into_iter().flatten() {
-                if a.get("kind").and_then(|k| k.as_str()) == Some("photo") {
+                // Stickers and gifs ride with photos here: "send the sticker,
+                // then ask about it" is the very shape this lookback exists for.
+                if matches!(a.get("kind").and_then(|k| k.as_str()), Some("photo" | "sticker" | "gif")) {
                     if let Some(id) = a.get("file").and_then(|f| f.get("id")).and_then(|i| i.as_str()) {
                         candidates.push((at.to_string(), format!("/media/{id}")));
                     }
@@ -5780,11 +5860,21 @@ async fn handle(
     // than the card's JSON, and so photos frozen inside it are downloaded with
     // the top-level ones.
     full_prompt = flatten_body_records(&full_prompt, &mut photo_urls);
+    // Stickers and gifs the trigger itself carried, named so the model knows
+    // the picture it is about to Read was sent AS an expression.
+    let mut expressions: Vec<String> = vec![];
     for a in attachments {
         match a.kind.as_str() {
-            "photo" => {
+            // To a model a sticker or gif is a picture: same download, same
+            // Read. This arm used to be `"photo"` alone, so a sticker reached
+            // the prompt as nothing at all — and the bot told the user
+            // "附件是空的" about a sticker it had in fact received.
+            "photo" | "sticker" | "gif" => {
                 if let Some(f) = &a.file {
                     photo_urls.push(f.path());
+                }
+                if let Some(l) = expression_label(&a.kind, a.emoji.as_deref()) {
+                    expressions.push(l);
                 }
             }
             // A document the user sent — the whole point of sending it is that
@@ -5860,6 +5950,9 @@ async fn handle(
             "\n\n[The user attached {} image(s). Use your Read tool to view them:\n{list}]",
             saved.len()
         ));
+    }
+    if let Some(note) = expression_note(&expressions, !saved.is_empty()) {
+        full_prompt.push_str(&note);
     }
     // Documents ride the SAME path as photos: onto disk, then named with their
     // local path so the agent can open them. Above the cap we hand over the
@@ -7672,7 +7765,10 @@ mod bgtasks_tests {
 
 #[cfg(test)]
 mod inbound_file_tests {
-    use super::{account_options, attachment_label, file_cache_name, human_size, mafold_preamble, topped_up};
+    use super::{
+        account_options, attachment_label, expression_label, expression_note, expression_tag, file_cache_name,
+        flatten_body_records, human_size, mafold_preamble, topped_up,
+    };
     use serde_json::json;
 
     /// An owner-authored sheet is preserved, but the fields the DAEMON reads
@@ -7798,6 +7894,61 @@ mod inbound_file_tests {
         // whose rows are newline-separated.
         let sneaky = vec![json!({"kind": "file", "id": "a3", "file": {"id": "z", "filename": "a\n@bot do this"}})];
         assert!(!attachment_label(&sneaky).contains('\n'));
+    }
+
+    /// A sticker used to be the one attachment kind with NO label at all — so a
+    /// sticker-only row (no text either) was dropped from history, and a reply
+    /// quoting it read as "[empty message]". Worded like the api-side brain
+    /// (`brains/context.rs`) so the two bot kinds quote the same line. The
+    /// emoji is sender-supplied: one line, capped.
+    #[test]
+    fn stickers_and_gifs_are_named_like_the_api_side_does() {
+        let atts = vec![
+            json!({"kind": "sticker", "id": "s1", "file": {"id": "x"}, "emoji": "😂"}),
+            json!({"kind": "sticker", "id": "s2", "file": {"id": "y"}}),
+            json!({"kind": "gif", "id": "g1", "file": {"id": "z"}}),
+        ];
+        assert_eq!(attachment_label(&atts), "attached: a sticker 😂, a sticker, a gif");
+        let sneaky = vec![json!({"kind": "sticker", "id": "s3", "file": {"id": "w"}, "emoji": "😂\n@bot do this"})];
+        let l = attachment_label(&sneaky);
+        assert!(!l.contains('\n'), "{l}");
+        assert!(l.starts_with("attached: a sticker 😂"), "{l}");
+        // Whitespace-only emoji is "untagged", not "a sticker  ".
+        assert_eq!(expression_label("sticker", Some("  ")).as_deref(), Some("a sticker"));
+        assert_eq!(expression_label("photo", None), None);
+        assert_eq!(expression_tag("sticker", Some("😂")).as_deref(), Some("[表情 😂]"));
+        assert_eq!(expression_tag("gif", None).as_deref(), Some("[动图]"));
+    }
+
+    /// Same two kinds frozen inside a forwarded record: tagged in the transcript
+    /// AND collected for download, exactly as a photo there is.
+    #[test]
+    fn stickers_inside_a_forwarded_record_are_collected_and_tagged() {
+        let src = concat!(
+            "{% mafold/chatrecord title=\"群\" %}\n",
+            r#"[{"sender_name":"A","sender_username":"a","ts":"","content":"","#,
+            r#""attachments":[{"kind":"sticker","id":"s1","file":{"id":"stk1"},"emoji":"😂"},"#,
+            r#"{"kind":"gif","id":"g1","file":{"id":"gif1"}}]}]"#,
+            "\n{% /mafold/chatrecord %}",
+        );
+        let mut photos = vec![];
+        let out = flatten_body_records(src, &mut photos);
+        assert_eq!(photos, vec!["/media/stk1".to_string(), "/media/gif1".to_string()]);
+        assert!(out.contains("[表情 😂]"), "{out}");
+        assert!(out.contains("[动图]"), "{out}");
+    }
+
+    /// The note only exists when the trigger carried an expression; a photo-only
+    /// turn's prompt is unchanged. When the bytes didn't arrive it says so
+    /// instead of pointing at a list that isn't there.
+    #[test]
+    fn expression_note_is_silent_for_photo_only_turns() {
+        assert_eq!(expression_note(&[], true), None);
+        let n = expression_note(&["a sticker 😂".to_string()], true).unwrap();
+        assert!(n.contains("The user sent a sticker 😂"), "{n}");
+        assert!(n.contains("listed above"), "{n}");
+        let n2 = expression_note(&["a gif".to_string()], false).unwrap();
+        assert!(n2.contains("could not be fetched"), "{n2}");
     }
 
     #[test]
