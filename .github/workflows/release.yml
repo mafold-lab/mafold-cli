@@ -20,6 +20,13 @@
 # target would fail to build. That pin belongs to the monorepo. `cargo build`
 # never compiles it.
 #
+# TWO CHANNELS, one workflow. The tag decides:
+#   v<X.Y.Z>            stable — published and flagged `--latest`
+#   v<X.Y.Z>-dev.<run>  dev    — published as a PRERELEASE, never `--latest`
+# GitHub excludes prereleases from /releases/latest, which install.sh and every
+# stable updater read; that exclusion is what keeps a dev build off stable
+# machines, and the last job in this file asserts it on every run.
+#
 # Secrets — set on THIS repo (Settings → Secrets → Actions). Fork PRs can never
 # read them, and this workflow has no pull_request trigger by design:
 #   MACOS_CERT_P12_BASE64 + MACOS_CERT_PASSWORD        REQUIRED — see build-mac
@@ -53,10 +60,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # A `v…-dev.N` tag is a DEV-CHANNEL build (mirrored from `cli.dev@X.Y.Z`
+          # in the monorepo). It must be a PRERELEASE, because GitHub excludes
+          # prereleases from /releases/latest — the endpoint install.sh and every
+          # stable updater read. That exclusion is the ONLY thing keeping a dev
+          # build off stable machines, so it is set at CREATE time rather than
+          # bolted on at publish.
+          PRE=""
+          case "$TAG" in *-dev.*) PRE="--prerelease"; echo "dev channel: $TAG will be a prerelease" ;; esac
           # Draft: fires no `published` webhook and stays out of /releases/latest
           # until the publish job flips it with every asset attached.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft $PRE \
                  --title "$TAG" --notes "Automated release $TAG."
 
   # ubuntu-latest is Ubuntu 24.04 / glibc 2.39 — the SAME floor as the node11
@@ -240,4 +255,43 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            *-dev.*)
+              # Published (downloadable, and it fires the `release` webhook so
+              # dev-channel daemons hear about it) but NEVER flagged latest.
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+              ;;
+            *)
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+              ;;
+          esac
+
+      # The dev channel's whole safety property, asserted rather than assumed.
+      # If `--prerelease` ever silently stopped excluding a build from
+      # /releases/latest, the only symptom would be stable machines quietly
+      # downloading a dev binary — so check the exact endpoint the updater and
+      # install.sh read, on every release, both channels.
+      - name: /releases/latest is the stable line
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || echo '(none)')"
+          echo "/releases/latest → $LATEST"
+          case "$LATEST" in
+            *-dev.*)
+              echo "::error::/releases/latest is $LATEST — a dev build became the stable channel. install.sh and every stable updater would take it."
+              exit 1
+              ;;
+          esac
+          case "$TAG" in
+            *-dev.*) echo "dev release $TAG published; stable channel still at $LATEST" ;;
+            *)
+              if [ "$LATEST" != "$TAG" ]; then
+                echo "::error::published $TAG but /releases/latest is $LATEST — stable machines would not see this release"
+                exit 1
+              fi
+              ;;
+          esac
