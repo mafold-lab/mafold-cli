@@ -728,6 +728,12 @@ pub async fn update_to_latest(
 /// same args + env. Never returns on success. Unix `exec`s in place (same pid);
 /// Windows respawns and exits — see `crate::platform::reexec`.
 pub fn reexec() -> std::io::Error {
+    // Warm `claude` connections are children of THIS process, and a unix
+    // `exec` replaces our image without touching them — they would live on as
+    // orphans holding sessions (and whatever they had spawned) that nothing
+    // will ever read from again. Close them first; this is the one choke point
+    // both platforms go through.
+    crate::harness::cc_conn::shutdown_all();
     crate::platform::reexec()
 }
 

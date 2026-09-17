@@ -41,6 +41,7 @@ pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>
             &run_claude(&["mcp", "list"], 25, env).await,
         )),
         "agents" => Outcome::Reply(dump_agents(workdir)),
+        "sessions" => Outcome::Reply(dump_sessions()),
         "skills" => Outcome::Reply(dump_skills(workdir)),
         "hooks" => Outcome::Reply(settings_key(workdir, "hooks", "🪝 Hooks")),
         "permissions" => Outcome::Reply(settings_key(workdir, "permissions", "🔐 Permissions")),
@@ -330,6 +331,55 @@ fn settings_key(workdir: &str, key: &str, title: &str) -> String {
         out.push_str(&format!("\n_No `{key}` configured._"));
     }
     out
+}
+
+/// `/sessions` — every claude session alive on THIS machine right now.
+///
+/// Each claude process registers itself in `~/.claude/sessions/<pid>.json` and
+/// opens a socket its peers can message it on; that file IS the machine's
+/// address book, and until now nothing in Mafold ever looked at it. The names
+/// listed here are what another session addresses with `SendMessage` — ours
+/// included, since a turn now names its process after the conversation.
+///
+/// Dead entries are skipped rather than cleaned: the registry belongs to claude,
+/// and a stale file is claude's to remove.
+fn dump_sessions() -> String {
+    let dir = home().join(".claude/sessions");
+    let mut rows: Vec<(String, String, String, String)> = vec![];
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(txt) = std::fs::read_to_string(&p) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+            let Some(pid) = v["pid"].as_u64() else { continue };
+            if !crate::platform::pid_alive(pid as u32) {
+                continue;
+            }
+            rows.push((
+                v["name"].as_str().unwrap_or("(unnamed)").to_string(),
+                v["status"].as_str().unwrap_or("—").to_string(),
+                v["kind"].as_str().unwrap_or("—").to_string(),
+                v["cwd"].as_str().unwrap_or("—").to_string(),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        return "No Claude Code sessions are registered on this machine.".into();
+    }
+    rows.sort();
+    let body = rows
+        .iter()
+        .map(|(n, s, k, c)| format!("{n}\t{s}\t{k}\t{c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fence_block(
+        &format!("🖥 {} Claude session(s) on this machine", rows.len()),
+        "",
+        &format!("NAME\tSTATUS\tKIND\tCWD\n{body}"),
+    )
 }
 
 fn dump_agents(workdir: &str) -> String {

@@ -47,6 +47,27 @@ pub enum AgentEvent {
     },
     /// The result of a tool call (correlated by `id`).
     ToolResult { id: String, text: String },
+    /// One step a SUBAGENT took, attributed to the tool call that started it
+    /// (`parent` is that call's id).
+    ///
+    /// A subagent's work comes back on the same stream as the main agent's —
+    /// Claude Code marks it only with `parent_tool_use_id` — so without this it
+    /// is flattened into the main timeline and reads as work the main agent
+    /// did, and its final text can land in the reply as if the main agent had
+    /// said it. Already summarized to one line by the producer, because the
+    /// card it lands in is a fixed-width bubble, not a transcript.
+    SubagentStep { parent: String, text: String },
+    /// Something happened around the turn that the user has to be TOLD, but
+    /// which is not model output: another local session tried to message this
+    /// one and the policy parked it, the model was quietly downgraded, a tool
+    /// was denied. Rendered in time order, like a steer, because when it
+    /// happened is part of what it means — and registered as a notice line, so
+    /// one arriving last is never mistaken for the answer.
+    ///
+    /// Producer-agnostic on purpose: any harness that learns one of these emits
+    /// it. A notice must change what the user would do — anything merely
+    /// explanatory belongs in the trace.
+    Notice(String),
     /// A thinking / chain-of-thought block (collapsed in the UI).
     Thinking(String),
     /// An image the agent PRODUCED this turn, as a path on the producer's

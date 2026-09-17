@@ -35,14 +35,27 @@ pub fn run() -> Result<()> {
     let mut _input = String::new();
     let _ = std::io::stdin().read_to_string(&mut _input);
 
-    let pending = std::env::var("MAFOLD_STEER_FILE").ok().and_then(|p| take(&p));
-    let Some(text) = pending else {
+    // Via `turnenv` (see `ask_hook`): the steer file is per-TURN, the child's
+    // environment is per-PROCESS, and a pooled process outlives its first turn.
+    let Some(out) = crate::turnenv::steer_file().and_then(|p| response(&p)) else {
         // No output at all: claude treats an empty hook result as "nothing to
         // add", which is precisely true and adds no tokens to the turn.
         return Ok(());
     };
+    println!("{out}");
+    Ok(())
+}
 
-    let out = serde_json::json!({
+/// What a PostToolUse hook should answer when the user spoke mid-turn, or None
+/// when they didn't.
+///
+/// Shared by both deliveries: this command (a process claude spawns per tool
+/// call, for a CLI without the control channel) and the in-process
+/// `hook_callback` the connection answers directly. One body, so the two can
+/// never drift into saying different things to the model.
+pub fn response(path: &str) -> Option<serde_json::Value> {
+    let text = take(path)?;
+    Some(serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": format!(
@@ -54,9 +67,7 @@ pub fn run() -> Result<()> {
                 text.trim()
             ),
         }
-    });
-    println!("{out}");
-    Ok(())
+    }))
 }
 
 /// Atomically claim whatever is waiting in `path`, or None.

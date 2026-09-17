@@ -9,6 +9,7 @@
 //! A `Daemon` (one bot presence) is `(token + workdir + harness + model)`; the
 //! supervisor runs many daemons, one process per bot.
 
+pub mod cc_conn;
 pub mod claude_code;
 pub mod codex;
 mod codex_stats;
@@ -65,6 +66,27 @@ impl Drop for ChildGuard {
 pub use mafold_transcript::AgentEvent;
 
 /// One turn to run against a harness.
+/// The spawn-time half of a turn: everything that decides WHICH process serves
+/// it, and nothing about the message.
+///
+/// Split out so a caller can start that process BEFORE it has a prompt. The
+/// daemon spends real time between "a message arrived" and "the turn runs" —
+/// it pulls the group's recent messages, asks the server which apps are
+/// installed, opens the draft — and a cold `claude` takes ~1.3s to come up.
+/// Those are the same wall-clock seconds; this lets them be spent once.
+#[derive(Clone, Debug)]
+pub struct TurnShape {
+    pub conv: String,
+    pub surface: String,
+    pub workdir: String,
+    pub session: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub thinking: Option<u32>,
+    pub system: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
 pub struct Turn {
     pub prompt: String,
     /// The conversation id this turn runs in — exported to the agent's process
@@ -364,6 +386,14 @@ pub trait Harness: Send + Sync {
     fn can_steer(&self) -> bool {
         false
     }
+
+    /// Start a process for a turn that is ABOUT to run, so its startup overlaps
+    /// the work the caller still has to do before it can call [`Self::run`].
+    ///
+    /// Best-effort and fire-and-forget: a harness that keeps no processes
+    /// between turns does nothing, a failure is simply a turn that starts cold,
+    /// and `run` never depends on this having happened.
+    fn prewarm(&self, _shape: TurnShape) {}
 
     /// Run one turn, pushing normalized events into `sink` as they arrive.
     async fn run(

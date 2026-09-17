@@ -33,6 +33,7 @@ mod room;
 mod session;
 mod steer_hook;
 mod supervisor;
+mod turnenv;
 mod update;
 mod vault;
 mod wallet;
@@ -781,7 +782,7 @@ async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Res
     let msg = match message {
         Some(m) => m.to_string(),
         None => {
-            let env_id = std::env::var("MAFOLD_DRAFT").ok().filter(|s| !s.is_empty()).context(
+            let env_id = turnenv::draft().context(
                 "no message to attach to — run this inside an agent turn (the daemon sets \
                  MAFOLD_DRAFT), or pass --message <id>",
             )?;

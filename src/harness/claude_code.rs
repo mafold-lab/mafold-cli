@@ -3,7 +3,7 @@
 //! [`AgentEvent`]s. Skill/command discovery and the emulated slash commands live
 //! in `crate::discover` / `crate::commands` (both Claude-Code-specific).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::Path;
@@ -11,6 +11,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::cc_conn;
 use super::{
     AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModeCap, ModelCap, SeatHealth,
     SeatLimit, Turn, TurnOutcome,
@@ -35,6 +36,65 @@ impl Harness for ClaudeCode {
         true
     }
 
+    /// Open the connection this turn will want, while the caller is still
+    /// assembling its prompt. Everything it needs is in the SHAPE; the per-turn
+    /// half reaches the child through `turnenv` at `begin_turn`.
+    ///
+    /// Silent about failure on purpose — a prewarm that doesn't land just means
+    /// the turn starts cold, which is what happened before this existed.
+    fn prewarm(&self, shape: super::TurnShape) {
+        if !cc_conn::enabled() {
+            return;
+        }
+        let key = cc_conn::PoolKey::new(
+            &shape.conv, &shape.surface, &shape.workdir, shape.model.as_deref(),
+            shape.effort.as_deref(), shape.thinking, shape.system.as_deref(), &shape.env,
+        );
+        // Nothing to gain when one is already warm (or already on its way), and
+        // a second process for the same key would just sit out its TTL.
+        let Some(sid) = shape.session.clone() else { return };
+        if !cc_conn::claim_prewarm(&key) {
+            return;
+        }
+        tokio::spawn(async move {
+            let _release = cc_conn::PrewarmGuard(key.clone());
+            let began = std::time::Instant::now();
+            let exe = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "mafold".into());
+            let Built { mut cmd, hook_settings, bash_only } = build_cmd(&shape, &exe);
+            let id = cc_conn::oneshot_id();
+            cmd.env("MAFOLD_TURN", crate::turnenv::path_for(&id));
+            let fallback = hook_settings.as_ref().map(|s| {
+                let mut f = cc_conn::clone_cmd(&cmd);
+                f.arg("--settings").arg(s);
+                f
+            });
+            cmd.arg("--settings").arg(&bash_only);
+            let Ok(mut c) = cc_conn::Conn::spawn(key, id.clone(), String::new(), cmd, &shape.workdir).await
+            else { return };
+            if !c.register_hooks(true, true).await {
+                let Some(f) = fallback else { return };
+                c.kill();
+                c.wait_exit(std::time::Duration::from_secs(5)).await;
+                let Ok(c2) = cc_conn::Conn::spawn(c.key.clone(), id, String::new(), f, &shape.workdir).await
+                else { return };
+                c = c2;
+            }
+            // A connection only answers for the session it actually holds, and
+            // a prewarmed one has not spoken yet — so claim the session the turn
+            // will ask to resume. It was passed `--resume` with exactly that id.
+            c.adopt_session(&sid);
+            eprintln!(
+                "[cc-pool] prewarmed pid {} in {}ms",
+                c.pid().unwrap_or(0),
+                began.elapsed().as_millis()
+            );
+            cc_conn::put(c);
+        });
+    }
+
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
         let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env } = turn;
         let _ = sink.send(AgentEvent::Stats(RunStats {
@@ -43,197 +103,113 @@ impl Harness for ClaudeCode {
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
-        let mut cmd = tokio::process::Command::new(super::program("claude"));
-        // `-p` with NO prompt argument: the prompt goes in on stdin instead (see
-        // the write below). It is the one input here that grows without bound —
-        // it carries the conversation — and Windows hard-caps a command line at
-        // 32,767 UTF-16 units, so on argv a long enough chat makes `CreateProcessW`
-        // refuse the spawn outright (os error 206, ERROR_FILENAME_EXCED_RANGE).
-        // Unconditionally, not past some Windows-only threshold: a size cliff that
-        // only one platform falls off, and only on long conversations, is exactly
-        // the kind of special case that gets shipped untested. `run_claude_stdin`
-        // feeds /usage the same way.
-        cmd.arg("-p")
-            .arg("--output-format").arg("stream-json")
-            .arg("--verbose")
-            .arg("--include-partial-messages")
-            .arg("--dangerously-skip-permissions")
-            // Ignore the user's GLOBAL MCP servers (e.g. browser-use): claude
-            // would otherwise spawn every configured MCP server on EVERY turn,
-            // which pops a Python dock icon and adds seconds of startup latency
-            // per reply. The daemon passes no --mcp-config, so this loads none.
-            .arg("--strict-mcp-config");
-        if let Some(m) = &model {
-            cmd.arg("--model").arg(m);
-        }
-        // Reasoning effort (owner-set via Customization). No flag = Claude Code's
-        // own default (currently xHigh).
-        if let Some(e) = &effort {
-            cmd.arg("--effort").arg(e);
-        }
-        // Export the current conversation so `mafold room …` (run by the agent
-        // via the room skill) defaults to THIS room. Per-turn (not a global env)
-        // because concurrent turns run different conversations.
-        cmd.env("MAFOLD_CONV", &conv);
-        // The surface (conv + forum channel) the reply lands on — the bash-hook
-        // registers detached background tasks under it, so their wrap-up turn
-        // comes back to THIS channel instead of leaking into another one.
-        cmd.env("MAFOLD_SURFACE", &surface);
-        // The reply being streamed right now — `mafold attach <file>` hangs
-        // media on it, so an image the agent makes lands in the same bubble as
-        // the text about it.
-        cmd.env("MAFOLD_DRAFT", &draft);
-        // The seat: which Claude login this turn runs on
-        // (`CLAUDE_SECURESTORAGE_CONFIG_DIR`, see `crate::accounts`). Empty for
-        // the default login — the daemon's own environment already is it.
-        // Only the credential moves with it; `~/.claude` (memory, skills,
-        // sessions) stays shared, which is what lets a `--resume` below carry
-        // on under a different account.
-        cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        // Extended thinking: a non-zero budget makes the model think before each
-        // reply (streamed as `thinking` blocks). No env = Claude Code's default.
-        if let Some(budget) = thinking {
-            cmd.env("MAX_THINKING_TOKENS", budget.to_string());
-        }
-        // mafold awareness: who the bot is, the conversation, embeddable cards.
-        if let Some(sys) = &system {
-            cmd.arg("--append-system-prompt").arg(sys);
-        }
-        // Interactive AskUserQuestion: a PreToolUse hook intercepts the native
-        // tool (which would otherwise auto-decline headless), blocks until the
-        // user answers the chat card, then returns the answer as a deny-reason —
-        // which claude feeds back as the tool result, same turn. The hook waits
-        // on MAFOLD_ASK_FILE (the daemon writes the answer there). See ask_hook.
+        // Everything that is fixed at spawn time goes into the key: two turns
+        // share a process only when every one of these agrees (a changed system
+        // prompt cannot be re-set on a live connection, and a different SEAT is
+        // a different Claude login, so each gets its own).
+        let key = cc_conn::PoolKey::new(
+            &conv,
+            &surface,
+            &workdir,
+            model.as_deref(),
+            effort.as_deref(),
+            thinking,
+            system.as_deref(),
+            &env,
+        );
         let exe = std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "mafold".into());
-        let mut pre: Vec<serde_json::Value> = Vec::new();
-        let mut post: Vec<serde_json::Value> = Vec::new();
+        let shape = super::TurnShape {
+            conv: conv.clone(),
+            surface: surface.clone(),
+            workdir: workdir.clone(),
+            session: session.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            thinking,
+            system: system.clone(),
+            env: env.clone(),
+        };
+        let Built { mut cmd, hook_settings, bash_only } = build_cmd(&shape, &exe);
+        // The reply being streamed right now — `mafold attach <file>` hangs
+        // media on it. Kept in the env for an OLDER `mafold` on the agent's
+        // $PATH; ours reads the turn file, which is current on every turn.
+        cmd.env("MAFOLD_DRAFT", &draft);
         // Watches the permission mailbox for as long as this turn runs (see
         // `permission_watcher`). Bound, never read: it is held for its Drop, so
-        // that all five of `run`'s exit paths stop the watcher without any of
-        // them having to remember to.
-        let mut _perm_watch: Option<PermWatch> = None;
-        // Detach run_in_background Bash tasks into their own session (registered
-        // under ~/.mafold/bgtasks by MAFOLD_SURFACE) — claude kills its own
-        // background shells the moment it exits, so without this they can never
-        // outlive the turn. See bash_hook.
-        //
-        // Unconditional, NOT nested under the ask-file arm it used to share:
-        // background detaching has nothing to do with interactive questions, and
-        // tying them together meant a turn with no ask-file silently lost its
-        // background tasks to claude's exit-time killpg.
-        pre.push(serde_json::json!({
-            "matcher": "Bash",
-            "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
-        }));
-        if let Some(af) = &ask_file {
-            cmd.env("MAFOLD_ASK_FILE", af);
-            pre.push(serde_json::json!({
-                "matcher": "AskUserQuestion",
-                "hooks": [{ "type": "command", "command": format!("\"{exe}\" ask-hook") }]
-            }));
-            // The user's OWN `ask` rules (`ask: ["Bash(rm *)"]`) mean "a person
-            // must say yes". They outrank `--dangerously-skip-permissions`, an
-            // `allow` rule, and a PreToolUse hook's `allow` — all three verified
-            // against claude 2.1.260 — and headless there is nobody to ask, so
-            // claude denied them outright. Point it at a person instead: this
-            // server puts the question in the reply as the ask card and blocks on
-            // the tap. `--strict-mcp-config` stays, so the user's global MCP
-            // servers still don't load — this config names ours and nothing else.
-            let perm_file = format!("{af}.perm");
-            cmd.env("MAFOLD_PERM_FILE", &perm_file);
-            cmd.arg("--mcp-config").arg(permission_mcp_config(&exe));
-            cmd.arg("--permission-prompt-tool").arg(crate::permission_mcp::TOOL_REF);
-            _perm_watch = Some(permission_watcher(perm_file, sink.clone()));
-        }
-        // Mid-turn steering: what the user says while this turn runs reaches the
-        // model at the next tool-result boundary. PostToolUse, matching every
-        // tool, so the tool that was running when they spoke finishes normally
-        // and nothing already on screen is un-said. See `steer_hook`.
-        if let Some(sf) = &steer_file {
-            cmd.env("MAFOLD_STEER_FILE", sf);
-            post.push(serde_json::json!({
-                "matcher": "*",
-                "hooks": [{ "type": "command", "command": format!("\"{exe}\" steer-hook") }]
-            }));
-        }
-        if !pre.is_empty() || !post.is_empty() {
-            let mut hooks = serde_json::Map::new();
-            if !pre.is_empty() {
-                hooks.insert("PreToolUse".into(), serde_json::Value::Array(pre));
-            }
-            if !post.is_empty() {
-                hooks.insert("PostToolUse".into(), serde_json::Value::Array(post));
-            }
-            let settings = serde_json::json!({ "hooks": hooks });
-            cmd.arg("--settings").arg(settings.to_string());
-        }
-        cmd.kill_on_drop(true);
-        if let Some(sid) = &session {
-            cmd.arg("--resume").arg(sid);
-            // Somebody else is holding this exact transcript right now (a VS
-            // Code tab, a terminal). Print-mode `--resume` does NOT fork — it
-            // hands back the same session id and appends to the same file — so
-            // without this both writers braid into one session tree and the
-            // resume pointer ends up wherever the last write landed. Forking
-            // inherits everything they've typed up to this instant and leaves
-            // their thread alone, which is what `/resume` has been promising in
-            // words all along. The new id arrives on the stream (`session_id`)
-            // and is what the caller stores, so this costs one fork, not one
-            // per turn.
-            if crate::commands::session_held_elsewhere(sid) {
-                cmd.arg("--fork-session");
-            }
-        }
+        // that all of `run`'s exit paths stop the watcher without any of them
+        // having to remember to.
+        let _perm_watch: Option<PermWatch> = ask_file
+            .as_ref()
+            .map(|af| permission_watcher(format!("{af}.perm"), sink.clone()));
         // Don't let the console child flash a window (the agent runs detached).
         crate::platform::no_window(&mut cmd);
-        let mut child = cmd
-            .current_dir(&workdir)
-            .env_remove("CLAUDECODE")
-            .env_remove("ANTHROPIC_API_KEY")
-            // Piped, never inherited: this carries the prompt, and inheriting the
-            // daemon's stdin also made the spawn depend on whatever handle it
-            // happens to hold (a duplication Windows can refuse on its own).
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| super::spawn_err("claude", &workdir, e))?;
-        // Register this run in the live-children set so a daemon shutdown kills
-        // exactly THIS process (see harness::live_children); RAII — deregisters
-        // on every exit path.
-        let _child_guard = crate::harness::ChildGuard::new(child.id());
+        cmd.env_remove("CLAUDECODE").env_remove("ANTHROPIC_API_KEY");
 
-        // Feed the prompt in its OWN task: a prompt past the pipe buffer (~64KB —
-        // and this one holds the conversation) would otherwise block us here while
-        // claude is blocked writing stdout that nobody is reading yet. Dropping
-        // the handle closes stdin, which is the EOF `-p` waits for.
-        if let Some(mut si) = child.stdin.take() {
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let _ = si.write_all(prompt.as_bytes()).await;
-                let _ = si.shutdown().await;
-            });
+        // A WARM connection for this exact configuration, or a new process.
+        // `take` removes it from the pool, so a second concurrent turn in the
+        // same conversation finds nothing and opens its own — which is what
+        // happens today (turns already run concurrently and fork the session).
+        let mut conn = match cc_conn::take_or_wait(&key, session.as_deref()).await {
+            Some(c) => c,
+            None => {
+                let id = cc_conn::oneshot_id();
+                // The child reads its PER-TURN values (draft / ask / steer) back
+                // out of this file, because its env cannot be rewritten and a
+                // connection outlives the turn that spawned it. See `turnenv`.
+                cmd.env("MAFOLD_TURN", crate::turnenv::path_for(&id));
+                // Cloned BEFORE any `--settings`, so the fallback carries ONE
+                // (the full set) rather than two conflicting ones.
+                let fallback = hook_settings.as_ref().map(|s| {
+                    let mut f = cc_conn::clone_cmd(&cmd);
+                    f.arg("--settings").arg(s);
+                    f
+                });
+                // The Bash hook goes in either way; ask and steer are registered
+                // over the control channel just below.
+                cmd.arg("--settings").arg(&bash_only);
+                let mut c =
+                    cc_conn::Conn::spawn(key.clone(), id.clone(), draft.clone(), cmd, &workdir).await?;
+                if !c.register_hooks(ask_file.is_some(), steer_file.is_some()).await {
+                    if let Some(f) = fallback {
+                        // Too old for the control channel: start over with the
+                        // hooks claude spawns as processes. One extra spawn
+                        // (~1.3s), once per connection, on old CLIs only.
+                        eprintln!(
+                            "[cc-pool] this claude didn't answer the hook handshake — \
+                             falling back to command hooks"
+                        );
+                        c.kill();
+                        c.wait_exit(std::time::Duration::from_secs(5)).await;
+                        c = cc_conn::Conn::spawn(key.clone(), id, draft.clone(), f, &workdir).await?;
+                    }
+                }
+                c
+            }
+        };
+        let reused = conn.turns > 0;
+        // Current values for THIS turn, before the prompt goes in. Written to
+        // the file (a hook claude spawns as a process reads it) AND handed to
+        // the connection (its in-process hook callbacks read that copy).
+        let tenv = crate::turnenv::TurnEnv {
+            draft: draft.clone(),
+            ask: ask_file.clone().unwrap_or_default(),
+            steer: steer_file.clone().unwrap_or_default(),
+            perm: ask_file.as_ref().map(|af| format!("{af}.perm")).unwrap_or_default(),
+            surface: surface.clone(),
+        };
+        crate::turnenv::write(&crate::turnenv::path_for(&conn.id), &tenv);
+        // An OLDER `mafold` on the agent's $PATH still reads `MAFOLD_DRAFT` from
+        // its env — which names the draft this connection was SPAWNED for. It
+        // already knows to follow the forwarding address a steer leaves; point
+        // that at this turn's draft so a picture lands on the right reply even
+        // from a binary that predates `MAFOLD_TURN`.
+        if reused && conn.spawn_draft != draft {
+            let _ = std::fs::write(crate::agent::draft_ptr_path(&conn.spawn_draft), &draft);
         }
-
-        let stdout = child.stdout.take().context("no stdout")?;
-        let mut lines = BufReader::new(stdout).lines();
-
-        // Drain stderr CONCURRENTLY: if `claude` writes more than the pipe buffer
-        // (~64KB) to stderr while we're blocked reading stdout / on wait(), the
-        // pipe fills, claude blocks on its write, and the turn deadlocks holding
-        // the conversation lock. A reader task keeps stderr flowing the whole turn.
-        let stderr_task = child.stderr.take().map(|se| {
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut buf = String::new();
-                let mut se = se;
-                let _ = se.read_to_string(&mut buf).await;
-                buf
-            })
-        });
+        conn.begin_turn(&prompt, tenv).await?;
 
         let mut produced = false;
         let mut stopped = false;
@@ -265,7 +241,7 @@ impl Harness for ClaudeCode {
         // an empty stderr, this tail is the ONLY explanation that exists; without
         // it the daemon reported a bare "claude exited unsuccessfully" and the
         // reason was destroyed at the exact moment it was needed.
-        let mut plain_tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        // Collected by the connection's reader (see `cc_conn`) and read back below.
         // Real output-token progress for the generating heartbeat: the API's
         // `message_delta` usage is cumulative PER assistant message, so completed
         // messages accumulate into `tokens_done` when the next one starts.
@@ -287,25 +263,21 @@ impl Harness for ClaudeCode {
         // purpose — the longest legitimate silence is a slow tool run.
         const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
         loop {
-            let line = tokio::select! {
-                line = lines.next_line() => match line? { Some(l) => l, None => break },
-                _ = cancel.notified() => { stopped = true; let _ = child.start_kill(); break; }
+            // Frames come from the CONNECTION's reader, which keeps draining
+            // stdout between turns too — an unread pipe fills at ~64KB and
+            // wedges the process. Plain (non-JSON) stdout is kept there as well;
+            // we collect it at the end, for the same "why did it die" reason.
+            let v = tokio::select! {
+                frame = conn.recv() => match frame { Some(v) => v, None => break },
+                _ = cancel.notified() => { stopped = true; conn.kill(); break; }
                 _ = tokio::time::sleep(STALL_AFTER) => {
                     error = Some(format!(
                         "no output from the agent for {} minutes — the run looks stalled and was stopped. Your context is kept; just resend to retry.",
                         STALL_AFTER.as_secs() / 60
                     ));
-                    let _ = child.start_kill();
+                    conn.kill();
                     break;
                 }
-            };
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            let v: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                // Not stream-json → keep it as a breadcrumb (see `plain_tail`)
-                // instead of dropping it on the floor.
-                Err(_) => { push_plain(&mut plain_tail, line); continue }
             };
             if session_id.is_none() {
                 if let Some(sid) = v["session_id"].as_str() { session_id = Some(sid.to_string()); }
@@ -329,6 +301,17 @@ impl Harness for ClaudeCode {
             }
             if v["type"] == "system" && v["subtype"] == "compact_boundary" {
                 let _ = sink.send(AgentEvent::Compacted { pre_tokens: compaction_pre_tokens(&v) });
+                continue;
+            }
+            // Another local claude session tried to say something to this one
+            // and the receive-side policy PARKED it. Silent until now: the
+            // sender saw nothing, the user saw nothing, and the message either
+            // arrives much later or never. It changes what the user would do
+            // (go look at the other session), so it belongs in the reply.
+            if v["type"] == "system" && v["subtype"] == "peer_message_hold" {
+                if let Some(t) = peer_hold_notice(&v) {
+                    let _ = sink.send(AgentEvent::Notice(t));
+                }
                 continue;
             }
             // Usage-limit state. Relayed ONLY when it is not "allowed": claude
@@ -358,7 +341,7 @@ impl Harness for ClaudeCode {
                         .map(str::to_string)
                         .unwrap_or_else(|| v.to_string()),
                 );
-                let _ = child.start_kill();
+                conn.kill();
                 break;
             }
             // Streaming assistant text — plus silent progress pulses for the
@@ -403,6 +386,44 @@ impl Harness for ClaudeCode {
             // Completed assistant message → tool calls + thinking, plus the text
             // itself when it never streamed (see `streamed_text`).
             if v["type"] == "assistant" {
+                // A SUBAGENT's message. It arrives on this same stream, marked
+                // only by `parent_tool_use_id` (the partial-delta stream never
+                // carries one — verified 118/118 — so only whole messages can
+                // be a subagent's). Flattened into the main timeline it reads
+                // as work the main agent did, and its final text would land in
+                // the reply as if the main agent had said it. Attribute it to
+                // the call that started it instead.
+                if let Some(parent) = v["parent_tool_use_id"].as_str() {
+                    if let Some(blocks) = v["message"]["content"].as_array() {
+                        for b in blocks {
+                            let line = match b["type"].as_str() {
+                                Some("tool_use") => Some(mafold_transcript::step_line(
+                                    b["name"].as_str().unwrap_or("tool"),
+                                    &b["input"],
+                                )),
+                                // What it reported back, trimmed to a line: the
+                                // full text arrives again as the tool RESULT of
+                                // the call that started it.
+                                Some("text") => b["text"]
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|t| !t.is_empty())
+                                    .map(|t| format!("· {}", first_line(t))),
+                                // Its thinking is not the user's business — the
+                                // main agent's already collapses into a trace.
+                                _ => None,
+                            };
+                            if let Some(l) = line {
+                                let _ = sink.send(AgentEvent::SubagentStep {
+                                    parent: parent.to_string(),
+                                    text: l,
+                                });
+                                produced = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(blocks) = v["message"]["content"].as_array() {
                     for b in blocks {
                         match b["type"].as_str() {
@@ -454,6 +475,12 @@ impl Harness for ClaudeCode {
                 }));
             }
             // Tool results (e.g. bash output).
+            // A subagent's tool results are already implied by the step line we
+            // drew for the call, so they are dropped rather than doubling every
+            // line in the card.
+            if v["type"] == "user" && v["parent_tool_use_id"].as_str().is_some() {
+                continue;
+            }
             if v["type"] == "user" {
                 if let Some(blocks) = v["message"]["content"].as_array() {
                     for b in blocks {
@@ -470,6 +497,15 @@ impl Harness for ClaudeCode {
                 }
             }
             if v["type"] == "result" {
+                // Whose result is this? Claude answers a background task's
+                // completion with a TURN OF ITS OWN and emits a result for it —
+                // on a connection that serves many turns those arrive while we
+                // are reading. `origin` says so structurally, so the guess below
+                // (`is_queued_receipt`) is now only the fallback for a CLI too
+                // old to stamp it.
+                if is_other_turns_result(&v) {
+                    continue;
+                }
                 // A non-success result means the agent GAVE UP (API error, max
                 // turns, exec error). Surface the specific reason and stop
                 // cleanly, instead of ending as if it had succeeded (previously
@@ -538,10 +574,15 @@ impl Harness for ClaudeCode {
         }
         drop(sink); // close → the renderer flushes its tail
 
+        // The session id the connection saw is the authority: on a reused one
+        // our local `session_id` only sees the frames of THIS turn, and a
+        // connection that forked or compacted knows better.
+        let session_id = conn.session_id().or(session_id);
+
         if stopped || error.is_some() {
-            let _ = child.start_kill(); // idempotent; ensures the error path stops it too
-            let _ = child.wait().await; // reap; the exit status is irrelevant here
-            if let Some(t) = stderr_task { t.abort(); }
+            conn.kill(); // a turn that ended badly never goes back in the pool
+            conn.wait_exit(std::time::Duration::from_secs(5)).await;
+            crate::turnenv::remove(&crate::turnenv::path_for(&conn.id));
             return Ok(TurnOutcome { limit: limit_hit(limit.clone(), error.as_deref()), produced, stopped, session: session_id, error });
         }
         // `claude` normally exits within a beat of its final `result`. When it
@@ -557,23 +598,30 @@ impl Harness for ClaudeCode {
         // We already have this turn's result, so an overstaying child is not a
         // failure of the reply: give it a grace period, then kill it and return
         // what we have.
+        // The turn is over and the process is healthy. Park it for the next one:
+        // 30 minutes of idle, or for as long as it still has in-process work
+        // (a subagent or workflow would be KILLED with it — see `cc_conn`).
+        if cc_conn::enabled() && conn.alive() {
+            conn.end_turn();
+            cc_conn::put(conn);
+            return Ok(TurnOutcome { produced, stopped, session: session_id, error: None, limit: None });
+        }
+
         const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
-        let status = match tokio::time::timeout(EXIT_GRACE, child.wait()).await {
-            Ok(s) => s?,
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                if let Some(t) = stderr_task { t.abort(); }
+        conn.close_stdin();
+        let status = match conn.wait_exit(EXIT_GRACE).await {
+            Some(s) => s,
+            None => {
+                crate::turnenv::remove(&crate::turnenv::path_for(&conn.id));
                 return Ok(TurnOutcome { limit: limit_hit(limit.clone(), error.as_deref()), produced, stopped, session: session_id, error });
             }
         };
+        crate::turnenv::remove(&crate::turnenv::path_for(&conn.id));
         if !status.success() {
-            // The concurrent reader already drained stderr (no post-wait read that
-            // could have deadlocked) — just collect what it captured.
-            let err = match stderr_task {
-                Some(t) => t.await.unwrap_or_default(),
-                None => String::new(),
-            };
+            // The connection's reader already drained stderr (no post-wait read
+            // that could have deadlocked) — just collect what it captured.
+            let err = conn.stderr_text();
+            let plain_tail = conn.plain_tail();
             // Reaching here at all means the process died WITHOUT a terminal
             // `result` line — EVERY `result`, success or `is_error`, breaks the
             // loop above and returns before this point. So this is the silent
@@ -589,7 +637,7 @@ impl Harness for ClaudeCode {
             // death burned the whole turn on a reply card that lived a couple of
             // seconds and the user had to notice and resend by hand. `produced`
             // rides along, so a run that already streamed work is never redone.
-            let reason = exit_reason(status.code(), &err, plain_tail.make_contiguous());
+            let reason = exit_reason(status.code(), &err, &plain_tail);
             return Ok(TurnOutcome {
                 produced,
                 stopped,
@@ -598,7 +646,6 @@ impl Harness for ClaudeCode {
                 error: Some(reason),
             });
         }
-        if let Some(t) = stderr_task { t.abort(); }
         Ok(TurnOutcome { produced, stopped, session: session_id, error: None, limit: None })
     }
 
@@ -1000,22 +1047,6 @@ fn seat_limit_label(kind: &str, l: &Value) -> String {
     }
 }
 
-/// Keep the last few plain-text stdout lines (see `plain_tail`). Bounded in both
-/// line count and line length — these are diagnostic breadcrumbs for a failed
-/// run, not a transcript, and a chatty non-JSON stream must not grow them.
-fn push_plain(tail: &mut std::collections::VecDeque<String>, line: &str) {
-    const MAX_LINES: usize = 5;
-    const MAX_CHARS: usize = 300;
-    let mut s: String = line.chars().take(MAX_CHARS).collect();
-    if line.chars().count() > MAX_CHARS {
-        s.push('…');
-    }
-    tail.push_back(s);
-    while tail.len() > MAX_LINES {
-        tail.pop_front();
-    }
-}
-
 /// Why a `claude` run that exited nonzero failed, in the most useful words we
 /// have: stderr when claude wrote there, else the plain-text stdout tail, else
 /// the exit code itself. Never a bare "exited unsuccessfully" — a failure with
@@ -1053,6 +1084,246 @@ const USAGE_KEYS: [&str; 4] =
 fn usage_tokens(v: &Value) -> u64 {
     let u = &v["usage"];
     USAGE_KEYS.iter().filter_map(|k| u[*k].as_u64()).sum()
+}
+
+/// Everything a `claude` process needs at SPAWN time, and the two hook blobs
+/// whose fate the handshake decides.
+struct Built {
+    cmd: tokio::process::Command,
+    /// The full COMMAND-hook settings, attached only when the control-channel
+    /// handshake fails.
+    hook_settings: Option<String>,
+    /// The Bash hook alone — always attached (see `cc_conn`'s callback ids).
+    bash_only: String,
+}
+
+/// Build the command for a turn's SHAPE. Nothing per-turn goes in here: the
+/// draft, the ask/steer/permission mailboxes and the watcher all belong to one
+/// turn, while this process may serve many, and they reach the child through
+/// `turnenv` instead. That is what lets [`ClaudeCode::prewarm`] build the same
+/// process before there is a message to answer.
+fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
+        let mut cmd = tokio::process::Command::new(super::program("claude"));
+        // `-p` with NO prompt argument: the prompt goes in on stdin instead (see
+        // the write below). It is the one input here that grows without bound —
+        // it carries the conversation — and Windows hard-caps a command line at
+        // 32,767 UTF-16 units, so on argv a long enough chat makes `CreateProcessW`
+        // refuse the spawn outright (os error 206, ERROR_FILENAME_EXCED_RANGE).
+        // Unconditionally, not past some Windows-only threshold: a size cliff that
+        // only one platform falls off, and only on long conversations, is exactly
+        // the kind of special case that gets shipped untested. `run_claude_stdin`
+        // feeds /usage the same way.
+        cmd.arg("-p")
+            // One JSON line per user message instead of raw text. This is what
+            // lets stdin stay OPEN after the prompt: the process can take
+            // another turn (see `cc_conn`), and the same pipe carries the
+            // control channel. A one-shot run closes stdin at the end and exits
+            // exactly as it always did.
+            .arg("--input-format").arg("stream-json")
+            .arg("--output-format").arg("stream-json")
+            .arg("--verbose")
+            .arg("--include-partial-messages")
+            .arg("--dangerously-skip-permissions")
+            // Ignore the user's GLOBAL MCP servers (e.g. browser-use): claude
+            // would otherwise spawn every configured MCP server on EVERY turn,
+            // which pops a Python dock icon and adds seconds of startup latency
+            // per reply. The daemon passes no --mcp-config, so this loads none.
+            .arg("--strict-mcp-config");
+        if let Some(m) = &shape.model {
+            cmd.arg("--model").arg(m);
+        }
+        // Reasoning effort (owner-set via Customization). No flag = Claude Code's
+        // own default (currently xHigh).
+        if let Some(e) = &shape.effort {
+            cmd.arg("--effort").arg(e);
+        }
+        // Export the current conversation so `mafold room …` (run by the agent
+        // via the room skill) defaults to THIS room. Per-turn (not a global env)
+        // because concurrent turns run different conversations.
+        cmd.env("MAFOLD_CONV", &shape.conv);
+        // The surface (conv + forum channel) the reply lands on — the bash-hook
+        // registers detached background tasks under it, so their wrap-up turn
+        // comes back to THIS channel instead of leaking into another one.
+        cmd.env("MAFOLD_SURFACE", &shape.surface);
+        // Name this process in the machine's session registry
+        // (`~/.claude/sessions/<pid>.json`), which is the address book every
+        // other local claude session sees. Without it the name is auto-derived
+        // from the pid — `mafold-3e`, a different one every turn — so nobody
+        // could address us twice. Keyed by the SURFACE, so a warm connection
+        // keeps one name for as long as it serves that conversation.
+        cmd.env("CLAUDE_CODE_SESSION_NAME", session_peer_name(&shape.surface));
+        // The seat: which Claude login this turn runs on
+        // (`CLAUDE_SECURESTORAGE_CONFIG_DIR`, see `crate::accounts`). Empty for
+        // the default login — the daemon's own environment already is it.
+        // Only the credential moves with it; `~/.claude` (memory, skills,
+        // sessions) stays shared, which is what lets a `--resume` below carry
+        // on under a different account.
+        cmd.envs(shape.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        // Extended thinking: a non-zero budget makes the model think before each
+        // reply (streamed as `thinking` blocks). No env = Claude Code's default.
+        if let Some(budget) = shape.thinking {
+            cmd.env("MAX_THINKING_TOKENS", budget.to_string());
+        }
+        // mafold awareness: who the bot is, the conversation, embeddable cards.
+        if let Some(sys) = &shape.system {
+            cmd.arg("--append-system-prompt").arg(sys);
+        }
+        // Interactive AskUserQuestion: a PreToolUse hook intercepts the native
+        // tool (which would otherwise auto-decline headless), blocks until the
+        // user answers the chat card, then returns the answer as a deny-reason —
+        // which claude feeds back as the tool result, same turn. The hook waits
+        // on MAFOLD_ASK_FILE (the daemon writes the answer there). See ask_hook.
+        let mut pre: Vec<serde_json::Value> = Vec::new();
+        let mut post: Vec<serde_json::Value> = Vec::new();
+        let mut hook_settings: Option<String> = None;
+        // Detach run_in_background Bash tasks into their own session (registered
+        // under ~/.mafold/bgtasks by MAFOLD_SURFACE) — claude kills its own
+        // background shells the moment it exits, so without this they can never
+        // outlive the turn. See bash_hook.
+        //
+        // Unconditional, NOT nested under the ask-file arm it used to share:
+        // background detaching has nothing to do with interactive questions, and
+        // tying them together meant a turn with no ask-file silently lost its
+        // background tasks to claude's exit-time killpg.
+        // ALWAYS a command hook, never a control callback. Its mechanism is
+        // that the hook PROCESS exits right after spawning the detached task,
+        // which is what makes init adopt it; answered inside the daemon the task
+        // would stay our child, nobody would reap it, and the completion monitor
+        // would read the zombie pid as "still running" and never report the
+        // result. Kept in its own settings blob so it survives either side of
+        // the hook handshake below.
+        let bash_hook = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
+        });
+        let bash_only = serde_json::json!({ "hooks": { "PreToolUse": [bash_hook.clone()] } }).to_string();
+        pre.push(bash_hook);
+        {
+            pre.push(serde_json::json!({
+                "matcher": "AskUserQuestion",
+                "hooks": [{ "type": "command", "command": format!("\"{exe}\" ask-hook") }]
+            }));
+            // The user's OWN `ask` rules (`ask: ["Bash(rm *)"]`) mean "a person
+            // must say yes". They outrank `--dangerously-skip-permissions`, an
+            // `allow` rule, and a PreToolUse hook's `allow` — all three verified
+            // against claude 2.1.260 — and headless there is nobody to ask, so
+            // claude denied them outright. Point it at a person instead: this
+            // server puts the question in the reply as the ask card and blocks on
+            // the tap. `--strict-mcp-config` stays, so the user's global MCP
+            // servers still don't load — this config names ours and nothing else.
+            cmd.arg("--mcp-config").arg(permission_mcp_config(exe));
+            cmd.arg("--permission-prompt-tool").arg(crate::permission_mcp::TOOL_REF);
+        }
+        // Mid-turn steering: what the user says while this turn runs reaches the
+        // model at the next tool-result boundary. PostToolUse, matching every
+        // tool, so the tool that was running when they spoke finishes normally
+        // and nothing already on screen is un-said. See `steer_hook`.
+        {
+            post.push(serde_json::json!({
+                "matcher": "*",
+                "hooks": [{ "type": "command", "command": format!("\"{exe}\" steer-hook") }]
+            }));
+        }
+        if !pre.is_empty() || !post.is_empty() {
+            let mut hooks = serde_json::Map::new();
+            if !pre.is_empty() {
+                hooks.insert("PreToolUse".into(), serde_json::Value::Array(pre));
+            }
+            if !post.is_empty() {
+                hooks.insert("PostToolUse".into(), serde_json::Value::Array(post));
+            }
+            // NOT attached yet. This is the COMMAND form of every hook — claude
+            // spawns `mafold <hook>` as its own process for each one, and for
+            // the steer hook that is a process per tool call. Ask and steer are
+            // registered over the control channel instead (in-process, and able
+            // to read the CURRENT turn rather than the environment this process
+            // was born with), so this is kept as the fallback for a CLI that
+            // can't do that. Attaching both would fire every hook twice.
+            hook_settings = Some(serde_json::json!({ "hooks": hooks }).to_string());
+        }
+        cmd.kill_on_drop(true);
+        if let Some(sid) = &shape.session {
+            cmd.arg("--resume").arg(sid);
+            // Somebody else is holding this exact transcript right now (a VS
+            // Code tab, a terminal). Print-mode `--resume` does NOT fork — it
+            // hands back the same session id and appends to the same file — so
+            // without this both writers braid into one session tree and the
+            // resume pointer ends up wherever the last write landed. Forking
+            // inherits everything they've typed up to this instant and leaves
+            // their thread alone, which is what `/resume` has been promising in
+            // words all along. The new id arrives on the stream (`session_id`)
+            // and is what the caller stores, so this costs one fork, not one
+            // per turn.
+            if crate::commands::session_held_elsewhere(sid) {
+                cmd.arg("--fork-session");
+            }
+        }
+        Built { cmd, hook_settings, bash_only }
+}
+
+/// The first non-empty line of `t`, bounded — a subagent's report can be pages
+/// long and it is going into one row of a fixed-width card.
+fn first_line(t: &str) -> String {
+    let line = t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    const MAX: usize = 120;
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    line.chars().take(MAX).collect::<String>() + "…"
+}
+
+/// The name this turn's process announces in the local session registry.
+///
+/// Short and stable, because it is an ADDRESS: another session types it into
+/// `SendMessage`. Derived from the surface (conversation, plus the forum
+/// channel when there is one) so the same conversation always answers to the
+/// same name, and two conversations never collide.
+fn session_peer_name(surface: &str) -> String {
+    let short: Vec<String> = surface
+        .split("__")
+        .take(2)
+        .map(|p| p.chars().filter(|c| c.is_ascii_alphanumeric()).take(6).collect::<String>())
+        .filter(|s: &String| !s.is_empty())
+        .collect();
+    if short.is_empty() {
+        return "mafold".into();
+    }
+    format!("mafold-{}", short.join("-"))
+}
+
+/// What to say about a `peer_message_hold`, or None when it isn't news.
+///
+/// Only the `held` state is: it is the one that means a message is NOT going to
+/// arrive on its own. `released` says it went through after all (the user will
+/// simply see it), and `dropped` is reported by the sending side.
+fn peer_hold_notice(v: &Value) -> Option<String> {
+    if v["state"].as_str()? != "held" {
+        return None;
+    }
+    let who = v["from_name"]
+        .as_str()
+        .or_else(|| v["from"].as_str())
+        .unwrap_or("another session on this machine");
+    let why = match v["cause"].as_str() {
+        Some("mode-mismatch") => " (it runs in a different permission mode)",
+        Some("no-mode-asserted") => " (it didn't say which permission mode it runs in)",
+        Some(_) | None => "",
+    };
+    Some(format!("`{who}` tried to message this session and it was held{why} — it has not reached me."))
+}
+
+/// Does this `result` belong to a turn claude started BY ITSELF?
+///
+/// Claude answers a background task's completion with a whole turn of its own
+/// and emits a `result` for it. On a connection that serves many turns those
+/// land while we are reading, and taking one as ours would end the reply early
+/// (the "0.1s empty reply"). `origin` is absent only on a result that answers a
+/// message the CLIENT sent, which is why this is a field test and not a guess.
+///
+/// Unknown `origin.kind` values count as NOT ours: the set grows over time, and
+/// every member of it is by definition a turn we did not ask for.
+fn is_other_turns_result(v: &Value) -> bool {
+    v["origin"]["kind"].as_str().is_some()
 }
 
 /// Is this successful `result` the receipt for a message that ISN'T ours — a
@@ -1246,24 +1517,67 @@ mod tests {
     }
 
     /// Even with nothing on either stream, the exit code is real information —
-    /// it used to be discarded too.
+
+    /// The exact three results one turn produced on 2026-09-15 when it started a
+    /// subagent and a background shell: ours, then two turns claude ran on its
+    /// own to close those out. On a pooled connection all three arrive while we
+    /// are still reading, so only the first may end the turn.
     #[test]
-    fn exit_code_is_reported_when_there_is_no_output_at_all() {
-        let r = exit_reason(Some(143), "", &[]);
-        assert!(r.contains("143"), "{r}");
-        assert!(exit_reason(None, "", &[]).contains("signal"));
+    fn a_background_tasks_follow_up_turn_is_not_our_result() {
+        let ours = serde_json::json!({
+            "type": "result", "subtype": "success", "result_index": 0, "origin": null,
+        });
+        let after_subagent = serde_json::json!({
+            "type": "result", "subtype": "success", "result_index": 1,
+            "origin": {"kind": "task-notification"},
+        });
+        assert!(!is_other_turns_result(&ours), "the answer to our prompt ends the turn");
+        assert!(is_other_turns_result(&after_subagent), "a task-notification turn does not");
+        let future = serde_json::json!({ "type": "result", "origin": {"kind": "added-in-2027"} });
+        assert!(is_other_turns_result(&future), "the set grows; unknown is still not ours");
+        let old = serde_json::json!({ "type": "result", "subtype": "success" });
+        assert!(!is_other_turns_result(&old), "a CLI too old to stamp it falls through");
     }
 
+    /// Only a HELD peer message is news. `released` means it got through (the
+    /// user will see it), and `dropped` is the sender's side of the story.
     #[test]
-    fn plain_tail_is_bounded_in_lines_and_line_length() {
-        let mut t = std::collections::VecDeque::new();
-        for i in 0..20 {
-            push_plain(&mut t, &format!("line {i}"));
+    fn only_a_held_peer_message_is_relayed() {
+        let held = serde_json::json!({
+            "type": "system", "subtype": "peer_message_hold", "state": "held",
+            "lane": "socket", "from": "mafold-3e", "from_name": "review session",
+            "cause": "mode-mismatch",
+        });
+        let t = peer_hold_notice(&held).expect("held is news");
+        assert!(t.contains("review session"), "{t}");
+        assert!(t.contains("permission mode"), "the cause is the actionable half: {t}");
+        for state in ["released", "dropped"] {
+            assert!(peer_hold_notice(&serde_json::json!({"state": state, "from": "x"})).is_none());
         }
-        assert_eq!(t.len(), 5, "keeps only the tail");
-        assert_eq!(t.back().unwrap(), "line 19", "keeps the LAST lines, not the first");
-        push_plain(&mut t, &"x".repeat(1000));
-        assert!(t.back().unwrap().chars().count() <= 301, "long line truncated");
+        assert!(peer_hold_notice(&serde_json::json!({"state": "held"})).is_some());
+    }
+
+    /// The name is an ADDRESS another session types, so it has to be stable for
+    /// a conversation and distinct between two.
+    #[test]
+    fn the_peer_name_is_stable_per_surface_and_distinct_between_them() {
+        let a = session_peer_name("85c0609e-5cb9-4f05-a2af-cb99f0cfa1f9");
+        assert_eq!(a, session_peer_name("85c0609e-5cb9-4f05-a2af-cb99f0cfa1f9"));
+        assert_ne!(a, session_peer_name("7abf9f90-077b-4bbf-9aa4-a69f9557833e"));
+        let chan = session_peer_name("85c0609e-5cb9__c71bbd28-7781");
+        assert_ne!(a, chan, "a forum channel is part of the surface, and of the name");
+        assert!(chan.starts_with("mafold-") && chan.len() <= 24, "an address must be typeable: {chan}");
+        assert_eq!(session_peer_name(""), "mafold");
+    }
+
+    /// A subagent's report goes into ONE row of a fixed-width card.
+    #[test]
+    fn a_subagents_line_is_the_first_line_and_bounded() {
+        assert_eq!(first_line("\n\n  hello \nworld"), "hello");
+        assert_eq!(first_line(""), "");
+        let long = "x".repeat(500);
+        let cut = first_line(&long);
+        assert!(cut.chars().count() <= 121 && cut.ends_with('…'), "{}", cut.len());
     }
 
     /// Blank-only breadcrumbs must not masquerade as an explanation.

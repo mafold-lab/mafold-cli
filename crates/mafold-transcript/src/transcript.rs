@@ -402,6 +402,15 @@ impl Transcript {
                 Advance::Immediate
             }
             AgentEvent::Steered(_) => Advance::Quiet,
+            // Lands where it arrived, for the same reason a steer does: WHEN it
+            // happened is part of what it says. `push_raw`, never into a group —
+            // a notice that opened a group of its own is exactly how the usage
+            // limit buried the answer in the trace on 2026-09-06.
+            AgentEvent::Notice(text) if !text.trim().is_empty() => {
+                self.push_raw(&render::notice_line(text));
+                Advance::Immediate
+            }
+            AgentEvent::Notice(_) => Advance::Quiet,
             AgentEvent::Done { duration_ms, cost_usd, tokens } => {
                 self.seal();
                 let rendered = if let Some(stats) = self.stats.as_mut() {
@@ -461,6 +470,18 @@ impl Transcript {
                         self.names.insert(id.clone(), name.to_lowercase());
                         self.open.insert(id.clone(), self.group.len());
                         self.group.push(GroupItem::Step(ToolStep::new(name, input)));
+                    }
+                    // Into the card of the call that STARTED this subagent. No
+                    // slot (its group already committed, or a parent we never
+                    // saw) → dropped, deliberately: a bare "Read x.rs" with
+                    // nothing tying it to whose read it was is exactly the
+                    // confusion this event exists to remove.
+                    AgentEvent::SubagentStep { parent, text } => {
+                        if let Some(&i) = self.open.get(parent) {
+                            if let Some(GroupItem::Step(s)) = self.group.get_mut(i) {
+                                s.note(text);
+                            }
+                        }
                     }
                     // Into its call's slot. No slot (the group was already
                     // committed) → fall back to a standalone output card: a
@@ -1236,6 +1257,51 @@ mod fold_tests {
         assert!(last > close, "last group must stay visible:\n{md}");
         assert!(md.find("Usage limit").expect("notice") > last, "{md}");
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
+    }
+
+    /// The SAME contract for a driver [`AgentEvent::Notice`] — the newest member
+    /// of the notice family, and the one most likely to arrive last (a peer
+    /// message parked while the turn was finishing). A new notice kind that
+    /// forgets to register its prefix reintroduces the 2026-09-06 bug exactly,
+    /// which is what this pins.
+    #[test]
+    fn a_driver_notice_is_not_mistaken_for_the_answer() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Looking.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("And now this.".into()));
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        t.push(&AgentEvent::Notice("`mafold-3e` tried to message this session".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        assert!(render::is_notice_line("> ⚠︎ anything"), "the prefix must be registered");
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        let last = md.find("cargo test").expect("last group");
+        assert!(last > close, "the last group stays visible:\n{md}");
+        assert!(md.find("mafold-3e").expect("notice") > last, "{md}");
+    }
+
+    /// A subagent's work belongs to the call that started it — in that card,
+    /// not loose in the timeline where it reads as the main agent's own.
+    #[test]
+    fn a_subagents_steps_land_in_the_card_of_the_call_that_started_it() {
+        let mut t = Transcript::new();
+        t.push(&call("t1", "Agent", json!({"subagent_type": "Explore", "description": "find it"})));
+        t.push(&AgentEvent::SubagentStep { parent: "t1".into(), text: "· Read note.txt".into() });
+        t.push(&AgentEvent::SubagentStep { parent: "t1".into(), text: "· found it".into() });
+        // A step whose parent we never saw has nothing to belong to: dropped,
+        // never promoted to a loose card.
+        t.push(&AgentEvent::SubagentStep { parent: "nope".into(), text: "· orphan".into() });
+        t.push(&result("t1", "note.txt says hello"));
+        let md = t.finish();
+        assert!(md.contains("subagent=\"Explore\""), "{md}");
+        assert!(md.contains("Read note.txt"), "{md}");
+        assert!(!md.contains("orphan"), "an unattributable step is dropped: {md}");
+        let steps = md.find("Read note.txt").unwrap();
+        let out = md.find("note.txt says hello").unwrap();
+        assert!(steps < out, "steps first, then what it reported: {md}");
     }
 }
 
