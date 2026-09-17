@@ -62,6 +62,25 @@ impl From<&wire::Conversation> for CoreConversation {
             member_edit_info: c.member_perms.edit_info,
             member_add_bots: c.member_perms.add_bots,
             last_message: c.last_message.as_ref().map(CoreMessage::from),
+            channel_unread: c.channel_unread,
+            channel_unread_mention: c.channel_unread_mention,
+            channel_muted_unread: c.channel_muted_unread,
+            latest_message: c.latest.as_ref().map(|l| CoreMessage::from(&l.message)),
+            latest_channel_id: c
+                .latest
+                .as_ref()
+                .and_then(|l| l.channel.as_ref())
+                .map(|ch| ch.id.to_string()),
+            latest_channel_name: c
+                .latest
+                .as_ref()
+                .and_then(|l| l.channel.as_ref())
+                .map(|ch| ch.name.clone()),
+            latest_channel_icon: c
+                .latest
+                .as_ref()
+                .and_then(|l| l.channel.as_ref())
+                .and_then(|ch| ch.icon.clone()),
         }
     }
 }

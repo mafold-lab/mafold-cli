@@ -126,6 +126,11 @@ pub struct Transcript {
     /// Groups closed this turn. Below two (and with no interim narration) there
     /// is nothing a fold would hide — see [`Transcript::finish_folded`].
     groups: usize,
+    /// The counts and step total of the group that closed LAST. `finish_folded`
+    /// can leave that one group outside the lid; when it does, the lid's own
+    /// summary has to stop counting it, and the whole-turn `totals` can't say
+    /// which share to drop.
+    last_group: (HashMap<&'static str, usize>, usize),
 }
 
 impl Default for Transcript {
@@ -206,6 +211,7 @@ impl Transcript {
             totals: HashMap::new(),
             steps: 0,
             groups: 0,
+            last_group: (HashMap::new(), 0),
         }
     }
 
@@ -285,6 +291,7 @@ impl Transcript {
         );
         self.groups += 1;
         self.steps += self.group.len();
+        self.last_group = (self.counts.clone(), self.group.len());
         self.full.push_str(&card);
         self.group.clear();
         // Slots are gone once committed — a result arriving after this takes
@@ -560,7 +567,11 @@ impl Transcript {
     ///     already one pill. Folding it just buries it one tap deeper.
     ///   * **Nothing left over** — a turn that ends ON its tool work, with no
     ///     closing sentence, would fold to an empty message. There it folds one
-    ///     group SHALLOWER, so the last thing that happened stays visible.
+    ///     group SHALLOWER, so the last thing that happened stays visible — and
+    ///     when there is no EARLIER group to take its place under the lid, it
+    ///     doesn't fold at all. A lid is a promise about what is inside it; one
+    ///     holding only narration, labelled with work that is sitting in the
+    ///     open below it, is worse than no lid.
     pub fn finish_folded(&mut self) -> String {
         self.seal();
         // Live shape is the fallback everywhere below, so a turn that shouldn't
@@ -588,13 +599,36 @@ impl Transcript {
         // seam). Fold everything and those would be the entire message.
         let has_answer =
             !render::strip_notices(&render::strip_cards(tail)).trim().is_empty() || has_own_card(tail);
-        let (head, tail) = if has_answer {
-            (head, tail)
+        let (head, tail, counts, steps) = if has_answer {
+            (head, tail, self.totals.clone(), self.steps)
         } else {
             // Fold one group shallower so the last thing that happened stays on
-            // screen. No earlier group → nothing worth folding, leave it alone.
+            // screen — but only when an EARLIER group is left to go under the
+            // lid. With a single group there is none, and folding anyway put the
+            // narration alone under a lid still labelled with the whole turn's
+            // work, while the group that lid named sat outside it: two pills,
+            // "Read 4 files · 4 步" above a "Read 4 files" it did not contain,
+            // and the sentence unreachable behind a lid with nothing to open.
+            // (Field case: conv 00e24642, 2026-09-15 11:22:15Z — one sentence,
+            // one group of four Reads, stopped before any answer.)
+            if self.groups < 2 {
+                return plain(&self.full);
+            }
             match head.rfind("\n{% mafold/run ") {
-                Some(j) if j > 0 => (&self.full[..j], &self.full[j..]),
+                Some(j) if j > 0 => {
+                    // The group that moves OUT leaves the lid's summary with it
+                    // — a trail that says "read 6 files" must hold six, not four
+                    // of its own plus two on show underneath it.
+                    let mut counts = self.totals.clone();
+                    for (k, n) in &self.last_group.0 {
+                        if let Some(v) = counts.get_mut(k) {
+                            *v = v.saturating_sub(*n);
+                        }
+                    }
+                    counts.retain(|_, n| *n > 0);
+                    let steps = self.steps.saturating_sub(self.last_group.1);
+                    (&self.full[..j], &self.full[j..], counts, steps)
+                }
                 _ => return plain(&self.full),
             }
         };
@@ -607,8 +641,8 @@ impl Transcript {
         // Healed as its own document: an unbalanced fence inside the trail must
         // be closed INSIDE the card, or the client parses the rest of the body
         // as code and the nested cards vanish.
-        let summary = render::run_summary(&self.totals);
-        let folded = render::trace_card(&summary, self.steps, &plain(head));
+        let summary = render::run_summary(&counts);
+        let folded = render::trace_card(&summary, steps, &plain(head));
         format!("{folded}{}", plain(tail))
     }
 }
@@ -1007,6 +1041,50 @@ mod fold_tests {
         let close = md.find("{% /mafold/trace %}").expect("folded");
         assert!(md.find("cargo test").expect("last group") > close, "{md}");
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
+        // The group left on show is no longer the lid's to claim: the trail
+        // holds the Read and says so, and the Bash below it is counted once.
+        let lid = &md[..close];
+        assert!(lid.contains("summary=\"Read 1 file\""), "lid over-claims:\n{md}");
+        assert!(lid.contains("steps=\"1\""), "lid over-counts:\n{md}");
+    }
+
+    /// The 2026-09-15 double pill (conv 00e24642, 11:22:15Z): one sentence, one
+    /// group of four Reads, and the user hit stop before any answer. Folding
+    /// "one shallower" had no earlier group to fall back on, so the lid closed
+    /// over the sentence alone while still labelled "Read 4 files · 4 步" — and
+    /// the group it named sat in the open right underneath, an identical pill.
+    /// A lid with no group under it is not a lid; don't fold.
+    #[test]
+    fn narration_and_a_single_group_do_not_fold_into_two_pills() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("又崩了？我先看你的截图，同时拉新的日志。".into()));
+        for i in 0..4 {
+            let id = format!("r{i}");
+            t.push(&call(&id, "Read", json!({ "file_path": format!("/a/{i}") })));
+            t.push(&result(&id, ""));
+        }
+        let md = t.finish_folded(); // no Done: the turn was killed mid-flight
+        assert!(!md.contains("mafold/trace"), "a lid with nothing under it:\n{md}");
+        assert_eq!(md.matches("{% mafold/run ").count(), 1, "two pills:\n{md}");
+        assert!(md.contains("又崩了"), "narration must stay readable:\n{md}");
+    }
+
+    /// The same shape one group further along still folds — there IS an earlier
+    /// group to put under the lid, which is what the shallower fold is for.
+    #[test]
+    fn two_groups_and_no_answer_still_fold_shallower() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("先看文件。".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("再跑测试。".into()));
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        let md = t.finish_folded();
+        let open = md.find("{% mafold/trace").expect("folded");
+        let close = md.find("{% /mafold/trace %}").expect("lid");
+        assert!(md[open..close].contains("{% mafold/run "), "lid holds a group:\n{md}");
+        assert!(md.find("cargo test").unwrap() > close, "{md}");
     }
 
     /// A reply that answers in a CARD (`{% mafold/html %}`) has an answer just
@@ -1160,3 +1238,4 @@ mod fold_tests {
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
     }
 }
+

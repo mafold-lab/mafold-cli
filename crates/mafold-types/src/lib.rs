@@ -391,6 +391,68 @@ pub struct Conversation {
     /// only, which is exactly how groups behaved before this field existed.
     #[serde(default, skip_serializing_if = "MemberPerms::is_default")]
     pub member_perms: MemberPerms,
+    /// FORUM ONLY — the unread sitting in this group's CHANNELS, summed at list
+    /// time for the requester.
+    ///
+    /// `unread_count` above is the MAIN timeline's and nothing else: channel
+    /// messages deliberately never enter `ConversationRecord.message_ids`, so a
+    /// forum that is on fire reports `unread_count: 0`. Every client papered
+    /// over that by summing `listChannels` for the forums it had already opened
+    /// — which is why the row you have never visited stays blank while the tab
+    /// badge, computed from the same partial data, shows a number. The sum
+    /// belongs here, once, computed by the side that can see every channel.
+    ///
+    /// Muted channels are NOT in it (they go to `channel_muted_unread`), and
+    /// neither are archived ones: archived means out of sight, and a number
+    /// that only an archive drawer can explain is worse than no number.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub channel_unread: u32,
+    /// Someone @-mentioned the requester inside `channel_unread`. Same rule the
+    /// per-channel badge follows: who is talking to you outranks how many.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channel_unread_mention: bool,
+    /// The unread the requester asked not to be shouted at about — muted
+    /// channels only. Clients draw a quiet dot for it, never a number.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub channel_muted_unread: u32,
+    /// The newest thing actually said in this conversation, wherever it was
+    /// said — `#all` or any un-archived channel — plus which channel that was.
+    ///
+    /// SEPARATE FROM `last_message` on purpose. `last_message` is the main
+    /// timeline's and doubles as the read-marker source clients hand back to
+    /// `markRead`; the server REJECTS a channel id there (it used to poison
+    /// `unread_for` into "everything unread"), so widening that field's meaning
+    /// would silently turn "mark all read" into a no-op. This one is additive:
+    /// a client that doesn't know it still renders exactly what it renders now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<LatestActivity>,
+}
+
+/// The newest visible message in a conversation together with the channel it
+/// came from — what a dialog row's second line should actually read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestActivity {
+    pub message: Message,
+    /// None = the `#all` main timeline. Clients draw no prefix for it: the
+    /// absence IS the statement "this is the main timeline", and a `#general`
+    /// stamped on most rows is noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<ChannelRef>,
+}
+
+/// Just enough of a `Channel` to name it in a dialog row. The whole record
+/// would drag a second `Message` (the channel's own `last_message`) into every
+/// row of the chat list — and the name is all the row draws.
+///
+/// Carried by value rather than as an id because the client has NO channel
+/// table for a forum it has never opened, which is exactly the row this exists
+/// to fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelRef {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// The member-side half of group permissions: powers an ordinary member does
@@ -966,6 +1028,44 @@ pub struct AppUpdateInfo {
     pub notes: Option<String>,
 }
 
+// MARK: - CLI update (release metadata for mafold-cli's self-updater)
+
+/// server → client answer to `cliUpdateCheck`: what the newest release on a
+/// channel IS, for one target triple. Metadata only — the bytes still come from
+/// the release host named in `url`.
+///
+/// DELIBERATELY NOT SHAPED LIKE [`AppUpdateInfo`]. There is no `available`
+/// flag, because the server does not get to decide: `mafold-cli`'s
+/// `wants_update` knows things this endpoint cannot (the checksum of the binary
+/// actually on that disk, which is what tells a real build apart from one that
+/// merely claims the same version). The server reports, the client decides.
+///
+/// `known: false` means THE SERVER HAS NO RECORD — not "you are up to date".
+/// Collapsing those two would be the worst bug in this feature: a client would
+/// read silence as reassurance and stop looking, right when the fallback path
+/// is the thing that should fire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliReleaseInfo {
+    /// false → no manifest for this channel yet; the caller must fall back to
+    /// the release host rather than treat itself as current.
+    pub known: bool,
+    /// Echoes the channel resolved (`stable` / `dev`).
+    pub channel: String,
+    /// Release version without the leading `v` (e.g. `0.9.116`, `0.9.116-dev.7`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Where the binary for the requested target lives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// The published checksum. `None` means the manifest is INCOMPLETE — the
+    /// updater refuses to install an unverifiable binary, so a caller that sees
+    /// this must fall back rather than proceed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
 #[cfg(test)]
 mod inline_result_tests {
     use super::{InlinePick, InlineResult};
@@ -1052,6 +1152,228 @@ mod inline_result_tests {
             InlineResult::from_body("内容 A".into()).id,
             InlineResult::from_body("内容 B".into()).id
         );
+    }
+}
+
+// ───────────────── Harness capabilities ─────────────────
+// What a coding-agent CLI on ONE machine actually accepts — probed by the
+// daemon that drives it, reported over the bot token (`reportHarnessCaps`),
+// and read back into the Customize sheet's model / effort menus
+// (`effective_fields`). The roster lives nowhere else: not in a client, not
+// in the daemon's seed, not in a langpack.
+
+/// One machine's report for one bot. A bot driven from two machines has two;
+/// the sheet shows their union, every option saying where it holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessCaps {
+    /// Harness id — `claude-code` | `codex` | `kimi-code` …
+    pub harness: String,
+    /// The harness CLI's version on that machine (`2.1.272`). The list is
+    /// version-bound: a build that lacks a model or a tier says so here.
+    pub version: String,
+    /// Stable id of the machine — the same `device_id` its `mafold login`
+    /// session reports in `reportHarnesses`, so New-Bot's device list and
+    /// these reports name the same box.
+    pub machine: String,
+    /// Human name of the machine, for provenance (`2.1.272 · ops's MacBook`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_name: Option<String>,
+    /// The login the list was read for. A harness answers PER ACCOUNT (the
+    /// subscription decides the roster), so another login is another entry,
+    /// never a correction of this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Epoch seconds the probe ran.
+    pub probed_at: i64,
+    /// Where the list came from — how much to trust it.
+    pub source: CapsSource,
+    /// Models the harness accepts, in the harness's own order.
+    #[serde(default)]
+    pub models: Vec<ModelCap>,
+    /// Effort tiers the binary accepts but that this probe could NOT attribute
+    /// to a model — what the fallback path learns (`--effort <bogus>` answers
+    /// with the valid values, no model roster attached). Unioned into the
+    /// effort menu beside the per-model tiers; empty whenever the handshake
+    /// answered, because then every tier has a model behind it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
+    /// Session modes beside the effort tiers (`ultracode`), when the harness
+    /// has any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<ModeCap>,
+}
+
+/// How a `HarnessCaps` was obtained.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapsSource {
+    /// The harness's own control-protocol handshake — authoritative.
+    Handshake,
+    /// Parsed out of `--help` text: tiers only, no per-model detail.
+    HelpText,
+    /// A previous probe, re-sent because the live one failed.
+    Cached,
+    /// Nothing could be probed. `models` is empty, and a client renders the
+    /// menus as unknown rather than as a picker of guesses. The default, so
+    /// that a half-built report claims nothing.
+    #[default]
+    None,
+}
+
+/// One model the harness accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCap {
+    /// The value the harness's model flag takes (`opus[1m]`).
+    pub id: String,
+    /// What it resolves to (`claude-opus-5[1m]`), when the harness says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// Other spellings the flag also accepts for this model (`fable` for
+    /// `claude-fable-5-1[1m]`). A stored value names a model by `id`,
+    /// `resolved` or any alias — see [`ModelCap::matches`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Display name from the harness (`Opus (1M context)`).
+    pub display: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Effort tiers THIS model takes, ascending. Empty = no effort dial at
+    /// all (Haiku): offer none, pass none.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+}
+
+/// A session mode that sits beside the effort tiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModeCap {
+    /// `ultracode`
+    pub id: String,
+    /// The tier the mode pins while on (`xhigh`), when it pins one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pins_effort: Option<String>,
+}
+
+impl ModelCap {
+    /// Does a stored value name this model — by id, resolved id or alias?
+    pub fn matches(&self, value: &str) -> bool {
+        self.id == value
+            || self.resolved.as_deref() == Some(value)
+            || self.aliases.iter().any(|a| a == value)
+    }
+}
+
+impl HarnessCaps {
+    /// The model a stored value names on this machine, if its harness accepts it.
+    pub fn model(&self, value: &str) -> Option<&ModelCap> {
+        self.models.iter().find(|m| m.matches(value))
+    }
+    /// `2.1.272 · ops's MacBook` — where a learned option holds.
+    pub fn provenance(&self) -> String {
+        format!("{} · {}", self.version, self.machine_name.as_deref().unwrap_or(&self.machine))
+    }
+    /// Does this report have anything to say about which MODELS exist?
+    ///
+    /// A probe that only reached the fallback path learns the effort tiers and
+    /// nothing else; its report must leave the model menu alone rather than
+    /// empty it. `source: none` — "the probe ran and found nothing" — is the
+    /// one case where saying nothing IS the statement, so it counts as telling.
+    pub fn tells_models(&self) -> bool {
+        !self.models.is_empty() || self.source == CapsSource::None
+    }
+    /// Same question for the effort tiers, whether they came attached to a
+    /// model, unattributed, or as a mode.
+    pub fn tells_efforts(&self) -> bool {
+        !self.efforts.is_empty()
+            || !self.modes.is_empty()
+            || self.models.iter().any(|m| !m.efforts.is_empty())
+            || self.source == CapsSource::None
+    }
+}
+
+#[cfg(test)]
+mod harness_caps_tests {
+    use super::*;
+
+    fn fable() -> ModelCap {
+        ModelCap {
+            id: "claude-fable-5-1[1m]".into(),
+            resolved: Some("claude-fable-5-1".into()),
+            aliases: vec!["fable".into()],
+            display: "Fable".into(),
+            description: None,
+            efforts: vec!["low".into(), "max".into()],
+        }
+    }
+
+    /// A stored value reaches a model by any of its spellings — the stock
+    /// seed wrote `fable`, the handshake says `claude-fable-5-1[1m]`.
+    #[test]
+    fn a_value_names_a_model_by_id_resolved_or_alias() {
+        let m = fable();
+        assert!(m.matches("claude-fable-5-1[1m]"));
+        assert!(m.matches("claude-fable-5-1"));
+        assert!(m.matches("fable"));
+        assert!(!m.matches("opus"));
+    }
+
+    /// The wire shape tolerates a report that omits the optional fields — an
+    /// older daemon, or a probe that learned less — and `source` is lowercase
+    /// on the wire.
+    #[test]
+    fn a_sparse_report_parses_and_source_is_snake_case() {
+        let c: HarnessCaps = serde_json::from_value(serde_json::json!({
+            "harness": "claude-code", "version": "2.1.272", "machine": "m1",
+            "probed_at": 1, "source": "help_text",
+            "models": [{ "id": "haiku", "display": "Haiku" }],
+        }))
+        .unwrap();
+        assert_eq!(c.source, CapsSource::HelpText);
+        assert!(c.models[0].efforts.is_empty());
+        assert_eq!(c.provenance(), "2.1.272 · m1");
+        assert_eq!(serde_json::to_value(CapsSource::None).unwrap(), "none");
+    }
+
+    /// A report speaks for each menu SEPARATELY. The fallback probe learns the
+    /// tiers and no roster: it must not be read as "this machine has no
+    /// models". `source: none` is the one report that means exactly that.
+    #[test]
+    fn a_report_speaks_only_for_what_it_learned() {
+        let base = HarnessCaps {
+            harness: "claude-code".into(),
+            version: "2.1.272".into(),
+            machine: "m1".into(),
+            machine_name: None,
+            account: None,
+            probed_at: 1,
+            source: CapsSource::HelpText,
+            models: vec![],
+            efforts: vec!["low".into()],
+            modes: vec![],
+        };
+        assert!(!base.tells_models(), "tiers alone say nothing about the roster");
+        assert!(base.tells_efforts());
+
+        // A handshake with a model that takes no tiers (Haiku) tells both:
+        // the roster is real, and "no tier here" is an answer.
+        let handshake = HarnessCaps {
+            source: CapsSource::Handshake,
+            models: vec![ModelCap {
+                id: "haiku".into(),
+                resolved: None,
+                aliases: vec![],
+                display: "Haiku".into(),
+                description: None,
+                efforts: vec![],
+            }],
+            efforts: vec![],
+            ..base.clone()
+        };
+        assert!(handshake.tells_models());
+        assert!(!handshake.tells_efforts());
+
+        // Nothing probed: that IS the statement, for both menus.
+        let nothing = HarnessCaps { source: CapsSource::None, models: vec![], efforts: vec![], ..base };
+        assert!(nothing.tells_models() && nothing.tells_efforts());
     }
 }
 

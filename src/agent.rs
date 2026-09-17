@@ -1766,7 +1766,9 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // where the release download is blocked, every restart used to announce
     // "updating…" and then do nothing, with no clue why.
     if auto_update {
-        if let Ok(Some(r)) = crate::update::check(&client.http).await {
+        if let Ok(Some(r)) =
+            crate::update::check(&client.http, &client.base, crate::update::Channel::current()).await
+        {
             if !crate::update::recently_failed(&r.version) {
                 println!("{}…", r.action_line());
                 match crate::update::apply(&client.http, &r.url, &r.version, r.sha256.as_deref()).await {
@@ -1913,6 +1915,16 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // consumes model/effort/system_prompt/thinking/cwd. Seed those fields once.
     ensure_customize_fields(&client, &my_username, owner_username.as_deref(), harness.id()).await;
 
+    // …and then tell the server what the harness on THIS machine actually
+    // takes, so those menus stop being a list we wrote down and start being
+    // what the binary answered. In the background: the probe starts a process,
+    // and nobody's first message should wait behind a menu.
+    {
+        let (client, harness) = (client.clone(), harness.clone());
+        let preferred = owner.account.clone();
+        tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred).await });
+    }
+
     // Recover only this machine's journaled drafts from dead producer PIDs.
     // An offline account can still have live turns elsewhere.
     let outbox = Arc::new(crate::drafts::Outbox::open(&client.base, &my_username)?);
@@ -1960,7 +1972,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
-                maybe_update(&client.http, &coord).await;
+                maybe_update(&client.http, &client.base, &coord).await;
             }
         });
     }
@@ -2089,7 +2101,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         // a reconnect storm doesn't hammer the releases API).
         if auto_update && last_update_check.elapsed() > Duration::from_secs(300) {
             last_update_check = std::time::Instant::now();
-            maybe_update(&client.http, &coord).await;
+            maybe_update(&client.http, &client.base, &coord).await;
         }
         eprintln!("reconnecting in {backoff}s…");
         tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -2121,8 +2133,8 @@ fn deprovision_and_exit(my_username: &str, token: &str, reason: &str) -> ! {
 /// flight → coord is idle), safely apply it and re-exec into the new
 /// binary. Idle-gated so a self-update never interrupts a reply; never returns
 /// on a successful re-exec. Shared by the periodic poll + the reconnect check.
-async fn maybe_update(http: &reqwest::Client, coord: &Arc<ExecCoord>) {
-    match crate::update::check(http).await {
+async fn maybe_update(http: &reqwest::Client, base: &str, coord: &Arc<ExecCoord>) {
+    match crate::update::check(http, base, crate::update::Channel::current()).await {
         // This version already failed to apply recently (e.g. the download is
         // blocked on this network) — cooldown, so a cliUpdate nudge storm can't
         // re-download-and-fail every few seconds.
@@ -2251,6 +2263,56 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
     {
         Ok(_) => println!("✓ published Customize fields for @{my_username} ({desc})"),
         Err(e) => println!("note: couldn't publish Customize fields for @{my_username}: {e}"),
+    }
+}
+
+/// Tell the server what the harness on THIS machine accepts — the models, and
+/// per model the reasoning tiers — so the Customize sheet's `model` / `effort`
+/// menus are the binary's own answer instead of a roster written into this
+/// daemon. A build that has a tier offers it the day it ships; one that doesn't
+/// can't be picked into a silent downgrade (`--effort` takes an unknown value,
+/// warns once on stderr nobody reads, and runs the default).
+///
+/// Rides the BOT's own token, unlike [`ensure_customize_fields`]: which models
+/// exist here is a fact about this machine, and it must not wait for the owner
+/// to have `mafold login`-ed on it.
+///
+/// The seat is chosen the way a TURN chooses one, preference and all, because
+/// the roster is per subscription: reporting the default login's models for a
+/// daemon whose turns all run on `personal` would describe a machine nobody
+/// uses. Best-effort throughout — a harness that can't be probed reports
+/// nothing and the sheet keeps whatever it had.
+async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>) {
+    let env = if harness.id() == "claude-code" {
+        crate::accounts::choose(preferred.as_deref(), None).await.account.env()
+    } else {
+        Vec::new()
+    };
+    let Some(caps) = crate::harness::caps_report(harness, &env).await else {
+        return;
+    };
+    let what = format!(
+        "{} model(s), {} tier(s){}",
+        caps.models.len(),
+        caps.models
+            .iter()
+            .flat_map(|m| m.efforts.iter())
+            .chain(caps.efforts.iter())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        if caps.modes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {}",
+                caps.modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(" + ")
+            )
+        }
+    );
+    let version = caps.version.clone();
+    match client.call("reportHarnessCaps", serde_json::json!({ "caps": caps })).await {
+        Ok(_) => println!("✓ reported what {} {version} takes here: {what}", harness.id()),
+        Err(e) => println!("note: couldn't report harness caps: {e}"),
     }
 }
 
@@ -2442,8 +2504,15 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
         // Claude Code (also the fallback): effort AND a thinking budget are two
         // different dials here — `--effort` picks how hard the agent works a
         // turn, MAX_THINKING_TOKENS how much it thinks before each reply — so
-        // unlike codex it gets both. The tiers are the ones `claude --effort`
-        // accepts (low/medium/high/xhigh/max — no `minimal`).
+        // unlike codex it gets both.
+        //
+        // The rosters below are a BOOTSTRAP, not the answer: they are what the
+        // sheet shows for the minute between a bot's first boot and its first
+        // `reportHarnessCaps` ([`report_caps`]), after which the server rebuilds
+        // both menus from what THIS machine's binary said it takes and these
+        // names stop being consulted. Don't grow them when Claude Code ships a
+        // model or a tier — the probe will find it without a release; a list
+        // here can only be right about the build it was typed against.
         _ => (
             serde_json::json!([
                 { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "", "show_on_profile": true,
@@ -3012,8 +3081,34 @@ async fn connect_and_run(
     // into the mafold preamble each turn AND used to canonicalise what the model
     // writes back (`cardtags::qualify`): the same list that advertises the cards
     // is the one that validates the output, so the two can't drift.
-    let card_tags = available_card_tags(client).await;
-    crate::cardtags::set_registry(&card_tags);
+    //
+    // Failed fetch → keep what we hold, exactly like the owner config below.
+    // Empty is not a neutral default here, it is a lie with two victims: an
+    // empty registry makes `qualify` return early, so a bare `{% ask %}` the
+    // model wrote ships bare and renders as a grey "Unsupported card" that
+    // eats the card's body; and the preamble flips to "No custom cards are
+    // published for you yet", which withdraws the whole menu. Both last until
+    // the next SUCCESSFUL connect, and neither said a word. A daemon on a
+    // flaky link lives there: 2026-09-15, @linsky:opus48 logged 1809
+    // reconnects and 6173 connect failures in one process while `listCards`
+    // itself answered 200 whenever it was actually reached.
+    let card_tags = match available_card_tags(client).await {
+        Some(fresh) => {
+            crate::cardtags::set_registry(&fresh);
+            fresh
+        }
+        None => {
+            let held = crate::cardtags::registry_ids();
+            match held.len() {
+                0 => println!(
+                    "⚠ listCards did not answer on connect — no card list held yet, \
+                     so this bot will be told it has no cards to embed"
+                ),
+                n => println!("⚠ listCards did not answer on connect — keeping the {n} cards we hold"),
+            }
+            held
+        }
+    };
 
     // Re-sync the owner config on EVERY (re)connect, not only at process start.
     // `events.botConfigUpdated` is the live hot-swap, but it only reaches us
@@ -3166,11 +3261,23 @@ async fn connect_and_run(
         // maybe_update is idle-gated, so it never interrupts a turn; on success it
         // re-execs into the new binary.
         if method == "events.cliUpdate" {
+            // The nudge names the channel the release landed on. Ignore one for
+            // a line we don't follow: a dev machine told about a stable release
+            // has nothing to do, and going to look anyway is a wasted round trip
+            // that the whole fleet makes at the same instant. An event with no
+            // `channel` is from an older api — treat it as stable, which is what
+            // it always meant.
+            let ev_channel = env["params"]["channel"].as_str().unwrap_or("stable");
+            if crate::update::Channel::parse(ev_channel) != Some(crate::update::Channel::current()) {
+                println!("↻ cliUpdate for the {ev_channel} channel — ignoring (we're on {})", crate::update::Channel::current().as_str());
+                continue;
+            }
             if auto_update {
                 // Standalone agent: self-update now (idle-gated, re-execs on success).
                 let http = client.http.clone();
+                let base = client.base.clone();
                 let coord = coord.clone();
-                tokio::spawn(async move { maybe_update(&http, &coord).await; });
+                tokio::spawn(async move { maybe_update(&http, &base, &coord).await; });
             } else {
                 // Supervised (--no-auto-update): the SUPERVISOR owns updates and
                 // respawns us on the new binary. Don't self-re-exec out from under
@@ -5230,26 +5337,28 @@ fn noop_open_dir() -> PathBuf {
 /// the renderer now requires. `listCards` returns `tag` (the slug) and `scope`
 /// (the owner) as separate fields, so they must be rejoined here — handing the
 /// model a bare `tag` is what made it write `{% ask %}`, which resolves to
-/// nothing since bare resolution was removed. Best-effort: an empty list just
-/// omits the card menu.
-async fn available_card_tags(client: &Client) -> Vec<String> {
-    match client.list_cards().await {
-        Ok(v) => v["items"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| {
-                        let tag = c["tag"].as_str()?;
-                        Some(match c["scope"].as_str() {
-                            Some(scope) if !scope.is_empty() => format!("{scope}/{tag}"),
-                            _ => tag.to_string(),
-                        })
-                    })
-                    .collect()
+/// nothing since bare resolution was removed.
+///
+/// `None` is "we did not find out" — a dead socket, a 500, a body without an
+/// `items` array. It is NOT the same answer as `Some(vec![])`, which is an
+/// account that genuinely publishes nothing, and the caller must not conflate
+/// them: see `connect_and_run`. This used to return a bare `Vec` and the
+/// distinction had nowhere to live.
+async fn available_card_tags(client: &Client) -> Option<Vec<String>> {
+    let v = client.list_cards().await.ok()?;
+    let items = v["items"].as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|c| {
+                let tag = c["tag"].as_str()?;
+                Some(match c["scope"].as_str() {
+                    Some(scope) if !scope.is_empty() => format!("{scope}/{tag}"),
+                    _ => tag.to_string(),
+                })
             })
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+            .collect(),
+    )
 }
 
 /// The mafold-awareness system prompt appended each turn (`--append-system-prompt`):
@@ -5534,7 +5643,46 @@ async fn stamp_finalized_ask(
 /// in a row are "before" then "after"). Getting that backwards silently shows
 /// the model the wrong one first, which is why this is its own function with
 /// its own tests rather than four lines inline.
-fn newest_photos(mut candidates: Vec<(String, String)>, max: usize) -> Vec<String> {
+/// How long before the trigger a photo still counts as "the one I just sent".
+///
+/// THE LOOKBACK IS A WINDOW, NOT AN ALBUM. Without this bound the rule was
+/// "the last four pictures this person ever posted in the page we fetched",
+/// and in a quiet chat that page spans months: on 2026-09-15 a text-only
+/// "我刚才又强制重启了" arrived with four screenshots from 2026-07-10 — 67 days
+/// and 29 messages earlier — announced to the model as freshly attached, which
+/// answered about pictures the user had not sent and could not see.
+///
+/// Ten minutes is sized for the shape this exists for — post the picture, then
+/// type the sentence about it — with room for a slow typist, and nowhere near
+/// long enough to reach a different conversation.
+const LOOKBACK_WINDOW_SECS: i64 = 10 * 60;
+
+/// Seconds from `at` to `now_rfc3339`, or None if either won't parse. Positive
+/// means `at` is in the past.
+fn age_secs(at: &str, now_rfc3339: &str) -> Option<i64> {
+    use chrono::DateTime;
+    let a = DateTime::parse_from_rfc3339(at).ok()?;
+    let b = DateTime::parse_from_rfc3339(now_rfc3339).ok()?;
+    Some((b - a).num_seconds())
+}
+
+/// The newest `max` photos from `candidates`, dropping anything older than
+/// [`LOOKBACK_WINDOW_SECS`] before `trigger_at`.
+///
+/// A candidate whose timestamp is unreadable is DROPPED, not kept: the whole
+/// point here is "recently", and a photo that can't prove it was recent is
+/// exactly the one that turned into a 67-day-old screenshot.
+fn newest_photos(
+    mut candidates: Vec<(String, String)>,
+    max: usize,
+    trigger_at: &str,
+) -> Vec<String> {
+    candidates.retain(|(at, _)| {
+        // A minute of slack on the FUTURE side, for the other order of the same
+        // move — "@ the bot, then paste the picture" — and for clock skew
+        // between two clients stamping the same moment.
+        age_secs(at, trigger_at).is_some_and(|s| s <= LOOKBACK_WINDOW_SECS && s >= -60)
+    });
     candidates.sort_by(|a, b| b.0.cmp(&a.0)); // RFC3339 sorts lexically
     candidates.truncate(max);
     candidates.reverse(); // back to chronological
@@ -5677,9 +5825,15 @@ async fn recent_group_context(
         })
         .collect();
     let mut rows: Vec<(String, String, String)> = Vec::new(); // (created_at, who+reply note, body)
+    // When the trigger was sent — the clock the photo lookback measures "just
+    // before this" against. Taken from the server's own stamp on the trigger
+    // row rather than from this machine's clock, so the two sides of the
+    // comparison come from the same source.
+    let mut trigger_at: Option<String> = None;
     for msg in items {
         // Skip the message that triggered THIS turn (it's the prompt below).
         if msg.get("id").and_then(|v| v.as_str()) == Some(trigger_id) {
+            trigger_at = msg.get("created_at").and_then(|c| c.as_str()).map(str::to_string);
             continue;
         }
         let who = msg
@@ -5760,8 +5914,20 @@ async fn recent_group_context(
         rows.push((at, format!("{who}{reply_note}"), body));
     }
     // Done BEFORE the early return below, so a chat whose only prior message is
-    // a bare photo still hands the image over.
-    *lookback_photos = newest_photos(candidates, MAX_LOOKBACK_PHOTOS);
+    // a bare photo still hands the image over. The trigger's own stamp bounds
+    // the window; if the trigger wasn't in the page (it always is — the skip
+    // above found it) this machine's clock stands in, which is within seconds
+    // of it either way.
+    // chrono here is clock-less (`default-features = false`), so the wall clock
+    // comes from `SystemTime` and chrono only formats it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    *lookback_photos =
+        newest_photos(candidates, MAX_LOOKBACK_PHOTOS, trigger_at.as_deref().unwrap_or(&now));
     if rows.is_empty() {
         return None; // brand-new chat — nothing to show
     }
@@ -5901,21 +6067,27 @@ async fn handle(
             _ => {}
         }
     }
-    // The trigger's own photos come first; the ones from just before it follow,
-    // so a turn that has both reads in the order they were sent.
+    // Everything collected so far RODE WITH the trigger — its own attachments
+    // and anything frozen into a record it carried. The lookback's photos come
+    // after that mark and are announced separately below: they are not on this
+    // message, and telling the model they were is how a turn ends up discussing
+    // a picture the sender never sent.
+    let own_photos = photo_urls.len();
     for u in lookback_photos {
         if !photo_urls.contains(u) {
             photo_urls.push(u.clone());
         }
     }
-    let mut saved: Vec<String> = vec![];
-    for url in &photo_urls {
+    let mut saved: Vec<String> = vec![]; // attached to THIS message
+    let mut nearby: Vec<String> = vec![]; // sent in the minutes just before it
+    for (idx, url) in photo_urls.iter().enumerate() {
+        let sink = if idx < own_photos { &mut saved } else { &mut nearby };
         // Already on disk from an earlier turn → hand over the path without
         // re-fetching. Without this, every follow-up question about the same
         // picture would re-download it.
         let cached = attachments_dir().join(sanitize_attachment_name(url.rsplit('/').next().unwrap_or("")));
         if cached.is_file() {
-            saved.push(cached.to_string_lossy().into_owned());
+            sink.push(cached.to_string_lossy().into_owned());
             continue;
         }
         match client.download(url).await {
@@ -5929,7 +6101,7 @@ async fn handle(
                 let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join(&name);
                 if std::fs::write(&path, &bytes).is_ok() {
-                    saved.push(path.to_string_lossy().into_owned());
+                    sink.push(path.to_string_lossy().into_owned());
                 }
             }
             Err(e) => eprintln!("attachment download failed: {e}"),
@@ -5949,6 +6121,20 @@ async fn handle(
         full_prompt.push_str(&format!(
             "\n\n[The user attached {} image(s). Use your Read tool to view them:\n{list}]",
             saved.len()
+        ));
+    }
+    // Said SEPARATELY, and said plainly. These rode on earlier messages, and the
+    // model has no other way to tell them from the trigger's own — so when they
+    // were folded into the block above it reported on them as "your screenshot"
+    // to a person who had attached nothing.
+    if !nearby.is_empty() {
+        let list = nearby.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
+        full_prompt.push_str(&format!(
+            "\n\n[NOT attached to this message: {} image(s) the same person sent in the \
+minutes just before it, saved on this machine. Read them only if the message is \
+about a picture (\"如图\", \"看这个\", a question with no other subject). If it names \
+its own subject, these are not it — do not describe or refer to them:\n{list}]",
+            nearby.len()
         ));
     }
     if let Some(note) = expression_note(&expressions, !saved.is_empty()) {
@@ -8716,6 +8902,9 @@ mod lookback_photo_tests {
         (at.into(), url.into())
     }
 
+    /// The trigger these fixtures are "just before".
+    const NOW: &str = "2026-08-10T09:10:00Z";
+
     /// The regression this exists for: in a group, "先发图,再 @ 一句" meant the
     /// image-bearing message @'d nobody, got skipped by the trigger gate, and
     /// its photo was never fetched. These are picked newest-first…
@@ -8728,6 +8917,7 @@ mod lookback_photo_tests {
                 c("2026-08-10T09:09:00Z", "new.png"),
             ],
             2,
+            NOW,
         );
         assert_eq!(got, vec!["mid.png", "new.png"]);
     }
@@ -8741,6 +8931,7 @@ mod lookback_photo_tests {
                 c("2026-08-10T09:00:00Z", "before.png"),
             ],
             4,
+            NOW,
         );
         assert_eq!(got, vec!["before.png", "after.png"]);
     }
@@ -8751,13 +8942,58 @@ mod lookback_photo_tests {
         let got = newest_photos(
             vec![c("2026-08-10T09:00:00Z", "a.png"), c("2026-08-10T09:01:00Z", "a.png")],
             4,
+            NOW,
         );
         assert_eq!(got, vec!["a.png"]);
     }
 
     #[test]
     fn no_candidates_means_no_photos() {
-        assert!(newest_photos(vec![], 4).is_empty());
+        assert!(newest_photos(vec![], 4, NOW).is_empty());
+    }
+
+    /// THE 虚空读截图 (2026-09-15, conv 00e24642). A text-only "我刚才又强制重启了"
+    /// arrived carrying four screenshots from 2026-07-10 — the sender's newest
+    /// four in a 50-message page that spanned two months — and the prompt told
+    /// the model they were attached to it. "The picture I just sent" has a
+    /// clock on it; without one this is "every picture in living memory".
+    #[test]
+    fn a_photo_from_months_ago_is_not_the_one_they_just_sent() {
+        let got = newest_photos(
+            vec![
+                c("2026-07-10T00:01:36Z", "blender-1.png"),
+                c("2026-07-10T02:00:14Z", "blender-4.png"),
+            ],
+            4,
+            "2026-09-15T11:22:00Z",
+        );
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// …and the shape the lookback EXISTS for still works: post the picture,
+    /// type the sentence a minute later.
+    #[test]
+    fn a_photo_from_a_minute_ago_still_rides_along() {
+        let got = newest_photos(vec![c("2026-08-10T09:09:00Z", "just-sent.png")], 4, NOW);
+        assert_eq!(got, vec!["just-sent.png"]);
+    }
+
+    /// The other order of the same move — @ first, paste second — is inside the
+    /// slack; a picture from well after the trigger belongs to the NEXT turn.
+    #[test]
+    fn a_photo_just_after_the_trigger_counts_but_a_later_one_does_not() {
+        assert_eq!(
+            newest_photos(vec![c("2026-08-10T09:10:30Z", "pasted.png")], 4, NOW),
+            vec!["pasted.png"]
+        );
+        assert!(newest_photos(vec![c("2026-08-10T09:30:00Z", "later.png")], 4, NOW).is_empty());
+    }
+
+    /// An unreadable stamp can't prove it is recent, and "recent" is the whole
+    /// claim — so it goes, rather than riding along unchecked as it used to.
+    #[test]
+    fn an_unparseable_timestamp_is_dropped() {
+        assert!(newest_photos(vec![c("", "no-stamp.png")], 4, NOW).is_empty());
     }
 
     // ── duplicate-delivery guard (2026-08-11 double-reply) ──────────────────

@@ -801,7 +801,7 @@ pub async fn supervise(base: String, auto_update: bool) {
         let nudged = crate::update::take_nudge();
         if auto_update && (nudged || ticks % 60 == 0) {
             if nudged { println!("↻ update nudge from a daemon — checking now"); }
-            match crate::update::check(&http).await {
+            match crate::update::check(&http, &base, crate::update::Channel::current()).await {
                 Ok(Some(r)) if crate::update::recently_failed(&r.version) => {}
                 Ok(Some(r)) => {
                     println!("{} — applying + restarting daemons…", r.action_line());

@@ -125,6 +125,8 @@ fn store_read(c: &mut Criterion) {
                     last_message: Some(msg("last", &id, i as i64, None)),
                     is_forum: false, forum_member_channels: false,
                     member_add_members: false, member_edit_info: false, member_add_bots: false,
+                    channel_unread: 0, channel_unread_mention: false, channel_muted_unread: 0,
+                    latest_message: None, latest_channel_id: None, latest_channel_name: None, latest_channel_icon: None,
                 }).await;
             }
         });

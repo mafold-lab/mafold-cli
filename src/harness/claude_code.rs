@@ -11,7 +11,10 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{AgentEvent, CommandOutcome, Harness, SeatHealth, SeatLimit, Turn, TurnOutcome};
+use super::{
+    AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModeCap, ModelCap, SeatHealth,
+    SeatLimit, Turn, TurnOutcome,
+};
 use mafold_transcript::RunStats;
 use crate::client::Client;
 
@@ -654,7 +657,212 @@ impl Harness for ClaudeCode {
     async fn cli_version(&self) -> String {
         crate::commands::claude_version().await
     }
+
+    /// Ask THIS `claude` what it accepts. Three questions, none of which costs
+    /// a turn:
+    ///
+    /// 1. the control-protocol handshake — `initialize` over stream-json with
+    ///    no user message. It answers with the model roster, each model's own
+    ///    effort tiers, and which login was asked (~4s, zero tokens).
+    /// 2. `--effort <nonsense> --version` — the binary names its valid tiers in
+    ///    the warning it prints. This is both the fallback when 1 can't be had
+    ///    and the PROOF that this build complains about a tier it doesn't know.
+    /// 3. `--effort <candidate> --version` for the values Claude Code takes and
+    ///    prints nowhere ([`HIDDEN_EFFORTS`]). Silence = accepted — but only on
+    ///    a build we just watched complain in 2, because on a build that never
+    ///    complains silence means nothing and nothing may be claimed from it.
+    ///
+    /// Every answer here is about the binary in front of us: nothing in this
+    /// function names a model, and the one place a tier is named is a question.
+    async fn caps(&self, env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
+        // (2) first — it is ~300ms and it decides how (3) may be read.
+        let complaint = effort_probe(env, EFFORT_NONSENSE).await;
+        let valid = complaint.as_deref().and_then(valid_efforts);
+        let answer = handshake(env).await;
+        let mut probe = HarnessProbe {
+            models: answer.as_ref().map(models_of).unwrap_or_default(),
+            account: answer.as_ref().and_then(account_of),
+            ..Default::default()
+        };
+        if !probe.models.is_empty() {
+            probe.source = CapsSource::Handshake;
+        } else if let Some(tiers) = valid.clone() {
+            // No roster, but the tiers are real and the effort menu is the one
+            // that was wrong. Reporting them says nothing about the models —
+            // `HarnessCaps::tells_models` keeps that menu as it was.
+            probe.source = CapsSource::HelpText;
+            probe.efforts = tiers;
+        }
+        // (3) — only where a "no complaint" answer is worth something.
+        if valid.is_some() {
+            for candidate in HIDDEN_EFFORTS {
+                let taken = effort_probe(env, candidate)
+                    .await
+                    .is_some_and(|err| !complains_about(&err, candidate));
+                if taken {
+                    probe.modes.push(ModeCap { id: (*candidate).to_string(), pins_effort: None });
+                }
+            }
+        }
+        (!probe.is_empty()).then_some(probe)
+    }
 }
+
+/// A value `--effort` cannot possibly mean, used to make the binary state its
+/// own valid list.
+const EFFORT_NONSENSE: &str = "mafold-probe";
+
+/// Effort values Claude Code accepts but prints nowhere — not in `--help`, not
+/// among the handshake's per-model tiers. A name here is a QUESTION put to the
+/// binary, never a claim: a build that doesn't take it never offers it, and a
+/// build that stops taking it drops it at the next probe.
+const HIDDEN_EFFORTS: &[&str] = &["ultracode"];
+
+/// Run `claude --effort <value> --version` and hand back its stderr. The pair
+/// is deliberate: `--version` makes the binary parse the flags and exit at once
+/// (no session, no quota), which is all the question needs.
+///
+/// `None` when the CLI couldn't be run at all — distinct from an empty stderr,
+/// which is the binary saying it has no objection.
+async fn effort_probe(env: &[(String, String)], value: &str) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(super::program("claude"));
+    cmd.arg("--effort")
+        .arg(value)
+        .arg("--version")
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null());
+    crate::platform::no_window(&mut cmd);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// Did the binary refuse `value` as a tier it doesn't know?
+fn complains_about(stderr: &str, value: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("--effort") && s.contains(&value.to_lowercase()) && s.contains("unknown")
+}
+
+/// The tiers named in that complaint: `… Valid values: low, medium, high,
+/// xhigh, max.` → the five. None when the binary said nothing of the sort, and
+/// that None is load-bearing — it means this build's silence proves nothing.
+fn valid_efforts(stderr: &str) -> Option<Vec<String>> {
+    let at = stderr.to_lowercase().find("valid values:")?;
+    let list = &stderr[at + "valid values:".len()..];
+    let list = list.split(['\n', '.']).next().unwrap_or(list);
+    let tiers: Vec<String> = list
+        .split(',')
+        .map(|s| s.trim().trim_matches('`').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty() && s.len() <= 32 && !s.contains(' '))
+        .collect();
+    (!tiers.is_empty()).then_some(tiers)
+}
+
+/// The models the handshake reported, in its own order. Every field is
+/// optional-tolerant: the shape has grown between builds (2.1.272 added
+/// `agents`), so a missing key means "this build didn't say", never a parse
+/// failure that costs the whole roster.
+fn models_of(resp: &Value) -> Vec<ModelCap> {
+    let s = |v: &Value, k: &str| v[k].as_str().map(str::to_string).filter(|x| !x.is_empty());
+    resp["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = s(m, "value")?;
+            Some(ModelCap {
+                display: s(m, "displayName").unwrap_or_else(|| id.clone()),
+                resolved: s(m, "resolvedModel"),
+                // Claude Code takes `--model fable` as well as the id it
+                // reports, but it accepts an unknown `--model` in silence (it
+                // only complains once a turn spends a token), so there is no
+                // quota-free way to ASK which other spellings work. An alias
+                // here would be this daemon guessing about someone else's
+                // build, which is the whole habit this probe exists to end.
+                aliases: Vec::new(),
+                description: s(m, "description"),
+                efforts: m["supportedEffortLevels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect(),
+                id,
+            })
+        })
+        .collect()
+}
+
+/// The login the handshake answered for (`account.email`), when it names one.
+fn account_of(resp: &Value) -> Option<String> {
+    resp["account"]["email"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// The `initialize` control request, answered by `claude` itself.
+///
+/// No user message is ever written, so the process starts up, reports what it
+/// is, and exits without running a turn — the one way to ask "what do you
+/// support" that doesn't spend the thing being asked about.
+async fn handshake(env: &[(String, String)]) -> Option<Value> {
+    use tokio::io::AsyncWriteExt;
+    let mut cmd = tokio::process::Command::new(super::program("claude"));
+    cmd.arg("-p")
+        .arg("--input-format").arg("stream-json")
+        .arg("--output-format").arg("stream-json")
+        .arg("--verbose")
+        .arg("--dangerously-skip-permissions")
+        // The user's global MCP servers have nothing to say about this and
+        // would each be spawned to not say it (the same reason `run` sets it).
+        .arg("--strict-mcp-config")
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        // Ask the BINARY, not a project: a workdir brings its own settings and
+        // hooks, and the answer must not depend on which bot asked.
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::platform::no_window(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let _guard = super::ChildGuard::new(child.id());
+    let req = serde_json::json!({
+        "type": "control_request",
+        "request_id": HANDSHAKE_ID,
+        "request": { "subtype": "initialize" },
+    });
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(format!("{req}\n").as_bytes()).await;
+        // EOF: there is no prompt coming, and claude exits once it has answered.
+        drop(stdin);
+    }
+    let stdout = child.stdout.take()?;
+    let mut lines = BufReader::new(stdout).lines();
+    let found = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if v["type"] == "control_response" && v["response"]["request_id"] == HANDSHAKE_ID {
+                return Some(v["response"]["response"].clone());
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    // Nothing more is wanted from it, and a build that waits for more input
+    // must not outlive the question.
+    let _ = child.start_kill();
+    found
+}
+
+const HANDSHAKE_ID: &str = "mafold-caps";
 
 /// The `--mcp-config` that mounts our permission server and nothing else.
 ///
@@ -1166,5 +1374,80 @@ mod tests {
         assert_eq!(seat_limit_label("weekly_all", &Value::Null), "Week (all models)");
         assert_eq!(seat_limit_label("weekly_scoped", &scoped), "Week (Fable)");
         assert_eq!(seat_limit_label("some_new_window", &Value::Null), "Some new window");
+    }
+
+    /// A real `initialize` answer (2.1.272, trimmed) becomes the roster, tiers
+    /// and all — including the model that has NO tiers, which is an answer and
+    /// not a gap: Haiku takes no `--effort`, so the sheet must offer it none.
+    #[test]
+    fn the_handshake_answer_becomes_the_roster() {
+        let resp: Value = serde_json::json!({
+            "account": { "email": "ops@example.com", "subscriptionType": "Claude Max" },
+            "models": [
+                { "value": "opus[1m]", "resolvedModel": "claude-opus-5[1m]",
+                  "displayName": "Opus (1M context)", "description": "Best for everyday",
+                  "supportsEffort": true, "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"] },
+                { "value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001",
+                  "displayName": "Haiku", "description": "Fastest for quick answers" },
+                { "displayName": "a model with no value at all" }
+            ]
+        });
+        let models = models_of(&resp);
+        assert_eq!(models.len(), 2, "a row with no flag value names nothing and is dropped");
+        assert_eq!(models[0].id, "opus[1m]");
+        assert_eq!(models[0].resolved.as_deref(), Some("claude-opus-5[1m]"));
+        assert_eq!(models[0].efforts, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(models[1].display, "Haiku");
+        assert!(models[1].efforts.is_empty());
+        assert!(models[1].aliases.is_empty(), "an alias here would be a guess — see models_of");
+        assert_eq!(account_of(&resp).as_deref(), Some("ops@example.com"));
+
+        // A build that says less is still worth reading: what it did say stands.
+        let sparse: Value = serde_json::json!({ "models": [{ "value": "sonnet" }] });
+        let m = models_of(&sparse);
+        assert_eq!(m[0].display, "sonnet", "no display name → the value is the label");
+        assert!(account_of(&sparse).is_none());
+    }
+
+    /// The binary's own complaint is the tier list, and the complaint itself is
+    /// what makes silence readable.
+    #[test]
+    fn the_complaint_names_the_valid_tiers() {
+        let warn = "Warning: Unknown --effort value 'mafold-probe' — ignoring it and using the \
+                    default effort. Valid values: low, medium, high, xhigh, max.\n";
+        assert_eq!(valid_efforts(warn).unwrap(), ["low", "medium", "high", "xhigh", "max"]);
+        assert!(complains_about(warn, EFFORT_NONSENSE));
+        // `ultracode` went in and drew no complaint: this build takes it.
+        assert!(!complains_about("", "ultracode"));
+        // A build that says nothing about anything proves nothing: with no
+        // valid-values line there is no list, and `caps` then claims no mode.
+        assert!(valid_efforts("2.1.272 (Claude Code)").is_none());
+        // Wording drift must not turn one sentence into five bogus tiers.
+        assert!(valid_efforts("Valid values: none at all here").is_none());
+    }
+
+    /// The whole probe against the `claude` on THIS machine — the only test
+    /// that can prove the questions are still the right questions, because the
+    /// answers live in someone else's binary. Ignored by default (it needs an
+    /// installed, logged-in CLI and takes ~5s); run it whenever Claude Code
+    /// ships a version that might have moved the handshake:
+    ///
+    ///     cargo test --bin mafold -- --ignored live_claude_caps
+    #[tokio::test]
+    #[ignore = "requires an installed, logged-in Claude Code CLI"]
+    async fn live_claude_caps_probe() {
+        let probe = ClaudeCode.caps(&[], "").await.expect("the local claude answered nothing");
+        println!("source={:?} account={:?}", probe.source, probe.account);
+        for m in &probe.models {
+            println!("  {} ({}) efforts={:?}", m.id, m.display, m.efforts);
+        }
+        println!("  modes={:?}", probe.modes);
+        assert_eq!(probe.source, CapsSource::Handshake, "the handshake is the main road");
+        assert!(!probe.models.is_empty());
+        assert!(
+            probe.models.iter().any(|m| !m.efforts.is_empty()),
+            "at least one model must report its tiers, or the effort menu has nothing to be built from"
+        );
+        assert!(probe.efforts.is_empty(), "a handshake attributes every tier to a model");
     }
 }

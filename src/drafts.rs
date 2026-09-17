@@ -193,13 +193,20 @@ impl Outbox {
 mod tests {
     use super::*;
 
-    fn dir() -> PathBuf {
-        std::env::temp_dir().join(format!("mafold-drafts-{}", crate::session::device_id(None)))
+    /// A scratch journal directory of this test's OWN — per test and per
+    /// process, because these tests end by deleting the directory they used and
+    /// cargo runs them side by side. (It used to borrow `session::device_id`,
+    /// which minted a fresh random id on every call and gave isolation by
+    /// accident; the id is now the stable one this machine reports, which is
+    /// what a device id ought to be — and would have handed all four tests the
+    /// same directory.)
+    fn dir(test: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("mafold-drafts-test-{}-{test}", std::process::id()))
     }
 
     #[test]
     fn restart_recovers_only_owned_drafts_from_dead_processes() {
-        let dir = dir();
+        let dir = dir("restart-owned");
         let old = Outbox::load(dir.clone(), |_| false).unwrap();
         let a = "00000000-0000-0000-0000-000000000001";
         let b = "00000000-0000-0000-0000-000000000002";
@@ -228,7 +235,7 @@ mod tests {
 
     #[test]
     fn exec_restart_recovers_entries_with_the_same_pid() {
-        let dir = dir();
+        let dir = dir("exec-restart");
         let old = Outbox::load(dir.clone(), |_| false).unwrap();
         let id = "00000000-0000-0000-0000-000000000005";
         old.track(id).unwrap();
@@ -239,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_delivery_retains_final_snapshot_and_ignores_active_drafts() {
-        let dir = dir();
+        let dir = dir("failed-delivery");
         let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
         let id = "00000000-0000-0000-0000-000000000003";
         let client = Client::new("http://127.0.0.1:1".into(), "dev:test".into());
@@ -323,7 +330,7 @@ mod tests {
             }
             paths
         });
-        let dir = dir();
+        let dir = dir("retry-after-ack");
         let id = "00000000-0000-0000-0000-000000000004";
         let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
         outbox.track(id).unwrap();

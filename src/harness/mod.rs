@@ -19,6 +19,7 @@ pub mod codex_app_server;
 pub mod kimi_code;
 
 use async_trait::async_trait;
+use mafold_core::mafold_types::{CapsSource, HarnessCaps, ModeCap, ModelCap};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -160,18 +161,55 @@ pub enum CommandOutcome {
     Forward,
 }
 
-/// One model advertised by a harness's live model catalog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelChoice {
-    /// Picker identity returned by the harness.
-    pub id: String,
-    /// Actual model slug passed to a turn.
-    pub model: String,
-    pub display_name: String,
-    pub description: String,
-    pub is_default: bool,
-    pub default_effort: Option<String>,
+/// What a harness's CLI on THIS machine turned out to accept, as [`Harness::caps`]
+/// read it off the binary itself: which models, and per model which reasoning
+/// tiers. It exists so that nothing downstream has to keep a roster — a list
+/// written here would be a guess about someone else's build, and the two go out
+/// of step the moment either ships.
+///
+/// [`report`](Self::report) stamps the machine onto it; from there it travels as
+/// `reportHarnessCaps` and becomes the Customize sheet's model / effort menus.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessProbe {
+    /// The login the answer is true for, when the harness names one. A
+    /// subscription decides the roster, so another login is another answer.
+    pub account: Option<String>,
+    /// How much of this was learned, and how directly.
+    pub source: CapsSource,
+    /// The models, in the harness's own order.
+    pub models: Vec<ModelCap>,
+    /// Tiers the binary takes that the probe could not attribute to a model.
     pub efforts: Vec<String>,
+    /// Session modes at the same dial (`ultracode`) that this build accepts.
+    pub modes: Vec<ModeCap>,
+}
+
+impl HarnessProbe {
+    /// Did the probe learn nothing at all?
+    ///
+    /// Kept apart from `CapsSource::None` on purpose: "we asked and this build
+    /// offers nothing" is a finding worth reporting, while "we couldn't ask" is
+    /// not, and collapsing them would let a timeout empty somebody's menus.
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty() && self.efforts.is_empty() && self.modes.is_empty()
+    }
+
+    /// Stamp this machine and this moment onto the answer.
+    pub fn report(self, harness: &str, version: &str) -> HarnessCaps {
+        let (machine, machine_name) = crate::session::machine();
+        HarnessCaps {
+            harness: harness.to_string(),
+            version: version.to_string(),
+            machine,
+            machine_name: Some(machine_name),
+            account: self.account,
+            probed_at: SeatHealth::now(),
+            source: self.source,
+            models: self.models,
+            efforts: self.efforts,
+            modes: self.modes,
+        }
+    }
 }
 
 /// One rate-limit window on the subscription seat behind a harness, normalized
@@ -364,10 +402,24 @@ pub trait Harness: Send + Sync {
         String::new()
     }
 
-    /// Live model catalog for `/model`. Empty means the harness has no dynamic
-    /// catalog and the daemon should keep its existing free-form model UX.
-    async fn model_choices(&self) -> anyhow::Result<Vec<ModelChoice>> {
-        Ok(Vec::new())
+    /// Ask THIS machine's binary what it accepts — which models, which effort
+    /// tiers (see [`HarnessProbe`]). `None` = this harness can't be asked, or
+    /// the asking failed; the sheet then keeps the menus it already had,
+    /// because a probe that didn't run has discovered nothing, least of all
+    /// that the machine is empty.
+    ///
+    /// `env` is the seat (see [`Turn::env`]): the roster is per LOGIN — the
+    /// subscription decides which models exist — so the answer is only true for
+    /// the login that gave it, and the report says which one that was.
+    ///
+    /// `version` is what [`Self::cli_version`] already read, passed in so a
+    /// probe doesn't spawn the binary twice to learn the same string.
+    ///
+    /// MUST be quota-free, like [`Self::seat_health`]: measuring what a harness
+    /// offers must never cost a turn.
+    async fn caps(&self, env: &[(String, String)], version: &str) -> Option<HarnessProbe> {
+        let (_, _) = (env, version);
+        None
     }
 
     /// The harness CLI's own version string (e.g. Claude Code `2.1.198`, Codex
@@ -544,6 +596,67 @@ pub async fn report_rows() -> Vec<Value> {
 /// installing a runtime so its availability + version report immediately.
 pub fn invalidate_versions() {
     *VERSION_CACHE.lock().unwrap() = None;
+}
+
+/// What `harness` accepts on this machine for the seat `env` selects, ready to
+/// report — from disk when the binary hasn't changed since we last asked, else
+/// by asking it ([`Harness::caps`]).
+///
+/// The cache is on DISK and not in this process because the thing being cached
+/// is a property of the MACHINE: a box running six bots would otherwise pay six
+/// identical probes every time the supervisor restarts them. It is keyed by
+/// harness + seat and holds only while the version it was read from is still
+/// installed, which is the whole of what can change the answer short of the
+/// account itself.
+///
+/// `None` = nothing to report: no binary, no probe, or a probe that came back
+/// empty-handed. Never a report that says the machine has nothing — that claim
+/// belongs to a probe that actually ran (`CapsSource::None`).
+pub async fn caps_report(h: &dyn Harness, env: &[(String, String)]) -> Option<HarnessCaps> {
+    if !h.available() {
+        return None;
+    }
+    let version = h.cli_version().await;
+    let seat = crate::accounts::Account::from_env(env).name;
+    if let Some(c) = cached_caps(h.id(), &seat) {
+        // An unknown version can't confirm freshness, and re-probing is cheap
+        // next to reporting a roster that moved.
+        if !version.is_empty() && c.version == version {
+            return Some(c);
+        }
+    }
+    let probe = h.caps(env, &version).await?;
+    if probe.is_empty() {
+        return None;
+    }
+    let caps = probe.report(h.id(), &version);
+    cache_caps(h.id(), &seat, &caps);
+    Some(caps)
+}
+
+fn caps_cache_path(harness: &str, seat: &str) -> PathBuf {
+    let safe = |s: &str| -> String {
+        s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home)
+        .join(".mafold/caps")
+        .join(format!("{}-{}.json", safe(harness), safe(seat)))
+}
+
+fn cached_caps(harness: &str, seat: &str) -> Option<HarnessCaps> {
+    let s = std::fs::read_to_string(caps_cache_path(harness, seat)).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn cache_caps(harness: &str, seat: &str, caps: &HarnessCaps) {
+    let path = caps_cache_path(harness, seat);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string(caps) {
+        let _ = std::fs::write(path, s);
+    }
 }
 
 /// `<bin> --version` → a short version string ("2.1.198"): first token that

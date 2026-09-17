@@ -90,6 +90,19 @@ pub enum AppsCmd {
         /// variables participants — including the bot via `mafold room` — edit.
         #[arg(long)]
         room_schema: Option<String>,
+        /// Let THIS app's own origin put the Mafold login door in an iframe
+        /// (`Mafold.mountSignIn`). Off until asked for: mafold.com refuses to
+        /// be framed by anyone otherwise. `--auth-embed false` takes it back.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        auth_embed: Option<bool>,
+        /// Mafold is this app's only way in, so the embedded door stops
+        /// offering ways back out to mafold.com.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        auth_primary: Option<bool>,
+        /// Let a brand-new visitor create their Mafold account inside the
+        /// frame instead of being sent away to do it.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        auth_register: Option<bool>,
     },
     /// List the apps you can manage (own the namespace of).
     List,
@@ -151,6 +164,9 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
             description,
             screenshots,
             room_schema,
+            auth_embed,
+            auth_primary,
+            auth_register,
         } => {
             cmd_register(
                 &id,
@@ -161,6 +177,9 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
                 description,
                 screenshots,
                 room_schema,
+                auth_embed,
+                auth_primary,
+                auth_register,
                 base,
                 token,
             )
@@ -460,6 +479,9 @@ async fn cmd_register(
     description: Option<String>,
     screenshots: Vec<String>,
     room_schema: Option<String>,
+    auth_embed: Option<bool>,
+    auth_primary: Option<bool>,
+    auth_register: Option<bool>,
     base: String,
     token: Option<String>,
 ) -> Result<()> {
@@ -480,6 +502,18 @@ async fn cmd_register(
         }
         None => None,
     };
+    // Only the flags actually typed go up; the server merges them over what is
+    // registered. Sending all three would mean `--auth-embed` quietly turns the
+    // other two off, which is the bug this shape exists to avoid.
+    let auth = {
+        let mut m = serde_json::Map::new();
+        for (k, v) in [("embed", auth_embed), ("primary", auth_primary), ("register", auth_register)] {
+            if let Some(v) = v {
+                m.insert(k.into(), Value::Bool(v));
+            }
+        }
+        (!m.is_empty()).then_some(m)
+    };
     let client = Client::new(base, token);
     // Screenshots are given as local image PATHS or as ids already uploaded.
     // Uploading them here is the difference between "add a preview" and "go run
@@ -492,7 +526,7 @@ async fn cmd_register(
             serde_json::json!({
                 "id": id, "url": url, "name": name, "icon": icon,
                 "capabilities": capabilities, "room": room,
-                "description": description,
+                "description": description, "auth": auth,
                 // Absent ⇒ the server keeps what's registered; `[]` clears.
                 "screenshots": shots,
             }),
