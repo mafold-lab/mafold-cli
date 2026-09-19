@@ -125,6 +125,10 @@ const BUILTINS: &[(&str, &str)] = &[
         "security-review",
         "Analyze pending changes for security issues",
     ),
+    (
+        "sessions",
+        "List the Claude Code sessions running on this machine",
+    ),
     ("setup-bedrock", "Configure Amazon Bedrock authentication"),
     ("setup-vertex", "Configure Google Vertex AI authentication"),
     ("simplify", "Review code for cleanup and apply fixes"),

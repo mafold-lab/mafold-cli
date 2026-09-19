@@ -33,6 +33,7 @@ mod room;
 mod session;
 mod steer_hook;
 mod supervisor;
+mod turnenv;
 mod update;
 mod vault;
 mod wallet;
@@ -88,7 +89,17 @@ enum Cmd {
     /// Show whether a background agent is running.
     Status,
     /// Update mafold to the latest release.
-    Update,
+    Update {
+        /// Switch this machine's release channel, then update into it.
+        ///
+        /// `stable` (default) follows published releases. `dev` follows the
+        /// prereleases built from `cli.dev@` tags — for trying a build on a
+        /// real machine WITHOUT turning auto-update off. The choice is sticky
+        /// (`~/.mafold/channel`): the supervisor and every agent here follow it
+        /// until you switch back with `--channel stable`.
+        #[arg(long, value_name = "stable|dev")]
+        channel: Option<String>,
+    },
     /// Install a coding-agent runtime (claude-code / codex / kimi-code /
     /// opencode). No argument lists the runtimes + their install state.
     Install {
@@ -325,17 +336,36 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    if matches!(cli.cmd, Cmd::Update) {
+    if let Cmd::Update { channel } = &cli.cmd {
         // No release binary is built for this platform (e.g. linux-arm64) → don't
         // claim "up to date" (the check would always no-op). Be honest instead.
         if !update::platform_supported() {
             println!("no mafold release is built for your platform — self-update isn't available.\nSee https://github.com/mafold-lab/mafold-cli/releases");
             return Ok(());
         }
+        // `--channel` is persisted BEFORE the update runs, so the update that
+        // follows is already the new channel's — one command switches and
+        // lands, instead of switching and leaving the machine on the old line
+        // until the next tick.
+        let channel = match channel {
+            Some(name) => {
+                let c = update::Channel::parse(name).with_context(|| {
+                    format!("unknown channel {name:?} — expected `stable` or `dev`")
+                })?;
+                c.save()?;
+                println!("✓ channel → {}", c.as_str());
+                c
+            }
+            None => update::Channel::current(),
+        };
         let http = reqwest::Client::new();
-        match update::update_to_latest(&http).await {
+        match update::update_to_latest(&http, &cli.base, channel).await {
             Ok(Some(v)) => println!("✓ updated to v{v} — restart a running agent with: mafold stop && mafold agent --detach …"),
-            Ok(None) => println!("already up to date (v{})", update::current_version()),
+            Ok(None) => println!(
+                "already up to date (v{}, {} channel)",
+                update::current_version(),
+                channel.as_str()
+            ),
             Err(e) => { eprintln!("update failed: {e}"); std::process::exit(1); }
         }
         return Ok(());
@@ -474,7 +504,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
-        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
+        Cmd::Stop | Cmd::Status | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
@@ -752,7 +782,7 @@ async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Res
     let msg = match message {
         Some(m) => m.to_string(),
         None => {
-            let env_id = std::env::var("MAFOLD_DRAFT").ok().filter(|s| !s.is_empty()).context(
+            let env_id = turnenv::draft().context(
                 "no message to attach to — run this inside an agent turn (the daemon sets \
                  MAFOLD_DRAFT), or pass --message <id>",
             )?;

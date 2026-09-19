@@ -19,7 +19,21 @@ pub fn run() -> Result<()> {
     let mut _input = String::new();
     let _ = std::io::stdin().read_to_string(&mut _input);
 
-    let reason = match std::env::var("MAFOLD_ASK_FILE").ok() {
+    // Via `turnenv`, not the raw env: a connection serves many turns and each
+    // one has its own ask file, while the child's environment still names the
+    // first turn's.
+    println!("{}", response(crate::turnenv::ask_file().as_deref()));
+    Ok(())
+}
+
+/// What a PreToolUse hook should answer for AskUserQuestion. BLOCKS until the
+/// user answers the chat card (≤10 min) or gives up.
+///
+/// Shared by both deliveries — this command, and the in-process `hook_callback`
+/// a connection answers over the control channel — so the model is told the
+/// same thing either way.
+pub fn response(ask_file: Option<&str>) -> serde_json::Value {
+    let reason = match ask_file {
         Some(path) => match wait_for_answer(&path) {
             Some(ans) if !ans.trim().is_empty() => format!("The user answered: {}", ans.trim()),
             _ => "No answer was received from the user (timed out). Do not call \
@@ -31,15 +45,13 @@ pub fn run() -> Result<()> {
             .to_string(),
     };
 
-    let out = serde_json::json!({
+    serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": reason,
         }
-    });
-    println!("{out}");
-    Ok(())
+    })
 }
 
 /// Poll `path` until the daemon writes the user's answer (≤ 10 min), then consume

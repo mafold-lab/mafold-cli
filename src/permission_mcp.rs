@@ -142,8 +142,11 @@ struct Mailbox {
 
 impl Mailbox {
     fn from_env() -> Self {
-        let var = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-        Self { perm: var("MAFOLD_PERM_FILE"), ask: var("MAFOLD_ASK_FILE") }
+        // Via `turnenv`, not the raw env: this server is a child of the
+        // CONNECTION, which serves many turns, so its own environment names
+        // whichever turn spawned the process. Answering into that turn's files
+        // means the card never paints for THIS one and the tool call hangs.
+        Self { perm: crate::turnenv::perm_file(), ask: crate::turnenv::ask_file() }
     }
 }
 

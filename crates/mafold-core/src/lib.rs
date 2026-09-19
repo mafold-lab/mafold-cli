@@ -232,6 +232,42 @@ pub struct CoreConversation {
     #[serde(default)]
     #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
     pub member_add_bots: bool,
+    /// The forum half of the row's badge — unread sitting in this group's
+    /// CHANNELS (`Conversation.channel_unread` and friends on the wire).
+    ///
+    /// Cached for the reason stated above `unread_mention`, and it bites harder
+    /// here: a forum's whole badge lives in these numbers (`unread_count` is the
+    /// main timeline's and reads 0 for a group that is on fire), so a cache that
+    /// drops them paints every forum row as read on every cold start.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub channel_unread: u32,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub channel_unread_mention: bool,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub channel_muted_unread: u32,
+    /// `Conversation.latest` — the newest message anywhere in the conversation
+    /// (`#all` or any un-archived channel) and the channel it came from, FLAT.
+    ///
+    /// Flat for the same reason the member permissions above are: every other
+    /// field in this cache shape is, and a nested uniffi Record would add a
+    /// generated type to Swift/C# for three strings. `latest_message` is NOT
+    /// `last_message`: that one stays the main timeline's, because clients hand
+    /// its id back as a read marker and the server rejects a channel id there.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = None))]
+    pub latest_message: Option<CoreMessage>,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = None))]
+    pub latest_channel_id: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = None))]
+    pub latest_channel_name: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = None))]
+    pub latest_channel_icon: Option<String>,
 }
 
 /// A forum channel, cached so a conversation opens with its channel list
@@ -1074,6 +1110,8 @@ mod tests {
             participants: vec![acct("alice"), acct("bob")],
             updated_at_ms: 100, unread_count: 2, unread_mention: false, last_message: None, is_forum: false, forum_member_channels: false,
             member_add_members: false, member_edit_info: false, member_add_bots: false,
+            channel_unread: 0, channel_unread_mention: false, channel_muted_unread: 0,
+            latest_message: None, latest_channel_id: None, latest_channel_name: None, latest_channel_icon: None,
         }).unwrap();
         core.upsert_message(CoreMessage {
             id: "m1".into(), conversation_id: "c1".into(), sender: acct("alice"),
@@ -1106,6 +1144,8 @@ mod tests {
             id: id.into(), kind: "direct".into(), title: None,
             participants: vec![acct("me"), acct(id)], updated_at_ms: ts, unread_count: 0, unread_mention: false, last_message: None, is_forum: false, forum_member_channels: false,
             member_add_members: false, member_edit_info: false, member_add_bots: false,
+            channel_unread: 0, channel_unread_mention: false, channel_muted_unread: 0,
+            latest_message: None, latest_channel_id: None, latest_channel_name: None, latest_channel_icon: None,
         };
         core.replace_conversations(vec![c("a", 1), c("b", 2)]).unwrap();
         assert_eq!(core.conversations().unwrap().len(), 2);
@@ -1366,6 +1406,8 @@ mod tests {
             id: "c".into(), kind: "group".into(), title: None,
             participants: vec![acct("me"), acct("bot")], updated_at_ms: 0, unread_count: 0, unread_mention: false, last_message: None, is_forum: false, forum_member_channels: false,
             member_add_members: false, member_edit_info: false, member_add_bots: false,
+            channel_unread: 0, channel_unread_mention: false, channel_muted_unread: 0,
+            latest_message: None, latest_channel_id: None, latest_channel_name: None, latest_channel_icon: None,
         }).unwrap();
 
         // A top-level root that is STILL generating, a plain channel message, and

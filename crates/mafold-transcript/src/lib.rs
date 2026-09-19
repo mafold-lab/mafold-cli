@@ -22,10 +22,12 @@
 pub mod event;
 pub mod lint;
 pub mod prose;
+pub mod preview;
 pub mod render;
 pub mod transcript;
 pub mod stats;
 
 pub use event::AgentEvent;
+pub use render::step_line;
 pub use stats::RunStats;
 pub use transcript::{Advance, Boundary, Qualify, Transcript};

@@ -1,0 +1,109 @@
+[
+  {
+    "name": "parent hides nested cards and props",
+    "content": "{% mafold/trace summary=\"not metadata\" %}Secret prose {% mafold/run %}{% mafold/tool name=\"Bash\" /%}{% /mafold/run %}{% /mafold/trace %} Done.",
+    "names": {
+      "mafold/trace": "Agent trace",
+      "mafold/run": "Run",
+      "mafold/tool": "Tool"
+    },
+    "expected": "Agent trace Done."
+  },
+  {
+    "name": "siblings use arbitrary publisher metadata",
+    "content": "Before {% alice/custom-widget /%} middle {% mafold/html %}<b>secret</b>{% /mafold/html %} {% mafold/ask %}q|secret{% /mafold/ask %} after",
+    "names": {
+      "alice/custom-widget": "My widget",
+      "mafold/html": "Live HTML",
+      "mafold/ask": "Question"
+    },
+    "expected": "Before My widget middle Live HTML Question after"
+  },
+  {
+    "name": "unknown empty or whitespace metadata falls back to slug",
+    "content": "{% alice/my_card name=\"Fake metadata\" summary=\"Ignore\" /%} {% mafold/trace /%} {% mafold/html /%} {% mafold/ask /%}",
+    "names": {
+      "alice/my_card": "   ",
+      "mafold/trace": ""
+    },
+    "expected": "my_card trace html ask"
+  },
+  {
+    "name": "pinned version name",
+    "content": "{% alice/widget version=\"1.2.0\" /%} {% alice/widget version=2.0.0 /%} {% alice/widget /%}",
+    "names": {
+      "alice/widget@1.2.0": "Old widget",
+      "alice/widget@2.0.0": "Next widget",
+      "alice/widget": "Current widget"
+    },
+    "expected": "Old widget Next widget Current widget"
+  },
+  {
+    "name": "body exceeds old raw cap",
+    "content": "{% mafold/trace %}secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output secret output {% mafold/tool /%}{% /mafold/trace %} The final answer survives.",
+    "names": {
+      "mafold/trace": "Agent trace"
+    },
+    "expected": "Agent trace The final answer survives."
+  },
+  {
+    "name": "unfinished streaming parent",
+    "content": "Opening {% alice/parent %} hidden {% alice/child /%} still writing",
+    "names": {},
+    "expected": "Opening parent"
+  },
+  {
+    "name": "mistyped close matches bubble recovery",
+    "content": "{% alice/parent %} hidden {% alice/child %} x {% /alice/child %} {% /typo/parent %} After",
+    "names": {},
+    "expected": "parent After"
+  },
+  {
+    "name": "reopened parent matches bubble recovery",
+    "content": "{% alice/parent %} <code>{% unclosed %}</code> {% alice/parent %} After",
+    "names": {},
+    "expected": "parent After"
+  },
+  {
+    "name": "fence inside card does not swallow next card",
+    "content": "{% alice/parent %}``` no close {% /alice/parent %} {% alice/next /%}",
+    "names": {},
+    "expected": "parent next"
+  },
+  {
+    "name": "literal code tags are text",
+    "content": "`{% alice/code /%}` and {% alice/real /%}",
+    "names": {
+      "alice/code": "DO NOT LOOK UP"
+    },
+    "expected": "{% alice/code /%} and real"
+  },
+  {
+    "name": "Unicode 240 character cap",
+    "content": "😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中",
+    "names": {},
+    "expected": "😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中😀中"
+  },
+  {
+    "name": "cap after card replacement",
+    "content": "{% alice/very-large %}hidden{% /alice/very-large %} 字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+    "names": {
+      "alice/very-large": "Preview"
+    },
+    "expected": "Preview 字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字"
+  },
+  {
+    "name": "markdown and whitespace normalization",
+    "content": "**Hello**\n\n# world > here `code` my_card",
+    "names": {},
+    "expected": "Hello world here code my_card"
+  },
+  {
+    "name": "metadata name stays literal",
+    "content": "{% alice/widget /%}",
+    "names": {
+      "alice/widget": "C# *name* my_card"
+    },
+    "expected": "C# *name* my_card"
+  }
+]

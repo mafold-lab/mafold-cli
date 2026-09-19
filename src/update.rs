@@ -13,6 +13,10 @@
 //!
 //! Used by the supervisor (which owns updates for its daemons) and by a
 //! standalone `mafold agent` (self-update, unless `--no-auto-update`).
+//!
+//! Two CHANNELS (`stable` / `dev`) — see [`Channel`]. The dev channel is how a
+//! real machine runs a prerelease build without switching auto-update off for
+//! everything on it.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -23,15 +27,88 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Which release line this machine follows.
+///
+/// STICKY, and deliberately so: the channel decides which releases are even
+/// VISIBLE to the updater, and the comparison never crosses lines. Without
+/// that, a `-dev` build would be measured against the stable release — same
+/// version digits, different bytes — and get "repaired" back to stable on the
+/// next 10-minute tick (see [`wants_update`]). Before this existed, the only
+/// way to keep a non-official binary alive on a machine was to turn auto-update
+/// off wholesale (`--no-auto-update`), which also stopped it from picking up
+/// the very fixes you were testing.
+///
+/// Leaving the dev channel is `mafold update --channel stable`, not a reinstall.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Channel {
+    #[default]
+    Stable,
+    Dev,
+}
+
+impl Channel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Dev => "dev",
+        }
+    }
+
+    /// `stable` / `dev`; anything else is `None` (callers decide what that means).
+    pub fn parse(s: &str) -> Option<Channel> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(Channel::Stable),
+            "dev" => Some(Channel::Dev),
+            _ => None,
+        }
+    }
+
+    /// This machine's channel. `MAFOLD_CHANNEL` wins (one-off overrides, CI),
+    /// then `~/.mafold/channel`, else stable.
+    ///
+    /// Anything unreadable or unrecognised resolves to STABLE, never dev: a
+    /// typo in that file must not quietly walk a production machine onto
+    /// prereleases. The file is machine-global on purpose — the supervisor and
+    /// every standalone agent read it independently, exactly like
+    /// `installed-version` and `update.lock` next to it.
+    pub fn current() -> Channel {
+        std::env::var("MAFOLD_CHANNEL")
+            .ok()
+            .and_then(|v| Channel::parse(&v))
+            .or_else(|| {
+                std::fs::read_to_string(channel_path())
+                    .ok()
+                    .and_then(|s| Channel::parse(&s))
+            })
+            .unwrap_or(Channel::Stable)
+    }
+
+    /// Persist the channel for every mafold process on this machine.
+    pub fn save(self) -> Result<()> {
+        let p = channel_path();
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        std::fs::write(&p, self.as_str()).with_context(|| format!("writing {}", p.display()))
+    }
+}
+
 /// A release available for this platform.
+#[derive(Debug)]
 pub struct Release {
     pub version: String, // without the leading `v`
     pub url: String,
     pub sha256: Option<String>,
+    /// The line it came from — decides how installing it announces itself.
+    pub channel: Channel,
 }
 
 fn mafold_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".mafold")
+}
+
+fn channel_path() -> PathBuf {
+    mafold_dir().join("channel")
 }
 
 /// This build's release-asset target triple (matches the release workflow).
@@ -56,9 +133,32 @@ pub fn platform_supported() -> bool {
     target_triple().is_some()
 }
 
-fn parse_semver(v: &str) -> (u64, u64, u64) {
+/// A comparable version: `(major, minor, patch, pre)`.
+///
+/// `pre` is what makes the dev channel orderable. A FINAL release gets
+/// `u64::MAX`; a `-dev.<N>` prerelease gets `N`. So `0.9.116-dev.7` sorts
+/// before `0.9.116-dev.8`, and both sort before the final `0.9.116` — semver's
+/// own rule, and the one the release flow needs (a dev build carries the
+/// version it is going to BECOME).
+///
+/// THE TRAP THIS CLOSES. The old parser read each dot-segment with
+/// `take_while(is_ascii_digit)`, so `0.9.116-dev.7` came out as `(0, 9, 116)` —
+/// indistinguishable from the released `0.9.116` and from every other dev
+/// build of it. Two consequences, both bad: a dev binary looked like a
+/// same-version impostor and got stomped by the stable release's checksum
+/// repair, and moving dev.7 → dev.8 had no path except that same repair, which
+/// announces itself as a REINSTALL and could just as easily walk backwards.
+///
+/// Stable-vs-stable comparisons are unchanged: both sides get `u64::MAX`.
+fn parse_version(v: &str) -> (u64, u64, u64, u64) {
     let v = v.trim().trim_start_matches('v');
-    let mut it = v.split('.').map(|p| {
+    // Split the prerelease tail off FIRST, so the patch number parses cleanly
+    // instead of stopping at the `-`.
+    let (core, pre) = match v.split_once('-') {
+        Some((core, tail)) => (core, prerelease_ordinal(tail)),
+        None => (v, u64::MAX),
+    };
+    let mut it = core.split('.').map(|p| {
         p.chars()
             .take_while(|c| c.is_ascii_digit())
             .collect::<String>()
@@ -69,13 +169,30 @@ fn parse_semver(v: &str) -> (u64, u64, u64) {
         it.next().unwrap_or(0),
         it.next().unwrap_or(0),
         it.next().unwrap_or(0),
+        pre,
     )
 }
+
+/// The ordinal in a `-dev.<N>` tail. An unparseable tail is ordinal 0 — still
+/// ordered before the final release, which is the safe direction (a build we
+/// can't read the ordinal of never claims to be newer than the real thing).
+fn prerelease_ordinal(tail: &str) -> u64 {
+    tail.rsplit('.')
+        .next()
+        .map(|n| {
+            n.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
 fn is_newer(latest: &str, current: &str) -> bool {
-    parse_semver(latest) > parse_semver(current)
+    parse_version(latest) > parse_version(current)
 }
 fn is_same_version(latest: &str, current: &str) -> bool {
-    parse_semver(latest) == parse_semver(current)
+    parse_version(latest) == parse_version(current)
 }
 
 /// Should we install `r`?
@@ -117,6 +234,14 @@ impl Release {
     /// 0.9.81 reads like a bug, and hides why the swap happened.)
     pub fn action_line(&self) -> String {
         if is_same_version(&self.version, current_version()) {
+            // On the dev channel a same-version swap is routine — a rebuild of
+            // the same ordinal — not the "someone put a hand-built binary here"
+            // case the stable wording describes. Saying REINSTALL there would
+            // point the reader at --no-auto-update, i.e. at leaving the very
+            // channel they opted into.
+            if self.channel == Channel::Dev {
+                return format!("↻ v{} rebuild — refreshing the dev build", self.version);
+            }
             format!(
                 "↻ v{} REINSTALL — this binary is not the build v{} published (checksum differs). \
                  Run the supervisor with --no-auto-update to keep a local build",
@@ -128,17 +253,133 @@ impl Release {
     }
 }
 
-async fn latest(http: &reqwest::Client) -> Result<Release> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let v: serde_json::Value = http
-        .get(&url)
+async fn get_json(http: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
+    Ok(http
+        .get(url)
         .header("User-Agent", "mafold-cli")
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?
         .error_for_status()?
         .json()
+        .await?)
+}
+
+/// The newest release on `channel` — **mafold-api first, GitHub second**.
+///
+/// WHY. GitHub's anonymous REST quota is 60 requests/hour PER IP, and one
+/// machine spends it by itself: the supervisor polls every 10 minutes, each
+/// standalone agent polls every 10 minutes *and* on reconnect *and* on startup,
+/// and a published release nudges all of them at once. Past the cap the check
+/// just prints "update check failed" and waits another 10 minutes, so a machine
+/// can sit an hour behind a release it was told about. `cliUpdateCheck` has no
+/// such ceiling.
+///
+/// The GitHub path is a PERMANENT fallback, not a transitional one: `--base`
+/// may point at an api older than that route, or at a self-hosted one that
+/// never grows it, and such a machine must still be able to update itself.
+async fn latest(http: &reqwest::Client, base: &str, channel: Channel) -> Result<Release> {
+    match latest_from_api(http, base, channel).await {
+        Ok(Some(r)) => return Ok(r),
+        // The api answered, but has nothing usable for us yet (no manifest for
+        // this channel, or one still missing this target's checksum). Expected
+        // in the window before the first release lands on a fresh node — say so
+        // rather than failing, and go ask GitHub.
+        Ok(None) => eprintln!("update: api has no usable {} manifest yet — asking GitHub", channel.as_str()),
+        // Never silent: a quiet fallback is how the rate-limit problem comes
+        // back without anyone noticing it had been fixed.
+        Err(e) => eprintln!("update: {base}/api/cliUpdateCheck unavailable ({e:#}) — asking GitHub"),
+    }
+    latest_from_github(http, channel).await
+}
+
+/// Ask mafold-api what the newest release is. `Ok(None)` = it has no answer we
+/// can act on; the caller falls back.
+async fn latest_from_api(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<Release>> {
+    let target = target_triple().context("unsupported platform for self-update")?;
+    let url = format!("{}/api/cliUpdateCheck", base.trim_end_matches('/'));
+    let env: serde_json::Value = http
+        .post(&url)
+        .json(&serde_json::json!({ "target": target, "channel": channel.as_str() }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
         .await?;
+    release_from_api_envelope(&env, channel)
+}
+
+/// The rules for reading a `cliUpdateCheck` answer, apart from the I/O so they
+/// can be tested. `Ok(None)` = nothing usable here, fall back to GitHub.
+fn release_from_api_envelope(
+    env: &serde_json::Value,
+    channel: Channel,
+) -> Result<Option<Release>> {
+    if env["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "{}",
+            env["description"].as_str().unwrap_or("cliUpdateCheck rejected the request")
+        );
+    }
+    let r = &env["result"];
+    // `known: false` is "the server has no record", NOT "you are current" —
+    // treating those as the same would leave a machine sitting on an old build
+    // believing it had checked. That is the whole reason the field exists.
+    if r["known"].as_bool() != Some(true) {
+        return Ok(None);
+    }
+    // A manifest missing the checksum is unusable: `apply` refuses to install an
+    // unverifiable binary, so going ahead would only produce a failure later.
+    // GitHub still has the `.sha256` asset, so the fallback can genuinely do
+    // better here.
+    let (Some(version), Some(dl), Some(sha)) =
+        (r["version"].as_str(), r["url"].as_str(), r["sha256"].as_str())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Release {
+        version: version.trim_start_matches('v').to_string(),
+        url: dl.to_string(),
+        sha256: Some(sha.to_string()),
+        channel,
+    }))
+}
+
+/// The newest release on `channel`, straight from GitHub.
+///
+/// Stable reads `/releases/latest`, which GitHub defines as the newest
+/// non-draft, NON-PRERELEASE release. That definition is the entire safety
+/// property of the dev channel: every dev build is published as a prerelease,
+/// so it is invisible here no matter how new it is, and a stable machine cannot
+/// wander onto one. `install.sh` reads the same endpoint and inherits it.
+///
+/// Dev has no such endpoint, so it lists releases (newest first) and takes the
+/// first prerelease itself.
+async fn latest_from_github(http: &reqwest::Client, channel: Channel) -> Result<Release> {
+    let v = match channel {
+        Channel::Stable => {
+            get_json(http, &format!("https://api.github.com/repos/{REPO}/releases/latest")).await?
+        }
+        Channel::Dev => {
+            let list =
+                get_json(http, &format!("https://api.github.com/repos/{REPO}/releases?per_page=20"))
+                    .await?;
+            list.as_array()
+                .and_then(|a| {
+                    a.iter()
+                        .find(|r| {
+                            r["prerelease"].as_bool() == Some(true)
+                                && r["draft"].as_bool() != Some(true)
+                        })
+                        .cloned()
+                })
+                .context("no prerelease published on the dev channel yet")?
+        }
+    };
     let tag = v["tag_name"].as_str().context("no tag_name")?.to_string();
     let target = target_triple().context("unsupported platform for self-update")?;
     let asset_name = format!("mafold-{target}");
@@ -156,6 +397,7 @@ async fn latest(http: &reqwest::Client) -> Result<Release> {
         version: tag.trim_start_matches('v').to_string(),
         url: dl,
         sha256,
+        channel,
     })
 }
 
@@ -322,11 +564,15 @@ pub fn recently_failed(version: &str) -> bool {
 /// Is a newer release available? Returns it (no download). No-ops on platforms
 /// the release workflow doesn't build a binary for (e.g. Windows) so the
 /// auto-update tick stays quiet instead of erroring every cycle.
-pub async fn check(http: &reqwest::Client) -> Result<Option<Release>> {
+pub async fn check(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<Release>> {
     if target_triple().is_none() {
         return Ok(None);
     }
-    let r = latest(http).await?;
+    let r = latest(http, base, channel).await?;
     // Hashed ONLY when the versions already match — the common "we're current"
     // tick still costs nothing beyond the API call it was already making.
     let our_sha = is_same_version(&r.version, current_version())
@@ -464,8 +710,12 @@ pub fn rollback() -> Result<()> {
 }
 
 /// Check + update if newer. Returns the new version if updated. (`mafold update`)
-pub async fn update_to_latest(http: &reqwest::Client) -> Result<Option<String>> {
-    match check(http).await? {
+pub async fn update_to_latest(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<String>> {
+    match check(http, base, channel).await? {
         Some(r) => {
             apply(http, &r.url, &r.version, r.sha256.as_deref()).await?;
             Ok(Some(r.version))
@@ -478,6 +728,12 @@ pub async fn update_to_latest(http: &reqwest::Client) -> Result<Option<String>> 
 /// same args + env. Never returns on success. Unix `exec`s in place (same pid);
 /// Windows respawns and exits — see `crate::platform::reexec`.
 pub fn reexec() -> std::io::Error {
+    // Warm `claude` connections are children of THIS process, and a unix
+    // `exec` replaces our image without touching them — they would live on as
+    // orphans holding sessions (and whatever they had spawned) that nothing
+    // will ever read from again. Close them first; this is the one choke point
+    // both platforms go through.
+    crate::harness::cc_conn::shutdown_all();
     crate::platform::reexec()
 }
 
@@ -500,13 +756,24 @@ pub fn reexec_or_warn(new_version: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_version, is_newer, wants_update, Release};
+    use super::{
+        current_version, is_newer, parse_version, release_from_api_envelope, wants_update, Channel,
+        Release,
+    };
 
     fn rel(version: &str, sha: Option<&str>) -> Release {
         Release {
             version: version.into(),
             url: "https://example.invalid/mafold".into(),
             sha256: sha.map(Into::into),
+            channel: Channel::Stable,
+        }
+    }
+
+    fn dev_rel(version: &str, sha: Option<&str>) -> Release {
+        Release {
+            channel: Channel::Dev,
+            ..rel(version, sha)
         }
     }
 
@@ -571,5 +838,125 @@ mod tests {
         assert!(repair.contains("REINSTALL"), "{repair}");
         assert!(repair.contains("--no-auto-update"), "must name the escape hatch: {repair}");
         assert!(rel(&newer_than_current(), None).action_line().contains("update v"));
+    }
+
+    // ── channels ──
+
+    /// A prerelease sorts BEFORE its final release and after the previous one,
+    /// and `-dev.N` ordinals order among themselves. The old parser collapsed
+    /// every one of these onto `(0, 9, 116)`.
+    #[test]
+    fn dev_builds_are_ordered_not_collapsed() {
+        assert!(parse_version("0.9.116-dev.7") < parse_version("0.9.116-dev.8"));
+        assert!(parse_version("0.9.116-dev.8") < parse_version("0.9.116"));
+        assert!(parse_version("0.9.115") < parse_version("0.9.116-dev.1"));
+        // …and a two-digit ordinal is not read as "1" (rsplit, not a char scan).
+        assert!(parse_version("0.9.116-dev.9") < parse_version("0.9.116-dev.12"));
+    }
+
+    /// Stable-vs-stable comparisons must be bit-for-bit what they were before
+    /// the 4th component existed — this parser change touches every update
+    /// decision on every machine.
+    #[test]
+    fn stable_comparisons_are_unchanged() {
+        assert!(is_newer("0.9.116", "0.9.115"));
+        assert!(!is_newer("0.9.115", "0.9.116"));
+        assert!(!is_newer("0.9.116", "0.9.116"));
+        assert!(is_newer("0.10.0", "0.9.999"));
+        assert_eq!(parse_version("v0.9.116"), parse_version("0.9.116"));
+    }
+
+    /// An unreadable prerelease tail must not out-rank the real release.
+    #[test]
+    fn an_unparseable_prerelease_tail_sorts_below_the_final_release() {
+        assert!(parse_version("0.9.116-wat") < parse_version("0.9.116"));
+        assert!(parse_version("0.9.116-dev") < parse_version("0.9.116"));
+    }
+
+    /// Moving between two dev builds is now an ordinary upgrade — it must NOT
+    /// need the same-version checksum repair, which is what it used to depend
+    /// on (and which announces itself as a REINSTALL).
+    #[test]
+    fn dev_to_dev_is_a_plain_upgrade() {
+        // No checksum anywhere: a newer ordinal alone is enough.
+        assert!(is_newer("0.9.116-dev.8", "0.9.116-dev.7"));
+        assert!(!is_newer("0.9.116-dev.7", "0.9.116-dev.8"));
+    }
+
+    /// The dev channel's same-version wording must not point the reader at
+    /// `--no-auto-update` — that would tell them to leave the channel they
+    /// deliberately joined.
+    #[test]
+    fn a_dev_rebuild_does_not_shout_reinstall() {
+        let line = dev_rel(current_version(), Some("cafebabe")).action_line();
+        assert!(line.contains("rebuild"), "{line}");
+        assert!(!line.contains("REINSTALL"), "{line}");
+        assert!(!line.contains("--no-auto-update"), "{line}");
+    }
+
+    // ── mafold-api as the metadata source ──
+
+    fn envelope(result: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "ok": true, "result": result })
+    }
+
+    /// THE ONE THAT MATTERS. "The server has no manifest" must not read as "you
+    /// are up to date" — a machine that made that mistake would stop looking
+    /// exactly when the fallback is the thing that should fire.
+    #[test]
+    fn no_manifest_is_not_up_to_date() {
+        let env = envelope(serde_json::json!({ "known": false, "channel": "stable" }));
+        let got = release_from_api_envelope(&env, Channel::Stable).expect("not an error");
+        assert!(got.is_none(), "must fall through to GitHub, not report 'current'");
+    }
+
+    /// The updater refuses unverifiable binaries, so a manifest without the
+    /// checksum is not something to proceed on — GitHub still has the
+    /// `.sha256` asset, so falling back can do strictly better.
+    #[test]
+    fn a_manifest_without_a_checksum_falls_back() {
+        let env = envelope(serde_json::json!({
+            "known": true, "channel": "stable",
+            "version": "0.9.117", "url": "https://example.invalid/mafold", "size": 1,
+        }));
+        assert!(release_from_api_envelope(&env, Channel::Stable).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_complete_manifest_is_used_as_is() {
+        let env = envelope(serde_json::json!({
+            "known": true, "channel": "dev",
+            "version": "v0.9.117-dev.3",
+            "url": "https://example.invalid/mafold-aarch64-apple-darwin",
+            "size": 12345, "sha256": "CAFEBABE",
+        }));
+        let r = release_from_api_envelope(&env, Channel::Dev).unwrap().expect("usable");
+        assert_eq!(r.version, "0.9.117-dev.3", "the leading v is the tag's, not the version's");
+        assert_eq!(r.sha256.as_deref(), Some("CAFEBABE"));
+        assert_eq!(r.channel, Channel::Dev);
+    }
+
+    /// An `{ok:false}` envelope is an ERROR, not "nothing here": the caller
+    /// prints it before falling back, so a misconfigured base url is visible
+    /// instead of silently costing everyone the GitHub quota again.
+    #[test]
+    fn a_rejected_request_is_an_error_not_a_shrug() {
+        let env = serde_json::json!({
+            "ok": false, "error_code": 400, "description": "unknown target \"sparc\"",
+        });
+        let e = release_from_api_envelope(&env, Channel::Stable).expect_err("must surface");
+        assert!(e.to_string().contains("sparc"), "{e}");
+    }
+
+    /// Anything we can't read is STABLE. A typo in `~/.mafold/channel` must
+    /// never be the reason a production machine starts taking prereleases.
+    #[test]
+    fn an_unknown_channel_is_stable() {
+        assert_eq!(Channel::parse("dev"), Some(Channel::Dev));
+        assert_eq!(Channel::parse("  DEV\n"), Some(Channel::Dev));
+        assert_eq!(Channel::parse("stable"), Some(Channel::Stable));
+        assert_eq!(Channel::parse("nightly"), None);
+        assert_eq!(Channel::parse(""), None);
+        assert_eq!(Channel::default(), Channel::Stable);
     }
 }

@@ -68,6 +68,26 @@ struct ConvMeta {
     /// deserialize (they show no preview until the next message refreshes it).
     #[serde(default)]
     last_message: Option<CoreMessage>,
+    /// The forum half of the row's badge, plus the newest message ANYWHERE in
+    /// the conversation (`#all` or any un-archived channel) and which channel
+    /// said it. Carried for the same reason `last_message` is: this is what the
+    /// dialog row's second line actually draws, and a cache that drops it paints
+    /// every forum as read-and-quiet until the network answers.
+    /// `#[serde(default)]` so caches written before these fields still load.
+    #[serde(default)]
+    channel_unread: u32,
+    #[serde(default)]
+    channel_unread_mention: bool,
+    #[serde(default)]
+    channel_muted_unread: u32,
+    #[serde(default)]
+    latest_message: Option<CoreMessage>,
+    #[serde(default)]
+    latest_channel_id: Option<String>,
+    #[serde(default)]
+    latest_channel_name: Option<String>,
+    #[serde(default)]
+    latest_channel_icon: Option<String>,
 }
 
 /// The instant a message is ORDERED by, in microseconds.
@@ -411,9 +431,16 @@ impl<S: Storage> Store<S> {
         // Preserve a denormalized last_message already tracked locally — the conv
         // head from the server may carry a stale/absent preview; the message stream
         // is the source of truth. Seed it from `c.last_message` only when unset.
-        let prior = self.store.get("conv", &c.id).await
-            .and_then(|v| de::<ConvMeta>(&v))
-            .and_then(|meta| meta.last_message);
+        let prior_meta = self.store.get("conv", &c.id).await.and_then(|v| de::<ConvMeta>(&v));
+        let prior = prior_meta.as_ref().and_then(|m| m.last_message.clone());
+        // `latest` is the SERVER's rollup across `#all` + every un-archived
+        // channel — nothing local can recompute it (the cache has no channel
+        // membership or archive flags), so the incoming value wins outright.
+        // The fallback is only for an upsert that carries none at all (a
+        // `chatUpdated` head, say): keep what we had rather than blanking the
+        // row's second line back to the main timeline's message.
+        let prior_latest = prior_meta.as_ref().and_then(|m| m.latest_message.clone());
+        let keep_latest = c.latest_message.is_none() && prior_latest.is_some();
         let meta = ConvMeta {
             kind: c.kind.clone(),
             title: c.title.clone(),
@@ -427,6 +454,25 @@ impl<S: Storage> Store<S> {
             member_edit_info: c.member_edit_info,
             member_add_bots: c.member_add_bots,
             last_message: prior.or_else(|| c.last_message.clone()),
+            channel_unread: c.channel_unread,
+            channel_unread_mention: c.channel_unread_mention,
+            channel_muted_unread: c.channel_muted_unread,
+            latest_message: if keep_latest { prior_latest } else { c.latest_message.clone() },
+            latest_channel_id: if keep_latest {
+                prior_meta.as_ref().and_then(|m| m.latest_channel_id.clone())
+            } else {
+                c.latest_channel_id.clone()
+            },
+            latest_channel_name: if keep_latest {
+                prior_meta.as_ref().and_then(|m| m.latest_channel_name.clone())
+            } else {
+                c.latest_channel_name.clone()
+            },
+            latest_channel_icon: if keep_latest {
+                prior_meta.as_ref().and_then(|m| m.latest_channel_icon.clone())
+            } else {
+                c.latest_channel_icon.clone()
+            },
         };
         self.store.put("conv", &c.id, ser(&meta)).await;
         if let Some(m) = &c.last_message {
@@ -554,6 +600,13 @@ impl<S: Storage> Store<S> {
                 member_edit_info: meta.member_edit_info,
                 member_add_bots: meta.member_add_bots,
                 last_message: meta.last_message,
+                channel_unread: meta.channel_unread,
+                channel_unread_mention: meta.channel_unread_mention,
+                channel_muted_unread: meta.channel_muted_unread,
+                latest_message: meta.latest_message,
+                latest_channel_id: meta.latest_channel_id,
+                latest_channel_name: meta.latest_channel_name,
+                latest_channel_icon: meta.latest_channel_icon,
             });
         }
         out.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
@@ -871,6 +924,8 @@ mod tests {
                 unread_mention: false,
                 last_message: None, is_forum: false, forum_member_channels: false,
                 member_add_members: false, member_edit_info: false, member_add_bots: false,
+                channel_unread: 0, channel_unread_mention: false, channel_muted_unread: 0,
+                latest_message: None, latest_channel_id: None, latest_channel_name: None, latest_channel_icon: None,
             }).await;
             s.upsert_message(&msg("a", "convP", None, 10, None)).await;
             s.upsert_message(&msg("b", "convP", None, 20, None)).await;

@@ -45,6 +45,17 @@ const OFFICIAL: &str = "mafold";
 /// refreshed on every daemon (re)connection.
 static REGISTRY: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
 
+/// The ids exactly as the last successful `listCards` handed them over — the
+/// MENU the preamble prints, kept beside the LOOKUP derived from it. One
+/// stored fact seen two ways, which is the property the call site depends on:
+/// the list that advertises the cards is the list that validates the output.
+///
+/// It cannot be recovered from [`REGISTRY`], which is deduped by slug with the
+/// official scope winning — rebuilding the menu from the map would quietly
+/// retire every shadowed family card (`linsky/generating`) from the model's
+/// vocabulary.
+static IDS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
 /// Record the card ids (`owner/slug`) this bot may embed. A slug published in
 /// BOTH the official scope and a family scope resolves to the official one:
 /// a bare tag then means the same card for every reader, which is the whole
@@ -65,6 +76,17 @@ pub fn set_registry(ids: &[String]) {
     if let Ok(mut reg) = REGISTRY.write() {
         *reg = map;
     }
+    if let Ok(mut held) = IDS.write() {
+        *held = ids.to_vec();
+    }
+}
+
+/// The last list [`set_registry`] was given. A reconnect whose `listCards` did
+/// not answer re-advertises THIS rather than telling the model it has no
+/// cards: "we did not find out" must never render as "there are none". Empty
+/// only before the first successful fetch.
+pub fn registry_ids() -> Vec<String> {
+    IDS.read().map(|v| v.clone()).unwrap_or_default()
 }
 
 /// How much of a streamed buffer can be committed without cutting a tag in
@@ -225,6 +247,22 @@ mod tests {
             qualify("{% generating-swap /%}"),
             "{% linsky/generating-swap /%}"
         );
+    }
+
+    #[test]
+    fn the_held_menu_is_verbatim_not_the_deduped_lookup() {
+        // What a reconnect whose `listCards` did not answer re-advertises.
+        // `generating` lives in two scopes and the LOOKUP keeps only the
+        // official one; the MENU must still offer both, or a fetch that merely
+        // timed out would quietly retire `linsky/generating` from the model's
+        // vocabulary — a slower version of the bug this replaced.
+        registry();
+        let held = registry_ids();
+        assert_eq!(held.len(), 6, "the menu is the list as given: {held:?}");
+        assert!(held.contains(&"linsky/generating".to_string()));
+        assert!(held.contains(&"mafold/generating".to_string()));
+        // …while the lookup still collapses the shadowed pair.
+        assert_eq!(qualify("{% generating /%}"), "{% mafold/generating /%}");
     }
 
     #[test]

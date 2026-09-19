@@ -14,6 +14,13 @@ use crate::event::AgentEvent;
 pub(crate) const RATE_LIMIT_PREFIX: &str = "_⏳ ";
 pub(crate) const COMPACTED_PREFIX: &str = "_🗜️ ";
 pub(crate) const STEER_PREFIX: &str = "> ↩︎ ";
+/// A driver notice ([`AgentEvent::Notice`]): something that happened AROUND the
+/// turn and changes what the user would do — another session's message parked by
+/// policy, a model quietly downgraded, a tool denied. Same family as the three
+/// above, and registered in [`is_notice_line`] for the same reason: a notice
+/// arriving after the last tool group must not be mistaken for the ANSWER, or
+/// `finish_folded` buries the real reply in the trace (the 2026-09-06 bug).
+pub(crate) const NOTICE_PREFIX: &str = "> ⚠︎ ";
 
 /// Render one event to a markdoc string (text or a card), or `None` to skip.
 /// `names` tracks `tool_use_id → tool name` so a bash `tool_result` can be
@@ -30,6 +37,11 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
     match ev {
         AgentEvent::Stats(_) | AgentEvent::ToolStatus { .. } => None,
         AgentEvent::Text(t) => Some(t.clone()),
+        // Placed by the transcript itself (`push_raw`), in time order.
+        AgentEvent::Notice(t) => Some(notice_line(t)),
+        // Never a card of its own: it belongs INSIDE the card of the call that
+        // started the subagent, which the transcript does by hand (`note`).
+        AgentEvent::SubagentStep { .. } => None,
         AgentEvent::ToolCall { id, name, input } => {
             names.insert(id.clone(), name.to_lowercase());
             Some(tool_use_tag(name, input, None))
@@ -199,18 +211,73 @@ fn answered_attr(answer: &str) -> String {
 /// the interactive ask).
 pub fn tool_kind(ev: &AgentEvent) -> Option<&'static str> {
     match ev {
-        AgentEvent::ToolCall { name, .. } => Some(match name.to_lowercase().as_str() {
-            "bash" => "shell",
-            "read" | "notebookedit" => "read",
-            "edit" | "write" | "multiedit" | "apply_patch" => "edit",
-            "glob" | "grep" => "search",
-            "webfetch" | "websearch" => "web",
-            "task" => "task",
-            "todowrite" => "plan",
-            "askuserquestion" => return None,
-            _ => "tool",
-        }),
+        AgentEvent::ToolCall { name, .. } => match kind_of(name) {
+            ToolKind::Ask => None,
+            k => Some(k.count_label()),
+        },
         _ => None,
+    }
+}
+
+/// What a tool DOES, independent of what it is called.
+///
+/// There were two tables of tool names here — one for counting, one for
+/// rendering — and they disagreed. Both said `task`, while the model had
+/// started emitting `Agent` (the `system/init` frame still advertises the tool
+/// as `Task`, so the two names are not even consistent inside one CLI), and
+/// neither had ever heard of `Workflow`. The result, verbatim off a real
+/// stream: `{% mafold/tool name="Agent" detail="" %}` — an anonymous tool card
+/// with the subagent's type and description thrown away — and "ran N subagents"
+/// stuck at zero. One table, and every name a producer might use lands in it,
+/// which is why `apply_patch` sits beside `Edit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolKind {
+    Shell,
+    Read,
+    Edit,
+    Search,
+    Web,
+    Plan,
+    Ask,
+    Subagent,
+    Workflow,
+    Skill,
+    Other,
+}
+
+impl ToolKind {
+    /// The bucket [`run_summary`] counts this under.
+    fn count_label(self) -> &'static str {
+        match self {
+            ToolKind::Shell => "shell",
+            ToolKind::Read => "read",
+            ToolKind::Edit => "edit",
+            ToolKind::Search => "search",
+            ToolKind::Web => "web",
+            ToolKind::Plan => "plan",
+            ToolKind::Subagent => "task",
+            ToolKind::Workflow => "workflow",
+            // A skill or anything unrecognised is just "a tool" in the summary.
+            ToolKind::Skill | ToolKind::Other | ToolKind::Ask => "tool",
+        }
+    }
+}
+
+pub fn kind_of(name: &str) -> ToolKind {
+    match name.to_lowercase().as_str() {
+        "bash" | "bashoutput" => ToolKind::Shell,
+        "read" | "notebookedit" => ToolKind::Read,
+        "edit" | "write" | "multiedit" | "apply_patch" => ToolKind::Edit,
+        "glob" | "grep" => ToolKind::Search,
+        "webfetch" | "websearch" => ToolKind::Web,
+        "todowrite" => ToolKind::Plan,
+        "askuserquestion" => ToolKind::Ask,
+        // `Agent` is what the model emits today; `Task` is the historical name
+        // (and still the one `system/init` advertises). Both, always.
+        "agent" | "task" => ToolKind::Subagent,
+        "workflow" => ToolKind::Workflow,
+        "skill" => ToolKind::Skill,
+        _ => ToolKind::Other,
     }
 }
 
@@ -226,6 +293,7 @@ pub fn run_summary(counts: &HashMap<&'static str, usize>) -> String {
     if n("search") > 0 { parts.push(format!("ran {}", phrase(n("search"), "search", "searches"))); }
     if n("web") > 0 { parts.push(format!("ran {}", phrase(n("web"), "web search", "web searches"))); }
     if n("task") > 0 { parts.push(format!("ran {}", phrase(n("task"), "subagent", "subagents"))); }
+    if n("workflow") > 0 { parts.push(format!("ran {}", phrase(n("workflow"), "workflow", "workflows"))); }
     if n("plan") > 0 { parts.push("updated the plan".into()); }
     if n("tool") > 0 { parts.push(format!("ran {}", phrase(n("tool"), "tool", "tools"))); }
     if parts.is_empty() {
@@ -280,6 +348,13 @@ pub fn steer_line(text: &str) -> String {
     format!("\n{STEER_PREFIX}{}\n", line_esc(text))
 }
 
+/// A driver notice ([`AgentEvent::Notice`]) — same quoted shape as a steer (it
+/// is the same kind of thing: not model output, but part of the timeline), with
+/// a different mark so the two don't read as each other.
+pub fn notice_line(text: &str) -> String {
+    format!("\n{NOTICE_PREFIX}{}\n", line_esc(text))
+}
+
 /// One atomic step in a run group: a tool CALL and, once it lands, its RESULT.
 ///
 /// The pair is one card. Harnesses stream every call in an assistant message and
@@ -298,11 +373,30 @@ pub struct ToolStep {
     pub input: Value,
     /// The result text — `None` while the tool is still running.
     pub out: Option<String>,
+    /// Work a SUBAGENT did under this call, one summarized line each. Bounded:
+    /// a subagent can run for hundreds of steps, and the card is 330pt wide.
+    pub inner: Vec<String>,
 }
 
 impl ToolStep {
+    /// Past this many lines the card says "…" instead of growing.
+    const MAX_INNER: usize = 12;
+
     pub fn new(name: &str, input: &Value) -> Self {
-        Self { name: name.to_string(), input: input.clone(), out: None }
+        Self { name: name.to_string(), input: input.clone(), out: None, inner: Vec::new() }
+    }
+
+    /// One step the subagent under this call took.
+    pub fn note(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if self.inner.len() < Self::MAX_INNER {
+            self.inner.push(line.to_string());
+        } else if self.inner.len() == Self::MAX_INNER {
+            self.inner.push("…".into());
+        }
     }
     /// The result landed. First one wins: a harness that re-sends a result must
     /// not append a second copy to a card that already shows it.
@@ -312,8 +406,41 @@ impl ToolStep {
         }
     }
     pub fn tag(&self) -> String {
-        tool_use_tag(&self.name, &self.input, self.out.as_deref())
+        tool_use_tag_inner(&self.name, &self.input, self.out.as_deref(), &self.inner)
     }
+}
+
+/// One line describing a tool call, for a producer that has to summarize a
+/// SUBAGENT's step before sending it ([`AgentEvent::SubagentStep`]).
+///
+/// Lives here, next to the card rendering, so a subagent's step reads like the
+/// main agent's steps do — same names, same details, same truncation.
+pub fn step_line(name: &str, input: &Value) -> String {
+    let detail = tool_detail(name, input);
+    if detail.is_empty() {
+        format!("· {name}")
+    } else {
+        format!("· {name} {detail}")
+    }
+}
+
+/// The subagent type a Task/Agent call names, with the historical spelling as a
+/// fallback so a producer that predates `subagent_type` still gets a label.
+fn subagent_type(input: &Value) -> &str {
+    input["subagent_type"]
+        .as_str()
+        .or_else(|| input["agent_type"].as_str())
+        .unwrap_or("agent")
+}
+
+/// What to call a Workflow run. The script's own `name` is the useful one; a
+/// description is the next best; otherwise say nothing rather than guess.
+fn workflow_label(input: &Value) -> &str {
+    input["name"]
+        .as_str()
+        .or_else(|| input["workflow_name"].as_str())
+        .or_else(|| input["description"].as_str())
+        .unwrap_or("")
 }
 
 /// One entry in a run group: a finished card (thinking, a legacy orphan result)
@@ -340,27 +467,48 @@ pub fn render_group(items: &[GroupItem]) -> String {
 
 /// A tool call (plus its result, when it has landed) → the right card.
 fn tool_use_tag(name: &str, input: &Value, out: Option<&str>) -> String {
+    tool_use_tag_inner(name, input, out, &[])
+}
+
+/// `inner` is the work a SUBAGENT did under this call (see
+/// [`AgentEvent::SubagentStep`]) — one already-summarized line each. It goes in
+/// the card's body, which is what keeps a subagent's tool calls out of the main
+/// timeline where they read as the main agent's own.
+fn tool_use_tag_inner(name: &str, input: &Value, out: Option<&str>, inner: &[String]) -> String {
     let lname = name.to_lowercase();
     let (summary, body) = result_parts(&lname, out);
-    match lname.as_str() {
-        "todowrite" => todo_tag(input),
+    // The subagent's own steps first, then whatever it reported back: the card
+    // reads top to bottom as the work and then its result.
+    let with_inner =
+        || if inner.is_empty() { body.clone() } else { format!("{}\n{body}", inner.join("\n")) };
+    match kind_of(name) {
+        ToolKind::Plan => todo_tag(input),
         // The diff IS the result — an "updated the file" line under it says
         // nothing the +N −M in its header doesn't already say.
-        "edit" | "multiedit" => diff_tag_edit(&lname, name, input),
-        "write" => diff_tag_write(name, input),
-        "task" => card(
+        ToolKind::Edit if lname == "write" => diff_tag_write(name, input),
+        ToolKind::Edit => diff_tag_edit(&lname, name, input),
+        ToolKind::Subagent => card(
             "task",
             &format!(
                 "subagent=\"{}\" desc=\"{}\"{}",
-                attr_esc(input["subagent_type"].as_str().unwrap_or("agent")),
+                attr_esc(subagent_type(input)),
                 attr_esc(input["description"].as_str().unwrap_or("")),
                 summary,
             ),
-            &body,
+            &with_inner(),
         ),
-        "webfetch" => card("web", &format!("url=\"{}\"{}", attr_esc(input["url"].as_str().unwrap_or("")), summary), ""),
-        "websearch" => card("web", &format!("query=\"{}\"{}", attr_esc(input["query"].as_str().unwrap_or("")), summary), ""),
-        "skill" => {
+        // A workflow is a script that runs agents, not an agent — it has a name
+        // of its own, so it does not pretend to be one.
+        ToolKind::Workflow => card(
+            "task",
+            &format!("subagent=\"workflow\" desc=\"{}\"{}", attr_esc(workflow_label(input)), summary),
+            &with_inner(),
+        ),
+        ToolKind::Web if !input["url"].is_null() => {
+            card("web", &format!("url=\"{}\"{}", attr_esc(input["url"].as_str().unwrap_or("")), summary), "")
+        }
+        ToolKind::Web => card("web", &format!("query=\"{}\"{}", attr_esc(input["query"].as_str().unwrap_or("")), summary), ""),
+        ToolKind::Skill => {
             let sname = input["command"].as_str()
                 .or_else(|| input["skill"].as_str())
                 .or_else(|| input["name"].as_str())
@@ -368,7 +516,7 @@ fn tool_use_tag(name: &str, input: &Value, out: Option<&str>) -> String {
             let args = input["args"].as_str().or_else(|| input["arguments"].as_str()).unwrap_or("");
             card("skill", &format!("name=\"{}\" args=\"{}\"{}", attr_esc(sname), attr_esc(args), summary), "")
         }
-        "askuserquestion" => ask_tag(input),
+        ToolKind::Ask => ask_tag(input),
         _ => card(
             "tool",
             &format!("name=\"{}\" detail=\"{}\"{}", attr_esc(name), attr_esc(&tool_detail(name, input)), summary),
@@ -647,7 +795,7 @@ pub fn strip_transcript_cards(md: &str) -> String {
 /// on the model's behalf.
 pub fn is_notice_line(line: &str) -> bool {
     let t = line.trim_start();
-    [RATE_LIMIT_PREFIX, COMPACTED_PREFIX, STEER_PREFIX].iter().any(|p| t.starts_with(p))
+    [RATE_LIMIT_PREFIX, COMPACTED_PREFIX, STEER_PREFIX, NOTICE_PREFIX].iter().any(|p| t.starts_with(p))
 }
 
 /// `md` with every notice line ([`is_notice_line`]) removed.

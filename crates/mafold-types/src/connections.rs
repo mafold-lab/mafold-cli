@@ -755,6 +755,31 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_client: None,
     },
     ProviderSpec {
+        id: "dashscope",
+        display: "Alibaba Cloud Model Studio",
+        blurb: "Your own key for Qwen and DashScope models",
+        badge: "dashscope",
+        kind: ProviderKind::ApiKey,
+        fields: API_KEY,
+        import_path: None,
+        env_var: Some("DASHSCOPE_API_KEY"),
+        auth: BEARER_API_KEY,
+        oauth_capable: false,
+        // The Singapore-region console: it is where the international account
+        // mints `sk-…` keys, and the same key works against the generic
+        // `dashscope-intl` endpoint. Mainland accounts mint theirs at
+        // bailian.console.aliyun.com with the same env var; no second row.
+        help_url: Some("https://modelstudio.console.alibabacloud.com/ap-southeast-1/settings/api-key"),
+        mcp_url: None,
+        // No device driver yet: the row exists so the key lives in the vault
+        // (`connection env dashscope` feeds a local tool) rather than a dotfile.
+        // A `dashscope-asr` driver (transcription submit / status) is the next
+        // step, and is what makes this grantable to other agents.
+        native_api: None,
+        device_bound: false,
+        oauth_client: None,
+    },
+    ProviderSpec {
         id: "codex-oauth",
         display: "Codex (OAuth)",
         blurb: "Run Codex as your agent",
@@ -1449,6 +1474,7 @@ mod tests {
                 "claude-code-oauth",
                 "anthropic-api",
                 "openai-api",
+                "dashscope",
                 "codex-oauth",
                 "notion",
                 "figma",

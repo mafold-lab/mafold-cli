@@ -31,6 +31,9 @@ pub static KNOWN_METHODS: &[&str] = &[
     "answerConnectionCall",
     "answerConnectionCallChunk",
     "answerInlineQuery",
+    "appBundleCheck",
+    "appBundleDownload",
+    "appBundlePublish",
     "appReleasePublish",
     "appRoom.get",
     "appRoom.increment",
@@ -60,6 +63,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "callConnection",
     "claimConnectionCall",
     "claimProvisions",
+    "cliUpdateCheck",
     "createBot",
     "createCapsule",
     "createChannel",
@@ -89,6 +93,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "editMessage",
     "ensureSelfConversation",
     "exchangeConnectionToken",
+    "fileAttachDerived",
     "finishIdentityLink",
     "forwardMerged",
     "forwardMessages",
@@ -109,6 +114,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "getBotToken",
     "getCapsules",
     "getChat",
+    "getChatDiff",
     "getChatHistory",
     "getChatInviteInfo",
     "getChats",
@@ -122,6 +128,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "getLangPackDiff",
     "getLinkedIdentities",
     "getMe",
+    "getMessage",
     "getMyBotConfig",
     "getMyBots",
     "getNotificationPrefs",
@@ -138,6 +145,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "getVaultKey",
     "getVaultRecovery",
     "githubWebhook",
+    "grantChatAccess",
     "installApp",
     "joinChatByInviteLink",
     "leaveChat",
@@ -181,6 +189,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "moments/timelineList",
     "oauth/authorize",
     "oauth/check",
+    "oauth/clientinfo",
     "oauth/token",
     "oauth/userinfo",
     "pinApp",
@@ -209,6 +218,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "renameChannel",
     "reorderFolders",
     "reportConnectionLink",
+    "reportHarnessCaps",
     "reportHarnesses",
     "reportMessage",
     "reportUser",
@@ -273,6 +283,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "signIn",
     "startChat",
     "startConnectionLink",
+    "startEmailBind",
     "startIdentityLink",
     "startMachinePairing",
     "sticker.add",
@@ -293,6 +304,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "updateProfile",
     "updateRoutine",
     "uploadFile",
+    "verifyEmailBind",
     "waitConnectionCall",
     "walletBalances",
     "walletConvert",
@@ -415,6 +427,21 @@ impl ApiClient {
             body["channel_id"] = serde_json::json!(ch);
         }
         self.call_typed("getChatHistory", &body).await
+    }
+    /// What changed in this timeline since `since` — the incremental twin of
+    /// [`Self::get_chat_history`]. `since` is the `pts` the caller last stored;
+    /// a `too_long` answer means fall back to a full page.
+    pub async fn get_chat_diff(
+        &self,
+        chat_id: Uuid,
+        since: u64,
+        channel_id: Option<Uuid>,
+    ) -> Result<wire::MessagesDiff, RpcError> {
+        let mut body = serde_json::json!({ "chat_id": chat_id, "since": since });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = serde_json::json!(ch);
+        }
+        self.call_typed("getChatDiff", &body).await
     }
     pub async fn get_thread_messages(
         &self,
