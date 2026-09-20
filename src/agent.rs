@@ -2110,30 +2110,55 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
 
     // Re-arm completion wakeups lost to a restart: detached background tasks
     // (bash-hook registry) run on across daemon restarts, but the armed monitor
-    // lived in the old process. Every SURFACE with leftover registrations —
-    // live OR finished-but-unreported — gets a fresh monitor; the tag carries
-    // the conversation and (in a forum) the channel, so the wrap-up comes back
-    // on the timeline the task was started from instead of always on `#all`.
+    // lived in the old process. Every surface OF MINE with leftover
+    // registrations — live OR finished-but-unreported — gets a fresh monitor;
+    // the tag carries the conversation and (in a forum) the channel, so the
+    // wrap-up comes back on the timeline the task was started from instead of
+    // always on `#all`.
+    //
+    // OF MINE is the whole point of the bot component in the tag: this
+    // directory belongs to the machine, not to this process. Scanning it
+    // unfiltered is how ONE finished task woke every daemon on this machine at
+    // once, four of which posted a wrap-up for work they never started
+    // (`surface_tag`). Membership in the conversation, checked below, does not
+    // narrow that down — those four were all in the same group chat.
     // Config layering is skipped here (defaults); the wrap-up resumes an
     // existing session anyway.
     {
+        let me = tag_part(&my_username);
         let mut tags: HashMap<String, u64> = HashMap::new();
+        let mut others = 0usize;
+        let mut orphans: Vec<String> = vec![];
         if let Ok(home) = std::env::var("HOME") {
             let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
             for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if let Some(stem) = name.strip_suffix(".pid") {
-                    let tag = stem.rsplit_once('.').map(|(t, _)| t).unwrap_or(stem);
-                    *tags.entry(tag.to_string()).or_insert(0) += 1;
+                match classify_registration(&name, &me) {
+                    Some(Registration::Mine(tag)) => *tags.entry(tag).or_insert(0) += 1,
+                    Some(Registration::Theirs) => others += 1,
+                    // Written before the key carried a bot. Nobody can prove
+                    // it is theirs, so nobody claims it — but the log is real
+                    // work someone is owed, so print where it is.
+                    Some(Registration::Unclaimable) => {
+                        orphans.push(e.path().with_extension("log").to_string_lossy().into_owned())
+                    }
+                    None => {}
                 }
             }
         }
+        if others > 0 {
+            println!("· {others} background-task registration(s) here belong to other bots — leaving them alone");
+        }
+        for log in &orphans {
+            println!("⚠ background-task registration predates the per-bot registry key — unclaimable; its output is at {log}");
+        }
         let stopper = owner_username.clone().unwrap_or_else(|| my_username.clone());
         for (tag, n) in tags {
-            let (conv, channel) = surface_split(&tag);
-            // The registry is machine-wide, including other API deployments.
-            // An explicit API refusal means this bot cannot own that wakeup.
-            // A transport failure still arms it, preserving restart recovery.
+            let Some((conv, channel, _)) = surface_split(&tag) else { continue };
+            // Second gate, not the first one: the registry spans API
+            // deployments too, and an explicit API refusal means this bot
+            // cannot own that wakeup. A transport failure still arms it,
+            // preserving restart recovery.
             if let Err(e) = client.get_chat(&conv).await {
                 if matches!(e.downcast_ref::<mafold_core::RpcError>(), Some(mafold_core::RpcError::Api(_))) {
                     eprintln!("skipping background-task wakeup for {tag}: conversation unavailable to this bot");
@@ -2145,6 +2170,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
                 client.clone(),
                 workdir.clone(),
                 false,
+                my_username.clone(),
                 conv,
                 None,
                 channel,
@@ -2806,7 +2832,7 @@ async fn intro_turn(
     )
     .await;
     handle(
-        client, &turn_workdir, workdir_ns, chat_id, None, None, &brief, &[],
+        client, &turn_workdir, workdir_ns, my_username, chat_id, None, None, &brief, &[],
         sessions, coord, chat_states, harness,
         model, effort, thinking, system, cc.account.clone(),
         &norm_user(answerer), group_context, &[],
@@ -4268,7 +4294,7 @@ async fn connect_and_run(
                 round += 1;
                 let first = round == 1;
                 match handle(
-                    &client, &turn_workdir, workdir_ns, &chat_id, thread_root.as_deref(),
+                    &client, &turn_workdir, workdir_ns, &me_user, &chat_id, thread_root.as_deref(),
                     channel_id.as_deref(), &p,
                     if first { &attachments } else { NO_ATTACHMENTS },
                     &sessions, &coord, &chat_states, &harness,
@@ -6459,6 +6485,10 @@ async fn handle(
     // — the claude session key is then namespaced by it (sessions are
     // cwd-bound; resuming one in a different cwd fails to find it).
     workdir_ns: bool,
+    // This bot's handle. Part of the background-task registry key: that
+    // directory is shared by every daemon on the machine, so a task detached
+    // by this turn must be findable by this bot and by nobody else.
+    bot: &str,
     chat_id: &str,
     thread_root: Option<&str>,
     channel_id: Option<&str>,
@@ -6487,10 +6517,11 @@ async fn handle(
 ) -> Result<Option<String>> {
     let skey = turn_session_key(chat_id, channel_id, workdir_ns, workdir);
     let prior = sessions.lock().await.get(&skey).cloned();
-    // The surface this turn runs on — same (conversation, channel) pair the
-    // session is keyed at. Exported to the agent so any background task it
-    // detaches is registered here and reported back HERE (see `surface_tag`).
-    let surface = surface_tag(chat_id, channel_id);
+    // The surface this turn runs on — the (conversation, channel) pair the
+    // session is keyed at, under the bot that owns the session. Exported to the
+    // agent so any background task it detaches is registered here and reported
+    // back HERE, by ME (see `surface_tag`).
+    let surface = surface_tag(bot, chat_id, channel_id);
     // Start the harness process NOW, while the work below is still waiting on
     // the network (the apps/rooms round trip, the draft). A cold `claude` takes
     // ~1.3s to come up and those are the same seconds; this spends them once.
@@ -7114,6 +7145,7 @@ async fn handle(
                 client.clone(),
                 workdir.to_string(),
                 workdir_ns,
+                bot.to_string(),
                 chat_id.to_string(),
                 thread_root.map(str::to_string),
                 channel_id.map(str::to_string),
@@ -7243,31 +7275,98 @@ fn bgtasks_beat_note(tag: &str) -> Option<String> {
 /// monitor scans to decide "my tasks are done, wake the chat". Keyed by
 /// conversation alone, #b's monitor collected #a's finished tasks, fired ITS
 /// wrap-up turn (in #b, resuming #b's session) reporting #a's logs, and then
-/// deleted the registrations #a's own monitor was still waiting on. One
-/// registry per surface makes that impossible by construction rather than by
-/// filtering after the fact. The granularity deliberately matches
-/// `session_key` — the wrap-up resumes that surface's harness session, so
-/// splitting any finer would put two turns on one session.
-fn surface_tag(chat_id: &str, channel_id: Option<&str>) -> String {
-    let raw = match channel_id {
-        Some(ch) => format!("{chat_id}__{ch}"),
-        None => chat_id.to_string(),
-    };
-    raw.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-        .collect()
+/// deleted the registrations #a's own monitor was still waiting on.
+///
+/// Why the BOT belongs in it too (2026-09-20): the key was scoped to match
+/// `session_key`, which is a map INSIDE one daemon process — but
+/// `~/.mafold/bgtasks` is ONE directory shared by every `mafold agent` on the
+/// machine, so that granularity is unique per process and not on disk.
+/// Measured on a seven-daemon machine: one detached task finished and four
+/// bots woke up to report it (one of them owned by a different account
+/// entirely), and whichever delivered first ran `bgtasks_cleanup` — deleting
+/// the log the bot that actually started the task was about to read. A key has
+/// to name every scope its directory is shared across; the bot is one of them.
+///
+/// Format — `{conv}__{channel}__{bot}`, each component sanitized to
+/// `[A-Za-z0-9-]` with runs of the replacement collapsed, so no component can
+/// contain the `__` separator and split the key at the wrong place. The
+/// channel component is EMPTY on the `#all` timeline (`{conv}____{bot}`),
+/// which keeps the arity fixed at three — that is what lets `surface_split`
+/// tell a current key from a pre-per-bot one (one or two components) without
+/// guessing.
+fn surface_tag(bot: &str, chat_id: &str, channel_id: Option<&str>) -> String {
+    format!(
+        "{}__{}__{}",
+        tag_part(chat_id),
+        channel_id.map(tag_part).unwrap_or_default(),
+        tag_part(bot),
+    )
+}
+
+/// One component of a `surface_tag`, reduced to the filename-safe alphabet.
+/// Runs collapse (`opsdu:claude-code` → `opsdu_claude-code`, `a::b` → `a_b`) so
+/// a component can never contain the `__` that separates them.
+fn tag_part(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// What a daemon may do with one file it finds in the machine-wide
+/// `~/.mafold/bgtasks` at startup.
+#[derive(Debug, PartialEq, Eq)]
+enum Registration {
+    /// Written by this bot — re-arm a monitor for its tag.
+    Mine(String),
+    /// Written by another daemon on this machine. Not mine to report, not mine
+    /// to delete: its own daemon re-arms it when IT restarts.
+    Theirs,
+    /// A key from before the bot joined it. Nobody can prove ownership.
+    Unclaimable,
+}
+
+/// Classify one filename from the registry directory against my handle.
+///
+/// This is the decision the restart re-arm used to skip entirely — it armed a
+/// monitor for every `.pid` in the directory, which on a machine running seven
+/// daemons meant seven monitors per task, four wrap-up replies for one task,
+/// and the first one to deliver deleting the log the others (and the bot that
+/// actually started it) still needed. `me` is a `tag_part`-sanitized handle.
+fn classify_registration(name: &str, me: &str) -> Option<Registration> {
+    let stem = name.strip_suffix(".pid")?;
+    let tag = stem.rsplit_once('.').map(|(t, _)| t).unwrap_or(stem);
+    Some(match surface_split(tag) {
+        Some((_, _, bot)) if bot == me => Registration::Mine(tag.to_string()),
+        Some(_) => Registration::Theirs,
+        None => Registration::Unclaimable,
+    })
 }
 
 /// Inverse of `surface_tag`, for the restart re-arm: it only has the filenames
-/// left on disk and must put each wrap-up back on the timeline the task was
-/// started from. A legacy conversation-only registration (written before the
-/// channel joined the key) splits to `(conv, None)` and lands on `#all`, which
-/// is exactly where those tasks used to report.
-fn surface_split(tag: &str) -> (String, Option<String>) {
-    match tag.split_once("__") {
-        Some((conv, ch)) => (conv.to_string(), Some(ch.to_string())),
-        None => (tag.to_string(), None),
+/// left on disk, and it has to put each wrap-up back on the timeline the task
+/// was started from AND on the daemon that started it.
+///
+/// `None` for a key written before the bot joined it (one or two components).
+/// Those are unattributable — nothing on disk says which of the machine's
+/// daemons owns them, and adopting them on a guess is the behaviour this key
+/// exists to end. The caller says so out loud instead.
+fn surface_split(tag: &str) -> Option<(String, Option<String>, String)> {
+    let parts: Vec<&str> = tag.split("__").collect();
+    let [conv, channel, bot] = parts[..] else { return None };
+    if conv.is_empty() || bot.is_empty() {
+        return None;
     }
+    Some((
+        conv.to_string(),
+        (!channel.is_empty()).then(|| channel.to_string()),
+        bot.to_string(),
+    ))
 }
 
 /// One detached task's registry entry, snapshotted for the `{% mafold/bgtasks %}` card:
@@ -7482,6 +7581,9 @@ fn arm_bg_wakeup(
     client: Client,
     workdir: String,
     workdir_ns: bool,
+    // Who I am — the registry is machine-wide, so the monitor must only ever
+    // collect (and clean up) registrations written under this bot's key.
+    bot: String,
     chat_id: String,
     thread_root: Option<String>,
     channel_id: Option<String>,
@@ -7513,7 +7615,7 @@ fn arm_bg_wakeup(
     let live_slot = || LIVE.get_or_init(|| StdMutex::new(HashMap::new()));
     // Registry tag — the surface this turn ran on (conv + forum channel), the
     // same key `bash_hook` registered its detached tasks under.
-    let tag = surface_tag(&chat_id, channel_id.as_deref());
+    let tag = surface_tag(&bot, &chat_id, channel_id.as_deref());
     // The monitor key IS the registry key (plus the workdir, which can differ
     // per chat): one monitor per registry, so two monitors can never race for
     // the same registrations.
@@ -7687,7 +7789,7 @@ fn arm_bg_wakeup(
                 let mut delivered = false;
                 for attempt in 0..3u32 {
                     match handle(
-                        &client, &workdir, workdir_ns, &chat_id,
+                        &client, &workdir, workdir_ns, &bot, &chat_id,
                         thread_root.as_deref(), channel_id.as_deref(), &prompt, &[],
                         &sessions, &coord, &chat_states, &harness,
                         model.clone(), effort.clone(), thinking, system.clone(), account.clone(),
@@ -8229,48 +8331,146 @@ mod deliver_ask_answer_tests {
 mod surface_tag_tests {
     use super::{surface_split, surface_tag};
 
-    /// The `#all` main timeline keeps the bare conversation id — registrations
-    /// written by an older hook (conversation-only) stay readable.
+    const BOT: &str = "opsdu:claude-code";
+    const CONV: &str = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
+
+    /// THE BUG this key exists to make impossible: `~/.mafold/bgtasks` is one
+    /// directory for the whole machine, so two bots on the SAME conversation
+    /// and channel must still land in disjoint registries. `bgtasks_scan`
+    /// matches on the `{tag}.` prefix, so neither key may be a prefix of the
+    /// other either.
     #[test]
-    fn main_timeline_is_the_bare_conversation() {
-        let conv = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
-        assert_eq!(surface_tag(conv, None), conv);
-        assert_eq!(surface_split(conv), (conv.to_string(), None));
+    fn two_bots_on_one_surface_do_not_share_a_registry() {
+        let mine = surface_tag(BOT, CONV, None);
+        let theirs = surface_tag("opsdutest06:assistant", CONV, None);
+        assert_ne!(mine, theirs);
+        assert!(!theirs.starts_with(&format!("{mine}.")) && !mine.starts_with(&format!("{theirs}.")));
+        assert_eq!(surface_split(&mine).unwrap().2, "opsdu_claude-code");
     }
 
-    /// THE BUG: two channels of one conversation must not share a registry.
-    /// `bgtasks_scan` matches on the `{tag}.` prefix, so #all's prefix must not
-    /// swallow a channel's files either.
+    /// Two channels of one conversation must not share a registry either —
+    /// #b's monitor collecting #a's tasks was the same bug one scope up.
     #[test]
     fn channels_get_their_own_registry() {
-        let conv = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
         let (a, b) = ("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222");
-        let ta = surface_tag(conv, Some(a));
-        let tb = surface_tag(conv, Some(b));
+        let ta = surface_tag(BOT, CONV, Some(a));
+        let tb = surface_tag(BOT, CONV, Some(b));
+        let all = surface_tag(BOT, CONV, None);
         assert_ne!(ta, tb);
-        assert!(!ta.starts_with(&format!("{conv}.")), "a channel's file must not match #all's prefix");
+        assert!(!ta.starts_with(&format!("{all}.")), "a channel's file must not match #all's prefix");
         assert!(!tb.starts_with(&ta), "one channel's prefix must not swallow another's");
-        assert_eq!(surface_split(&ta), (conv.to_string(), Some(a.to_string())));
+        assert_eq!(
+            surface_split(&ta),
+            Some((CONV.to_string(), Some(a.to_string()), "opsdu_claude-code".to_string())),
+        );
     }
 
     /// The restart re-arm only has filenames to go on: whatever the hook wrote
-    /// must split back into the timeline the wrap-up has to be posted on.
+    /// must split back into the timeline the wrap-up has to be posted on, and
+    /// into the bot allowed to post it.
     #[test]
     fn split_is_the_inverse_of_tag() {
-        let conv = "conv-1";
         for ch in [None, Some("chan-9")] {
-            let (c, k) = surface_split(&surface_tag(conv, ch));
-            assert_eq!((c.as_str(), k.as_deref()), (conv, ch));
+            let got = surface_split(&surface_tag("bot-9", "conv-1", ch)).unwrap();
+            assert_eq!((got.0.as_str(), got.1.as_deref(), got.2.as_str()), ("conv-1", ch, "bot-9"));
         }
     }
 
+    /// A key written before the bot joined it (`conv` or `conv__channel`) is
+    /// unattributable — no daemon may adopt it, so the split must REFUSE it
+    /// rather than read the channel as a bot or the conversation as a channel.
+    #[test]
+    fn pre_per_bot_keys_are_refused() {
+        assert_eq!(surface_split(CONV), None);
+        assert_eq!(surface_split(&format!("{CONV}__11111111-1111-1111-1111-111111111111")), None);
+        assert_eq!(surface_split("untagged"), None);
+    }
+
     /// Sanitization must survive the join — the hook writes `{tag}.{ts}.pid`,
-    /// so a tag containing a `.` would break the filename split both ways.
+    /// so a tag containing a `.` would break the filename split both ways, and
+    /// a component sanitizing to a `__` run would split the key in the wrong
+    /// place (`a::b` as a bot handle is the realistic shape).
     #[test]
     fn odd_ids_are_sanitized_and_still_split() {
-        let t = surface_tag("a.b/c", Some("d.e"));
+        let t = surface_tag("x::y", "a.b/c", Some("d.e"));
         assert!(!t.contains('.') && !t.contains('/'));
-        assert_eq!(surface_split(&t), ("a_b_c".to_string(), Some("d_e".to_string())));
+        assert_eq!(
+            surface_split(&t),
+            Some(("a_b_c".to_string(), Some("d_e".to_string()), "x_y".to_string())),
+        );
+    }
+}
+
+#[cfg(test)]
+mod registration_claim_tests {
+    use super::{classify_registration, surface_tag, tag_part, Registration};
+
+    /// The 2026-09-20 incident, replayed: seven daemons share one registry
+    /// directory, ONE of them detached a task in the DEV group, and all seven
+    /// restarted together. Exactly one may claim it — and membership in the
+    /// conversation does not narrow it down, because most of them are in it.
+    #[test]
+    fn one_task_on_a_seven_daemon_machine_has_exactly_one_owner() {
+        let conv = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
+        let chan = "e8cc32c3-7e2a-4b4b-a105-b9c9b7d92539";
+        let owner = "opsdu:claude-code";
+        let file = format!("{}.1789837413003519000.pid", surface_tag(owner, conv, Some(chan)));
+
+        let machine = [
+            "opsdu:claude-code", "opsdu:codex", "opsdu:claude333", "opsdu:8964",
+            "opsdu:assistant", "opsdu:kimi-code", "opsdutest06:assistant",
+        ];
+        let claimers: Vec<&str> = machine
+            .iter()
+            .filter(|bot| {
+                matches!(classify_registration(&file, &tag_part(bot)), Some(Registration::Mine(_)))
+            })
+            .copied()
+            .collect();
+        assert_eq!(claimers, [owner], "exactly the bot that started it re-arms");
+
+        // And the other six see it for what it is — someone else's, left alone
+        // rather than swept up (deleting it is what ate the owner's log).
+        for bot in machine.iter().filter(|b| **b != owner) {
+            assert_eq!(classify_registration(&file, &tag_part(bot)), Some(Registration::Theirs));
+        }
+    }
+
+    /// Two bots whose handles share a prefix must not shadow each other —
+    /// `opsdu:claude` seeing `opsdu:claude-code`'s file is the same class of
+    /// bug as #all's prefix swallowing a channel's.
+    #[test]
+    fn a_prefix_of_my_handle_is_not_my_handle() {
+        let file = format!("{}.17.pid", surface_tag("opsdu:claude-code", "conv-1", None));
+        assert_eq!(classify_registration(&file, &tag_part("opsdu:claude")), Some(Registration::Theirs));
+        assert_eq!(classify_registration(&file, &tag_part("opsdu:claude-code-2")), Some(Registration::Theirs));
+    }
+
+    /// Keys written by a pre-per-bot hook stay unowned — the upgrade must not
+    /// resurrect "everybody reports it" for the files already on disk.
+    #[test]
+    fn old_keys_are_claimed_by_nobody() {
+        let me = tag_part("opsdu:claude-code");
+        for tag in ["72355ef4-c43f-44ba-a0d5-b2c061026cd6", "72355ef4-c43f__e8cc32c3", "untagged"] {
+            assert_eq!(
+                classify_registration(&format!("{tag}.17.pid"), &me),
+                Some(Registration::Unclaimable),
+            );
+        }
+    }
+
+    /// Only `.pid` files are registrations; the siblings are payload.
+    #[test]
+    fn siblings_are_not_registrations() {
+        let me = tag_part("opsdu:claude-code");
+        let tag = surface_tag("opsdu:claude-code", "conv-1", None);
+        for ext in ["log", "sh", "meta"] {
+            assert_eq!(classify_registration(&format!("{tag}.17.{ext}"), &me), None);
+        }
+        assert!(matches!(
+            classify_registration(&format!("{tag}.17.pid"), &me),
+            Some(Registration::Mine(_))
+        ));
     }
 }
 
