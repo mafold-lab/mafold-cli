@@ -356,13 +356,24 @@ impl<S: Storage> Store<S> {
     /// `reconcile` runs the optimistic-send scan (skipped by `replace_messages`,
     /// which just cleared the window — there's nothing to reconcile against, and
     /// scanning per insert is what made the batch O(n²)).
+    fn older_message(incoming: &CoreMessage, current: &CoreMessage) -> bool {
+        let revision = |m: &CoreMessage| m.payload.as_deref()
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+            .and_then(|p| p.get("content_revision").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        (current.finalized_at_ms.is_some() && incoming.finalized_at_ms.is_none())
+            || revision(incoming) < revision(current)
+    }
+
     async fn upsert_message_locked(&self, m: &CoreMessage, reconcile: bool) {
         let key = msg_key(m);
         let mut m = m.clone();
-        if m.payload.is_none() {
-            if let Some(prev) = self.store.get("msg", &key).await.and_then(|v| de::<CoreMessage>(&v)) {
-                m.payload = prev.payload;
-            }
+        if let Some(prev) = self.store.get("msg", &key).await.and_then(|v| de::<CoreMessage>(&v)) {
+            // All callers (history, WS, native and wasm) share this comparison
+            // under the write lock. Completion order of async cache writes is
+            // not message order. Revisions travel in the preserved wire payload.
+            if Self::older_message(&m, &prev) { return; }
+            if m.payload.is_none() { m.payload = prev.payload; }
         }
         if reconcile {
             if let Some(cid) = m.client_msg_id.clone() {
@@ -518,11 +529,14 @@ impl<S: Storage> Store<S> {
     /// drop an open thread's loaded replies on every history refresh.
     pub async fn replace_messages(&self, conv: &str, msgs: &[CoreMessage]) {
         let _g = self.write_lock.lock().await;
+        let incoming_keys: std::collections::HashSet<String> = msgs.iter().map(msg_key).collect();
         for (k, v) in self.store.scan_prefix("msg", &format!("{conv}|")).await {
-            if de::<CoreMessage>(&v).is_some_and(|m| m.thread_root_id.is_some()) { continue; }
+            if de::<CoreMessage>(&v).is_some_and(|m| m.thread_root_id.is_some()) || incoming_keys.contains(&k) { continue; }
             self.store.delete("msg", &k).await;
         }
-        // The window was just cleared, so there's no stored placeholder to
+        // Keep overlapping keys until upsert compares their revisions; clearing
+        // those first would let an old history page erase the newer live body.
+        // Non-overlapping placeholders were cleared, so there's nothing to
         // reconcile against — skip the per-insert scan (it's what made this O(n²)).
         // Dedup within the batch by client_msg_id, keeping the newest, so two rows
         // sharing a client_msg_id don't both persist.
@@ -1174,4 +1188,32 @@ mod tests {
             assert_eq!(s.last_channel("convB").await.as_deref(), Some("chan2"), "other conv untouched");
         });
     }
+    #[test]
+    fn message_revisions_survive_reordered_upserts_and_history_replacement() {
+        let s = store();
+        pollster::block_on(async {
+            let mut old = msg("stream", "conv", None, 100, None);
+            old.finalized_at_ms = None;
+            old.content = "long old draft".into();
+            old.payload = Some(r#"{"content_revision":2}"#.into());
+            let mut new = old.clone();
+            new.content = "new".into();
+            new.payload = Some(r#"{"content_revision":3}"#.into());
+            s.upsert_message(&new).await;
+            s.upsert_message(&old).await;
+            assert_eq!(s.messages("conv").await[0].content, "new");
+            s.replace_messages("conv", &[old.clone()]).await;
+            assert_eq!(s.messages("conv").await[0].content, "new");
+            new.finalized_at_ms = Some(200);
+            new.payload = Some(r#"{"content_revision":4}"#.into());
+            s.upsert_message(&new).await;
+            s.replace_messages("conv", &[old]).await;
+            assert_eq!(s.messages("conv").await[0].finalized_at_ms, Some(200));
+            new.content = "edited".into();
+            new.payload = Some(r#"{"content_revision":5}"#.into());
+            s.upsert_message(&new).await;
+            assert_eq!(s.messages("conv").await[0].content, "edited");
+        });
+    }
+
 }

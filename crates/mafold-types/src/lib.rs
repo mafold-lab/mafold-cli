@@ -651,6 +651,11 @@ pub struct Channel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Server-assigned content/attachment revision, persisted with the message.
+    /// Independent of a recipient's event seq: late broadcasts and history
+    /// responses keep the revision of the snapshot they actually carry.
+    #[serde(default)]
+    pub content_revision: u64,
     pub id: Uuid,
     pub conversation_id: Uuid,
     pub sender: Account,
@@ -928,6 +933,10 @@ pub struct AccountsPage {
     pub items: Vec<Account>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Usernames among `items` that couldn't answer the caller right now —
+    /// set by `getOfficialBots` only (a resale pool with no seller free).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<String>,
 }
 
 // MARK: - Auth
@@ -1477,3 +1486,4 @@ mod langpack_checksum_tests {
         assert_ne!(langpack_checksum(&a), langpack_checksum(&d));
     }
 }
+pub mod tutorial;

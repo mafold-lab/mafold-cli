@@ -99,12 +99,20 @@ impl std::fmt::Display for DraftRefused {
 
 impl std::error::Error for DraftRefused {}
 
+/// Durable trigger facts needed by the daemon after reconnect. Used both by
+/// the server-side replay filter and the daemon's local compatibility filter.
+pub(crate) const REPLAY_METHODS: &[&str] = &[
+    "events.messageNew", "events.threadReply", "events.messageComplete", "events.chatCleared",
+];
+
 #[derive(Clone)]
 pub struct Client {
     pub http: reqwest::Client,
     pub base: String,
     pub token: String,
     pub drafts: Option<std::sync::Arc<crate::drafts::Outbox>>,
+    writer_id: uuid::Uuid,
+    writer_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Client {
@@ -117,7 +125,11 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http, base, token, drafts: None }
+        Self {
+            http, base, token, drafts: None,
+            writer_id: uuid::Uuid::new_v4(),
+            writer_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
     }
 
     /// The core's typed API handle for this base+token (base gains the `/api`
@@ -239,11 +251,14 @@ impl Client {
     }
 
     /// POST /api/getUpdates — events with hub seq > `since` from the server's
-    /// per-account replay buffer (256 newest per account). Items are
+    /// per-account replay buffer. Ask only for durable trigger events so a
+    /// reconnect does not download hundreds of draft bodies before listening.
+    /// Older servers ignore `methods`; the daemon still filters locally.
+    /// Items are
     /// `{seq, method, params}` in the exact shape WS frames arrive, so a
     /// reconnect replays what it missed through the same handling path.
     pub async fn get_updates(&self, since: u64) -> Result<Vec<Value>> {
-        let v = self.post("getUpdates", json!({ "since": since })).await?;
+        let v = self.post("getUpdates", json!({ "since": since, "methods": REPLAY_METHODS })).await?;
         Ok(v["updates"].as_array().cloned().unwrap_or_default())
     }
 
@@ -870,9 +885,10 @@ retry {attempt}/{} in {delay:?}…",
     /// it to a two-second uplink blip left the bubble animating forever with a
     /// Stop button that could never resolve — the failure this retry exists for.
     pub async fn edit_draft(&self, message_id: &str, content: &str) -> Result<()> {
+        let seq = self.writer_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         self.post_idempotent(
             "botEditDraft",
-            json!({ "message_id": message_id, "content": content }),
+            json!({ "message_id": message_id, "content": content, "writer_id": self.writer_id, "writer_seq": seq }),
         )
         .await?;
         Ok(())
@@ -949,23 +965,23 @@ retry {attempt}/{} in {delay:?}…",
     }
     /// RETRIED: finalizing an already-finalized message is a no-op server-side,
     /// and an unfinalized draft is precisely the "forever generating" bubble.
-    pub async fn finalize(&self, message_id: &str) -> Result<()> {
-        self.post_idempotent("botFinalize", json!({ "message_id": message_id }))
+    pub async fn finalize(&self, message_id: &str, success_for: Option<&str>) -> Result<()> {
+        self.post_idempotent("botFinalize", json!({ "message_id": message_id, "success_for": success_for }))
             .await?;
         Ok(())
     }
 
     /// Persist the final snapshot before attempting either write. A periodic
     /// daemon task retries pending entries, including after process restart.
-    pub async fn finish_draft(&self, message_id: &str, content: &str) -> Result<bool> {
+    pub async fn finish_draft(&self, message_id: &str, content: &str, success_for: Option<&str>) -> Result<bool> {
         if let Some(outbox) = &self.drafts {
-            if let Err(e) = outbox.complete(message_id, content) {
+            if let Err(e) = outbox.complete(message_id, content, success_for) {
                 eprintln!("draft {message_id} completion journal failed: {e:#}");
             }
             outbox.deliver(self, message_id).await
         } else {
             self.edit_draft(message_id, content).await?;
-            self.finalize(message_id).await?;
+            self.finalize(message_id, success_for).await?;
             Ok(true)
         }
     }
@@ -1984,5 +2000,53 @@ content-range: bytes {}-{}/{}\r\ncontent-length: {}\r\n\r\n",
         let s = cause_chain(&Decoding(Reset));
         assert!(s.contains("error decoding response body"), "{s}");
         assert!(s.contains("connection reset by peer"), "must keep the reason: {s}");
+    }
+}
+
+#[cfg(test)]
+mod draft_order_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn draft_retry_keeps_ordinal_and_cloned_producer_advances_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let len: usize = header.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    if bytes.len() < end + 4 + len { continue; }
+                    requests.push(serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + len]).unwrap());
+                    break;
+                }
+                if attempt == 0 { continue; } // Request committed, response lost.
+                let body = r#"{"ok":true,"result":{}}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let client = Client::new(base, "test".into());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            client.edit_draft("message", "first").await.unwrap();
+            client.clone().edit_draft("message", "second").await.unwrap();
+            let bodies = server.await.unwrap();
+            assert_eq!(bodies[0], bodies[1]);
+            assert_eq!(bodies[1]["writer_id"], bodies[2]["writer_id"]);
+            assert!(bodies[2]["writer_seq"].as_u64().unwrap() > bodies[1]["writer_seq"].as_u64().unwrap());
+            assert_eq!(bodies[2]["content"], "second");
+        }).await.unwrap();
     }
 }

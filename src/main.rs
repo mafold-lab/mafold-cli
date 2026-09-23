@@ -58,6 +58,11 @@ struct Cli {
     base: String,
     #[arg(long, env = "MAFOLD_BOT_TOKEN", global = true)]
     token: Option<String>,
+    /// Act as this logged-in human account (default: the current one).
+    /// Applies to every command that speaks as a person — `connection`,
+    /// `report`, and the control plane.
+    #[arg(long, env = "MAFOLD_ACCOUNT", global = true)]
+    account: Option<String>,
     /// Disable the agent's hourly auto-update.
     #[arg(long, env = "MAFOLD_NO_AUTO_UPDATE", global = true)]
     no_auto_update: bool,
@@ -250,6 +255,12 @@ enum Cmd {
         #[arg(long)]
         password: Option<String>,
     },
+    /// The human accounts logged in on this machine: list them, switch which
+    /// one commands act as, or forget one. No argument lists them.
+    Account {
+        #[command(subcommand)]
+        cmd: Option<AccountCmd>,
+    },
     /// Re-report this machine's available harnesses (uses the saved login).
     Report,
     /// Roll back to the previous binary (after a bad update).
@@ -285,6 +296,25 @@ enum Cmd {
     PermissionMcp,
 }
 
+#[derive(Subcommand)]
+enum AccountCmd {
+    /// List the accounts logged in on this machine.
+    List,
+    /// Make this the account commands act as from now on.
+    Use { username: String },
+    /// Sign an account out here: revoke its session server-side, then forget
+    /// it locally. The account itself is untouched — `mafold login` brings it
+    /// back.
+    Rm {
+        username: String,
+        /// Only forget it here, leaving the session alive server-side. For a
+        /// machine you can't reach the api from; the session then has to be
+        /// killed by hand in Settings ▸ Active Sessions.
+        #[arg(long)]
+        local: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // The agent stores its pid/log/config under `~/.mafold`, keyed off `$HOME`.
@@ -310,6 +340,35 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::PermissionMcp) {
         return permission_mcp::run();
+    }
+
+    // `--account` decides whose session the person-shaped commands speak with,
+    // so it is resolved ONCE here rather than re-derived per command. Naming an
+    // account this machine hasn't logged in gets a list, not a silent fallback
+    // to somebody else's credentials — running as the wrong person "works"
+    // right up until it writes something. `login` and `account` are exempt:
+    // there the name is the thing being created or inspected.
+    if let Some(want) = cli.account.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let exempt = matches!(cli.cmd, Cmd::Login { .. } | Cmd::Account { .. });
+        if !exempt && session::load_named(want).is_none() {
+            let known = session::all();
+            anyhow::bail!(
+                "no account @{want} on this machine{}",
+                if known.is_empty() {
+                    " — run `mafold login` first".to_string()
+                } else {
+                    format!(
+                        " — logged in here: {}",
+                        known.iter().map(|s| format!("@{}", s.username)).collect::<Vec<_>>().join(", ")
+                    )
+                }
+            );
+        }
+        session::select(want);
+    }
+
+    if let Cmd::Account { cmd } = &cli.cmd {
+        return account_cmd(&cli.base, cmd.as_ref()).await;
     }
 
     // Daemon control + self-update need no auth.
@@ -506,7 +565,8 @@ async fn main() -> Result<()> {
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
-        | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
+        | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }
+        | Cmd::Account { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
         | Cmd::SteerHook | Cmd::PermissionMcp => unreachable!(),
@@ -659,6 +719,17 @@ async fn finish_login(base: &str, token: String, uname: String, auto_up: bool, n
     };
     session::save(&sess)?;
     println!("✓ logged in as {uname} on {}", sess.device_name);
+    // A second login used to overwrite the first in silence. Now it stacks —
+    // so say so, or someone who expected a clobber won't know the old account
+    // is still here answering connection calls.
+    let others: Vec<String> = session::all()
+        .into_iter()
+        .filter(|s| !s.username.eq_ignore_ascii_case(&uname))
+        .map(|s| format!("@{}", s.username))
+        .collect();
+    if !others.is_empty() {
+        println!("  also on this machine: {}  (mafold account)", others.join(", "));
+    }
     report_with(base, &sess).await?;
     if auto_up {
         // Best-effort: a failure here must not fail the login itself.
@@ -667,6 +738,71 @@ async fn finish_login(base: &str, token: String, uname: String, auto_up: bool, n
         }
     } else {
         println!("\n→ keep this machine available + auto-provision new bots:  mafold up");
+    }
+    Ok(())
+}
+
+/// `mafold account [list|use|rm]` — the human logins this machine holds.
+/// `list` and `use` never touch the network: they only read and re-point
+/// ~/.mafold/session.json, so they still answer when the api is down, which is
+/// exactly when you want to know who you are. Only `rm` calls out, because
+/// signing out has to reach the server to mean anything.
+async fn account_cmd(base: &str, cmd: Option<&AccountCmd>) -> Result<()> {
+    match cmd.unwrap_or(&AccountCmd::List) {
+        AccountCmd::List => {
+            let accounts = session::all();
+            if accounts.is_empty() {
+                println!("No account logged in on this machine.  →  mafold login");
+                return Ok(());
+            }
+            let current = session::current_username().unwrap_or_default();
+            println!("{:<3}{:<24}{}", "", "ACCOUNT", "MACHINE");
+            for s in &accounts {
+                let mark = if s.username.eq_ignore_ascii_case(&current) { "*" } else { " " };
+                println!("{mark:<3}{:<24}{}", format!("@{}", s.username), s.device_name);
+            }
+            // The star is the default, not a lock — say how to move it, and how
+            // to override it for one command without moving it at all.
+            println!(
+                "\n  * = current   ·   switch: mafold account use <name>   ·   one command: --account <name>"
+            );
+        }
+        AccountCmd::Use { username } => {
+            let s = session::use_account(username)?;
+            println!("✓ now acting as @{}", s.username);
+        }
+        AccountCmd::Rm { username, local } => {
+            let Some(sess) = session::load_named(username) else {
+                anyhow::bail!("no account @{username} on this machine — `mafold account` lists them");
+            };
+            // Revoke BEFORE forgetting. The stored token is the only thing that
+            // can kill its own session, so dropping it first would strand a
+            // live session nobody on this machine can reach any more — the
+            // exact opposite of what signing out is for. A failure therefore
+            // stops here rather than half-succeeding.
+            if !*local {
+                Client::new(base.to_string(), sess.token.clone())
+                    .call("auth/logout", serde_json::json!({}))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "couldn't revoke @{username}'s session (nothing was forgotten, so you can retry). \
+                             Offline? `mafold account rm {username} --local` forgets it here and leaves the \
+                             session alive — kill it in Settings ▸ Active Sessions"
+                        )
+                    })?;
+            }
+            session::remove(username)?;
+            let fate = if *local {
+                "forgot here · session still ALIVE server-side"
+            } else {
+                "signed out · session revoked"
+            };
+            match session::current_username() {
+                Some(next) => println!("✓ @{username} {fate} · now acting as @{next}"),
+                None => println!("✓ @{username} {fate} · no accounts left on this machine"),
+            }
+        }
     }
     Ok(())
 }

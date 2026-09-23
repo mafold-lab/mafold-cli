@@ -766,11 +766,14 @@ pub async fn supervise(base: String, auto_update: bool) {
         let _ = writeln!(f, "{}", std::process::id());
     }
     println!("supervisor up (pid {}) · base {base}", std::process::id());
-    // Answer granted connection calls for the OWNER's account while the
-    // daemons run — the piece that makes "@chatgpt on my Codex subscription"
-    // work whenever this machine is up. Quiet: it only serves when the vault
-    // key is already cached here (see `connection::supervise_listener`).
-    tokio::spawn(crate::connection::supervise_listener(base.clone()));
+    // Answer granted connection calls for EACH account logged in here while
+    // the daemons run — the piece that makes "@chatgpt on my Codex
+    // subscription" work whenever this machine is up. One listener per
+    // account, spawned from the loop below so an account that logs in later
+    // gets served without restarting the supervisor. Quiet: each only serves
+    // when that account's vault key is already cached here (see
+    // `connection::supervise_listener`).
+    let mut listening: std::collections::HashSet<String> = std::collections::HashSet::new();
     let http = reqwest::Client::new();
     let mut ticks: u64 = 0;
     loop {
@@ -832,12 +835,25 @@ pub async fn supervise(base: String, auto_update: bool) {
         // Control plane (after `mafold login`): claim any auto-provisioned bots
         // (→ add + start their daemons, no `mafold add` paste) and keep this
         // machine's harness report fresh (~every 30s) so New-Bot sees it online.
-        if let Some(sess) = crate::session::load() {
+        // EVERY account logged in here, not just the current one. The server
+        // upserts both of these on `(account, device_id)`, so each login gets
+        // its own row for this one machine; reporting only the current account
+        // would make a second person's machine read as offline the moment
+        // somebody ran `mafold account use`.
+        for sess in crate::session::all() {
             if let Err(e) = poll_provisions(&http, &base, &sess).await {
-                eprintln!("provision poll failed: {e}");
+                eprintln!("provision poll failed (@{}): {e}", sess.username);
             }
             if ticks % 3 == 0 {
                 let _ = report_local_harnesses(&http, &base, &sess).await;
+            }
+            // Accounts are re-read every tick, so a login added while the
+            // supervisor is already up gets its vault listener right here.
+            if listening.insert(sess.username.to_lowercase()) {
+                tokio::spawn(crate::connection::supervise_listener(
+                    base.clone(),
+                    sess.username.clone(),
+                ));
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;

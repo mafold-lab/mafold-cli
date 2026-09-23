@@ -916,10 +916,7 @@ fn trigger_message(method: &str, env: &serde_json::Value) -> Option<serde_json::
 /// filter and the cursor pin used to carry their own copies of it, and a copy
 /// is how `messageComplete` would have gone missing from one of them.
 fn is_durable_event(method: &str) -> bool {
-    matches!(
-        method,
-        "events.messageNew" | "events.threadReply" | "events.messageComplete" | "events.chatCleared"
-    )
+    crate::client::REPLAY_METHODS.contains(&method)
 }
 
 /// Does this message take the AI door — `should_respond`'s explicit-@-only
@@ -2381,14 +2378,23 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
         Err(_) => return, // can't read own detail — don't guess
     }
     let Some(owner) = owner_username else { return };
-    let Some(sess) = crate::session::load() else {
-        println!("note: Customize fields for @{my_username} need publishing — run `mafold login` once as @{owner} and restart.");
+    // Ask for the OWNER's session BY NAME, not for "the" session: this machine
+    // can hold several logins, and which one happens to be current has nothing
+    // to do with who owns this bot. While there was one slot these two were the
+    // same thing, so a machine logged in as anyone else refused to publish.
+    let Some(sess) = crate::session::load_named(owner) else {
+        let here = crate::session::all();
+        let who = if here.is_empty() {
+            "no account is logged in here".to_string()
+        } else {
+            format!(
+                "this machine has {}",
+                here.iter().map(|s| format!("@{}", s.username)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        println!("note: Customize fields for @{my_username} need publishing — {who}; run `mafold login` as @{owner} and restart.");
         return;
     };
-    if !sess.username.eq_ignore_ascii_case(owner) {
-        println!("note: Customize fields for @{my_username} need publishing, but this machine is logged in as @{} (owner is @{owner}) — fields not published.", sess.username);
-        return;
-    }
     let owner_client = Client::new(client.base.clone(), sess.token.clone());
     match owner_client
         .call("setBotConfig", serde_json::json!({ "username": my_username, "config_schema": fields }))
@@ -7118,7 +7124,7 @@ async fn handle(
     // ever gets a given message.
     let leftover = crate::steer_hook::take(&steer_file);
     let _ = std::fs::remove_file(&steer_file);
-    match client.finish_draft(&msg_id, &final_content).await {
+    match client.finish_draft(&msg_id, &final_content, if clean_end { trigger_id } else { None }).await {
         Ok(true) => println!("→ finalized reply for chat {chat_id}"),
         Ok(false) => println!("→ reply {msg_id} completion delivery in progress"),
         Err(e) => eprintln!("reply {msg_id} completion queued for retry: {e:#}"),

@@ -358,10 +358,33 @@ impl Conn {
         if !sent {
             return false;
         }
-        let ok = matches!(
-            tokio::time::timeout(Duration::from_secs(10), rx).await,
-            Ok(Ok(v)) if v["subtype"] == "success"
-        );
+        // A timeout, a dropped channel and a reply we don't recognise all
+        // collapsed into the same `false`, and the fallback line that follows
+        // names none of them — so a handshake that silently costs ten seconds
+        // on every prewarm reads exactly like a CLI that answered "no".
+        let began = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        let ok = matches!(&outcome, Ok(Ok(v)) if v["subtype"] == "success");
+        if !ok {
+            let why = match &outcome {
+                Err(_) => "no reply in 10s".to_string(),
+                Ok(Err(_)) => "reply channel dropped".to_string(),
+                Ok(Ok(v)) => format!("reply subtype={}", v["subtype"]),
+            };
+            // Whatever claude complained about on its way up is the one thing
+            // this side cannot reconstruct afterwards.
+            let tail = self.stderr_text();
+            let tail = tail.trim_end();
+            eprintln!(
+                "[cc-pool] hook handshake failed after {}ms ({why}) rid={rid}{}",
+                began.elapsed().as_millis(),
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — claude stderr: {}", tail.replace('\n', " ⏎ "))
+                }
+            );
+        }
         self.shared.pending.lock().unwrap().remove(&rid);
         self.control_hooks = ok;
         ok
@@ -545,6 +568,14 @@ fn spawn_reader(
                                 let rid = v["response"]["request_id"].as_str().unwrap_or("");
                                 if let Some(w) = shared.pending.lock().unwrap().remove(rid) {
                                     let _ = w.send(v["response"].clone());
+                                } else if rid.starts_with("mf-init-") {
+                                    // The handshake already gave up on this one.
+                                    // "Answered late" and "never answered" are
+                                    // different bugs, and only this line tells
+                                    // them apart.
+                                    eprintln!(
+                                        "[cc-pool] late init reply for {rid} — nobody waiting any more"
+                                    );
                                 }
                                 continue;
                             }
@@ -1121,5 +1152,60 @@ mod tests {
         let p = orphaned_text_preview(&[delta(&long)]);
         assert!(p.ends_with('…'), "{p}");
         assert_eq!(p.chars().count(), 241, "240 chars + the ellipsis");
+    }
+
+    /// A stub standing in for claude: `script` owns stdin/stdout the same way
+    /// the real CLI does, so the handshake runs its true path.
+    async fn stub(script: &str) -> Conn {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(script);
+        Conn::spawn(key("opus"), "t1".into(), String::new(), cmd, "/tmp")
+            .await
+            .expect("stub spawns")
+    }
+
+    const REPLY: &str =
+        r#"{"type":"control_response","response":{"subtype":"%S","request_id":"mf-init-t1"}}"#;
+
+    #[tokio::test]
+    async fn a_cli_that_answers_the_handshake_registers_control_hooks() {
+        let mut c = stub(&format!(
+            "read -r _; echo '{}'; cat > /dev/null",
+            REPLY.replace("%S", "success")
+        ))
+        .await;
+        assert!(c.register_hooks(true, true).await);
+        assert!(c.control_hooks);
+    }
+
+    /// The reply we don't recognise must fail FAST — conflating it with the
+    /// ten-second timeout is what hid a 10s-per-prewarm tax for days.
+    #[tokio::test]
+    async fn an_unrecognised_reply_fails_without_burning_the_timeout() {
+        let mut c = stub(&format!(
+            "read -r _; echo '{}'; cat > /dev/null",
+            REPLY.replace("%S", "error")
+        ))
+        .await;
+        let began = Instant::now();
+        assert!(!c.register_hooks(true, true).await);
+        assert!(!c.control_hooks);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "answered at {:?} — a reply is not a timeout",
+            began.elapsed()
+        );
+    }
+
+    /// The production shape. Ignored because it deliberately costs the full ten
+    /// seconds: run it with `--ignored --nocapture` to read the diagnostic line.
+    #[tokio::test]
+    #[ignore = "spends the real 10s handshake timeout"]
+    async fn a_silent_cli_times_out_and_the_line_carries_its_stderr() {
+        let mut c = stub("echo 'stub refuses to handshake' >&2; cat > /dev/null").await;
+        let began = Instant::now();
+        assert!(!c.register_hooks(true, true).await);
+        assert!(began.elapsed() >= Duration::from_secs(10));
+        assert!(c.stderr_text().contains("stub refuses to handshake"));
     }
 }

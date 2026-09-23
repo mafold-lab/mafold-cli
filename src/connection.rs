@@ -1633,12 +1633,16 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
 /// never prints. Locked (or logged-out) machines just re-check on a slow tick,
 /// so running `mafold connection unlock` later brings this to life without
 /// restarting the supervisor.
-pub async fn supervise_listener(base: String) {
+pub async fn supervise_listener(base: String, username: String) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMsg;
     let mut said_locked = false;
     loop {
-        let Some(sess) = session::load() else {
+        // By NAME, never "the current session": this machine can hold several
+        // logins and one listener belongs to exactly one of them. Re-read each
+        // pass so a re-login (new token) is picked up, and so the listener
+        // stands down on its own once that account is removed.
+        let Some(sess) = session::load_named(&username) else {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             continue;
         };
