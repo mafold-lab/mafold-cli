@@ -322,33 +322,41 @@ fn attachment_label(atts: &[serde_json::Value]) -> String {
     }
 }
 
-/// Drop `{% … %}` Markdoc tag markup from a message body. Reply quotes and
-/// excerpts want the prose a human read, not a wall of card attributes — an
-/// agent's reply is routinely 90% run/tool cards. Content BETWEEN a container
-/// tag's open and close survives (it's often the readable part); an unclosed
-/// tag drops to end-of-string (a truncated card is not prose either).
-fn strip_card_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find("{%") {
-        out.push_str(&rest[..i]);
-        rest = match rest[i..].find("%}") {
-            Some(j) => &rest[i + j + 2..],
-            None => "",
-        };
+/// A message body as the MODEL should read it — in a reply quote, a reply
+/// excerpt, or a RECENT CONVERSATION row: forwarded records flattened, the
+/// transcript machinery cut WITH its bodies (run groups, traces, tool cards,
+/// the result stamp and its usage JSON), and the blank lines that leaves
+/// closed. Cards someone authored — a `{% mafold/html %}` the model wrote, an
+/// `{% mafold/ask %}`, a `{% mafold/quote %}` — are content and stay.
+///
+/// The strip is the shared one the hosted brains use (`brains/context.rs`),
+/// on purpose: the daemon used to keep its own tag-only stripper, which
+/// dropped `{% … %}` markup but KEPT every card's body. Quoting an agent's
+/// reply then meant quoting its tool output and usage JSON — and the 1200-char
+/// head+tail cut kept exactly those two ends, dropping the answer between
+/// them.
+fn model_view(raw: &str) -> String {
+    let flat = flatten_body_records(raw, &mut vec![]);
+    let mut out = mafold_transcript::render::strip_transcript_cards(&flat).trim().to_string();
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
     }
-    out.push_str(rest);
     out
 }
 
-/// One-line excerpt of a message body for reply annotations: forwarded records
-/// flattened, card tags stripped, whitespace collapsed, capped at `max` chars.
-/// A card-only body falls back to its raw text — "{% mafold/ask" still
-/// identifies WHICH message was replied to, which is the whole job here.
+/// One-line excerpt of a message body for reply annotations: [`model_view`],
+/// whitespace collapsed, capped at `max` chars. A body that is ONLY machinery
+/// falls back to its raw text — markup still identifies WHICH message was
+/// replied to, which is the whole job here.
 fn excerpt(body: &str, max: usize) -> String {
-    let flat = flatten_body_records(body, &mut vec![]);
-    let stripped = strip_card_tags(&flat);
-    let base = if stripped.trim().is_empty() { flat.as_str() } else { stripped.as_str() };
+    let stripped = model_view(body);
+    let flat;
+    let base = if stripped.is_empty() {
+        flat = flatten_body_records(body, &mut vec![]);
+        flat.as_str()
+    } else {
+        stripped.as_str()
+    };
     let one = base.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= max {
         one
@@ -356,6 +364,46 @@ fn excerpt(body: &str, max: usize) -> String {
         let cut: String = one.chars().take(max).collect();
         format!("{cut}…")
     }
+}
+
+/// `(author, body)` of a quote-reply's target, as [`reply_context_block`]
+/// quotes it: [`model_view`], head+tail capped, its attachments named. An
+/// agent's reply reads as its ANSWER — the run groups and the usage stamp
+/// around it are how the answer was made, not what it said.
+fn quoted_message(m: &serde_json::Value) -> (String, String) {
+    let who = m
+        .get("sender")
+        .and_then(|s| s.get("username"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("someone")
+        .to_string();
+    let raw = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let mut body = model_view(raw);
+    if body.is_empty() {
+        // Nothing but machinery (or a card-only body): its markup still
+        // identifies WHICH message was quoted — the hosted brains fall back
+        // the same way.
+        body = flatten_body_records(raw, &mut vec![]).trim().to_string();
+    }
+    // Same head+tail keep as history rows, smaller budget: the quote is
+    // orientation, not the transcript.
+    const QUOTE_MAX: usize = 1200;
+    if body.chars().count() > QUOTE_MAX {
+        let chars: Vec<char> = body.chars().collect();
+        let head: String = chars[..QUOTE_MAX * 3 / 4].iter().collect();
+        let tail: String = chars[chars.len() - QUOTE_MAX / 4..].iter().collect();
+        body = format!("{head}\n…[truncated]…\n{tail}");
+    }
+    let attach = attachment_label(
+        m.get("attachments").and_then(|a| a.as_array()).map(|v| v.as_slice()).unwrap_or(&[]),
+    );
+    if !attach.is_empty() {
+        body = if body.is_empty() { format!("[{attach}]") } else { format!("{body}\n[{attach}]") };
+    }
+    if body.is_empty() {
+        body = "[empty message]".to_string(); // tombstoned target
+    }
+    (who, body)
 }
 
 /// The bracketed block injected ahead of a quote-reply trigger's text so the
@@ -917,6 +965,63 @@ fn trigger_message(method: &str, env: &serde_json::Value) -> Option<serde_json::
 /// is how `messageComplete` would have gone missing from one of them.
 fn is_durable_event(method: &str) -> bool {
     crate::client::REPLAY_METHODS.contains(&method)
+}
+
+/// Did the socket skip something? Every frame carries `prev`: the seq the
+/// server numbered for THIS account right before it. `covered` is the highest
+/// seq we have accounted for — processed, or vouched for by a catch-up. A
+/// `prev` above it names a frame that was numbered for us and never arrived.
+///
+/// `seq` alone cannot say this: it is one counter shared by every account, so
+/// it jumps on every frame and a jump means nothing. Found 2026-09-24: a
+/// daemon on a machine that froze for a minute fell a ring (256 events) behind,
+/// the api skipped what it could not deliver (`RecvError::Lagged`), and the @
+/// that was supposed to summon the bot was among the skipped — no reconnect,
+/// so no catch-up, and nothing on either side noticed. An older api sends no
+/// `prev` (reads as 0): no detection, exactly the old behavior.
+fn socket_skipped(prev: u64, covered: u64) -> bool {
+    prev > covered
+}
+
+/// What a gap fetch replays ahead of the frame that exposed the gap: the
+/// durable events numbered BEFORE it, in order. Anything numbered after it is
+/// still on its way down the socket, and replaying it first would push the
+/// cursor past the frame we are holding — which the duplicate check would then
+/// throw away.
+fn gap_fill(items: Vec<serde_json::Value>, before: u64) -> Vec<serde_json::Value> {
+    items
+        .into_iter()
+        .filter(|u| is_durable_event(u["method"].as_str().unwrap_or("")))
+        .filter(|u| u["seq"].as_u64().is_some_and(|s| s < before))
+        .collect()
+}
+
+/// `getUpdates`, patiently. A failure here is not a hiccup — the frames in the
+/// window live only in the server's in-memory backlog, the cursor moves on with
+/// the next live frame, and nothing ever fetches them again: the user simply
+/// never gets an answer.
+///
+/// And the moments this is called are the moments it is most likely to fail.
+/// After a reconnect: an api re-deploy drops every daemon's socket at once, they
+/// all reconnect together, and the fresh container is still hydrating (a
+/// 26k-row load that reports itself as a ~6s slow statement), so the catch-up
+/// lands on an upstream that is briefly 502 or just very slow. After a gap: the
+/// link was bad enough to lose frames in the first place. Either window is
+/// seconds long. Waiting it out costs nothing; not waiting costs messages.
+async fn fetch_missed(client: &Client, since: u64, what: &str) -> Result<crate::client::Updates> {
+    let mut attempt = 0u32;
+    loop {
+        match client.get_updates(since).await {
+            Ok(u) => return Ok(u),
+            Err(e) if attempt < 4 => {
+                let wait = 2u64.pow(attempt + 1); // 2s, 4s, 8s, 16s
+                eprintln!("⚠ {what} getUpdates failed ({e:#}) — retrying in {wait}s");
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Does this message take the AI door — `should_respond`'s explicit-@-only
@@ -3307,10 +3412,18 @@ async fn connect_and_run(
     let mut last_seq: u64 = load_cursor(my_username);
     let mut last_cursor_save = std::time::Instant::now();
     let mut replay: std::collections::VecDeque<serde_json::Value> = Default::default();
+    // The highest seq a catch-up has vouched for: everything the server
+    // numbered for us up to here was either handed over in `replay` or was
+    // never replayable (a draft snapshot, a live-only signal). Without it the
+    // first live frame after a catch-up would usually point `prev` at one of
+    // those, and report a gap that is not there.
+    let mut covered: u64 = 0;
 
     loop {
-        let env: serde_json::Value = match replay.pop_front() {
-            Some(v) => v,
+        // `live`: this frame came off the socket, not out of `replay` — only a
+        // live frame can reveal that the socket skipped something (below).
+        let (env, live): (serde_json::Value, bool) = match replay.pop_front() {
+            Some(v) => (v, false),
             None => {
                 // Zombie-socket watchdog. A dead peer does NOT error this read:
                 // when the api restarts behind Cloudflare, the edge keeps our
@@ -3332,7 +3445,7 @@ async fn connect_and_run(
                 };
                 let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
                 let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
-                match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue }
+                match serde_json::from_str(&text) { Ok(v) => (v, true), Err(_) => continue }
             }
         };
         // React to new top-level messages, thread replies (so the bot can be
@@ -3354,52 +3467,68 @@ async fn connect_and_run(
                 last_seq = head;
                 save_cursor(my_username, last_seq);
             } else if last_seq < head {
-                // ONE attempt used to be the whole story, and a failure here is
-                // not a hiccup — it is data loss. The frames in this window are
-                // only in the server's in-memory backlog; the cursor moves on
-                // with the next live frame, so nothing ever fetches them again
-                // and the user simply never gets an answer.
-                //
-                // And the one moment this call is most likely to fail is the
-                // moment it matters most: an api re-deploy drops every daemon's
-                // socket at once, they all reconnect together, and the fresh
-                // container is still hydrating (a 26k-row load that reports
-                // itself as a ~6s slow statement) — so the catch-up lands on an
-                // upstream that is briefly 502 or just very slow. That window is
-                // seconds long. Waiting it out costs nothing; not waiting costs
-                // messages. Retry, then say plainly what was lost if it really
-                // is unreachable.
-                let mut attempt = 0u32;
-                let fetched = loop {
-                    match client.get_updates(last_seq).await {
-                        Ok(items) => break Ok(items),
-                        Err(e) if attempt < 4 => {
-                            let wait = 2u64.pow(attempt + 1); // 2s, 4s, 8s, 16s
-                            eprintln!("⚠ catch-up getUpdates failed ({e:#}) — retrying in {wait}s");
-                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                            attempt += 1;
-                        }
-                        Err(e) => break Err(e),
-                    }
-                };
-                match fetched {
-                    Ok(items) => {
+                // Retried, not tried once (`fetch_missed`): one failed attempt
+                // used to be permanent loss.
+                match fetch_missed(client, last_seq, "catch-up").await {
+                    Ok(u) => {
                         // Replay message-bearing events (+ chatCleared) only
                         // (`is_durable_event`): a stale inline query / probe /
                         // push job must not re-fire its side effects.
-                        let items: Vec<_> = items
+                        let items: Vec<_> = u
+                            .items
                             .into_iter()
                             .filter(|u| is_durable_event(u["method"].as_str().unwrap_or("")))
                             .collect();
                         if !items.is_empty() {
                             println!("↻ catch-up: replaying {} missed event(s) (seq {last_seq} → {head})", items.len());
                         }
+                        if u.truncated {
+                            eprintln!("⚠ catch-up: part of (seq {last_seq}, {head}] had already aged out of the server's backlog — those events are gone");
+                        }
+                        covered = covered.max(u.head);
                         replay.extend(items);
                     }
-                    Err(e) => eprintln!("⚠ catch-up getUpdates failed after 5 attempts: {e:#} — events in (seq {last_seq}, {head}] are lost to this daemon"),
+                    // Not the last word any more: the first live frame will
+                    // point `prev` into this window and the gap check below
+                    // asks again.
+                    Err(e) => eprintln!("⚠ catch-up getUpdates failed after 5 attempts: {e:#} — events in (seq {last_seq}, {head}] are missing; the next frame will retry"),
                 }
             }
             continue;
+        }
+        // ── Gap check ── A live frame whose `prev` we never saw means the
+        // socket skipped something while we stayed connected — we were too
+        // slow to be handed it (a frozen machine, a saturated link) and the
+        // server moved on (`socket_skipped`). The skipped frames are still in
+        // the server's backlog: fetch them, replay the durable ones through
+        // the same arms, and only then handle this frame. It goes back on the
+        // queue BEHIND them, so the order things were said is the order they
+        // are handled.
+        if live {
+            let seq = env.get("seq").and_then(|v| v.as_u64());
+            let prev = env.get("prev").and_then(|v| v.as_u64()).unwrap_or(0);
+            // (A frame at or below the cursor is a raced duplicate; the cursor
+            // step below drops it, and it has nothing to say about gaps.)
+            if let Some(s) = seq.filter(|&s| s > last_seq && socket_skipped(prev, last_seq.max(covered))) {
+                println!("⚠ gap: the socket skipped frame(s) before seq {s} — it follows {prev}, the last one seen was {last_seq}; fetching them");
+                match fetch_missed(client, last_seq, "gap").await {
+                    Ok(u) => {
+                        let items = gap_fill(u.items, s);
+                        println!("↻ gap: replaying {} missed event(s) ahead of seq {s}", items.len());
+                        if u.truncated {
+                            eprintln!("⚠ gap: part of (seq {last_seq}, {s}) had already aged out of the server's backlog — those events are gone");
+                        }
+                        // Vouched for up to this frame, no further: anything
+                        // the answer held past it was dropped by `gap_fill`
+                        // and is still ours to hear about.
+                        covered = covered.max(u.head.min(s));
+                        replay.extend(items);
+                        replay.push_back(env);
+                        continue;
+                    }
+                    Err(e) => eprintln!("⚠ gap: getUpdates failed after 5 attempts: {e:#} — events in (seq {last_seq}, {s}) are lost to this daemon"),
+                }
+            }
         }
         // Every frame — live or replayed — advances the cursor. A live frame
         // the replay already covered (it raced in while getUpdates ran) is a
@@ -4279,12 +4408,18 @@ async fn connect_and_run(
             // authorized AI account and how the exchange terminates — an @ hands
             // the mic back, no @ lets it end (`.docs/a2a-v0.md` §3). Prompt-only:
             // `content` above stays pristine for the slash and ask-stamp paths.
+            // What the trigger SAID, the way the quote above reads it (and the
+            // hosted brains read a trigger): an AI sender's message is a
+            // finished transcript, and its run groups, tool output and usage
+            // stamp are how it got there, not what it is asking.
+            let said = mafold_transcript::render::strip_transcript_cards(&content);
             let prompt = if sender_is_bot {
                 format!(
-                    "[该消息来自已授权的 AI 账户 @{sender_username}。直接回复即可;只有当你需要对方再回应时才 @ 他。若对话可以收尾,回复中不要 @ 任何 AI 账户。]\n{content}"
+                    "[该消息来自已授权的 AI 账户 @{sender_username}。直接回复即可;只有当你需要对方再回应时才 @ 他。若对话可以收尾,回复中不要 @ 任何 AI 账户。]\n{}",
+                    said.trim()
                 )
             } else {
-                content
+                said
             };
             // …and when ONE message @-ed several agents, say so. The server gave
             // this one the mic (`.docs/a2a-v2.md`); the others were named, are
@@ -6052,7 +6187,8 @@ async fn recent_group_context(
     // agents' run/tool cards) mid-tag, which made AI-authored messages
     // second-class in practice — against the unified account model. One
     // uniform, larger budget for EVERY sender, with head+tail keeping so a
-    // long message's conclusion survives (see below).
+    // long message's conclusion survives (see below); the cards themselves no
+    // longer reach it (`model_view`).
     const MAX_CHARS: usize = 2000;
     // Whole-block cap: a card-heavy chat could otherwise inject 30 × MAX_CHARS.
     // Past this, OLDEST rows are dropped first.
@@ -6079,42 +6215,7 @@ async fn recent_group_context(
     // row filter below drops); one deeper fetch before giving up on old ones.
     if let Some(rid) = reply_to_id {
         let find = |arr: &[serde_json::Value]| -> Option<(String, String)> {
-            let m = arr.iter().find(|m| m.get("id").and_then(|v| v.as_str()) == Some(rid))?;
-            let who = m
-                .get("sender")
-                .and_then(|s| s.get("username"))
-                .and_then(|u| u.as_str())
-                .unwrap_or("someone")
-                .to_string();
-            let raw = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            let flat = flatten_body_records(raw, &mut vec![]);
-            let mut body = strip_card_tags(&flat).trim().to_string();
-            if body.is_empty() {
-                body = flat.trim().to_string(); // card-only target: markup still identifies it
-            }
-            // Stripped cards leave their blank lines behind — collapse the gaps.
-            while body.contains("\n\n\n") {
-                body = body.replace("\n\n\n", "\n\n");
-            }
-            // Same head+tail keep as history rows, smaller budget: the quote is
-            // orientation, not the transcript.
-            const QUOTE_MAX: usize = 1200;
-            if body.chars().count() > QUOTE_MAX {
-                let chars: Vec<char> = body.chars().collect();
-                let head: String = chars[..QUOTE_MAX * 3 / 4].iter().collect();
-                let tail: String = chars[chars.len() - QUOTE_MAX / 4..].iter().collect();
-                body = format!("{head}\n…[truncated]…\n{tail}");
-            }
-            let attach = attachment_label(
-                m.get("attachments").and_then(|a| a.as_array()).map(|v| v.as_slice()).unwrap_or(&[]),
-            );
-            if !attach.is_empty() {
-                body = if body.is_empty() { format!("[{attach}]") } else { format!("{body}\n[{attach}]") };
-            }
-            if body.is_empty() {
-                body = "[empty message]".to_string(); // tombstoned target
-            }
-            Some((who, body))
+            arr.iter().find(|m| m.get("id").and_then(|v| v.as_str()) == Some(rid)).map(quoted_message)
         };
         let mut quote = find(items);
         if quote.is_none() {
@@ -6174,10 +6275,13 @@ async fn recent_group_context(
         // (this row used to be the raw card markup, and before the body
         // transport it was the literal string "[1 attachment(s)]"). Photos
         // inside history records are NOT downloaded — only the trigger
-        // message's are — so the sink is discarded.
+        // message's are — so the sink is discarded. Another agent's message
+        // reads as what it SAID (`model_view`): its run groups and usage stamp
+        // would otherwise spend this row's budget and put the answer past the
+        // cut.
         let raw = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        let flattened = flatten_body_records(raw, &mut vec![]);
-        let text = flattened.trim();
+        let view = model_view(raw);
+        let text = view.as_str();
         let attach = attachment_label(
             msg.get("attachments").and_then(|a| a.as_array()).map(|v| v.as_slice()).unwrap_or(&[]),
         );
@@ -8510,25 +8614,108 @@ mod registration_claim_tests {
 
 #[cfg(test)]
 mod reply_context_tests {
-    use super::{excerpt, reply_context_block, strip_card_tags};
+    use super::{excerpt, model_view, quoted_message, reply_context_block};
+    use mafold_transcript::{AgentEvent, RunStats, Transcript};
+    use serde_json::json;
 
-    /// Cards are the noise here: an agent's reply is routinely one prose line
-    /// plus a wall of run/tool markup, and the quote wants the prose.
-    #[test]
-    fn card_tags_are_stripped_and_prose_survives() {
-        let s = "做好了：\n{% mafold/run summary=\"x\" %}\ninner log\n{% /mafold/run %}\n- 四色光环";
-        let out = strip_card_tags(s);
-        assert!(out.contains("做好了"));
-        assert!(out.contains("inner log")); // container BODY is kept
-        assert!(out.contains("四色光环"));
-        assert!(!out.contains("{%") && !out.contains("%}"));
+    /// A finished agent reply exactly as the daemon posts it — built by the
+    /// real renderer (`finish_folded`), not typed out by hand, so this keeps
+    /// testing the real shape when the renderer changes. A long tool log goes
+    /// under the fold, the answer stays in the open, and the result stamp
+    /// carries its usage JSON.
+    fn agent_reply() -> String {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Stats(RunStats {
+            run_id: Some("run-7f3a".into()),
+            model: Some("claude-opus-5".into()),
+            input_tokens: Some(848_642),
+            output_tokens: Some(2_321),
+            ..Default::default()
+        }));
+        t.push(&AgentEvent::Text("先看一眼白名单。".into()));
+        t.push(&AgentEvent::ToolCall {
+            id: "a".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "ops ssh 12 'cat whitelist.json'" }),
+        });
+        t.push(&AgentEvent::ToolResult { id: "a".into(), text: "WHITELIST-LOG-LINE\n".repeat(120) });
+        t.push(&AgentEvent::Text("两道门都没有他,这次一起加上。".into()));
+        t.push(&AgentEvent::ToolCall {
+            id: "b".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "ops ssh 12 'whitelist add luoye'" }),
+        });
+        t.push(&AgentEvent::ToolResult { id: "b".into(), text: "Added luoye to the whitelist".into() });
+        t.push(&AgentEvent::Text("加好了 ✅ 两边人数都是 21,`/reload` 没报错。".into()));
+        t.push(&AgentEvent::Done { duration_ms: Some(38_000.0), cost_usd: Some(2.5), tokens: None });
+        t.finish_folded()
     }
 
-    /// An unclosed tag is a truncated card — drop it to end-of-string rather
-    /// than leak half its attributes into the quote.
+    /// The field bug (2026-09-25): quoting an agent's reply handed the model
+    /// its tool output and usage JSON instead of its answer. The old stripper
+    /// removed only the `{% … %}` tags and kept every card's body, and the
+    /// 1200-char head+tail cut then kept the two ends — tool log up front,
+    /// usage JSON at the back — and dropped the answer in between.
     #[test]
-    fn an_unclosed_tag_drops_the_tail() {
-        assert_eq!(strip_card_tags("before {% mafold/result tokens=\"1"), "before ");
+    fn a_quoted_agent_reply_reads_as_its_answer() {
+        let content = agent_reply();
+        // The fixture really is the bad case: machinery, and plenty of it.
+        for card in ["{% mafold/trace", "{% mafold/result", "input_tokens"] {
+            assert!(content.contains(card), "fixture lost {card}: {content}");
+        }
+        assert!(content.chars().count() > 1200, "fixture must exceed the quote cap");
+
+        let m = json!({ "id": "m1", "sender": { "username": "opsdu:claude-code" }, "content": content });
+        let (who, body) = quoted_message(&m);
+        assert_eq!(who, "opsdu:claude-code");
+        assert!(body.contains("加好了 ✅ 两边人数都是 21"), "the answer must survive: {body}");
+        for gone in [
+            "WHITELIST-LOG-LINE", // tool output
+            "Added luoye",        // tool output
+            "input_tokens",       // usage JSON
+            "run-7f3a",
+            "{%",                 // any card markup at all
+            "…[truncated]…",      // nothing left to cut
+        ] {
+            assert!(!body.contains(gone), "{gone:?} leaked into the quote: {body}");
+        }
+
+        // And the block the model reads carries the same.
+        let b = reply_context_block(Some("opsdu:claude-code"), Some(&(who, body)));
+        assert!(b.contains("加好了 ✅") && !b.contains("input_tokens"), "{b}");
+    }
+
+    /// A RECENT CONVERSATION row and a reply excerpt go through the same view:
+    /// another agent's message is what it said, not how it got there.
+    #[test]
+    fn history_rows_and_excerpts_see_the_answer_too() {
+        let content = agent_reply();
+        let view = model_view(&content);
+        assert!(view.contains("加好了 ✅"), "{view}");
+        assert!(!view.contains("WHITELIST-LOG-LINE") && !view.contains("input_tokens"), "{view}");
+        let e = excerpt(&content, 80);
+        assert!(e.starts_with("加好了 ✅"), "{e}");
+    }
+
+    /// Only the transcript machinery goes: a card the model or a person
+    /// AUTHORED is content, exactly as the hosted brains read it.
+    #[test]
+    fn authored_cards_are_content_and_stay() {
+        let s = "做好了：\n{% mafold/run summary=\"x\" %}\ninner log\n{% /mafold/run %}\n\
+                 {% mafold/html %}<b>四色光环</b>{% /mafold/html %}";
+        let out = model_view(s);
+        assert!(out.contains("做好了"), "{out}");
+        assert!(!out.contains("inner log") && !out.contains("mafold/run"), "{out}");
+        assert!(out.contains("{% mafold/html %}<b>四色光环</b>{% /mafold/html %}"), "{out}");
+    }
+
+    /// A body that is nothing BUT machinery still names which message it was.
+    #[test]
+    fn a_machinery_only_quote_falls_back_to_its_markup() {
+        let raw = "{% mafold/run summary=\"Ran 1 shell command\" %}\n{% mafold/bash cmd=\"ls\" /%}\n{% /mafold/run %}";
+        let m = json!({ "id": "m2", "sender": { "username": "eons:bot" }, "content": raw });
+        let (_, body) = quoted_message(&m);
+        assert!(body.contains("Ran 1 shell command"), "{body}");
     }
 
     #[test]
@@ -9091,9 +9278,9 @@ mod customize_seed_tests {
 #[cfg(test)]
 mod gate_tests {
     use super::{
-        directed_at_me, floor_roster, is_durable_event, machine_authored, mentions_me,
+        directed_at_me, floor_roster, gap_fill, is_durable_event, machine_authored, mentions_me,
         resolve_turn_workdir,
-        sanitize_attachment_name, should_respond, slash_command,
+        sanitize_attachment_name, should_respond, slash_command, socket_skipped,
         trigger_message, turn_session_key, AllowList, ChatStates, ConvGate,
     };
     use crate::client::Client;
@@ -9120,6 +9307,39 @@ mod gate_tests {
         assert!(!mentions_me("ping @claude", "ops:claude"));                 // partial ≠ full handle
         assert!(!mentions_me("just chatting, no mention", "ops:claude"));
         assert!(!mentions_me("@opsclaudex", "ops:claude"));                  // longer handle ≠
+    }
+
+    /// The socket skipped a frame iff the frame's `prev` — the seq numbered for
+    /// us right before it — is something we never accounted for. `seq` jumps
+    /// are NOT gaps (one global counter, every account's traffic in between).
+    #[test]
+    fn a_prev_we_never_saw_is_a_gap_a_seq_jump_is_not() {
+        // Contiguous for this account, even though seq jumped 100 → 250.
+        assert!(!socket_skipped(100, 100));
+        // A catch-up vouched for up to 180 (drafts, live signals): not a gap.
+        assert!(!socket_skipped(180, 100u64.max(180)));
+        // Frame 250 follows 200, which never reached us.
+        assert!(socket_skipped(200, 100));
+        // An older api sends no `prev` (reads as 0): never a gap.
+        assert!(!socket_skipped(0, 0));
+        assert!(!socket_skipped(0, 100));
+    }
+
+    /// A gap fetch replays what was numbered BEFORE the frame that exposed the
+    /// gap, durable events only, in order — never something after it, which
+    /// would push the cursor past the held frame and get it dropped.
+    #[test]
+    fn a_gap_fill_replays_only_durable_events_before_the_held_frame() {
+        use serde_json::json;
+        let items = vec![
+            json!({"seq": 101, "method": "events.messageDraft", "params": {"id": "d"}}),
+            json!({"seq": 102, "method": "events.messageComplete", "params": {"id": "the-at"}}),
+            json!({"seq": 103, "method": "events.typing", "params": {}}),
+            json!({"seq": 104, "method": "events.messageNew", "params": {"id": "n"}}),
+            json!({"seq": 106, "method": "events.messageNew", "params": {"id": "after"}}),
+        ];
+        let got: Vec<u64> = gap_fill(items, 105).iter().map(|u| u["seq"].as_u64().unwrap()).collect();
+        assert_eq!(got, vec![102, 104]);
     }
 
     /// A streamed reply is born empty and finishes as `messageComplete`. The

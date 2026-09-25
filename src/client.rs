@@ -99,6 +99,20 @@ impl std::fmt::Display for DraftRefused {
 
 impl std::error::Error for DraftRefused {}
 
+/// What `getUpdates` answered.
+pub struct Updates {
+    /// `{seq, method, params}`, in the shape WS frames arrive in.
+    pub items: Vec<Value>,
+    /// The cursor the server vouches for: every event it numbered for this
+    /// account up to here is either in `items` or was never replayable. (An
+    /// older server answers the newest event it KEPT — a lower bound, which
+    /// costs at most one extra fetch.)
+    pub head: u64,
+    /// Part of the window had already aged out of the server's backlog —
+    /// `items` is what is left of it, not all of it.
+    pub truncated: bool,
+}
+
 /// Durable trigger facts needed by the daemon after reconnect. Used both by
 /// the server-side replay filter and the daemon's local compatibility filter.
 pub(crate) const REPLAY_METHODS: &[&str] = &[
@@ -257,9 +271,13 @@ impl Client {
     /// Items are
     /// `{seq, method, params}` in the exact shape WS frames arrive, so a
     /// reconnect replays what it missed through the same handling path.
-    pub async fn get_updates(&self, since: u64) -> Result<Vec<Value>> {
+    pub async fn get_updates(&self, since: u64) -> Result<Updates> {
         let v = self.post("getUpdates", json!({ "since": since, "methods": REPLAY_METHODS })).await?;
-        Ok(v["updates"].as_array().cloned().unwrap_or_default())
+        Ok(Updates {
+            items: v["updates"].as_array().cloned().unwrap_or_default(),
+            head: v["seq"].as_u64().unwrap_or(since),
+            truncated: v["truncated"].as_bool().unwrap_or(false),
+        })
     }
 
     /// Recent messages in a conversation (`{ items: [Message] }`). The access
