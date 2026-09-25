@@ -100,6 +100,37 @@ pub struct ReadArgs {
     pub channel: Option<String>,
     pub json: bool,
     pub media: bool,
+    /// Only the unread (the chat's badge, capped by `limit`), then mark read.
+    pub unread: bool,
+    /// Prefix every row with its message id.
+    pub ids: bool,
+}
+
+/// How many unread messages the caller has in this timeline — the same badge
+/// the chat list shows. A channel keeps its own count (`listChannels`); the
+/// main timeline's is on the chat row. None = the room isn't in my list.
+async fn unread_badge(client: &Client, chat_id: &str, channel: Option<&str>) -> Result<Option<usize>> {
+    let rows = match channel {
+        Some(_) => client.list_channels(chat_id).await?,
+        None => client.chats().await?,
+    };
+    let want = channel.unwrap_or(chat_id);
+    let list = rows["items"].as_array().or_else(|| rows.as_array()).cloned().unwrap_or_default();
+    Ok(list
+        .iter()
+        .find(|r| r["id"].as_str() == Some(want))
+        .map(|r| r["unread_count"].as_u64().unwrap_or(0) as usize))
+}
+
+/// The newest message on a page — the read marker to move to. By timestamp,
+/// not position, so it holds whichever order the page came in.
+pub(crate) fn newest_id(page: &Value) -> Option<String> {
+    page["items"]
+        .as_array()?
+        .iter()
+        .filter(|m| m["id"].as_str().is_some())
+        .max_by(|a, b| a["created_at"].as_str().unwrap_or("").cmp(b["created_at"].as_str().unwrap_or("")))
+        .and_then(|m| m["id"].as_str().map(str::to_string))
 }
 
 /// `mafold read [chat]` — the transcript, and an ask if there isn't one yet.
@@ -120,9 +151,22 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
         None => None,
     };
 
+    // `--unread`: only as many as the badge says, and none at all is an answer.
+    let mut limit = a.limit;
+    if a.unread {
+        match unread_badge(client, &chat.id, channel.as_deref()).await? {
+            Some(0) => {
+                println!("# {} · {} · 没有未读", chat.label, chat.shape);
+                return Ok(());
+            }
+            Some(n) => limit = n.min(a.limit),
+            None => anyhow::bail!("--unread: {} isn't one of your chats", chat.label),
+        }
+    }
+
     // Try as myself first. A participant never touches the grant table, so the
     // ordinary case costs exactly one request.
-    let mine = client.chat_history(&chat.id, a.limit, channel.as_deref(), None).await;
+    let mine = client.chat_history(&chat.id, limit, channel.as_deref(), None).await;
     let (page, lender) = match mine {
         Ok(p) => (p, None),
         Err(e) if !is_permission_error(&e) => return Err(e),
@@ -148,7 +192,19 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
     // Bytes first, so the transcript can print real paths beside the rows they
     // belong to rather than a trailing list the reader has to match up.
     let files = if a.media { fetch_media(client, &page).await } else { Default::default() };
-    print_transcript(&chat, lender.as_deref(), &page, &files);
+    print_transcript_ex(&chat, lender.as_deref(), &page, &files, a.ids);
+    // Reading the unread is what opening the chat does: move MY marker to the
+    // newest message shown (never past it — anything that arrived since stays
+    // unread). Not when reading on someone else's ticket: it isn't my room.
+    let dry = std::env::var("MAFOLD_SEND_DRY").is_ok_and(|v| v.trim() == "1");
+    if a.unread && lender.is_none() && !dry {
+        if let Some(newest) = newest_id(&page) {
+            match channel.as_deref() {
+                Some(ch) => client.mark_channel_read(&chat.id, ch, &newest).await?,
+                None => client.mark_read(&chat.id, Some(&newest)).await?,
+            }
+        }
+    }
     if channel.is_none() {
         forum_hint(client, &chat).await;
     }
@@ -365,6 +421,16 @@ fn print_transcript(
     page: &Value,
     files: &std::collections::HashMap<String, String>,
 ) {
+    print_transcript_ex(chat, lender, page, files, false)
+}
+
+fn print_transcript_ex(
+    chat: &Room,
+    lender: Option<&str>,
+    page: &Value,
+    files: &std::collections::HashMap<String, String>,
+    ids: bool,
+) {
     let items = page["items"].as_array().cloned().unwrap_or_default();
     let head = match lender {
         Some(g) => format!("# {} · {} · 以 @{} 的视角", chat.label, chat.shape, g),
@@ -381,7 +447,11 @@ fn print_transcript(
         let ts = m["created_at"].as_str().unwrap_or("");
         let when = ts.get(5..16).unwrap_or(ts).replace('T', " ");
         let body = readable_body(m["content"].as_str().unwrap_or(""));
-        println!("[{when}] {who}: {}", if body.is_empty() { "—".into() } else { body });
+        let id = match (ids, m["id"].as_str()) {
+            (true, Some(id)) => format!("#{id} "),
+            _ => String::new(),
+        };
+        println!("{id}[{when}] {who}: {}", if body.is_empty() { "—".into() } else { body });
         for a in m["attachments"].as_array().into_iter().flatten() {
             let name = attachment_name(a);
             match a["file"]["id"].as_str().and_then(|id| files.get(id)) {
@@ -406,7 +476,7 @@ fn print_transcript(
     println!("─ {} 条{tail} ─", items.len());
 }
 
-fn attachment_name(a: &Value) -> String {
+pub(crate) fn attachment_name(a: &Value) -> String {
     match a["kind"].as_str().unwrap_or("") {
         "photo" => "图片".to_string(),
         "video" => "视频".to_string(),
@@ -427,7 +497,7 @@ fn attachment_name(a: &Value) -> String {
 /// its body is the frozen conversation, which is exactly what someone reading
 /// a transcript asked for. That reuses the daemon's own renderer, so a record
 /// reads the same here as it does in a prompt.
-fn readable_body(text: &str) -> String {
+pub(crate) fn readable_body(text: &str) -> String {
     let mut photos = vec![];
     let flattened = crate::agent::flatten_body_records(text, &mut photos);
     let mut out = String::new();

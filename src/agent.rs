@@ -826,7 +826,7 @@ fn is_handle_byte(c: u8) -> bool {
 /// backticks renders no mention label, so it wakes nobody. Incident 2026-09-03:
 /// a 693 KB record quoting `@linsky:opus48` ONCE, ~8 KB deep inside a pasted
 /// tool output, woke the bot in a group where nobody had @-ed it.
-fn mentions_me(text: &str, my_username: &str) -> bool {
+pub(crate) fn mentions_me(text: &str, my_username: &str) -> bool {
     let me = my_username.to_lowercase();
     // The cut can only take a mention away (a cut ends on `%}` or a backtick,
     // never on a handle byte), so the projection runs only when the raw scan
@@ -3354,7 +3354,35 @@ async fn connect_and_run(
                 last_seq = head;
                 save_cursor(my_username, last_seq);
             } else if last_seq < head {
-                match client.get_updates(last_seq).await {
+                // ONE attempt used to be the whole story, and a failure here is
+                // not a hiccup — it is data loss. The frames in this window are
+                // only in the server's in-memory backlog; the cursor moves on
+                // with the next live frame, so nothing ever fetches them again
+                // and the user simply never gets an answer.
+                //
+                // And the one moment this call is most likely to fail is the
+                // moment it matters most: an api re-deploy drops every daemon's
+                // socket at once, they all reconnect together, and the fresh
+                // container is still hydrating (a 26k-row load that reports
+                // itself as a ~6s slow statement) — so the catch-up lands on an
+                // upstream that is briefly 502 or just very slow. That window is
+                // seconds long. Waiting it out costs nothing; not waiting costs
+                // messages. Retry, then say plainly what was lost if it really
+                // is unreachable.
+                let mut attempt = 0u32;
+                let fetched = loop {
+                    match client.get_updates(last_seq).await {
+                        Ok(items) => break Ok(items),
+                        Err(e) if attempt < 4 => {
+                            let wait = 2u64.pow(attempt + 1); // 2s, 4s, 8s, 16s
+                            eprintln!("⚠ catch-up getUpdates failed ({e:#}) — retrying in {wait}s");
+                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            attempt += 1;
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+                match fetched {
                     Ok(items) => {
                         // Replay message-bearing events (+ chatCleared) only
                         // (`is_durable_event`): a stale inline query / probe /
@@ -3368,7 +3396,7 @@ async fn connect_and_run(
                         }
                         replay.extend(items);
                     }
-                    Err(e) => eprintln!("⚠ catch-up getUpdates failed: {e:#} — events in (seq {last_seq}, {head}] are lost to this daemon"),
+                    Err(e) => eprintln!("⚠ catch-up getUpdates failed after 5 attempts: {e:#} — events in (seq {last_seq}, {head}] are lost to this daemon"),
                 }
             }
             continue;

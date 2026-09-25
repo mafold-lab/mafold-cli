@@ -23,6 +23,7 @@ mod daemon;
 mod discover;
 mod drafts;
 mod harness;
+mod inbox;
 mod install;
 mod langpack;
 mod mcp_link;
@@ -56,7 +57,9 @@ struct Cli {
         global = true
     )]
     base: String,
-    #[arg(long, env = "MAFOLD_BOT_TOKEN", global = true)]
+    /// A credential: never echo its value in `--help` (clap prints env values
+    /// by default, which put a live session token into an agent's transcript).
+    #[arg(long, env = "MAFOLD_BOT_TOKEN", global = true, hide_env_values = true)]
     token: Option<String>,
     /// Act as this logged-in human account (default: the current one).
     /// Applies to every command that speaks as a person — `connection`,
@@ -88,6 +91,15 @@ enum Cmd {
         /// running after you close the shell. Logs to ~/.mafold/agent.log.
         #[arg(long, short)]
         detach: bool,
+        /// Run the INBOX loop instead of the bot loop: look at the account's
+        /// chats the way a person does (events + heartbeat), think, and speak
+        /// only through `mafold send` / `mafold react` — the turn's own text
+        /// goes to a log, never into a chat. Works for any account, human or
+        /// bot (`--account <name>` for a human). See `.docs/clone-ceo-v1.md`.
+        #[arg(long)]
+        inbox: bool,
+        #[command(flatten)]
+        inbox_opts: inbox::InboxOpts,
     },
     /// Stop a background agent started with `agent --detach`.
     Stop,
@@ -139,6 +151,13 @@ enum Cmd {
         /// Machine-readable page, for code rather than for a model.
         #[arg(long)]
         json: bool,
+        /// Only what you haven't read yet (as many as the chat's unread badge,
+        /// capped by --limit), then mark it read — what opening a chat does.
+        #[arg(long)]
+        unread: bool,
+        /// Print each message's id, for `send --reply <id>` / `react <id>`.
+        #[arg(long)]
+        ids: bool,
     },
     /// Chat-history tickets: ask for one, see what you hold, revoke one you gave.
     Access {
@@ -151,8 +170,19 @@ enum Cmd {
         /// Send into a forum channel (id or #name) instead of the main timeline.
         #[arg(long)]
         channel: Option<String>,
+        /// Quote-reply to this message id (`mafold read --ids` shows them).
+        #[arg(long)]
+        reply: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
+    },
+    /// React to a message with an emoji (`--remove` takes it back).
+    React {
+        /// The message id (`mafold read --ids` shows them).
+        message: String,
+        emoji: String,
+        #[arg(long)]
+        remove: bool,
     },
     /// Attach local files to the reply you are streaming right now — images,
     /// clips, documents. Run by an AGENT mid-turn (the daemon presets
@@ -483,16 +513,35 @@ async fn main() -> Result<()> {
         return install::run(tool.as_deref().unwrap_or(""), *yes);
     }
 
-    let token = cli.token.context(
+    // The bot loop and `add` drive a BOT and need its mb_ token. Everything that
+    // just talks in chats speaks as whoever `speaking_token` resolves — which
+    // may be a person (`--account`), since the API has one door for both.
+    let bot_token = cli.token.clone().context(
         "set --token or $MAFOLD_BOT_TOKEN (your bot's mb_ token — create a bot in the Mafold app)",
-    )?;
+    );
+    let token = speaking_token(cli.token.clone(), cli.account.as_deref());
 
     match cli.cmd {
+        Cmd::Agent { workdir, harness, inbox: true, inbox_opts, detach } => {
+            if detach {
+                anyhow::bail!(
+                    "--inbox doesn't detach — run it under your service manager (systemd / launchd) or nohup"
+                );
+            }
+            let workdir = workdir.map(|w| {
+                std::fs::canonicalize(&w)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(w)
+            });
+            inbox::run(Client::new(cli.base, token?), workdir, harness, inbox_opts).await?;
+        }
         Cmd::Agent {
             workdir,
             harness,
             detach,
+            ..
         } => {
+            let token = bot_token?;
             // An explicit --workdir wins; if omitted, the server owner-config (or
             // the current dir) decides at runtime. Resolve an explicit one to an
             // absolute path so the agent — and the detached child, which has a
@@ -534,35 +583,40 @@ async fn main() -> Result<()> {
             env,
         } => {
             let env = supervisor::parse_env(&env)?;
-            supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
+            supervisor::add(name, bot_token?, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
-        Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
-        Cmd::Read { chat: c, limit, channel, media, json } => {
+        Cmd::Chats => chats(&Client::new(cli.base, token?)).await?,
+        Cmd::Read { chat: c, limit, channel, media, json, unread, ids } => {
             chat::read(
-                &Client::new(cli.base, token),
-                chat::ReadArgs { chat: c, limit, channel, json, media },
+                &Client::new(cli.base, token?),
+                chat::ReadArgs { chat: c, limit, channel, json, media, unread, ids },
             )
             .await?
         }
-        Cmd::Access { cmd } => chat::run(cmd, &Client::new(cli.base, token)).await?,
+        Cmd::Access { cmd } => chat::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Send {
             chat,
             channel,
+            reply,
             text,
         } => {
             send(
-                &Client::new(cli.base, token),
+                &Client::new(cli.base, token?),
                 &chat,
                 channel.as_deref(),
+                reply.as_deref(),
                 &text.join(" "),
             )
             .await?
         }
-        Cmd::Attach { files, message } => {
-            attach(&Client::new(cli.base, token), &files, message.as_deref()).await?
+        Cmd::React { message, emoji, remove } => {
+            react(&Client::new(cli.base, token?), &message, &emoji, remove).await?
         }
-        Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token)).await?,
-        Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
+        Cmd::Attach { files, message } => {
+            attach(&Client::new(cli.base, token?), &files, message.as_deref()).await?
+        }
+        Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }
@@ -946,21 +1000,124 @@ async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Res
     Ok(())
 }
 
-async fn send(client: &Client, chat: &str, channel: Option<&str>, text: &str) -> Result<()> {
-    match channel {
+/// Whose credential the chat-shaped commands (`chats`, `read`, `send`, `react`,
+/// `attach`, `channels`, `wallet`, `agent --inbox`) speak with.
+///
+/// An explicit `--account` (or `$MAFOLD_ACCOUNT`) names a person logged in on
+/// this machine and wins even over an inherited `$MAFOLD_BOT_TOKEN`: an agent
+/// running inside a bot's turn that writes `--account opsdu` means to speak as
+/// that person, and silently speaking as the bot instead would be the wrong
+/// author on every message. Then the bot token; then whoever is logged in here.
+/// The API takes both kinds at the same door (`mafold-api/src/auth.rs`).
+fn speaking_token(bot_token: Option<String>, account: Option<&str>) -> Result<String> {
+    if let Some(name) = account.map(str::trim).filter(|s| !s.is_empty()) {
+        // Validated against the logins on this machine at the top of `main`.
+        return session::load_named(name)
+            .map(|s| s.token)
+            .with_context(|| format!("no account @{name} on this machine — `mafold login`"));
+    }
+    if let Some(t) = bot_token.filter(|t| !t.trim().is_empty()) {
+        return Ok(t);
+    }
+    session::load().map(|s| s.token).context(
+        "no identity — pass --token / $MAFOLD_BOT_TOKEN (a bot), or `mafold login` and --account <you> (a person)",
+    )
+}
+
+/// `mafold send`. Two environment switches, set by the inbox loop for the agent
+/// it runs and meaningful to anyone scripting a person-shaped sender:
+///
+/// * `MAFOLD_SEND_PACE=1` — show "typing…" first and wait roughly as long as a
+///   person takes to type the text, so a burst of short messages arrives the
+///   way a person's does instead of all in the same second.
+/// * `MAFOLD_SEND_JOURNAL=<file>` — append one JSON line per message sent, so
+///   the loop knows afterwards who its agent actually spoke to.
+/// * `MAFOLD_SEND_DRY=1` — say what WOULD be sent and send nothing (the inbox
+///   loop's `--dry-run`). Checked before anything touches the network: even
+///   resolving an `@username` can open a DM.
+async fn send(client: &Client, chat: &str, channel: Option<&str>, reply: Option<&str>, text: &str) -> Result<()> {
+    if env_flag("MAFOLD_SEND_DRY") {
+        journal(&serde_json::json!({
+            "kind": "send", "dry": true, "chat_id": chat, "channel_id": channel, "reply_to": reply, "text": text,
+        }));
+        let at = channel.map(|c| format!(" #{c}")).unwrap_or_default();
+        let re = reply.map(|r| format!(" (回复 #{r})")).unwrap_or_default();
+        println!("✓ (dry-run,没有真发) → {chat}{at}{re}: {text}");
+        return Ok(());
+    }
+    let (chat_id, channel_id, label) = match channel {
         Some(ch) => {
             let (chat_id, ch) = channels::resolve(client, chat, ch).await?;
-            let name = ch["name"].as_str().unwrap_or("?");
-            client
-                .send_to(Dest::chat(&chat_id).channel(ch["id"].as_str()), text)
-                .await?;
-            println!("✓ sent to {chat} #{name}");
+            let name = ch["name"].as_str().unwrap_or("?").to_string();
+            (chat_id, ch["id"].as_str().map(str::to_string), format!("{chat} #{name}"))
         }
-        None => {
-            let chat_id = client.resolve_chat(chat).await?;
-            client.send_to(Dest::chat(&chat_id), text).await?;
-            println!("✓ sent to {chat}");
-        }
+        None => (client.resolve_chat(chat).await?, None, chat.to_string()),
+    };
+    if env_flag("MAFOLD_SEND_PACE") {
+        pace_typing(client, &chat_id, channel_id.as_deref(), text).await;
     }
+    let mut dest = Dest::chat(&chat_id).channel(channel_id.as_deref());
+    dest.reply_to_message_id = reply;
+    let sent = client.send_to(dest, text).await?;
+    journal(&serde_json::json!({
+        "kind": "send",
+        "chat_id": chat_id,
+        "channel_id": channel_id,
+        "message_id": sent["id"],
+        "reply_to": reply,
+        "text": text,
+    }));
+    println!("✓ sent to {label}");
     Ok(())
+}
+
+async fn react(client: &Client, message: &str, emoji: &str, remove: bool) -> Result<()> {
+    if env_flag("MAFOLD_SEND_DRY") {
+        journal(&serde_json::json!({ "kind": "react", "dry": true, "message_id": message, "emoji": emoji }));
+        println!("✓ (dry-run,没有真点) {emoji} → #{message}");
+        return Ok(());
+    }
+    client.set_reaction(message, emoji, remove).await?;
+    journal(&serde_json::json!({
+        "kind": if remove { "unreact" } else { "react" },
+        "message_id": message,
+        "emoji": emoji,
+    }));
+    println!("✓ {} {emoji}", if remove { "removed" } else { "reacted" });
+    Ok(())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+}
+
+/// How long a person takes to type `text`: a beat to start, then per
+/// character, capped — nobody watches dots for half a minute.
+fn typing_secs(text: &str) -> f64 {
+    (1.2 + 0.08 * text.chars().count() as f64).min(8.0)
+}
+
+/// Show "typing…" for about as long as typing `text` takes. Clients drop the
+/// indicator after a few seconds, so it is renewed every 4s. Best-effort: a
+/// failed indicator must never cost the message.
+async fn pace_typing(client: &Client, chat_id: &str, channel_id: Option<&str>, text: &str) {
+    let mut left = typing_secs(text);
+    while left > 0.0 {
+        let _ = client.send_chat_action(chat_id, channel_id, "typing").await;
+        let step = left.min(4.0);
+        tokio::time::sleep(std::time::Duration::from_secs_f64(step)).await;
+        left -= step;
+    }
+}
+
+/// Append one line to `$MAFOLD_SEND_JOURNAL`, if it is set. Best-effort.
+fn journal(entry: &serde_json::Value) {
+    let Ok(path) = std::env::var("MAFOLD_SEND_JOURNAL") else { return };
+    if path.trim().is_empty() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{entry}");
+    }
 }

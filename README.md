@@ -59,4 +59,20 @@ stuck "typing…". The bot shows **online** only while the agent is running.
 
 Everything runs on **your** machine, on **your** files in `--workdir`.
 
+### `agent --inbox`
+
+The other shape: instead of answering each message with one streamed reply,
+the account looks at its chats the way a person does — a DM, an @ or a reply
+wakes it; a heartbeat (`--heartbeat`, `--hours`) opens everything else — and
+it speaks only by calling `mafold send` / `mafold react`, as many times as it
+likes (or not at all). The agent's own text goes to a log (`--log-to <chat>`
+posts a folded trace there too). Works for a person as well as a bot:
+
+```sh
+mafold --account you agent --inbox --principal you --workdir ~/notebook
+```
+
+`read --unread --ids`, `send --reply <id>` and `react <id> <emoji>` are the
+tools it uses, and work from any terminal.
+
 MIT licensed.

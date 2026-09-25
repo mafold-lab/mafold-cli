@@ -574,6 +574,57 @@ impl Client {
         self.post("sendMessage", body).await
     }
 
+    /// Move the caller's read position in a conversation's main timeline to
+    /// `message_id` (None = the newest message the server knows). The same
+    /// marker every client moves when a person opens a chat, so the other side
+    /// sees "read" exactly as they would for a person.
+    pub async fn mark_read(&self, chat_id: &str, message_id: Option<&str>) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id });
+        if let Some(id) = message_id {
+            body["message_id"] = json!(id);
+        }
+        self.post_idempotent("markRead", body).await.map(|_| ())
+    }
+
+    /// `mark_read` for one forum channel. Channels keep their own marker: a
+    /// read in `#all` must never drain them, and vice versa.
+    pub async fn mark_channel_read(&self, chat_id: &str, channel_id: &str, message_id: &str) -> Result<()> {
+        self.post_idempotent(
+            "markChannelRead",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "message_id": message_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Show (`"typing"`) or clear (anything else) the "typing…" indicator the
+    /// people in this timeline see for the caller.
+    pub async fn send_chat_action(&self, chat_id: &str, channel_id: Option<&str>, action: &str) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id, "action": action });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        self.post("sendChatAction", body).await.map(|_| ())
+    }
+
+    /// Replace the text of a message the caller SENT (`editMessage` is
+    /// sender-only). Used to stamp an ask card `answered="…"` so every device
+    /// renders it answered, the way the daemon stamps its own drafts.
+    pub async fn edit_message(&self, message_id: &str, text: &str) -> Result<()> {
+        self.post_idempotent("editMessage", json!({ "message_id": message_id, "text": text }))
+            .await
+            .map(|_| ())
+    }
+
+    /// Add (or, with `remove`, take back) the caller's `emoji` on a message.
+    pub async fn set_reaction(&self, message_id: &str, emoji: &str, remove: bool) -> Result<Value> {
+        self.post(
+            "setMessageReaction",
+            json!({ "message_id": message_id, "emoji": emoji, "remove": remove }),
+        )
+        .await
+    }
+
     /// Publish this bot's slash commands (the chat command panel).
     pub async fn set_commands(&self, commands: Value) -> Result<()> {
         self.post("setBotCommands", json!({ "commands": commands }))
