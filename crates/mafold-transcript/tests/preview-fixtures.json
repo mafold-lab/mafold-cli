@@ -105,5 +105,14 @@
       "alice/widget": "C# *name* my_card"
     },
     "expected": "C# *name* my_card"
+  },
+  {
+    "name": "a card its publisher hid from previews says nothing",
+    "content": "我是 deepseek-v4-pro（V4 Pro）模型。\n\n{% mafold/result ms=\"2100\" tokens=\"3.5k\" model=\"V4 Pro\" /%}",
+    "names": {
+      "mafold/result": "Result"
+    },
+    "hidden": ["mafold/result"],
+    "expected": "我是 deepseek-v4-pro（V4 Pro）模型。"
   }
 ]

@@ -41,9 +41,20 @@ fn version(attrs: &str) -> Option<&str> {
     found
 }
 
+/// What a row preview says for one card, per its publisher's metadata.
+pub enum CardLabel {
+    /// The card's published name (already in the reader's language, if the
+    /// publisher gave one). Blank reads as unknown ⇒ the slug.
+    Name(String),
+    /// The publisher opted the card out of previews (`"preview": false`) —
+    /// chrome such as a reply's usage footer, which says nothing about what
+    /// was said. Every bot reply ended its row with "… Result" before this.
+    Hidden,
+}
+
 pub fn message_preview(
     text: &str,
-    mut display_name: impl FnMut(&str, Option<&str>) -> Option<String>,
+    mut label: impl FnMut(&str, Option<&str>) -> Option<CardLabel>,
 ) -> String {
     let named = crate::prose::map_card_text(
         text,
@@ -53,10 +64,10 @@ pub fn message_preview(
                 .filter(|c| !matches!(c, '*' | '`' | '#' | '>'))
                 .collect()
         },
-        |tag, attrs| {
-            display_name(tag, version(attrs))
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| tag.rsplit('/').next().unwrap_or(tag).to_owned())
+        |tag, attrs| match label(tag, version(attrs)) {
+            Some(CardLabel::Hidden) => String::new(),
+            Some(CardLabel::Name(name)) if !name.trim().is_empty() => name,
+            _ => tag.rsplit('/').next().unwrap_or(tag).to_owned(),
         },
     );
     named
@@ -77,9 +88,16 @@ mod tests {
         let fixtures: serde_json::Value =
             serde_json::from_str(include_str!("../tests/preview-fixtures.json")).unwrap();
         for case in fixtures.as_array().unwrap() {
+            let hidden: Vec<&str> = case["hidden"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
             let out = message_preview(case["content"].as_str().unwrap(), |tag, version| {
+                if hidden.contains(&tag) {
+                    return Some(CardLabel::Hidden);
+                }
                 let key = version.map_or_else(|| tag.to_owned(), |v| format!("{tag}@{v}"));
-                case["names"][&key].as_str().map(str::to_owned)
+                case["names"][&key].as_str().map(|n| CardLabel::Name(n.to_owned()))
             });
             assert_eq!(out, case["expected"].as_str().unwrap(), "{}", case["name"]);
             assert!(out.chars().count() <= PREVIEW_CHARS);

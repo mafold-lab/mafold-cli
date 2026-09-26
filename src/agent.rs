@@ -7684,6 +7684,15 @@ fn splice_bgtasks(content: &str, block: &str) -> Option<String> {
     Some(out)
 }
 
+/// The live-card refresh for one reply: `current` is the message as the server
+/// holds it right now, and only the `{% mafold/bgtasks %}` block is replaced —
+/// whatever else changed since the reply was finalized (an ask card stamped
+/// `answered=`, anything else edited in) is carried through untouched. None
+/// when there is no card to refresh or nothing would change.
+fn live_card_update(current: &str, block: &str) -> Option<String> {
+    splice_bgtasks(current, block).filter(|next| next != current)
+}
+
 /// Watch this turn's surviving background tasks and, once they have ALL exited,
 /// resume the session for a wrap-up turn that reports their results.
 ///
@@ -7826,24 +7835,34 @@ fn arm_bg_wakeup(
                 let block = bgtasks_block(&snap);
                 if block != last_block {
                     last_block = block.clone();
-                    // Collect edits under the lock, await them after (std mutex
-                    // guards must not live across an await).
-                    let edits: Vec<(String, String)> = {
-                        let mut slot = live_slot().lock().unwrap();
-                        match slot.get_mut(&key) {
-                            Some(targets) => targets
-                                .iter_mut()
-                                .filter_map(|(mid, content)| {
-                                    let next = splice_bgtasks(content, &block)?;
-                                    *content = next.clone();
-                                    Some((mid.clone(), next))
-                                })
-                                .collect(),
-                            None => vec![],
+                    // Splice into the message AS IT IS NOW, never into our own
+                    // copy of it. The reply keeps changing after we cached it:
+                    // answering its ask card stamps `answered=` in with an
+                    // editMessage, and every tick of this loop used to push the
+                    // copy from finalize time back over it — the card came
+                    // unstuck ≤10s after it was answered (reproduced end to end
+                    // 2026-09-26: rev 10 answered=YES → rev 11 answered=no, 7s
+                    // later). A read we can't make skips this tick instead of
+                    // falling back to the stale copy.
+                    let targets: Vec<String> = live_slot()
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .map(|t| t.iter().map(|(mid, _)| mid.clone()).collect())
+                        .unwrap_or_default();
+                    let at = Dest::chat(&chat_id)
+                        .channel(channel_id.as_deref())
+                        .thread(thread_root.as_deref());
+                    for mid in targets {
+                        let Some(current) = own_message(&client, at, &mid, &bot).await else { continue };
+                        let Some(next) = live_card_update(&current, &block) else { continue };
+                        if client.edit_draft(&mid, &next).await.is_ok() {
+                            if let Some(t) = live_slot().lock().unwrap().get_mut(&key) {
+                                if let Some(entry) = t.iter_mut().find(|(m, _)| *m == mid) {
+                                    entry.1 = next;
+                                }
+                            }
                         }
-                    };
-                    for (mid, content) in edits {
-                        let _ = client.edit_draft(&mid, &content).await;
                     }
                 }
             }
@@ -8765,7 +8784,38 @@ mod reply_context_tests {
 
 #[cfg(test)]
 mod bgtasks_tests {
-    use super::{bgtasks_block, card_line, splice_bgtasks, strip_ansi, BgTask};
+    use super::{bgtasks_block, card_line, live_card_update, splice_bgtasks, strip_ansi, BgTask};
+
+    /// Reproduced end to end on 2026-09-26: the reply's ask card was answered
+    /// (rev 10, `answered=` stamped by editMessage) and the next monitor tick
+    /// pushed the finalize-time copy back over it (rev 11, unanswered). The
+    /// refresh is computed from the message as it stands NOW, so the stamp is
+    /// carried through and only the bgtasks block moves.
+    #[test]
+    fn a_refresh_keeps_an_answered_stamp_that_landed_after_finalize() {
+        let at_finalize = "跑起来了。\n{% mafold/ask %}\nq|Pick|0|先看哪个?\no|A|第一个\n{% /mafold/ask %}\n\
+            {% mafold/bgtasks n=1 %}\nt|1|running|ticker\no|tick 1\n{% /mafold/bgtasks %}\n";
+        let answered = at_finalize.replace("{% mafold/ask %}", "{% mafold/ask answered=\"A\" %}");
+        let block = "{% mafold/bgtasks n=1 %}\nt|1|running|ticker\no|tick 9\n{% /mafold/bgtasks %}";
+
+        let next = live_card_update(&answered, block).expect("the block changed");
+        assert!(next.contains("answered=\"A\""), "the stamp must survive the refresh: {next}");
+        assert!(next.contains("o|tick 9") && !next.contains("o|tick 1"), "{next}");
+
+        // What the old loop did — splice into its own finalize-time copy —
+        // is exactly the write that erased the answer.
+        let stale = splice_bgtasks(at_finalize, block).unwrap();
+        assert!(!stale.contains("answered="));
+    }
+
+    /// Nothing to push when the card already shows this block, or when the
+    /// message carries no card at all.
+    #[test]
+    fn a_refresh_that_changes_nothing_writes_nothing() {
+        let block = "{% mafold/bgtasks n=1 %}\nt|1|done|x\n{% /mafold/bgtasks %}";
+        assert_eq!(live_card_update(&format!("hi\n{block}"), block), None);
+        assert_eq!(live_card_update("no card here", block), None);
+    }
 
     /// The card is a PROMISE that a wrap-up reply is coming. No registered task
     /// ⇒ nobody is watching ⇒ there must be no card. Pinned here because the

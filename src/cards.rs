@@ -87,6 +87,13 @@ struct CardManifest {
     /// the server's.
     #[serde(default)]
     composer: Option<serde_json::Value>,
+    /// `{"zh-Hans": "红包"}` — the card's name per language, read by row
+    /// previews. Carried verbatim, like `composer`.
+    #[serde(rename = "displayNames", default)]
+    display_names: Option<serde_json::Value>,
+    /// `false` keeps the card out of row previews (a reply's usage footer).
+    #[serde(default)]
+    preview: Option<bool>,
 }
 fn default_entry() -> String {
     "src/card.tsx".into()
@@ -237,6 +244,8 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         "version": manifest.version,
         "display_name": manifest.display_name,
         "composer": manifest.composer,
+        "display_names": manifest.display_names,
+        "preview": manifest.preview,
     });
     let r = client.publish_card(&meta, bundle).await?;
     let scope = r["scope"].as_str().unwrap_or("?");
