@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.117-dev.91"
+version = "0.9.123-dev.99"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -58,3 +58,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Globalization",
 ] }
+
+# Test-only: `#[tokio::test(start_paused = true)]`. A failed attachment fetch
+# retries five times with exponential backoff (`client::MEDIA_ATTEMPTS`), which
+# is ~9 real seconds the "the picture didn't reach me" test would otherwise sit
+# through. A paused clock advances itself the moment the runtime idles, so the
+# test asserts the same behaviour in no time at all. Dev-only: the shipped
+# binary never builds with this feature on.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

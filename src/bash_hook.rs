@@ -5,12 +5,14 @@
 //! loop), so a `run_in_background` task can never outlive its turn on its own.
 //! This hook intercepts Bash calls with `run_in_background: true` BEFORE they
 //! run and moves the work out of claude's kill radius:
-//!   1. the command is written to `~/.mafold/bgtasks/<conv>.<ts>.sh`,
+//!   1. the command is written to `~/.mafold/bgtasks/<surface>.<ts>.sh`,
 //!   2. the hook ITSELF spawns it in a new session (fork + setsid — macOS has
 //!      no `setsid` utility) with output to the sibling `.log`; the hook exits
 //!      right after, so init adopts the task,
 //!   3. the pid lands in the sibling `.pid`; `.meta` records the exact cwd and
-//!      scoped surface so restart recovery resumes the right bot/harness/tree,
+//!      scoped surface — forensics only (the filename IS the key restart
+//!      recovery reads), so that `ls ~/.mafold/bgtasks` plus one `cat` answers
+//!      "whose task is this, and where did it run",
 //!   4. the tool input is rewritten (`updatedInput`) to a foreground `echo`
 //!      telling the model the task is detached and reported next turn.
 //! Anything that isn't a background Bash — or any internal failure — produces
@@ -69,11 +71,18 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
     sweep_old(&dir);
 
     // Same registry key the daemon scans for (agent::bgtasks_scan): the SURFACE
-    // claude was launched on — the conversation plus, in a forum, the channel
-    // (`agent::surface_tag`). Keying by conversation alone let a task started in
-    // #a be collected by #b's completion monitor, which then reported #a's logs
-    // into #b (and deleted the registration #a was waiting on). Falls back to
-    // the bare conversation for an older daemon that doesn't export it.
+    // claude was launched on — the bot, the conversation, and in a forum the
+    // channel (`agent::surface_tag`). Every scope this ONE machine-wide
+    // directory is shared across has to be in the key: leave out the channel
+    // and #b's monitor collects #a's tasks; leave out the bot and every daemon
+    // on the machine collects every other daemon's. Re-sanitized here (not
+    // re-derived) so the two sides cannot drift — `agent::surface_tag` already
+    // produced this alphabet, including the empty channel component that keeps
+    // the key's arity readable.
+    //
+    // The fallbacks are deliberately unattributable: a daemon too old to export
+    // MAFOLD_SURFACE writes a key no current daemon will adopt, which is the
+    // safe direction to fail — one unreported task beats six bots reporting it.
     let tag: String = std::env::var("MAFOLD_SURFACE")
         .ok()
         .filter(|s| !s.is_empty())

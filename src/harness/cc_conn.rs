@@ -358,10 +358,33 @@ impl Conn {
         if !sent {
             return false;
         }
-        let ok = matches!(
-            tokio::time::timeout(Duration::from_secs(10), rx).await,
-            Ok(Ok(v)) if v["subtype"] == "success"
-        );
+        // A timeout, a dropped channel and a reply we don't recognise all
+        // collapsed into the same `false`, and the fallback line that follows
+        // names none of them — so a handshake that silently costs ten seconds
+        // on every prewarm reads exactly like a CLI that answered "no".
+        let began = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        let ok = matches!(&outcome, Ok(Ok(v)) if v["subtype"] == "success");
+        if !ok {
+            let why = match &outcome {
+                Err(_) => "no reply in 10s".to_string(),
+                Ok(Err(_)) => "reply channel dropped".to_string(),
+                Ok(Ok(v)) => format!("reply subtype={}", v["subtype"]),
+            };
+            // Whatever claude complained about on its way up is the one thing
+            // this side cannot reconstruct afterwards.
+            let tail = self.stderr_text();
+            let tail = tail.trim_end();
+            eprintln!(
+                "[cc-pool] hook handshake failed after {}ms ({why}) rid={rid}{}",
+                began.elapsed().as_millis(),
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — claude stderr: {}", tail.replace('\n', " ⏎ "))
+                }
+            );
+        }
         self.shared.pending.lock().unwrap().remove(&rid);
         self.control_hooks = ok;
         ok
@@ -394,8 +417,30 @@ impl Conn {
     }
 
     /// Live in-process work → this connection must not be evicted.
+    ///
+    /// ⚠️ This only knows about tasks the daemon itself detached. A command the
+    /// HARNESS backgrounded on its own (claude moves a long-running Bash off the
+    /// critical path after its own timeout) never reaches this registry, so the
+    /// connection parks unpinned and whatever claude says when that command
+    /// finishes lands in [`Conn::drain_parked`]. That gap is why the drain
+    /// reports instead of staying quiet.
     pub fn busy_with_tasks(&self) -> bool {
         !self.shared.tasks.lock().unwrap().is_empty()
+    }
+
+    /// Take everything that arrived while parked: how many frames, and a short
+    /// preview of any ASSISTANT TEXT among them.
+    ///
+    /// The preview is what makes the log line actionable — frame counts alone
+    /// can't tell "claude emitted a stray keep-alive" from "claude wrote a
+    /// thousand words nobody will ever see". Tool frames and thinking deltas are
+    /// deliberately not previewed: they are noise for this purpose.
+    fn drain_parked(&mut self) -> (usize, String) {
+        let mut frames = Vec::new();
+        while let Ok(v) = self.rx.try_recv() {
+            frames.push(v);
+        }
+        (frames.len(), orphaned_text_preview(&frames))
     }
 
     pub fn plain_tail(&self) -> Vec<String> {
@@ -409,8 +454,29 @@ impl Conn {
     /// Open the floor for a turn: drop anything claude said while parked, then
     /// start forwarding, then send the prompt. The drain is what keeps a
     /// follow-up turn claude ran on its own from being read as this turn's work.
+    ///
+    /// **Dropping is right; dropping in silence is not.** Whatever arrived while
+    /// this connection was parked belongs to a turn whose reply the daemon has
+    /// already finalized — forwarding it would put one turn's words in the next
+    /// one's bubble. But it is not noise: the usual producer is a background
+    /// task finishing and claude writing up the result, i.e. exactly the output
+    /// somebody is waiting for.
+    ///
+    /// 2026-09-17: an hour of work (a release plus a 2,099-object backfill) was
+    /// reported into a parked connection and eaten here without a trace. The
+    /// person watching the chat saw a bot that had simply gone quiet for two
+    /// hours, and the daemon log said nothing at all. So: still dropped, now
+    /// loud — a line in the log is the difference between "a known gap" and
+    /// "the bot is haunted".
     pub async fn begin_turn(&mut self, prompt: &str, env: crate::turnenv::TurnEnv) -> Result<()> {
-        while self.rx.try_recv().is_ok() {}
+        let (dropped, orphan) = self.drain_parked();
+        if !orphan.is_empty() {
+            eprintln!(
+                "[cc-pool] ⚠️ discarded {dropped} frame(s) claude produced while parked \
+(pid {}) — that reply belonged to an already-finalized turn and reached nobody: {orphan}",
+                self.pid().unwrap_or(0)
+            );
+        }
         self.shared.plain.lock().unwrap().clear();
         *self.shared.turn.lock().unwrap() = env;
         self.shared.in_turn.store(true, Ordering::SeqCst);
@@ -502,6 +568,14 @@ fn spawn_reader(
                                 let rid = v["response"]["request_id"].as_str().unwrap_or("");
                                 if let Some(w) = shared.pending.lock().unwrap().remove(rid) {
                                     let _ = w.send(v["response"].clone());
+                                } else if rid.starts_with("mf-init-") {
+                                    // The handshake already gave up on this one.
+                                    // "Answered late" and "never answered" are
+                                    // different bugs, and only this line tells
+                                    // them apart.
+                                    eprintln!(
+                                        "[cc-pool] late init reply for {rid} — nobody waiting any more"
+                                    );
                                 }
                                 continue;
                             }
@@ -789,6 +863,46 @@ pub fn put(conn: Conn) {
     );
 }
 
+/// A short, single-line preview of the ASSISTANT TEXT inside frames that are
+/// about to be thrown away.
+///
+/// The preview is what makes the drain's log line actionable — a frame count
+/// alone cannot tell "claude emitted a stray keep-alive" from "claude wrote a
+/// thousand words nobody will ever see". Tool calls and thinking deltas are
+/// deliberately not previewed: for this purpose they are noise, and a log line
+/// full of tool json is a log line people learn to skip.
+///
+/// Empty string = nothing worth reporting, which is the common case and must
+/// stay quiet.
+fn orphaned_text_preview(frames: &[Value]) -> String {
+    const PREVIEW: usize = 240;
+    let mut text = String::new();
+    for v in frames {
+        // The two shapes the turn reader consumes (`claude_code.rs`): streaming
+        // text deltas, and the completed-message form.
+        if v["type"] == "stream_event" && v["event"]["delta"]["type"] == "text_delta" {
+            if let Some(t) = v["event"]["delta"]["text"].as_str() {
+                text.push_str(t);
+            }
+        } else if v["type"] == "assistant" {
+            if let Some(blocks) = v["message"]["content"].as_array() {
+                for b in blocks {
+                    if let Some(t) = b["text"].as_str() {
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+    let flat = text.replace(['\n', '\r'], " ");
+    let flat = flat.trim();
+    if flat.is_empty() {
+        return String::new();
+    }
+    let shown: String = flat.chars().take(PREVIEW).collect();
+    format!("{shown}{}", if flat.chars().count() > PREVIEW { "…" } else { "" })
+}
+
 /// Drop everything — called before the daemon re-execs itself so an update
 /// never leaves orphaned processes holding sessions.
 pub fn shutdown_all() {
@@ -974,5 +1088,124 @@ mod tests {
         assert!(!enabled());
         std::env::remove_var("MAFOLD_CC_POOL");
         assert!(enabled());
+    }
+
+    fn delta(t: &str) -> Value {
+        serde_json::json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": t } }
+        })
+    }
+
+    /// The whole point of the preview: a drop that carried real words must be
+    /// distinguishable, in the log, from a drop that carried none.
+    #[test]
+    fn a_dropped_reply_is_quoted_so_the_log_shows_what_was_lost() {
+        let frames = vec![
+            delta("回填跑完了:"),
+            serde_json::json!({ "type": "stream_event",
+                "event": { "type": "content_block_delta",
+                           "delta": { "type": "thinking_delta", "thinking": "不该出现" } } }),
+            delta(" 2,099 成功"),
+        ];
+        let p = orphaned_text_preview(&frames);
+        assert!(p.contains("回填跑完了"), "{p}");
+        assert!(p.contains("2,099 成功"), "{p}");
+        assert!(!p.contains("不该出现"), "thinking 不进预览:{p}");
+    }
+
+    /// A completed `assistant` message counts too — a turn that never streamed
+    /// still said something.
+    #[test]
+    fn a_completed_message_counts_as_words_too() {
+        let frames = vec![serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [ { "type": "text", "text": "done" },
+                                      { "type": "tool_use", "name": "Bash" } ] }
+        })];
+        assert_eq!(orphaned_text_preview(&frames), "done");
+    }
+
+    /// Silence must stay silent. Keep-alives, tool traffic and an empty park are
+    /// the common case; a warning that fires on those is a warning nobody reads.
+    #[test]
+    fn frames_without_words_say_nothing() {
+        assert_eq!(orphaned_text_preview(&[]), "");
+        assert_eq!(
+            orphaned_text_preview(&[
+                serde_json::json!({ "type": "system", "subtype": "init" }),
+                serde_json::json!({ "type": "stream_event",
+                    "event": { "type": "content_block_delta",
+                               "delta": { "type": "input_json_delta", "partial_json": "{\"a\":" } } }),
+            ]),
+            ""
+        );
+        // Whitespace-only is nothing, not something.
+        assert_eq!(orphaned_text_preview(&[delta("  \n  ")]), "");
+    }
+
+    /// Long output is truncated (a log line, not a transcript) but marked, so
+    /// nobody reads the tail as the whole of what was lost.
+    #[test]
+    fn a_long_lost_reply_is_cut_but_says_it_was_cut() {
+        let long = "字".repeat(1000);
+        let p = orphaned_text_preview(&[delta(&long)]);
+        assert!(p.ends_with('…'), "{p}");
+        assert_eq!(p.chars().count(), 241, "240 chars + the ellipsis");
+    }
+
+    /// A stub standing in for claude: `script` owns stdin/stdout the same way
+    /// the real CLI does, so the handshake runs its true path.
+    async fn stub(script: &str) -> Conn {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(script);
+        Conn::spawn(key("opus"), "t1".into(), String::new(), cmd, "/tmp")
+            .await
+            .expect("stub spawns")
+    }
+
+    const REPLY: &str =
+        r#"{"type":"control_response","response":{"subtype":"%S","request_id":"mf-init-t1"}}"#;
+
+    #[tokio::test]
+    async fn a_cli_that_answers_the_handshake_registers_control_hooks() {
+        let mut c = stub(&format!(
+            "read -r _; echo '{}'; cat > /dev/null",
+            REPLY.replace("%S", "success")
+        ))
+        .await;
+        assert!(c.register_hooks(true, true).await);
+        assert!(c.control_hooks);
+    }
+
+    /// The reply we don't recognise must fail FAST — conflating it with the
+    /// ten-second timeout is what hid a 10s-per-prewarm tax for days.
+    #[tokio::test]
+    async fn an_unrecognised_reply_fails_without_burning_the_timeout() {
+        let mut c = stub(&format!(
+            "read -r _; echo '{}'; cat > /dev/null",
+            REPLY.replace("%S", "error")
+        ))
+        .await;
+        let began = Instant::now();
+        assert!(!c.register_hooks(true, true).await);
+        assert!(!c.control_hooks);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "answered at {:?} — a reply is not a timeout",
+            began.elapsed()
+        );
+    }
+
+    /// The production shape. Ignored because it deliberately costs the full ten
+    /// seconds: run it with `--ignored --nocapture` to read the diagnostic line.
+    #[tokio::test]
+    #[ignore = "spends the real 10s handshake timeout"]
+    async fn a_silent_cli_times_out_and_the_line_carries_its_stderr() {
+        let mut c = stub("echo 'stub refuses to handshake' >&2; cat > /dev/null").await;
+        let began = Instant::now();
+        assert!(!c.register_hooks(true, true).await);
+        assert!(began.elapsed() >= Duration::from_secs(10));
+        assert!(c.stderr_text().contains("stub refuses to handshake"));
     }
 }

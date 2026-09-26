@@ -61,6 +61,27 @@ pub struct FileRef {
     /// file, not a second addressing scheme.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local: bool,
+    /// The picture itself, small enough to ride along: a JPEG whose long edge
+    /// is ~40px with its metadata segments stripped, base64, ~1.2 KB. It costs
+    /// **zero requests** — by the time a bubble exists, its first frame is
+    /// already in hand. `w`/`h` reserve the box; this fills it.
+    ///
+    /// A plain JPEG on purpose, not Telegram's header-stripped form: readers
+    /// hand it straight to `data:image/jpeg;base64,…` with no expansion code
+    /// and no hardcoded quantisation table to keep in sync. See
+    /// `.docs/thumbnail-v1.md` §3.1/§4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip: Option<String>,
+    /// The same picture at higher fidelity, when one exists.
+    ///
+    /// `None` is the COMMON case, not a degraded one: the sender has to tick
+    /// "original" for the full-size bytes to be uploaded at all. Readers show
+    /// a "view original" affordance exactly when this is `Some` — there is no
+    /// second question to ask and no request that can 404.
+    ///
+    /// One level deep; an `orig`'s own `orig` is always `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orig: Option<Box<FileRef>>,
 }
 
 impl FileRef {
@@ -77,6 +98,8 @@ impl FileRef {
             duration_ms: None,
             filename: None,
             local: false,
+            strip: None,
+            orig: None,
         }
     }
 }
@@ -357,6 +380,17 @@ pub struct Conversation {
     /// Not stored; computed per requester (respects their deletes/hidden).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message: Option<Message>,
+    /// Incremental-sync watermark for this conversation's `#all` timeline — the
+    /// value `messages.diff` takes as `since`. Monotonic, server-issued, and
+    /// bumped by anything that changes a row (new message, finalize, edit,
+    /// delete, reaction).
+    ///
+    /// Shipped WITH the list on purpose: a client that already cached this
+    /// conversation can compare it against its own watermark and know, without
+    /// a single request, whether opening the chat needs the network at all.
+    /// Same "populated at list time" rule as `last_message`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub pts: u64,
     /// Group creator (lowercased username) — full control. None for direct
     /// chats and for legacy groups created before roles existed (those fall
     /// back to "any participant can manage", preserving prior behaviour).
@@ -554,6 +588,10 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 /// An extra forum channel (beyond the implicit `#all` main timeline). A group
 /// becomes a forum via `is_forum`; each `Channel` is a named sub-timeline whose
 /// messages carry `Message.channel_id = Some(this.id)`.
@@ -576,6 +614,11 @@ pub struct Channel {
     /// channel-list preview. Not stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message: Option<Message>,
+    /// Plain summary of the full last message, at most 240 characters. Kept
+    /// separate from the bounded raw prefix so clients never parse it as markup
+    /// or mistake a generating-only placeholder for meaningful spoken content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_preview: Option<String>,
     /// Closed = read-only lock: history stays, new messages are rejected
     /// server-side (`channel_guard`); reopen anytime. `#all` can't close (v1).
     #[serde(default, skip_serializing_if = "is_false")]
@@ -608,6 +651,11 @@ pub struct Channel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Server-assigned content/attachment revision, persisted with the message.
+    /// Independent of a recipient's event seq: late broadcasts and history
+    /// responses keep the revision of the snapshot they actually carry.
+    #[serde(default)]
+    pub content_revision: u64,
     pub id: Uuid,
     pub conversation_id: Uuid,
     pub sender: Account,
@@ -846,6 +894,33 @@ pub struct MessagesPage {
     pub next_cursor: Option<String>,
 }
 
+/// The answer to `messages.diff`: everything one timeline did since the
+/// caller's watermark, and the watermark to carry next time.
+///
+/// Not a page. A page is positional ("the newest fifty") and this is temporal
+/// ("what moved"), which is why it has no cursor and why `items` can be empty
+/// while `pts` still advances — activity in a sibling forum channel moves the
+/// conversation's counter without touching this timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagesDiff {
+    /// The new watermark. Store it with the timeline; send it back as `since`.
+    pub pts: u64,
+    /// Rows to insert or replace, chronological. A tombstoned message arrives
+    /// here like any other row, with `deleted` set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<Message>,
+    /// Rows that left this timeline for THIS caller — delete-for-me, and drafts
+    /// that were thrown away rather than tombstoned. Without it a cache keeps
+    /// showing messages their owner deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
+    /// The caller is further behind than the log reaches: this diff is empty
+    /// and meaningless, reload the newest page instead. Telegram's
+    /// `updates.differenceTooLong`, and the reason a bounded log is safe.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub too_long: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationsPage {
     pub items: Vec<Conversation>,
@@ -858,6 +933,10 @@ pub struct AccountsPage {
     pub items: Vec<Account>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Usernames among `items` that couldn't answer the caller right now —
+    /// set by `getOfficialBots` only (a resale pool with no seller free).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<String>,
 }
 
 // MARK: - Auth
@@ -1407,3 +1486,4 @@ mod langpack_checksum_tests {
         assert_ne!(langpack_checksum(&a), langpack_checksum(&d));
     }
 }
+pub mod tutorial;

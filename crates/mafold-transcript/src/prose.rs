@@ -62,7 +62,7 @@ pub fn visible_prose(text: &str) -> Cow<'_, str> {
             tag.end
         } else {
             find_close(text, tag.end, tag.name)
-                .or_else(|| orphan_close(text, tag.end, &ranges).map(|(_, end)| end))
+                .or_else(|| orphan_close(text, tag.end, &ranges, tag.name).map(|(_, end)| end))
                 .unwrap_or(text.len())
         };
         push_code_cuts(&mut cuts, &ranges, settled, start);
@@ -99,6 +99,52 @@ pub fn visible_prose(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Replace only outer card islands, keeping their bodies opaque and code
+/// samples literal. Used by previews so child tool/HTML/ask content cannot leak.
+/// The callback receives the qualified tag and its raw opening attributes.
+pub fn map_card_text(
+    text: &str,
+    prose: impl Fn(&str) -> String,
+    mut label: impl FnMut(&str, &str) -> String,
+) -> String {
+    let mut ranges = code_ranges(text);
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while let Some(rel) = text[i..].find("{%") {
+        let start = i + rel;
+        let Some(tag) = parse_tag(text, start) else {
+            i = start + 2;
+            continue;
+        };
+        i = tag.end;
+        if tag.is_close || in_code(start, &ranges) {
+            continue;
+        }
+        let end = if tag.self_close {
+            tag.end
+        } else {
+            find_close(text, tag.end, tag.name)
+                .or_else(|| orphan_close(text, tag.end, &ranges, tag.name).map(|(_, end)| end))
+                .unwrap_or(text.len())
+        };
+        out.push_str(&prose(&text[copied..start]));
+        out.push(' ');
+        out.push_str(&label(tag.name, tag.attrs));
+        out.push(' ');
+        if text[start..end].contains(['`', '~']) {
+            ranges = code_ranges(&text[end..])
+                .into_iter()
+                .map(|(a, b)| (a + end, b + end))
+                .collect();
+        }
+        copied = end;
+        i = end;
+    }
+    out.push_str(&prose(&text[copied..]));
+    out
+}
+
 /// The code ranges that fall inside the prose run `from..to`, clipped to it.
 fn push_code_cuts(cuts: &mut Vec<(usize, usize)>, ranges: &[(usize, usize)], from: usize, to: usize) {
     for &(a, b) in ranges {
@@ -110,6 +156,7 @@ fn push_code_cuts(cuts: &mut Vec<(usize, usize)>, ranges: &[(usize, usize)], fro
 
 struct Tag<'a> {
     name: &'a str,
+    attrs: &'a str,
     is_close: bool,
     self_close: bool,
     /// Byte offset just past the tag's `%}`.
@@ -159,7 +206,7 @@ fn parse_tag(text: &str, at: usize) -> Option<Tag<'_>> {
     let name = &text[name_start..p];
     let close = p + text[p..].find("%}")?;
     let self_close = text[p..close].trim_end().ends_with('/');
-    Some(Tag { name, is_close, self_close, end: close + 2 })
+    Some(Tag { name, attrs: &text[p..close], is_close, self_close, end: close + 2 })
 }
 
 /// End offset of the first `{% /NAME %}` at or after `from` — the same fixed-tag
@@ -189,7 +236,22 @@ fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
 /// `(start, end)` of the first close tag after `from` that nothing inside the
 /// body opened — the close the author meant for the unclosed container but
 /// misspelled. Depth-tracked so a nested container's own close isn't taken.
-fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)]) -> Option<(usize, usize)> {
+fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)], name: &str) -> Option<(usize, usize)> {
+    // Match the client's recovery: an unmatched tag-shaped mention inside a
+    // body is not another container, and a same-name re-open can be a typo.
+    let mut last_close = std::collections::HashMap::new();
+    let mut i = from;
+    while let Some(rel) = text[i..].find("{%") {
+        let start = i + rel;
+        let Some(tag) = parse_tag(text, start) else {
+            i = start + 2;
+            continue;
+        };
+        i = tag.end;
+        if tag.is_close && !in_code(start, ranges) {
+            last_close.insert(tag.name, start);
+        }
+    }
     let mut depth = 0usize;
     let mut i = from;
     while let Some(rel) = text[i..].find("{%") {
@@ -208,7 +270,12 @@ fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)]) -> Option<(u
             }
             depth -= 1;
         } else if !tag.self_close {
-            depth += 1;
+            if depth == 0 && tag.name == name {
+                return Some((start, tag.end));
+            }
+            if last_close.get(tag.name).is_some_and(|end| *end > start) {
+                depth += 1;
+            }
         }
     }
     None

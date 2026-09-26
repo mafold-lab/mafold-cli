@@ -17,6 +17,8 @@ struct Entry {
     /// final snapshot is acknowledged, clear it so retries cannot overwrite a
     /// later live-card edit to the delivered message.
     content: Option<String>,
+    #[serde(default)]
+    success_for: Option<String>,
     #[serde(skip)]
     delivering: bool,
 }
@@ -104,6 +106,7 @@ impl Outbox {
             pid: std::process::id(),
             ready: false,
             content: None,
+            success_for: None,
             delivering: false,
         };
         let mut entries = self.entries.lock().unwrap();
@@ -112,11 +115,12 @@ impl Outbox {
         Ok(())
     }
 
-    pub fn complete(&self, id: &str, content: &str) -> Result<()> {
+    pub fn complete(&self, id: &str, content: &str, success_for: Option<&str>) -> Result<()> {
         let entry = Entry {
             pid: std::process::id(),
             ready: true,
             content: Some(content.into()),
+            success_for: success_for.map(str::to_string),
             delivering: false,
         };
         let mut entries = self.entries.lock().unwrap();
@@ -139,7 +143,7 @@ impl Outbox {
     }
 
     pub async fn deliver(&self, client: &Client, id: &str) -> Result<bool> {
-        let content = {
+        let (content, success_for) = {
             let mut entries = self.entries.lock().unwrap();
             let Some(entry) = entries.get_mut(id) else {
                 return Ok(true);
@@ -148,7 +152,7 @@ impl Outbox {
                 return Ok(false);
             }
             entry.delivering = true;
-            entry.content.clone()
+            (entry.content.clone(), entry.success_for.clone())
         };
         let result = async {
             if let Some(content) = content {
@@ -159,7 +163,7 @@ impl Outbox {
                     self.persist(id, entry)?;
                 }
             }
-            client.finalize(id).await?;
+            client.finalize(id, success_for.as_deref()).await?;
             self.forget(id)?;
             Ok(true)
         }
@@ -212,7 +216,7 @@ mod tests {
         let b = "00000000-0000-0000-0000-000000000002";
         old.track(a).unwrap();
         old.track(b).unwrap();
-        old.complete(b, "the final answer").unwrap();
+        old.complete(b, "the final answer", Some(a)).unwrap();
         // Simulate a different live daemon; this test process's own PID is
         // deliberately recoverable across an exec-based update.
         for (id, entry) in old.entries.lock().unwrap().iter_mut() {
@@ -229,7 +233,9 @@ mod tests {
         let entries = recovered.entries.lock().unwrap();
         assert!(entries[a].ready);
         assert!(entries[a].content.is_none());
+        assert!(entries[a].success_for.is_none(), "recovered partial output is not success");
         assert_eq!(entries[b].content.as_deref(), Some("the final answer"));
+        assert_eq!(entries[b].success_for.as_deref(), Some(a));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -253,7 +259,7 @@ mod tests {
         outbox.track(id).unwrap();
         outbox.deliver(&client, id).await.unwrap(); // active: no network call
         outbox
-            .complete(id, "complete text, no footer needed")
+            .complete(id, "complete text, no footer needed", None)
             .unwrap();
         assert!(outbox.deliver(&client, id).await.is_err());
         assert!(!outbox.entries.lock().unwrap()[id].delivering);
@@ -334,7 +340,7 @@ mod tests {
         let id = "00000000-0000-0000-0000-000000000004";
         let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
         outbox.track(id).unwrap();
-        outbox.complete(id, "full final answer").unwrap();
+        outbox.complete(id, "full final answer", None).unwrap();
         assert!(outbox.deliver(&client, id).await.is_err());
         let recovered = Outbox::load(dir.clone(), |_| false).unwrap();
         assert!(recovered.entries.lock().unwrap()[id].content.is_none());

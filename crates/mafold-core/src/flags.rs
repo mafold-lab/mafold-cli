@@ -47,6 +47,15 @@ pub struct FlagMeta {
 /// gate code on every client.
 pub static KNOWN_FLAGS: &[FlagMeta] = &[
     FlagMeta {
+        key: "starterTutorial",
+        default: false,
+        dev_default: true,
+        label: "Starter tutorial",
+        description: "Three guided starter quests in Activity Center.",
+        owner: "ops",
+        added: "2026-09",
+    },
+    FlagMeta {
         key: "showIds",
         default: false,
         dev_default: false,

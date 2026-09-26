@@ -696,6 +696,8 @@ impl Harness for ClaudeCode {
                 SeatHealth::from_limits(tier, limits)
             }
             P::NoCredential => SeatHealth::unauthenticated(),
+            // Signed in, renewed on its next run — we didn't get to look.
+            P::Stale => SeatHealth::unknown(),
             P::Http(s) => SeatHealth::from_status(s),
             P::Unreachable => SeatHealth::unreachable(),
         }

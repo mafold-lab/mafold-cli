@@ -16,6 +16,9 @@ use automerge::{AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Subcommand;
 use serde_json::{json, Map, Value as J};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::client::Client;
 
@@ -300,10 +303,63 @@ fn schema_mode<'a>(schema: &'a std::collections::BTreeMap<String, String>, key: 
 /// it reflects whatever is installed and whatever each app declares, with zero
 /// per-app knowledge. `None` when nothing is installed (no prompt overhead).
 pub async fn context_block(client: &Client, conv: &str) -> Result<Option<String>> {
-    let resp = client.list_installs(conv).await?;
+    // Fresh enough → answer without touching the network. `None` is cached the
+    // same way: a conversation with no apps is the common case and deserves the
+    // same skip, not a round trip that re-learns "still nothing" every turn.
+    {
+        let cache = installs_cache().lock().unwrap();
+        if let Some((at, block)) = cache.get(conv) {
+            if at.elapsed() < INSTALLS_TTL {
+                return Ok(block.clone());
+            }
+        }
+    }
+    let resp = match client.list_installs(conv).await {
+        Ok(r) => r,
+        Err(e) => {
+            // A fetch error used to mean the turn simply ran without this block.
+            // Holding a previous answer we can do better than silence: the last
+            // known list beats no list, and the staleness is bounded by how long
+            // the API has been unreachable — precisely the window in which
+            // nobody is installing anything either.
+            if let Some((_, block)) = installs_cache().lock().unwrap().get(conv) {
+                return Ok(block.clone());
+            }
+            return Err(e);
+        }
+    };
+    let block = render_installs(&resp);
+    installs_cache()
+        .lock()
+        .unwrap()
+        .insert(conv.to_string(), (Instant::now(), block.clone()));
+    Ok(block)
+}
+
+/// How long a fetched apps/rooms block stays good. The list changes only when
+/// someone installs or removes a mini-app — rare next to "every turn" — while
+/// the fetch sits on the turn's critical path, ahead of the draft the bot opens
+/// to say it is alive. A minute surfaces a freshly installed app almost at once
+/// and still takes the round trip off nearly every turn.
+const INSTALLS_TTL: Duration = Duration::from_secs(60);
+
+/// Per-conversation cache for `context_block`. Deliberately NOT pushed down into
+/// `Client::list_installs`: `app_rooms` shares that call to back `mafold room
+/// get/set`, where the caller is asking what the room holds RIGHT NOW and a
+/// stale schema is a wrong answer rather than a slow one. Only the prompt block
+/// — read by the next turn, not by a command — can trade freshness for latency.
+static INSTALLS: OnceLock<Mutex<HashMap<String, (Instant, Option<String>)>>> = OnceLock::new();
+
+fn installs_cache() -> &'static Mutex<HashMap<String, (Instant, Option<String>)>> {
+    INSTALLS.get_or_init(Default::default)
+}
+
+/// `listInstalls` response → the prompt block, or `None` when nothing is
+/// installed. Pure, so `context_block` has exactly one place that caches.
+fn render_installs(resp: &J) -> Option<String> {
     let items = match resp.get("items").and_then(|i| i.as_array()) {
         Some(a) if !a.is_empty() => a,
-        _ => return Ok(None),
+        _ => return None,
     };
     let mut apps: Vec<String> = Vec::new();
     let mut rooms: Vec<String> = Vec::new();
@@ -330,7 +386,7 @@ pub async fn context_block(client: &Client, conv: &str) -> Result<Option<String>
         }
     }
     if apps.is_empty() {
-        return Ok(None);
+        return None;
     }
     let mut s = String::from(
         "[AVAILABLE APPS & ROOMS — mini-apps installed in THIS conversation. Their shared \
@@ -355,7 +411,7 @@ entry matches any key with that prefix (e.g. `issue:*` covers `issue:abc`):\n",
         }
     }
     s.push_str("[END AVAILABLE APPS & ROOMS]");
-    Ok(Some(s))
+    Some(s)
 }
 
 async fn resolve_app(client: &Client, conv: &str, app: Option<String>) -> Result<String> {
@@ -462,5 +518,81 @@ mod tests {
         doc2.load_incremental(&STANDARD.decode(blob).unwrap())
             .unwrap();
         assert_eq!(room_to_json(&doc2), out);
+    }
+
+    /// The apps block sits in front of the draft the bot opens to say it is
+    /// alive, so the round trip behind it is paid before the user sees anything.
+    /// It may be paid ONCE per conversation per TTL, never once per turn.
+    #[tokio::test]
+    async fn the_apps_block_is_fetched_once_then_served_from_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Counted rather than "serve one then stop listening": a refused second
+        // connection would fall into the stale-on-error path and return the same
+        // block, so the assertion has to be on round trips, not on the answer.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len: usize = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(str::to_string)
+                            })
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                seen.fetch_add(1, Ordering::SeqCst);
+                let reply = r#"{"ok":true,"result":{"items":[{"id":"mafold/todos","manifest":{"name":"Standup","room":{"item:*":"write"}}}]}}"#;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = Client::new(format!("http://{addr}"), "dev:test".into());
+        // Keyed per conversation, and the cache is process-global — so this test
+        // owns a conv id nothing else uses.
+        let conv = "conv-for-the-installs-cache-test";
+
+        let first = context_block(&client, conv).await.unwrap().unwrap();
+        assert!(first.contains("Standup"), "app name is rendered: {first}");
+        assert!(first.contains("item:*:write"), "room schema is rendered: {first}");
+
+        let second = context_block(&client, conv).await.unwrap().unwrap();
+        assert_eq!(first, second, "cached answer is byte-identical");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second call must not re-ask the server — that round trip is what used to delay every turn's generating card",
+        );
     }
 }

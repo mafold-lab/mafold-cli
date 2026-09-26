@@ -22,6 +22,7 @@
 pub mod event;
 pub mod lint;
 pub mod prose;
+pub mod preview;
 pub mod render;
 pub mod transcript;
 pub mod stats;

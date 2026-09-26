@@ -44,10 +44,20 @@ pub enum AccessCmd {
     /// first miss; run it directly to ask for a room before you need it, to
     /// set a different TTL, or to ask on behalf of another agent.
     Request {
-        /// Conversation id, @username (the DM), or a name from `mafold chats`.
-        chat: String,
+        /// Conversation id, or a name from `mafold chats`. Leave it out when
+        /// using --of/--with.
+        chat: Option<String>,
+        /// Name a DM you are NOT in by its two people: `--of @ops --with
+        /// @linsky`. The only form that can reach such a room — its uuid is
+        /// learnable only from inside it.
+        #[arg(long)]
+        of: Option<String>,
+        /// The other end of `--of`.
+        #[arg(long)]
+        with: Option<String>,
         /// Who to address the ask to. Defaults to a participant you already
         /// share a conversation with; required when that is ambiguous.
+        /// Implied by --of.
         #[arg(long)]
         from: Option<String>,
         /// How long to ask for (1–90).
@@ -58,6 +68,21 @@ pub enum AccessCmd {
         /// ask for someone else; only a participant can answer it.
         #[arg(long = "for")]
         for_account: Option<String>,
+    },
+    /// Lend one of YOUR rooms to an account, without waiting to be asked.
+    ///
+    /// The mirror of `request`. It exists because the ask alone could not
+    /// start: to post the card the asker must name the room by uuid, and a
+    /// uuid is only learnable from inside — so the commonest case, "let my own
+    /// agent read my own chat", had nothing to press.
+    Grant {
+        /// Conversation id, or a name from `mafold chats`. You must be in it.
+        chat: String,
+        /// Who to lend it to.
+        grantee: String,
+        /// How long (1–90).
+        #[arg(long, default_value_t = 7)]
+        days: i64,
     },
     /// What you may read, and what you are still waiting on.
     Status,
@@ -75,6 +100,37 @@ pub struct ReadArgs {
     pub channel: Option<String>,
     pub json: bool,
     pub media: bool,
+    /// Only the unread (the chat's badge, capped by `limit`), then mark read.
+    pub unread: bool,
+    /// Prefix every row with its message id.
+    pub ids: bool,
+}
+
+/// How many unread messages the caller has in this timeline — the same badge
+/// the chat list shows. A channel keeps its own count (`listChannels`); the
+/// main timeline's is on the chat row. None = the room isn't in my list.
+async fn unread_badge(client: &Client, chat_id: &str, channel: Option<&str>) -> Result<Option<usize>> {
+    let rows = match channel {
+        Some(_) => client.list_channels(chat_id).await?,
+        None => client.chats().await?,
+    };
+    let want = channel.unwrap_or(chat_id);
+    let list = rows["items"].as_array().or_else(|| rows.as_array()).cloned().unwrap_or_default();
+    Ok(list
+        .iter()
+        .find(|r| r["id"].as_str() == Some(want))
+        .map(|r| r["unread_count"].as_u64().unwrap_or(0) as usize))
+}
+
+/// The newest message on a page — the read marker to move to. By timestamp,
+/// not position, so it holds whichever order the page came in.
+pub(crate) fn newest_id(page: &Value) -> Option<String> {
+    page["items"]
+        .as_array()?
+        .iter()
+        .filter(|m| m["id"].as_str().is_some())
+        .max_by(|a, b| a["created_at"].as_str().unwrap_or("").cmp(b["created_at"].as_str().unwrap_or("")))
+        .and_then(|m| m["id"].as_str().map(str::to_string))
 }
 
 /// `mafold read [chat]` — the transcript, and an ask if there isn't one yet.
@@ -95,9 +151,22 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
         None => None,
     };
 
+    // `--unread`: only as many as the badge says, and none at all is an answer.
+    let mut limit = a.limit;
+    if a.unread {
+        match unread_badge(client, &chat.id, channel.as_deref()).await? {
+            Some(0) => {
+                println!("# {} · {} · 没有未读", chat.label, chat.shape);
+                return Ok(());
+            }
+            Some(n) => limit = n.min(a.limit),
+            None => anyhow::bail!("--unread: {} isn't one of your chats", chat.label),
+        }
+    }
+
     // Try as myself first. A participant never touches the grant table, so the
     // ordinary case costs exactly one request.
-    let mine = client.chat_history(&chat.id, a.limit, channel.as_deref(), None).await;
+    let mine = client.chat_history(&chat.id, limit, channel.as_deref(), None).await;
     let (page, lender) = match mine {
         Ok(p) => (p, None),
         Err(e) if !is_permission_error(&e) => return Err(e),
@@ -123,8 +192,65 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
     // Bytes first, so the transcript can print real paths beside the rows they
     // belong to rather than a trailing list the reader has to match up.
     let files = if a.media { fetch_media(client, &page).await } else { Default::default() };
-    print_transcript(&chat, lender.as_deref(), &page, &files);
+    print_transcript_ex(&chat, lender.as_deref(), &page, &files, a.ids);
+    // Reading the unread is what opening the chat does: move MY marker to the
+    // newest message shown (never past it — anything that arrived since stays
+    // unread). Not when reading on someone else's ticket: it isn't my room.
+    let dry = std::env::var("MAFOLD_SEND_DRY").is_ok_and(|v| v.trim() == "1");
+    if a.unread && lender.is_none() && !dry {
+        if let Some(newest) = newest_id(&page) {
+            match channel.as_deref() {
+                Some(ch) => client.mark_channel_read(&chat.id, ch, &newest).await?,
+                None => client.mark_read(&chat.id, Some(&newest)).await?,
+            }
+        }
+    }
+    if channel.is_none() {
+        forum_hint(client, &chat).await;
+    }
     Ok(())
+}
+
+/// A forum's `#all` is usually the quietest timeline it has — say so.
+///
+/// Reading a forum without `--channel` gives you the main timeline, which in a
+/// busy forum can be hours or weeks behind the rooms people actually talk in.
+/// Silence about that is the whole problem: the transcript LOOKS complete, so
+/// the reader concludes messages have stopped arriving rather than that they
+/// opened the wrong one. (Burned on the Mafold DEV group: `#all` ended 1.5h
+/// back while the live conversation sat in a channel, and it read exactly like
+/// a sync bug.)
+///
+/// Printed after the transcript and only when no channel was named; a room
+/// that isn't a forum says nothing at all.
+async fn forum_hint(client: &Client, chat: &Room) {
+    let Ok(v) = client.list_channels(&chat.id).await else { return };
+    let items: Vec<&Value> = v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["archived"].as_bool() != Some(true))
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    println!(
+        "\n※「{}」是论坛,上面读到的是 #all 主时间线 —— 另有 {} 个频道。",
+        chat.label,
+        items.len()
+    );
+    // Name the few with unread, since that is where a reader looking for
+    // "recent" almost certainly wants to be.
+    let mut hot: Vec<(&str, u64)> = items
+        .iter()
+        .filter_map(|c| Some((c["name"].as_str()?, c["unread_count"].as_u64().unwrap_or(0))))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    hot.sort_by(|a, b| b.1.cmp(&a.1));
+    for (name, n) in hot.iter().take(5) {
+        println!("   #{name}  ({n} 条未读)");
+    }
+    println!("   mafold read {} --channel '<频道名>'", chat.id);
 }
 
 /// Download every attachment on the page; `id → local path`.
@@ -295,6 +421,16 @@ fn print_transcript(
     page: &Value,
     files: &std::collections::HashMap<String, String>,
 ) {
+    print_transcript_ex(chat, lender, page, files, false)
+}
+
+fn print_transcript_ex(
+    chat: &Room,
+    lender: Option<&str>,
+    page: &Value,
+    files: &std::collections::HashMap<String, String>,
+    ids: bool,
+) {
     let items = page["items"].as_array().cloned().unwrap_or_default();
     let head = match lender {
         Some(g) => format!("# {} · {} · 以 @{} 的视角", chat.label, chat.shape, g),
@@ -311,7 +447,11 @@ fn print_transcript(
         let ts = m["created_at"].as_str().unwrap_or("");
         let when = ts.get(5..16).unwrap_or(ts).replace('T', " ");
         let body = readable_body(m["content"].as_str().unwrap_or(""));
-        println!("[{when}] {who}: {}", if body.is_empty() { "—".into() } else { body });
+        let id = match (ids, m["id"].as_str()) {
+            (true, Some(id)) => format!("#{id} "),
+            _ => String::new(),
+        };
+        println!("{id}[{when}] {who}: {}", if body.is_empty() { "—".into() } else { body });
         for a in m["attachments"].as_array().into_iter().flatten() {
             let name = attachment_name(a);
             match a["file"]["id"].as_str().and_then(|id| files.get(id)) {
@@ -336,7 +476,7 @@ fn print_transcript(
     println!("─ {} 条{tail} ─", items.len());
 }
 
-fn attachment_name(a: &Value) -> String {
+pub(crate) fn attachment_name(a: &Value) -> String {
     match a["kind"].as_str().unwrap_or("") {
         "photo" => "图片".to_string(),
         "video" => "视频".to_string(),
@@ -357,7 +497,7 @@ fn attachment_name(a: &Value) -> String {
 /// its body is the frozen conversation, which is exactly what someone reading
 /// a transcript asked for. That reuses the daemon's own renderer, so a record
 /// reads the same here as it does in a prompt.
-fn readable_body(text: &str) -> String {
+pub(crate) fn readable_body(text: &str) -> String {
     let mut photos = vec![];
     let flattened = crate::agent::flatten_body_records(text, &mut photos);
     let mut out = String::new();
@@ -382,7 +522,32 @@ fn readable_body(text: &str) -> String {
 
 pub async fn run(cmd: AccessCmd, client: &Client) -> Result<()> {
     match cmd {
-        AccessCmd::Request { chat, from, days, for_account } => {
+        AccessCmd::Request { chat: None, of: Some(of), with: Some(with), days, for_account, .. } => {
+            let who = for_account.as_deref().unwrap_or("你");
+            let r = client
+                .request_chat_access_pair(&of, &with, days, for_account.as_deref())
+                .await?;
+            let pair = format!("@{} 和 @{} 的私聊", of.trim_start_matches('@'), with.trim_start_matches('@'));
+            if r["granted"].as_bool() == Some(true) {
+                println!("✓ {who} 已经能读「{pair}」了 —— 不用再问");
+            } else if r["pending"].as_bool() == Some(true) {
+                println!("⏳ 已经问过了,卡还挂着,没人回应");
+                std::process::exit(EXIT_PENDING);
+            } else {
+                // Deliberately does not claim the card landed: for this form
+                // the server answers the same whether that DM exists or not,
+                // so saying "已发到 X" would be inventing a fact we were
+                // never told. See `request_chat_access_pair`.
+                println!("已向 @{} 提出申请:读「{pair}」,受权人写的是 {who}。", of.trim_start_matches('@'));
+                println!("对方点「允许」才算数 —— 我不能替他点头。用 `mafold access status` 看有没有下文。");
+            }
+            Ok(())
+        }
+        AccessCmd::Request { chat, of, with, from, days, for_account } => {
+            if of.is_some() || with.is_some() {
+                bail!("--of 和 --with 要成对出现,而且不能再带 <chat>");
+            }
+            let chat = chat.context("要指名一个会话:<chat>,或者 --of @某人 --with @某人")?;
             let room = resolve_room(client, &chat).await?;
             let r = ask(client, &room.id, from.as_deref(), days, for_account.as_deref()).await?;
             let who = for_account.as_deref().unwrap_or("你");
@@ -394,6 +559,18 @@ pub async fn run(cmd: AccessCmd, client: &Client) -> Result<()> {
             } else {
                 println!("同意卡已发到「{}」,受权人写的是 {who}", room.label);
                 println!("这个房间里任何一个人点「允许」都算数 —— 我不能替它点头。");
+            }
+            Ok(())
+        }
+        AccessCmd::Grant { chat, grantee, days } => {
+            let room = resolve_room(client, &chat).await?;
+            let r = client.grant_chat_access(&room.id, &grantee, days).await?;
+            let who = grantee.trim_start_matches('@');
+            if r["reason"].as_str() == Some("participant") {
+                println!("@{who} 本来就在「{}」里 —— 不需要票", room.label);
+            } else {
+                println!("✓ 已把「{}」借给 @{who},{days} 天后到期", room.label, days = days);
+                println!("随时可以收回:mafold access revoke {} @{who}", room.id);
             }
             Ok(())
         }
@@ -578,9 +755,20 @@ pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
         }) {
             return Ok(room_from(client, c).await);
         }
-        // Not in the list yet — `startChat` opens (or finds) the DM.
-        let id = client.resolve_chat(a).await?;
-        return Ok(Room { id, label: format!("@{needle}"), shape: "私聊".into() });
+        // Not in my list — and this is deliberately where it STOPS.
+        //
+        // It used to fall through to `resolve_chat`, i.e. `startChat`, i.e.
+        // `conversations_create`: a lookup that quietly opened a brand-new DM
+        // between me and them and handed back its id. So `mafold read @linsky`
+        // meant "create my own chat with linsky, then read it" — and because it
+        // SUCCEEDED, the caller got an almost-empty room and exit 0 instead of
+        // an error. A resolver that invents its answer is worse than one that
+        // fails; someone else's DM is not a room `startChat` can ever return.
+        bail!(
+            "我不在和 @{needle} 的私聊里,而「解析」不会去建一个。\n\
+             · 要读某人和 @{needle} 的私聊:mafold access request --of @那个人 --with @{needle}\n\
+             · 要给 @{needle} 发消息(这一步才会建私聊):mafold send @{needle} ……"
+        );
     }
 
     let hits: Vec<&Value> = items
@@ -590,8 +778,27 @@ pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
     match hits.len() {
         1 => Ok(room_from(client, hits[0]).await),
         0 => {
-            let id = client.resolve_chat(a).await?;
-            Ok(Room { id, label: a.into(), shape: String::new() })
+            // Same rule as the @handle arm: no match is an ANSWER, not a cue
+            // to create. This one was worse — `a` here is a room NAME, so the
+            // old fallback handed a group's title to `startChat` as if it were
+            // a username. Report what does exist instead; a caller that can
+            // see the list can correct itself in one step.
+            let mut msg = format!("没有叫「{a}」的会话。现在能看到的:\n");
+            for c in items.iter().take(20) {
+                msg.push_str(&format!(
+                    "  {}  {} · {}\n",
+                    c["id"].as_str().unwrap_or("?"),
+                    label_of(c, &my),
+                    shape_of(
+                        c["kind"].as_str().unwrap_or(""),
+                        c["participants"].as_array().map_or(0, |p| p.len())
+                    ),
+                ));
+            }
+            if items.len() > 20 {
+                msg.push_str(&format!("  …… 还有 {} 个,`mafold chats` 看全部\n", items.len() - 20));
+            }
+            bail!(msg)
         }
         _ => {
             // Ambiguity is REPORTED, never guessed. Two rooms wearing the same

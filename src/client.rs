@@ -9,10 +9,13 @@ use serde_json::{json, Value};
 /// / proxy TLS reset. The daemon's durable completion outbox covers longer outages.
 const RETRY_ATTEMPTS: u32 = 5;
 
-/// Tries for fetching a media attachment (600ms → 1.2s of cover). Small on
-/// purpose: the user is waiting on the reply this attachment belongs to, so a
-/// long backoff here would trade a missing image for a late answer.
-const MEDIA_ATTEMPTS: u32 = 3;
+/// Tries for fetching a media attachment (600ms → 1.2s → 2.4s → 4.8s of cover).
+/// The user is waiting on the reply this attachment belongs to, so the backoff
+/// stays short — but every attempt after the first RESUMES (see `download`),
+/// asking only for the bytes still missing, so a later try costs a fraction of
+/// the first and five of them are cheaper than the three full restarts this
+/// replaced.
+const MEDIA_ATTEMPTS: u32 = 5;
 
 /// Outcome of `me_probed`: the identity, or a definitive auth rejection.
 pub enum MeProbe {
@@ -96,12 +99,34 @@ impl std::fmt::Display for DraftRefused {
 
 impl std::error::Error for DraftRefused {}
 
+/// What `getUpdates` answered.
+pub struct Updates {
+    /// `{seq, method, params}`, in the shape WS frames arrive in.
+    pub items: Vec<Value>,
+    /// The cursor the server vouches for: every event it numbered for this
+    /// account up to here is either in `items` or was never replayable. (An
+    /// older server answers the newest event it KEPT — a lower bound, which
+    /// costs at most one extra fetch.)
+    pub head: u64,
+    /// Part of the window had already aged out of the server's backlog —
+    /// `items` is what is left of it, not all of it.
+    pub truncated: bool,
+}
+
+/// Durable trigger facts needed by the daemon after reconnect. Used both by
+/// the server-side replay filter and the daemon's local compatibility filter.
+pub(crate) const REPLAY_METHODS: &[&str] = &[
+    "events.messageNew", "events.threadReply", "events.messageComplete", "events.chatCleared",
+];
+
 #[derive(Clone)]
 pub struct Client {
     pub http: reqwest::Client,
     pub base: String,
     pub token: String,
     pub drafts: Option<std::sync::Arc<crate::drafts::Outbox>>,
+    writer_id: uuid::Uuid,
+    writer_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Client {
@@ -114,7 +139,11 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http, base, token, drafts: None }
+        Self {
+            http, base, token, drafts: None,
+            writer_id: uuid::Uuid::new_v4(),
+            writer_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
     }
 
     /// The core's typed API handle for this base+token (base gains the `/api`
@@ -157,8 +186,17 @@ impl Client {
                 // and hides the real error. Only transport failures get another go.
                 Err(e) if attempt == RETRY_ATTEMPTS || Self::is_api_error(&e) => return Err(e),
                 Err(e) => {
+                    // `{e:#}` — the whole chain. `post` wraps every failure in a
+                    // `"<method> failed"` context, so plain `{e}` printed that
+                    // wrapper and nothing else: 572 lines of
+                    // `botEditDraft failed (botEditDraft failed)` in one daemon
+                    // log, not one of which says whether the api refused us, was
+                    // unreachable, or timed out. A retry line that cannot
+                    // distinguish those is a retry line that costs a person an
+                    // afternoon (2026-09-17). Same trap as the attachment
+                    // downloader — see `Client::download`.
                     eprintln!(
-                        "{method} failed ({e}) — retry {attempt}/{RETRY_ATTEMPTS} in {delay:?}…"
+                        "{method} failed ({e:#}) — retry {attempt}/{RETRY_ATTEMPTS} in {delay:?}…"
                     );
                     tokio::time::sleep(delay).await;
                     delay *= 2;
@@ -227,12 +265,19 @@ impl Client {
     }
 
     /// POST /api/getUpdates — events with hub seq > `since` from the server's
-    /// per-account replay buffer (256 newest per account). Items are
+    /// per-account replay buffer. Ask only for durable trigger events so a
+    /// reconnect does not download hundreds of draft bodies before listening.
+    /// Older servers ignore `methods`; the daemon still filters locally.
+    /// Items are
     /// `{seq, method, params}` in the exact shape WS frames arrive, so a
     /// reconnect replays what it missed through the same handling path.
-    pub async fn get_updates(&self, since: u64) -> Result<Vec<Value>> {
-        let v = self.post("getUpdates", json!({ "since": since })).await?;
-        Ok(v["updates"].as_array().cloned().unwrap_or_default())
+    pub async fn get_updates(&self, since: u64) -> Result<Updates> {
+        let v = self.post("getUpdates", json!({ "since": since, "methods": REPLAY_METHODS })).await?;
+        Ok(Updates {
+            items: v["updates"].as_array().cloned().unwrap_or_default(),
+            head: v["seq"].as_u64().unwrap_or(since),
+            truncated: v["truncated"].as_bool().unwrap_or(false),
+        })
     }
 
     /// Recent messages in a conversation (`{ items: [Message] }`). The access
@@ -298,6 +343,44 @@ impl Client {
         self.post("requestChatAccess", body).await
     }
 
+    /// Ask for a DM by naming BOTH of its people, for a room whose uuid the
+    /// caller cannot have: a uuid is only learnable from inside.
+    ///
+    /// The answer is deliberately the same whether or not that DM exists —
+    /// otherwise this is a probe for who talks to whom. Don't add a branch
+    /// here that tries to tell the two apart.
+    pub async fn request_chat_access_pair(
+        &self,
+        of: &str,
+        with: &str,
+        days: i64,
+        for_account: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({
+            "of": of.trim_start_matches('@'),
+            "with": with.trim_start_matches('@'),
+            "ttl_days": days,
+        });
+        if let Some(f) = for_account {
+            body["for"] = json!(f.trim_start_matches('@'));
+        }
+        self.post("requestChatAccess", body).await
+    }
+
+    /// Lend one of MY rooms to an account, unprompted — the other direction
+    /// from `request_chat_access`. See `chat_grants::grant_chat_access`.
+    pub async fn grant_chat_access(&self, chat_id: &str, to: &str, days: i64) -> Result<Value> {
+        self.post(
+            "grantChatAccess",
+            json!({
+                "conversation_id": chat_id,
+                "to": to.trim_start_matches('@'),
+                "ttl_days": days,
+            }),
+        )
+        .await
+    }
+
     /// Both directions of chat.read at once: `granted` (mine, lent out),
     /// `held` (what I may read), `pending` (asks nobody has answered).
     pub async fn list_chat_grants(&self) -> Result<Value> {
@@ -315,6 +398,20 @@ impl Client {
     /// A thread's messages (root + replies) — used to rebuild context when the
     /// bot is @-mentioned INSIDE a thread (thread replies aren't in the channel's
     /// main timeline, so getChatHistory alone misses them).
+    /// One message by id, surface-agnostic.
+    ///
+    /// A message id is already unique, so needing to know WHICH channel it
+    /// lives in before you can read it is a hole, not a feature: three helpers
+    /// in `agent.rs` used to page the `#all` main timeline looking for a card
+    /// that was posted in a forum channel, find nothing, and return in silence.
+    /// This asks by the one thing the caller actually holds.
+    ///
+    /// Errors on an api that predates the route (`unknown method`), so callers
+    /// keep a paging fallback — `--base` may point at an older server.
+    pub async fn get_message(&self, message_id: &str) -> Result<Value> {
+        self.post("getMessage", json!({ "message_id": message_id })).await
+    }
+
     pub async fn get_thread_messages(
         &self,
         chat_id: &str,
@@ -495,6 +592,57 @@ impl Client {
         self.post("sendMessage", body).await
     }
 
+    /// Move the caller's read position in a conversation's main timeline to
+    /// `message_id` (None = the newest message the server knows). The same
+    /// marker every client moves when a person opens a chat, so the other side
+    /// sees "read" exactly as they would for a person.
+    pub async fn mark_read(&self, chat_id: &str, message_id: Option<&str>) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id });
+        if let Some(id) = message_id {
+            body["message_id"] = json!(id);
+        }
+        self.post_idempotent("markRead", body).await.map(|_| ())
+    }
+
+    /// `mark_read` for one forum channel. Channels keep their own marker: a
+    /// read in `#all` must never drain them, and vice versa.
+    pub async fn mark_channel_read(&self, chat_id: &str, channel_id: &str, message_id: &str) -> Result<()> {
+        self.post_idempotent(
+            "markChannelRead",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "message_id": message_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Show (`"typing"`) or clear (anything else) the "typing…" indicator the
+    /// people in this timeline see for the caller.
+    pub async fn send_chat_action(&self, chat_id: &str, channel_id: Option<&str>, action: &str) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id, "action": action });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        self.post("sendChatAction", body).await.map(|_| ())
+    }
+
+    /// Replace the text of a message the caller SENT (`editMessage` is
+    /// sender-only). Used to stamp an ask card `answered="…"` so every device
+    /// renders it answered, the way the daemon stamps its own drafts.
+    pub async fn edit_message(&self, message_id: &str, text: &str) -> Result<()> {
+        self.post_idempotent("editMessage", json!({ "message_id": message_id, "text": text }))
+            .await
+            .map(|_| ())
+    }
+
+    /// Add (or, with `remove`, take back) the caller's `emoji` on a message.
+    pub async fn set_reaction(&self, message_id: &str, emoji: &str, remove: bool) -> Result<Value> {
+        self.post(
+            "setMessageReaction",
+            json!({ "message_id": message_id, "emoji": emoji, "remove": remove }),
+        )
+        .await
+    }
+
     /// Publish this bot's slash commands (the chat command panel).
     pub async fn set_commands(&self, commands: Value) -> Result<()> {
         self.post("setBotCommands", json!({ "commands": commands }))
@@ -514,6 +662,20 @@ impl Client {
     /// a screenshot out of the prompt, leaving the model to answer a message it
     /// could not see, with one log line as the only trace. A 4xx is the server
     /// saying the thing is really gone — that one is not worth repeating.
+    ///
+    /// RESUMED, which is the part that matters for big files. The retry above
+    /// used to restart from byte 0, so a 2.6 MB screenshot on a link that tears
+    /// mid-body tore on every attempt and the image was simply lost (2026-09-17,
+    /// observed five times in one afternoon, all `error decoding response body`).
+    /// Now the bytes already delivered are kept and the next try sends
+    /// `Range: bytes=<have>-`, so each attempt only has to survive what is LEFT.
+    /// A server that ignores the header answers 200 with the whole object — that
+    /// is detected and the partial prefix dropped, because appending to it would
+    /// silently corrupt the file.
+    ///
+    /// And the result is LENGTH-CHECKED: a body that ends short without raising
+    /// an error is retried rather than handed back, since a truncated screenshot
+    /// the model treats as whole is worse than a missing one.
     pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
         let url = if path.starts_with("http://") || path.starts_with("https://") {
             if !self.media_origin_allowed(path) {
@@ -528,30 +690,82 @@ impl Client {
                 "refusing to fetch attachment from a non-relative, non-Mafold URL: {path}"
             );
         };
+        // Survives across attempts — that is the whole point of the resume.
+        let mut buf: Vec<u8> = Vec::new();
+        // The object's full size, learned from whichever response first states
+        // it. `None` = the server never said (a chunked 200), and then there is
+        // nothing to check the length against.
+        let mut total: Option<u64> = None;
         let mut delay = std::time::Duration::from_millis(600);
         let mut attempt = 1;
         loop {
             let got = async {
-                let resp = self.http.get(&url).send().await?.error_for_status()?;
-                Ok::<_, reqwest::Error>(resp.bytes().await?)
+                let mut req = self.http.get(&url);
+                if !buf.is_empty() {
+                    req = req.header(reqwest::header::RANGE, format!("bytes={}-", buf.len()));
+                }
+                let mut resp = req.send().await?.error_for_status()?;
+                // 206 means the range was honoured and the body continues where
+                // we stopped. ANY other success is the whole object again, so the
+                // prefix in hand has to go — appending would duplicate its head.
+                if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    buf.clear();
+                }
+                if total.is_none() {
+                    total = full_length(&resp);
+                }
+                // Chunk by chunk rather than `bytes()`, so a body that tears
+                // half-way leaves what it already delivered in `buf` instead of
+                // discarding it with the error.
+                while let Some(chunk) = resp.chunk().await? {
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok::<bool, reqwest::Error>(total.is_none_or(|t| buf.len() as u64 >= t))
             }
             .await;
-            match got {
-                Ok(bytes) => return Ok(bytes.to_vec()),
-                Err(e)
-                    if attempt < MEDIA_ATTEMPTS
-                        && !e.status().is_some_and(|s| s.is_client_error()) =>
-                {
-                    eprintln!(
-                        "attachment fetch failed ({e}) — retry {attempt}/{} in {delay:?}…",
-                        MEDIA_ATTEMPTS - 1
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                    attempt += 1;
+            let err = match got {
+                Ok(true) => return Ok(std::mem::take(&mut buf)),
+                // Ended cleanly but short. Rare, and exactly the case that must
+                // not be mistaken for success.
+                Ok(false) => None,
+                // A 4xx is the server saying the thing is really gone.
+                Err(e) if e.status().is_some_and(|s| s.is_client_error()) => {
+                    return Err(anyhow::Error::new(e))
                 }
-                Err(e) => return Err(anyhow::Error::new(e)),
+                Err(e) => Some(e),
+            };
+            if attempt >= MEDIA_ATTEMPTS {
+                return match err {
+                    Some(e) => Err(anyhow::Error::new(e).context(format!(
+                        "attachment download gave up after {attempt} tries with {} of {} bytes",
+                        buf.len(),
+                        total.map_or_else(|| "?".to_string(), |t| t.to_string())
+                    ))),
+                    None => anyhow::bail!(
+                        "attachment body ended short: {} of {} bytes after {attempt} tries",
+                        buf.len(),
+                        total.map_or_else(|| "?".to_string(), |t| t.to_string())
+                    ),
+                };
             }
+            // `{e}` alone prints only the OUTERMOST layer — which is how every
+            // one of those tears logged as a bare "error decoding response body"
+            // with the reason (connection reset? incomplete message?) dropped on
+            // the floor. Walk the chain.
+            let why = match &err {
+                Some(e) => cause_chain(e),
+                None => "body ended short".to_string(),
+            };
+            eprintln!(
+                "attachment fetch failed ({why}) — {} of {} bytes in hand, resuming; \
+retry {attempt}/{} in {delay:?}…",
+                buf.len(),
+                total.map_or_else(|| "?".to_string(), |t| t.to_string()),
+                MEDIA_ATTEMPTS - 1
+            );
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+            attempt += 1;
         }
     }
 
@@ -740,9 +954,10 @@ impl Client {
     /// it to a two-second uplink blip left the bubble animating forever with a
     /// Stop button that could never resolve — the failure this retry exists for.
     pub async fn edit_draft(&self, message_id: &str, content: &str) -> Result<()> {
+        let seq = self.writer_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         self.post_idempotent(
             "botEditDraft",
-            json!({ "message_id": message_id, "content": content }),
+            json!({ "message_id": message_id, "content": content, "writer_id": self.writer_id, "writer_seq": seq }),
         )
         .await?;
         Ok(())
@@ -819,23 +1034,23 @@ impl Client {
     }
     /// RETRIED: finalizing an already-finalized message is a no-op server-side,
     /// and an unfinalized draft is precisely the "forever generating" bubble.
-    pub async fn finalize(&self, message_id: &str) -> Result<()> {
-        self.post_idempotent("botFinalize", json!({ "message_id": message_id }))
+    pub async fn finalize(&self, message_id: &str, success_for: Option<&str>) -> Result<()> {
+        self.post_idempotent("botFinalize", json!({ "message_id": message_id, "success_for": success_for }))
             .await?;
         Ok(())
     }
 
     /// Persist the final snapshot before attempting either write. A periodic
     /// daemon task retries pending entries, including after process restart.
-    pub async fn finish_draft(&self, message_id: &str, content: &str) -> Result<bool> {
+    pub async fn finish_draft(&self, message_id: &str, content: &str, success_for: Option<&str>) -> Result<bool> {
         if let Some(outbox) = &self.drafts {
-            if let Err(e) = outbox.complete(message_id, content) {
+            if let Err(e) = outbox.complete(message_id, content, success_for) {
                 eprintln!("draft {message_id} completion journal failed: {e:#}");
             }
             outbox.deliver(self, message_id).await
         } else {
             self.edit_draft(message_id, content).await?;
-            self.finalize(message_id).await?;
+            self.finalize(message_id, success_for).await?;
             Ok(true)
         }
     }
@@ -1455,6 +1670,39 @@ impl Client {
     }
 }
 
+/// The object's FULL size from a response: `content-length` on a plain 200, the
+/// `/<total>` tail of `content-range` on a 206. `None` when the server didn't
+/// say (a chunked body) — then there is simply nothing to verify against, and a
+/// short read stays indistinguishable from a complete one.
+fn full_length(resp: &reqwest::Response) -> Option<u64> {
+    if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let cr = resp.headers().get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+        // `bytes 1024-2047/4096` → 4096. An unknown total is spelled `*`, which
+        // fails to parse and correctly yields None.
+        return cr.rsplit('/').next()?.trim().parse().ok();
+    }
+    resp.content_length()
+}
+
+/// Every layer of an error, joined. `{e}` on its own prints ONLY the outermost
+/// one, so a reqwest body tear reads as a bare "error decoding response body"
+/// and the sentence that actually names the fault — connection reset, incomplete
+/// message, TLS shutdown — never reaches the log. Repeated layers (hyper likes
+/// to restate its child) are skipped so the line stays readable.
+fn cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        let layer = c.to_string();
+        if !out.contains(&layer) {
+            out.push_str(": ");
+            out.push_str(&layer);
+        }
+        src = c.source();
+    }
+    out
+}
+
 /// Do two URLs share the same origin (scheme + host + port)? Used to keep the
 /// attachment downloader from following an absolute URL to a foreign host.
 fn same_origin(base: &str, other: &str) -> bool {
@@ -1584,6 +1832,27 @@ mod lost_turn_tests {
     }
 
     #[test]
+    /// Every failure `post` returns is wrapped in a `"<method> failed"` context,
+    /// so the retry line MUST print the chain — with plain `{e}` it printed that
+    /// wrapper back at itself and the real reason never reached the log.
+    #[test]
+    fn a_retry_line_says_why_not_just_which_call() {
+        let real = mafold_core::RpcError::Transport("connect failed: connection refused".into());
+        let wrapped = anyhow::Error::new(real).context("botEditDraft failed");
+
+        // What the log used to say: the context, twice, and nothing else.
+        assert_eq!(format!("{wrapped}"), "botEditDraft failed");
+
+        // What it says now.
+        let chain = format!("{wrapped:#}");
+        assert!(chain.contains("botEditDraft failed"), "{chain}");
+        assert!(
+            chain.contains("connection refused"),
+            "the reason must survive into the log: {chain}"
+        );
+    }
+
+    #[test]
     fn a_blip_is_the_far_end_falling_over_not_the_far_end_saying_no() {
         use mafold_core::RpcError as R;
         // It broke inside the handler → the same request may well work now.
@@ -1647,5 +1916,206 @@ mod lost_turn_tests {
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("send it again"), "must say what to do: {text}");
         assert!(text.contains("HTTP 500"), "must keep the reason: {text}");
+    }
+}
+
+/// The attachment downloader, against a server that tears bodies — the failure
+/// that lost five screenshots in one afternoon on 2026-09-17.
+#[cfg(test)]
+mod download_resume_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 200 deterministic bytes standing in for the 2.6 MB screenshot.
+    fn payload() -> Vec<u8> {
+        (0..200u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn read_head(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if text.contains("\r\n\r\n") {
+                return Some(text);
+            }
+        }
+    }
+
+    /// Promises 200 bytes and delivers 120 on the FIRST request, then hangs up —
+    /// which is what "error decoding response body" actually is. Later requests
+    /// are answered in full, honouring `Range` or deliberately ignoring it.
+    /// Records the `Range:` header of every request it saw.
+    async fn tearing_stub(honour_range: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+        const TEAR_AT: usize = 120;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut nth = 0u32;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let Some(head) = read_head(&mut sock).await else { continue };
+                let range = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                log.lock().unwrap().push(range.clone());
+                let body = payload();
+                nth += 1;
+                if nth == 1 {
+                    let h = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let _ = sock.write_all(&body[..TEAR_AT]).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                let from: usize = range
+                    .split('=')
+                    .nth(1)
+                    .and_then(|v| v.trim().trim_end_matches('-').parse().ok())
+                    .unwrap_or(0);
+                if honour_range && from > 0 && from < body.len() {
+                    let rest = &body[from..];
+                    let h = format!(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-type: image/png\r\n\
+content-range: bytes {}-{}/{}\r\ncontent-length: {}\r\n\r\n",
+                        from,
+                        body.len() - 1,
+                        body.len(),
+                        rest.len()
+                    );
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let _ = sock.write_all(rest).await;
+                } else {
+                    let h = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The whole point: the retry asks for what is MISSING, not for the file.
+    #[tokio::test]
+    async fn a_torn_body_resumes_instead_of_starting_over() {
+        let (base, seen) = tearing_stub(true).await;
+        let c = Client::new(base, "t".into());
+        let got = c.download("/media/shot.png").await.unwrap();
+        assert_eq!(got, payload(), "the resumed file must be byte-identical");
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one tear, one resume — got {calls:?}");
+        assert!(calls[0].is_empty(), "the first try asks for the whole thing: {:?}", calls[0]);
+        assert!(
+            calls[1].to_ascii_lowercase().contains("bytes=120-"),
+            "the retry must ask only for the remainder, got {:?}",
+            calls[1]
+        );
+    }
+
+    /// Not every server honours `Range`; one that doesn't answers 200 with the
+    /// WHOLE object. Appending that to the prefix already in hand would hand the
+    /// model a file with a duplicated head — silent corruption, worse than the
+    /// missing image this all exists to prevent.
+    #[tokio::test]
+    async fn a_server_that_ignores_range_replaces_rather_than_appends() {
+        let (base, seen) = tearing_stub(false).await;
+        let c = Client::new(base, "t".into());
+        let got = c.download("/media/shot.png").await.unwrap();
+        assert_eq!(got, payload(), "a 200 on the retry must REPLACE the partial prefix");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// `{e}` prints only the outermost layer — the log needs the one that names
+    /// the fault.
+    #[test]
+    fn the_cause_chain_survives_into_the_log() {
+        #[derive(Debug)]
+        struct Reset;
+        impl std::fmt::Display for Reset {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection reset by peer")
+            }
+        }
+        impl std::error::Error for Reset {}
+        #[derive(Debug)]
+        struct Decoding(Reset);
+        impl std::fmt::Display for Decoding {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error decoding response body")
+            }
+        }
+        impl std::error::Error for Decoding {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let s = cause_chain(&Decoding(Reset));
+        assert!(s.contains("error decoding response body"), "{s}");
+        assert!(s.contains("connection reset by peer"), "must keep the reason: {s}");
+    }
+}
+
+#[cfg(test)]
+mod draft_order_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn draft_retry_keeps_ordinal_and_cloned_producer_advances_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let len: usize = header.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    if bytes.len() < end + 4 + len { continue; }
+                    requests.push(serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + len]).unwrap());
+                    break;
+                }
+                if attempt == 0 { continue; } // Request committed, response lost.
+                let body = r#"{"ok":true,"result":{}}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let client = Client::new(base, "test".into());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            client.edit_draft("message", "first").await.unwrap();
+            client.clone().edit_draft("message", "second").await.unwrap();
+            let bodies = server.await.unwrap();
+            assert_eq!(bodies[0], bodies[1]);
+            assert_eq!(bodies[1]["writer_id"], bodies[2]["writer_id"]);
+            assert!(bodies[2]["writer_seq"].as_u64().unwrap() > bodies[1]["writer_seq"].as_u64().unwrap());
+            assert_eq!(bodies[2]["content"], "second");
+        }).await.unwrap();
     }
 }
