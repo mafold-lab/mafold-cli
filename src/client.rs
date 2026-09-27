@@ -999,13 +999,35 @@ retry {attempt}/{} in {delay:?}…",
     /// did before) meant a `.html` the agent wrote arrived as a broken image
     /// bubble, which is also why agents stopped believing they could send files.
     pub async fn attach_media(&self, message_id: &str, path: &std::path::Path) -> Result<Value> {
+        self.attach_media_as(message_id, path, AttachAs::Detected).await
+    }
+
+    /// [`Self::attach_media`] with the kind chosen by the caller instead of the
+    /// bytes, for the one intent a file cannot carry: "send this picture as a
+    /// sticker". Same upload, same `botAttach`, same de-dup key — only the
+    /// attachment's `kind` differs, and that is exactly the renderer's contract
+    /// (bare, fixed size, no lightbox) the web and app already honour.
+    pub async fn attach_media_as(
+        &self,
+        message_id: &str,
+        path: &std::path::Path,
+        how: AttachAs<'_>,
+    ) -> Result<Value> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let (kind, mime) = classify(&name, &bytes);
+        let (kind, mime) = match how {
+            AttachAs::Detected => classify(&name, &bytes),
+            // Refused rather than downgraded: the caller ASKED for a sticker,
+            // and a PDF quietly arriving as a file card instead would read as
+            // "sent" to an agent that never looks at the bubble.
+            AttachAs::Sticker { .. } => ("sticker", sticker_mime(&bytes).with_context(|| {
+                format!("{} can't be a sticker — it has to be a png, jpeg, gif or webp picture", path.display())
+            })?),
+        };
         // The upload's filename must AGREE with the bytes (the declared name is
         // what the registry row keeps); a screenshot handed over as `shot.txt`
         // should register as the image it is. A file keeps the caller's own
@@ -1021,8 +1043,26 @@ retry {attempt}/{} in {delay:?}…",
         let file_id = up["id"].as_str().context("uploadFile returned no id")?;
         // `id` is the attachment's identity for the server's de-dup, so key it
         // on the file — re-attaching the same upload is a no-op, not a twin.
-        let att = json!({ "kind": kind, "id": file_id, "file": file_id });
+        let mut att = json!({ "kind": kind, "id": file_id, "file": file_id });
+        let sticker_emoji = match how {
+            AttachAs::Sticker { emoji } => Some(emoji.map(str::trim).filter(|e| !e.is_empty())),
+            AttachAs::Detected => None,
+        };
+        if let Some(Some(e)) = sticker_emoji {
+            att["emoji"] = json!(e);
+        }
         self.attach(message_id, json!([att.clone()])).await?;
+        if let Some(emoji) = sticker_emoji {
+            // Sending a sticker is how it ENTERS the sender's library — the
+            // composers do the same right after their upload — and a bot is an
+            // account like any other. After the attach, never before: the
+            // message must not wait on the library, and a failed add costs a
+            // row the next send re-creates, never the sticker in the reply.
+            let add = json!({ "file": file_id, "emoji": emoji.into_iter().collect::<Vec<_>>() });
+            if let Err(e) = self.post("sticker.add", add).await {
+                eprintln!("sticker sent, but not kept in the library: {e:#}");
+            }
+        }
         Ok(att)
     }
 
@@ -1461,6 +1501,16 @@ async fn ws_tunnel(
 /// asymmetry is the whole bug: a name-based guess turned every attachment into a
 /// photo, so `.html`, `.pdf` and a mis-saved screenshot alike arrived as broken
 /// image bubbles.
+/// How [`Client::attach_media_as`] presents what it uploads.
+#[derive(Debug, Clone, Copy)]
+pub enum AttachAs<'a> {
+    /// Whatever the bytes are: a photo, a clip, or a file card (`classify`).
+    Detected,
+    /// A sticker — the composers' `+ ▸ 表情` row. `emoji` is what it reads as
+    /// where a picture can't be shown (push text, a quoted-reply preview).
+    Sticker { emoji: Option<&'a str> },
+}
+
 fn classify(name: &str, bytes: &[u8]) -> (&'static str, &'static str) {
     match sniff_media(bytes) {
         Some(m) if m.starts_with("image/") => ("photo", m),
@@ -1500,6 +1550,14 @@ fn sniff_media(b: &[u8]) -> Option<&'static str> {
         };
     }
     None
+}
+
+/// The pictures a sticker can be. Pictures only, like the composers' own
+/// sticker picker (`accept="image/*"`), and of those the ones every client can
+/// draw: HEIC proves itself an image but no browser decodes it (see the api's
+/// `media.rs`), so it would land as a blank square.
+fn sticker_mime(b: &[u8]) -> Option<&'static str> {
+    sniff_media(b).filter(|m| matches!(*m, "image/png" | "image/jpeg" | "image/gif" | "image/webp"))
 }
 
 /// The same basename carrying the extension that matches `mime` — what we
@@ -1642,6 +1700,189 @@ mod attach_tests {
     fn a_lying_extension_cannot_fake_media() {
         assert_eq!(classify("broken.png", b"<html>404</html>"), ("file", "application/octet-stream"));
         assert_eq!(classify("song.m4a", &ftyp(b"M4A ")), ("file", "application/octet-stream"));
+    }
+
+    /// A sticker is a picture every client can draw. The header decides, as for
+    /// photos — `face.txt` holding a PNG is still a sticker — and what the
+    /// browsers can't decode (HEIC) or isn't a picture at all is refused.
+    #[test]
+    fn only_drawable_pictures_can_be_stickers() {
+        use super::sticker_mime;
+        assert_eq!(sticker_mime(&png_header(128, 128)), Some("image/png"));
+        assert_eq!(sticker_mime(b"\xff\xd8\xff\xe0JFIF"), Some("image/jpeg"));
+        assert_eq!(sticker_mime(b"GIF89a\x01\0"), Some("image/gif"));
+        assert_eq!(sticker_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sticker_mime(&ftyp(b"heic")), None);
+        assert_eq!(sticker_mime(&ftyp(b"isom")), None);
+        assert_eq!(sticker_mime(b"%PDF-1.7"), None);
+        assert_eq!(sticker_mime(b"<svg xmlns="), None);
+    }
+}
+
+#[cfg(test)]
+mod sticker_attach_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One request as the fake api saw it: the path it hit and its raw body.
+    type Seen = Vec<(String, Vec<u8>)>;
+
+    /// A stand-in api that answers the three calls a sticker send makes and
+    /// records every request, in order.
+    async fn fake_api() -> (String, tokio::task::JoinHandle<Seen>, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut seen: Seen = Vec::new();
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    s = listener.accept() => s.unwrap(),
+                    _ = &mut stopped => return seen,
+                };
+                let mut bytes = Vec::new();
+                let (path, body) = loop {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "client hung up mid-request");
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                    let header = String::from_utf8_lossy(&bytes[..end]).to_string();
+                    let len: usize = header
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().unwrap())
+                        })
+                        .expect("request without content-length");
+                    if bytes.len() < end + 4 + len {
+                        continue;
+                    }
+                    let path = header.split_whitespace().nth(1).unwrap().to_string();
+                    break (path, bytes[end + 4..end + 4 + len].to_vec());
+                };
+                let reply = match path.as_str() {
+                    // uploadFile answers with the file itself, no envelope.
+                    "/api/uploadFile" => r#"{"id":"F1","unique_id":"U1","mime":"image/png"}"#,
+                    _ => r#"{"ok":true,"result":{}}"#,
+                };
+                seen.push((path, body));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (base, server, stop)
+    }
+
+    fn picture(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v
+    }
+
+    /// THE FEATURE: the same upload and `botAttach` a photo takes, with the one
+    /// difference that matters to the renderer — `kind: sticker` — plus the
+    /// emoji it reads as, and the send puts it in the sender's library.
+    #[tokio::test]
+    async fn a_sticker_rides_botattach_as_a_sticker_and_joins_the_library() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named `.txt` on purpose: the header, not the name, makes it a picture.
+        let path = picture(&dir, "wave.txt", &png(128, 128));
+        let client = Client::new(base, "test".into());
+        let att = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.attach_media_as("M1", &path, AttachAs::Sticker { emoji: Some(" 👋 ") }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        stop.send(()).unwrap();
+        let seen = server.await.unwrap();
+
+        assert_eq!(att, json!({ "kind": "sticker", "id": "F1", "file": "F1", "emoji": "👋" }));
+        let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["/api/uploadFile", "/api/botAttach", "/api/sticker.add"]);
+
+        let upload = String::from_utf8_lossy(&seen[0].1);
+        assert!(upload.contains("filename=\"wave.png\""), "uploaded under the name its bytes earn: {upload}");
+        assert!(upload.contains("Content-Type: image/png"), "{upload}");
+
+        let attach: Value = serde_json::from_slice(&seen[1].1).unwrap();
+        assert_eq!(attach, json!({ "message_id": "M1", "attachments": [att] }));
+
+        let add: Value = serde_json::from_slice(&seen[2].1).unwrap();
+        assert_eq!(add, json!({ "file": "F1", "emoji": ["👋"] }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No emoji is a legal sticker — the composers send exactly that — and an
+    /// empty `--emoji ""` is the same as none, not a blank caption.
+    #[tokio::test]
+    async fn a_sticker_without_an_emoji_carries_none() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = picture(&dir, "blob.gif", b"GIF89a\x01\0\x01\0");
+        let client = Client::new(base, "test".into());
+        let att = client.attach_media_as("M1", &path, AttachAs::Sticker { emoji: Some("  ") }).await.unwrap();
+        stop.send(()).unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(att, json!({ "kind": "sticker", "id": "F1", "file": "F1" }));
+        let add: Value = serde_json::from_slice(&seen[2].1).unwrap();
+        assert_eq!(add, json!({ "file": "F1", "emoji": [] }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asked for a sticker, handed a PDF: refused before a single byte leaves,
+    /// rather than quietly sent as a file card the agent will report as a
+    /// sticker it never looked at.
+    #[tokio::test]
+    async fn a_non_picture_is_refused_before_anything_is_uploaded() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = picture(&dir, "paper.png", b"%PDF-1.7");
+        let client = Client::new(base, "test".into());
+        let err = client.attach_media_as("M1", &path, AttachAs::Sticker { emoji: None }).await.unwrap_err();
+        stop.send(()).unwrap();
+        assert!(format!("{err:#}").contains("can't be a sticker"), "{err:#}");
+        assert!(server.await.unwrap().is_empty(), "nothing may reach the api");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `--sticker` nothing changes: a picture is still a photo and no
+    /// library call is made.
+    #[tokio::test]
+    async fn a_plain_attach_is_still_a_photo() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = picture(&dir, "shot.png", &png(4, 4));
+        let client = Client::new(base, "test".into());
+        let att = client.attach_media("M1", &path).await.unwrap();
+        stop.send(()).unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(att, json!({ "kind": "photo", "id": "F1", "file": "F1" }));
+        let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["/api/uploadFile", "/api/botAttach"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

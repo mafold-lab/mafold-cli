@@ -188,7 +188,8 @@ enum Cmd {
     /// clips, documents. Run by an AGENT mid-turn (the daemon presets
     /// MAFOLD_DRAFT), so what it just made arrives in the same bubble as the
     /// text about it. The kind is read from the bytes: an image becomes a photo,
-    /// a clip becomes a player, anything else becomes a file card.
+    /// a clip becomes a player, anything else becomes a file card — unless
+    /// `--sticker` says a picture is a sticker.
     Attach {
         /// Files on this machine.
         #[arg(required = true)]
@@ -197,6 +198,16 @@ enum Cmd {
         /// reply — which is what an agent almost always wants.
         #[arg(long)]
         message: Option<String>,
+        /// Send each picture as a STICKER — drawn bare at sticker size, no
+        /// bubble, no full-screen viewer — instead of a photo. It also joins
+        /// this account's sticker library, as a sticker sent from the composer
+        /// does. Pictures only: png, jpeg, gif (animates) or webp.
+        #[arg(long)]
+        sticker: bool,
+        /// What the sticker reads as where a picture can't be shown — a push
+        /// notification, a quoted reply: `--emoji 😂`.
+        #[arg(long, requires = "sticker")]
+        emoji: Option<String>,
     },
     /// Manage a forum's channels (list/create/rename/close/pin/delete).
     Channels {
@@ -612,8 +623,13 @@ async fn main() -> Result<()> {
         Cmd::React { message, emoji, remove } => {
             react(&Client::new(cli.base, token?), &message, &emoji, remove).await?
         }
-        Cmd::Attach { files, message } => {
-            attach(&Client::new(cli.base, token?), &files, message.as_deref()).await?
+        Cmd::Attach { files, message, sticker, emoji } => {
+            let how = if sticker {
+                client::AttachAs::Sticker { emoji: emoji.as_deref() }
+            } else {
+                client::AttachAs::Detected
+            };
+            attach(&Client::new(cli.base, token?), &files, message.as_deref(), how).await?
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
@@ -965,10 +981,16 @@ async fn chats(client: &Client) -> Result<()> {
 /// Hang local files on a message we authored — the general door for "the agent
 /// made something, put it in the reply". Images become photo bubbles, clips
 /// become players, everything else becomes a file card (the kind is decided from
-/// the bytes in `Client::attach_media`). Codex's own generated images are swept
-/// up without this (see `harness::codex::ImageSweep`); every other harness, and
-/// anything an agent writes with a script, comes through here.
-async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Result<()> {
+/// the bytes in `Client::attach_media`), and `--sticker` makes a picture a
+/// sticker. Codex's own generated images are swept up without this (see
+/// `harness::codex::ImageSweep`); every other harness, and anything an agent
+/// writes with a script, comes through here.
+async fn attach(
+    client: &Client,
+    files: &[String],
+    message: Option<&str>,
+    how: client::AttachAs<'_>,
+) -> Result<()> {
     let msg = match message {
         Some(m) => m.to_string(),
         None => {
@@ -992,10 +1014,13 @@ async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Res
     for f in files {
         let path = std::path::Path::new(f);
         client
-            .attach_media(&msg, path)
+            .attach_media_as(&msg, path, how)
             .await
             .with_context(|| format!("attaching {}", path.display()))?;
-        println!("✓ attached {}", path.display());
+        match how {
+            client::AttachAs::Sticker { .. } => println!("✓ attached {} as a sticker", path.display()),
+            client::AttachAs::Detected => println!("✓ attached {}", path.display()),
+        }
     }
     Ok(())
 }

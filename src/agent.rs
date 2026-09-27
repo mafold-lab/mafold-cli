@@ -2227,7 +2227,14 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     let owner = Arc::new(RwLock::new(owner));
     let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
     let workdirs: Workdirs = Arc::new(Mutex::new(load_workdirs()));
-    let chat_states: ChatStates = Arc::new(Mutex::new(HashMap::new()));
+    // `/account` pins outlive the process: an update restarts every daemon,
+    // and a pin that silently vanished with it looked exactly like one that
+    // never took.
+    let chat_states: ChatStates = Arc::new(Mutex::new({
+        let mut states = HashMap::new();
+        seed_pins(&mut states, load_pins_from(&pins_path(&my_username)));
+        states
+    }));
     // Per-conversation execution: different conversations run in parallel; turns
     // within one conversation serialize. (They share this workdir — don't run
     // conflicting edits in two chats at once.)
@@ -4315,7 +4322,7 @@ async fn connect_and_run(
                 let access_ctx = AccessCtx {
                     is_owner: allow.read().await.owner.as_deref() == Some(sender_lc.as_str()),
                 };
-                handle_control(client, workdir, owner.read().await.clone(), &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, workdirs, chat_states, harness, access_ctx).await;
+                handle_control(client, workdir, owner.read().await.clone(), &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, workdirs, chat_states, harness, access_ctx, my_username).await;
                 continue;
             }
         }
@@ -5164,6 +5171,8 @@ async fn handle_control(
     // `/access`: the current tier + price tag for anyone allowed to ask, and
     // the two change proposals for the owner alone.
     access_ctx: AccessCtx,
+    // Whose daemon this is — `/account` pins are kept beside its cursor.
+    my_username: &str,
 ) {
     // A session key is only meaningful together with the directory its turns
     // run in (see `turn_session_key`), so the arms that touch one resolve the
@@ -5414,44 +5423,49 @@ async fn handle_control(
                     "Only the Claude Code agent keeps several logins on one machine. This bot has one account, set where its CLI was signed in.").await;
                 return;
             }
-            let a = arg.trim();
-            let text = if a.is_empty() {
-                account_list(seat_account.as_deref(), pinned_account.is_some()).await
-            } else if let Some(rest) = a.strip_prefix("forget ").or_else(|| a.strip_prefix("rm ")) {
-                let n = rest.trim().to_ascii_lowercase();
-                let mut reg = crate::accounts::load();
-                if reg.remove(&n) {
-                    let _ = crate::accounts::save(&reg);
-                    crate::accounts::forget_seat(&n);
-                    format!("Forgot account `{n}`. Its credential directory is left alone — sign in again with `/login {n}` to bring it back.")
-                } else if n == crate::accounts::DEFAULT {
-                    "`default` is this machine's own Claude login — it can't be forgotten. `/logout` signs it out.".to_string()
-                } else {
-                    format!("No account named `{n}` on this machine. `/account` lists them.")
+            let unknown = |n: &str| {
+                format!("No account named `{n}` on this machine. `/login {n}` signs one in under that name; `/account` lists what's here.")
+            };
+            let text = match parse_account_arg(arg) {
+                AccountArg::List => account_list(cfg_account.as_deref(), pinned_account.as_deref()).await,
+                AccountArg::Forget(n) => {
+                    let mut reg = crate::accounts::load();
+                    if reg.remove(&n) {
+                        let _ = crate::accounts::save(&reg);
+                        crate::accounts::forget_seat(&n);
+                        format!("Forgot account `{n}`. Its credential directory is left alone — sign in again with `/login {n}` to bring it back.")
+                    } else if n == crate::accounts::DEFAULT {
+                        "`default` is this machine's own Claude login — it can't be forgotten. `/logout` signs it out.".to_string()
+                    } else {
+                        format!("No account named `{n}` on this machine. `/account` lists them.")
+                    }
                 }
-            } else if matches!(a, "reset" | "default" | "-") {
-                let mut states = chat_states.lock().await;
-                states.entry(chat_id.to_string()).or_default().account = None;
-                match &cfg_account {
-                    Some(n) => format!("This chat follows the bot's account setting again (`{n}`)."),
-                    None => "This chat follows the bot's account setting again — currently the machine's own login.".to_string(),
+                AccountArg::Reset => {
+                    {
+                        let mut states = chat_states.lock().await;
+                        states.entry(chat_id.to_string()).or_default().account = None;
+                        save_pins_to(&pins_path(my_username), &pins_of(&states));
+                    }
+                    match &cfg_account {
+                        Some(n) => format!("This chat follows the bot's account setting again (`{n}`)."),
+                        None => "This chat follows the bot's account setting again — currently the machine's own login.".to_string(),
+                    }
                 }
-            } else {
-                let n = a.to_ascii_lowercase();
-                match crate::accounts::load().get(&n) {
+                AccountArg::Pin(n) => match crate::accounts::load().get(&n) {
                     Some(_) => {
                         {
                             let mut states = chat_states.lock().await;
                             states.entry(chat_id.to_string()).or_default().account = Some(n.clone());
+                            save_pins_to(&pins_path(my_username), &pins_of(&states));
                         }
-                        format!(
-                            "This chat now runs on account `{n}`.\nIt's a preference, not a wall: if that window fills up I still move a turn to another login and say so."
-                        )
+                        account_pin_receipt(&n, cfg_account.as_deref(), access_ctx.is_owner)
                     }
-                    None => format!(
-                        "No account named `{n}` on this machine. `/login {n}` signs one in under that name; `/account` lists what's here."
-                    ),
-                }
+                    None => unknown(&n),
+                },
+                AccountArg::Bot(n) => match crate::accounts::load().get(&n) {
+                    Some(_) => account_bot_receipt(&n, access_ctx.is_owner),
+                    None => unknown(&n),
+                },
             };
             let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &text).await;
         }
@@ -5678,9 +5692,9 @@ async fn resume_session(client: Client, dir: String, chat_id: String, skey: Stri
 /// The probe is the point. "Why did my turn move to another account" and "can
 /// I pin this chat to the one that isn't full" are both questions about live
 /// state, and a list of names alone answers neither.
-async fn account_list(current: Option<&str>, pinned: bool) -> String {
+async fn account_list(bot_setting: Option<&str>, pin: Option<&str>) -> String {
     let now = crate::accounts::now();
-    let current = current.unwrap_or(crate::accounts::DEFAULT);
+    let current = pin.or(bot_setting).unwrap_or(crate::accounts::DEFAULT);
     let states = crate::accounts::list_states().await;
     let mut body = String::new();
     for (a, snap, held) in &states {
@@ -5699,21 +5713,153 @@ async fn account_list(current: Option<&str>, pinned: bool) -> String {
         let mark = if a.name == current { "▸ " } else { "" };
         body.push_str(&format!("kv|{mark}{}|{v}\n", a.name));
     }
-    let scope = if pinned {
-        format!("This chat is pinned to `{current}` — `/account reset` hands it back to the bot's setting.")
-    } else if current == crate::accounts::DEFAULT {
-        "This chat follows the bot's setting — currently this machine's own login.".to_string()
-    } else {
-        format!("This chat follows the bot's setting (`{current}`).")
-    };
+    let scope = account_scope_line(bot_setting, pin);
     format!(
         "{{% mafold/stats title=\"Claude accounts\" icon=\"key\" %}}\n{body}{{% /mafold/stats %}}\n\
-         {scope}\n\
-         `/account <name>` pins this chat · `/login <name>` signs in another account · \
-         `/account forget <name>` drops one.\n\
+         {scope}\n\n\
+         `/account <name>` pins this conversation · `/account <name> --bot` proposes it for the whole bot · \
+         `/login <name>` signs in another account · `/account forget <name>` drops one.\n\
          All of them share the same memory, skills and sessions — only the subscription differs, \
          and I move a turn to another login by myself when a usage window fills up.",
     )
+}
+
+/// The line under `/account`'s list saying which setting this conversation
+/// runs on. `bot_setting` = the Customize sheet's account (None = the
+/// machine's own login); `pin` = this conversation's `/account` pin.
+fn account_scope_line(bot_setting: Option<&str>, pin: Option<&str>) -> String {
+    let bot = format!("Bot setting: {}", bot_setting_phrase(bot_setting));
+    match pin {
+        Some(p) => format!("{bot} · this conversation: pinned to `{p}` — `/account reset` hands it back."),
+        None => format!("{bot} · this conversation follows it."),
+    }
+}
+
+/// What `/account …` asks for.
+#[derive(Debug, Clone, PartialEq)]
+enum AccountArg {
+    /// Bare: the list.
+    List,
+    /// `forget <name>` / `rm <name>`: drop a login from the machine.
+    Forget(String),
+    /// `reset` / `default` / `-`: this conversation follows the bot again.
+    Reset,
+    /// `<name>`: pin THIS conversation.
+    Pin(String),
+    /// `<name> --bot` / `bot <name>`: propose it for the WHOLE bot.
+    Bot(String),
+}
+
+fn parse_account_arg(arg: &str) -> AccountArg {
+    let a = arg.trim();
+    if a.is_empty() {
+        return AccountArg::List;
+    }
+    if let Some(rest) = a.strip_prefix("forget ").or_else(|| a.strip_prefix("rm ")) {
+        return AccountArg::Forget(rest.trim().to_ascii_lowercase());
+    }
+    if matches!(a, "reset" | "default" | "-") {
+        return AccountArg::Reset;
+    }
+    if let Some(name) = a.strip_suffix("--bot").or_else(|| a.strip_prefix("bot ")) {
+        return AccountArg::Bot(name.trim().to_ascii_lowercase());
+    }
+    AccountArg::Pin(a.to_ascii_lowercase())
+}
+
+/// How a bot-level account reads in a sentence: None / `default` is the
+/// machine's own login.
+fn bot_setting_phrase(bot_setting: Option<&str>) -> String {
+    match bot_setting.filter(|b| *b != crate::accounts::DEFAULT) {
+        Some(b) => format!("`{b}`"),
+        None => "this machine's own login".to_string(),
+    }
+}
+
+/// The one-tap proposal to run the whole bot on `name` — the same
+/// "a command proposes, the owner's tap applies" door `/access` uses. The api
+/// already lets a card set `account` (its card safelist), and the daemon
+/// declares that field in the bot's Customize schema.
+fn bot_account_card(name: &str) -> String {
+    format!(
+        "{{% mafold/customize field=\"account\" value=\"{name}\" hint=\"Every conversation of this bot runs on {name} (a conversation pinned with /account keeps its pin)\" /%}}"
+    )
+}
+
+/// The reply to `/account <name>`: THIS conversation is now pinned to `name`.
+///
+/// 2026-09-27: linsky pinned Rei's DM and expected the whole bot — and Muse,
+/// a different bot — to switch. The receipt says exactly what changed, for
+/// how long, and (to the owner) where the whole-bot switch is.
+fn account_pin_receipt(name: &str, bot_setting: Option<&str>, is_owner: bool) -> String {
+    let mut out = format!(
+        "This conversation now runs on account `{name}` — this conversation only (every channel in it). \
+         My other conversations keep following the bot setting ({}), and other bots on this machine aren't affected. \
+         It stays until `/account reset`.\n\
+         It's a preference, not a wall: if that window fills up I still move a turn to another login and say so.",
+        bot_setting_phrase(bot_setting)
+    );
+    if is_owner {
+        out.push_str(&format!("\n\nTo run the whole bot on `{name}` instead:\n{}", bot_account_card(name)));
+    }
+    out
+}
+
+/// The reply to `/account <name> --bot`: a proposal to run the WHOLE bot on
+/// `name`. It pins nothing — the owner's tap on the card applies it, the same
+/// way `/access` proposes and the tap consents.
+fn account_bot_receipt(name: &str, is_owner: bool) -> String {
+    if !is_owner {
+        return format!(
+            "Only the owner can switch the whole bot's account. `/account {name}` pins just this conversation."
+        );
+    }
+    format!(
+        "Run every conversation of this bot on `{name}`? Tap Apply — conversations pinned with `/account` keep their pin.\n\n{}",
+        bot_account_card(name)
+    )
+}
+
+/// Where `/account` pins live on disk: beside the cursor.
+fn pins_path(my_username: &str) -> PathBuf {
+    cursor_path(my_username).with_extension("pins.json")
+}
+
+/// conversation id → the account it is pinned to.
+fn load_pins_from(path: &std::path::Path) -> HashMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic tmp+rename, like the cursor beside it: a torn file would drop
+/// every pin at once.
+fn save_pins_to(path: &std::path::Path, pins: &HashMap<String, String>) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(body) = serde_json::to_string_pretty(pins) {
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Every conversation's pin, as held in live chat state.
+fn pins_of(states: &HashMap<String, ChatState>) -> HashMap<String, String> {
+    states
+        .iter()
+        .filter_map(|(conv, s)| s.account.clone().map(|a| (conv.clone(), a)))
+        .collect()
+}
+
+/// Put pins read from disk back into live chat state (daemon start).
+fn seed_pins(states: &mut HashMap<String, ChatState>, pins: HashMap<String, String>) {
+    for (conv, account) in pins {
+        states.entry(conv).or_default().account = Some(account);
+    }
 }
 
 /// Interactive `/login`: drive `claude auth login`, post the sign-in URL to the
@@ -5955,7 +6101,7 @@ async fn login_flow(
 /// as "not logged in" is the one a user can fix — or that there is no other.
 /// Why a running turn moves to another login on this machine.
 #[derive(Debug, Clone, PartialEq)]
-enum Handover {
+pub(crate) enum Handover {
     /// Its usage window is full.
     Limit(crate::harness::LimitHit),
     /// Anthropic refused its sign-in mid-run — a revoked refresh token on a
@@ -5966,7 +6112,7 @@ enum Handover {
 }
 
 impl Handover {
-    fn what(&self) -> String {
+    pub(crate) fn what(&self) -> String {
         match self {
             Handover::Limit(hit) => format!("hit its {} limit", hit.kind),
             Handover::SignedOut => "had its sign-in refused".to_string(),
@@ -5975,8 +6121,9 @@ impl Handover {
 }
 
 /// The seat problem a finished run ended on, if any. `/stop` is never one:
-/// the user ended it, not the account.
-fn handover_cause(o: &crate::harness::TurnOutcome) -> Option<Handover> {
+/// the user ended it, not the account. Shared with the inbox loop
+/// (`crate::inbox`), which fails over the same way.
+pub(crate) fn handover_cause(o: &crate::harness::TurnOutcome) -> Option<Handover> {
     if o.stopped {
         return None;
     }
@@ -6244,7 +6391,8 @@ renders live in the bubble, scripts and all. Best for something small and intera
 demo, a layout, a mini-game.\n\
   • **the file itself** — `mafold attach <path>` (one or more paths) hangs a real file on THIS \
 reply. An image lands as a photo, a clip as a player, and anything else (.html, .pdf, .md, .csv, …) \
-as a file card the user can open, download and keep.\n\
+as a file card the user can open, download and keep. `mafold attach --sticker [--emoji 😂] <picture>` \
+sends a picture as a STICKER instead — bare and sticker-sized, no bubble, the way a person sends one.\n\
   • **a screenshot** — `mafold attach shot.png`. Only when the PICTURE is the content: proof of a \
 bug, what the app actually looks like right now, a rendering you cannot hand over any other way.\n\
 Their words decide. Asked for HTML → give HTML — the inline card or the `.html` file, NEVER a \
@@ -9508,6 +9656,7 @@ mod inbound_file_tests {
         let p = mafold_preamble("ops:claude", "ops", &[]);
         assert!(p.contains("mafold/html"), "inline card route missing");
         assert!(p.contains("mafold attach <path>"), "file route missing");
+        assert!(p.contains("mafold attach --sticker"), "an agent can't send a sticker it doesn't know about");
         assert!(p.contains("a screenshot"), "screenshot route missing");
         // …and that the user's own words are what choose between them.
         assert!(p.contains("NEVER a screenshot of it"), "{p}");
@@ -11638,5 +11787,94 @@ mod wall_footer_tests {
         assert_eq!(handover_cause(&ended_on("API Error: 529 overloaded")), None);
         let stopped = crate::harness::TurnOutcome { stopped: true, ..refused };
         assert_eq!(handover_cause(&stopped), None, "/stop is the user's, not the account's");
+    }
+}
+
+#[cfg(test)]
+mod account_scope_tests {
+    use super::{
+        account_bot_receipt, account_pin_receipt, account_scope_line, load_pins_from, parse_account_arg,
+        pins_of, save_pins_to, seed_pins, AccountArg, ChatState,
+    };
+    use std::collections::HashMap;
+
+    const CARD: &str = r#"{% mafold/customize field="account" value="new5x""#;
+
+    /// 2026-09-27: linsky sent `/account new5x` in Rei's DM expecting the
+    /// whole bot — and Muse, another bot — to switch. The receipt has to say
+    /// what it actually changed, and for how long.
+    #[test]
+    fn a_pin_receipt_says_this_conversation_only_and_until_reset() {
+        let r = account_pin_receipt("new5x", None, false);
+        assert!(r.contains("this conversation only"), "{r}");
+        assert!(r.contains("other bots on this machine"), "{r}");
+        assert!(r.contains("until `/account reset`"), "{r}");
+        assert!(r.contains("machine's own login"), "names what the rest of the bot is on: {r}");
+        assert!(!r.contains("mafold/customize"), "no card for someone who can't apply it: {r}");
+    }
+
+    /// The owner is offered the whole-bot switch right there, as the same
+    /// one-tap proposal `/access` uses — the tap applies it.
+    #[test]
+    fn the_owner_gets_a_one_tap_card_for_the_whole_bot() {
+        let r = account_pin_receipt("new5x", Some("default"), true);
+        assert!(r.contains(CARD), "{r}");
+    }
+
+    #[test]
+    fn the_bot_form_parses_both_spellings_and_never_pins() {
+        assert_eq!(parse_account_arg("new5x --bot"), AccountArg::Bot("new5x".into()));
+        assert_eq!(parse_account_arg("bot new5x"), AccountArg::Bot("new5x".into()));
+        assert_eq!(parse_account_arg("New5x"), AccountArg::Pin("new5x".into()));
+        assert_eq!(parse_account_arg("  "), AccountArg::List);
+        assert_eq!(parse_account_arg("reset"), AccountArg::Reset);
+        assert_eq!(parse_account_arg("forget work"), AccountArg::Forget("work".into()));
+    }
+
+    /// `--bot` proposes; it never claims to have pinned anything. Only the
+    /// owner gets the card — anyone else is told who can.
+    #[test]
+    fn the_bot_receipt_is_a_proposal_only_the_owner_can_apply() {
+        let owner = account_bot_receipt("new5x", true);
+        assert!(owner.contains(CARD), "{owner}");
+        assert!(!owner.contains("now runs on"), "--bot must not claim a pin: {owner}");
+        let other = account_bot_receipt("new5x", false);
+        assert!(!other.contains("mafold/customize"), "{other}");
+        assert!(other.contains("Only the owner"), "{other}");
+    }
+
+    /// Bare `/account` names both layers: what the bot runs on, and what
+    /// this conversation runs on.
+    #[test]
+    fn the_list_names_both_layers() {
+        let s = account_scope_line(Some("default"), Some("new5x"));
+        assert!(s.contains("pinned to `new5x`"), "{s}");
+        assert!(s.contains("Bot setting") && s.contains("machine's own login"), "{s}");
+        let s = account_scope_line(Some("work"), None);
+        assert!(s.contains("Bot setting: `work`") && s.contains("follows it"), "{s}");
+    }
+
+    /// An update restarts every daemon; a pin that vanished with it looked
+    /// exactly like one that never took. Set → restart → still there; reset
+    /// → restart → gone.
+    #[test]
+    fn a_pin_survives_a_daemon_restart() {
+        let path = std::env::temp_dir().join(format!("mafold-pins-{}.json", std::process::id()));
+        let mut states: HashMap<String, ChatState> = HashMap::new();
+        states.entry("conv-rei".into()).or_default().account = Some("new5x".into());
+        states.entry("conv-other".into()).or_default();
+        save_pins_to(&path, &pins_of(&states));
+
+        let mut restarted: HashMap<String, ChatState> = HashMap::new();
+        seed_pins(&mut restarted, load_pins_from(&path));
+        assert_eq!(restarted.get("conv-rei").and_then(|s| s.account.clone()).as_deref(), Some("new5x"));
+        assert!(restarted.get("conv-other").is_none(), "no pin, no entry");
+
+        restarted.get_mut("conv-rei").unwrap().account = None;
+        save_pins_to(&path, &pins_of(&restarted));
+        let mut again: HashMap<String, ChatState> = HashMap::new();
+        seed_pins(&mut again, load_pins_from(&path));
+        let _ = std::fs::remove_file(&path);
+        assert!(again.get("conv-rei").and_then(|s| s.account.clone()).is_none(), "a reset survives too");
     }
 }

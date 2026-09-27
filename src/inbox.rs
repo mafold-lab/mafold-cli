@@ -36,6 +36,11 @@ pub struct InboxOpts {
     /// account. Everyone else's messages are information to be judged.
     #[arg(long, env = "MAFOLD_INBOX_PRINCIPAL")]
     pub principal: Option<String>,
+    /// Another handle that addresses THIS account's person (repeatable): an @
+    /// or a reply to it wakes the loop like one to this account. A clone
+    /// passes its principal — the team writes @opsdu, not @realopsdu.
+    #[arg(long = "alias")]
+    pub aliases: Vec<String>,
     /// Seconds between looks during active hours.
     #[arg(long, default_value_t = 600)]
     pub heartbeat: u64,
@@ -475,10 +480,14 @@ fn is_bot(m: &Value) -> bool {
     m["sender"]["kind"].as_str().is_some_and(|k| k.eq_ignore_ascii_case("bot"))
 }
 
-/// A reply still streaming. Content-driven (the `generating` tag is removed by
-/// the last push), never inferred from `finalized_at`.
+/// A reply still streaming: its `generating` tag is still on (the last push
+/// removes it), or it is an agent's draft that was never finalized. A person's
+/// message is always finalized on send, so the second test only ever holds a
+/// bot's reply back — the 133 KB one that woke this loop every 40 seconds while
+/// it was still being written, before the tag-only test caught up.
 fn in_progress(m: &Value) -> bool {
     m["content"].as_str().is_some_and(|c| c.contains("{% mafold/generating"))
+        || (is_bot(m) && m.get("finalized_at").is_some_and(Value::is_null))
 }
 
 /// The last messages of a timeline, oldest first, cut before the first reply
@@ -585,7 +594,9 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> String {
         out.push_str(&format!("\n== {} ==\n", tl.heading()));
         for m in &items {
             let line = render_msg(m, &ctx.me_lc, ctx.principal.as_deref(), off);
-            out.push_str(&clip(&line, OVERVIEW_BODY + 80));
+            // An agent's line keeps its END (the conclusion), a person's its start.
+            let line = if is_bot(m) { clip_body_tail(&line, OVERVIEW_BODY + 80) } else { clip(&line, OVERVIEW_BODY + 80) };
+            out.push_str(&line);
             out.push('\n');
         }
     }
@@ -600,15 +611,25 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> String {
 /// bot loop opens to AI senders (`agent.rs` `should_respond`), which is what
 /// keeps two agents from answering each other forever.
 fn wakes_now(m: &Value, me_lc: &str, is_dm: bool) -> bool {
-    if sender(m) == me_lc || in_progress(m) {
+    wakes_now_as(m, me_lc, aliases(), is_dm)
+}
+
+/// `wakes_now` with the aliases explicit. An alias is another handle for the
+/// same person (a clone's principal): the team @s @opsdu, not @realopsdu, so
+/// for the clone an @ or a reply to opsdu is an @ or a reply to it.
+fn wakes_now_as(m: &Value, me_lc: &str, aliases: &[String], is_dm: bool) -> bool {
+    let who = sender(m);
+    if who == me_lc || in_progress(m) || aliases.iter().any(|a| *a == who) {
         return false;
     }
     let content = m["content"].as_str().unwrap_or("");
-    let at_me = crate::agent::mentions_me(content, me_lc);
+    let at_me = crate::agent::mentions_me(content, me_lc) || aliases.iter().any(|a| crate::agent::mentions_me(content, a));
     if is_bot(m) {
         return at_me;
     }
-    let reply_to_me = m["reply_to_sender"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(me_lc));
+    let reply_to_me = m["reply_to_sender"]
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case(me_lc) || aliases.iter().any(|a| s.eq_ignore_ascii_case(a)));
     is_dm || at_me || reply_to_me
 }
 
@@ -635,6 +656,48 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// How much of an agent's (prose) reply a look shows: its opening and, above
+/// all, its ending — where the conclusion is.
+const BOT_HEAD: usize = 300;
+const BOT_TAIL: usize = 1800;
+
+/// `s` if short; else its first `head` and last `tail` chars around a marker.
+fn head_tail(s: &str, head: usize, tail: usize) -> String {
+    let n = s.chars().count();
+    if n <= head + tail {
+        return s.to_string();
+    }
+    let front: String = s.chars().take(head).collect();
+    let back: String = s.chars().skip(n - tail).collect();
+    format!("{front} …(中间省略 {} 字)… {back}", n - head - tail)
+}
+
+/// A rendered line (`#id [time] @who…: body`) cut to `max`, keeping the header
+/// and the END of the body.
+fn clip_body_tail(line: &str, max: usize) -> String {
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let (head, body) = line.split_once(": ").unwrap_or(("", line));
+    let room = max.saturating_sub(head.chars().count() + 3).max(40);
+    let n = body.chars().count();
+    let tail: String = body.chars().skip(n.saturating_sub(room)).collect();
+    format!("{head}: …{tail}")
+}
+
+/// Other handles that address THIS account's person — the principal's own
+/// account, for a clone. Set once at start (`--alias`); empty otherwise.
+static ALIASES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn aliases() -> &'static [String] {
+    ALIASES.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Runs of blank lines and indentation left behind by stripped cards → one space.
+fn collapse_blank(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// One message as the agent reads it: id to reply with, time, who (and what
 /// kind of who), what it answers, then the text a person would see.
 fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> String {
@@ -656,6 +719,8 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
     if let Some(to) = m["reply_to_sender"].as_str() {
         if to.eq_ignore_ascii_case(me_lc) {
             line.push_str(" ↩回复你");
+        } else if aliases().iter().any(|a| to.eq_ignore_ascii_case(a)) {
+            line.push_str(&format!(" ↩回复本人(@{to})"));
         } else {
             line.push_str(&format!(" ↩回复 @{to}"));
         }
@@ -663,9 +728,22 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
             line.push_str(&format!(" #{rid}"));
         }
     }
-    let body = crate::chat::readable_body(m["content"].as_str().unwrap_or(""));
+    if who != me_lc && aliases().iter().any(|a| *a != who && crate::agent::mentions_me(m["content"].as_str().unwrap_or(""), a)) {
+        line.push_str(" [找本人的]");
+    }
+    let raw = m["content"].as_str().unwrap_or("");
+    // An agent's reply is mostly its working trail (cards) with the answer at
+    // the END — 80–130 KB where the conclusion is the last paragraph. Read it
+    // as prose, and when it's long keep its tail: clipping from the front is
+    // exactly how this loop read "no answer yet" into replies that had one.
+    let body = if is_bot(m) {
+        let prose = mafold_transcript::render::strip_cards(raw);
+        head_tail(&collapse_blank(&prose), BOT_HEAD, BOT_TAIL)
+    } else {
+        clip(&crate::chat::readable_body(raw), BODY_MAX)
+    };
     line.push_str(": ");
-    line.push_str(&clip(if body.is_empty() { "—" } else { &body }, BODY_MAX));
+    line.push_str(if body.trim().is_empty() { "—" } else { &body });
     for a in m["attachments"].as_array().into_iter().flatten() {
         line.push_str(&format!(" [附:{}]", crate::chat::attachment_name(a)));
     }
@@ -711,6 +789,8 @@ struct Patrol<'a> {
     window_hours: u64,
     /// `--patrol-mode ask`: propose, don't hand out.
     ask: bool,
+    /// The last card is still unanswered: follow up, don't propose.
+    card_pending: bool,
     /// The last few decisions (`decisions_digest`).
     decisions: &'a str,
 }
@@ -745,9 +825,17 @@ fn build_prompt(
              - 已经有人在做、或者 ledger 里派过的,别重复提 —— 该追的写成「追一句」。\n",
             pt.window_hours
         ));
-        if pt.ask {
+        p.push_str(
+            "- **跟进不用等任何人批**:群里谁在等 ops(问了你、找你拍板、交了活等验收、答应了到点没兑现),这一轮就接 ——\
+             回答、验收(看证据,不够就要)、追一句、或者把需要拍板的事写成提案。\n",
+        );
+        if pt.ask && pt.card_pending {
             p.push_str(
-                "- **这一轮先别派。** 把找到的活按优先级写进工作目录的 `proposals.json`(JSON 数组,第一个最优先,最多 8 件):\n\
+                "- 上一张提案卡本人还没回答:**这一轮只跟进**,不要写 proposals.json(卡答了才出下一张)。\n",
+            );
+        } else if pt.ask {
+            p.push_str(
+                "- **新活这一轮先别派。** 把找到的活按优先级写进工作目录的 `proposals.json`(JSON 数组,第一个最优先,最多 8 件):\n\
                  \u{20} `[{\"title\": \"一句话说是什么\", \"source\": \"从哪看到的\", \"why\": \"为什么现在做\", \"who\": \"派给谁(@handle)\", \"done\": \"怎么算做完、要什么证据\", \"where\": \"在哪说(chat=… channel=…)\"}]`\n\
                  \u{20} 循环会把它做成一张卡发给本人;他勾完你再按他选的去派。能找多少找多少,每件都要能直接派出去。真没有就别写这个文件。\n\
                  - 本来就在跟你说话的人(上面的新消息),照常回。\n",
@@ -845,7 +933,8 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
          \u{20} · 表情:`mafold react <消息id> <emoji>`——很多时候回个表情就够了。\n\
          \u{20} · 要更多上下文:`mafold read <chat_id> [--channel <channel_id>] --ids --limit 30`;所有会话:`mafold chats`。\n\
          \u{20} · 分派工作 = 一件事一个频道:群是论坛(有频道)时,先 `mafold channels list <chat_id>` 找对应这件事的频道;没有就 `mafold channels create <chat_id> <名字>` 开一个(名字就写这件事,短),再用 `--channel` 在里面说、@ 人。别把不相干的事堆进私聊或主时间线。开不了(只有管理员能开)就用最接近的现有频道,并说明一句。事情结了,`mafold channels close <chat_id> <频道>` 关掉你自己开的那个。\n\
-         - 看完什么都不说,是完全正常的结果。只在你这个身份真的会开口的时候开口。\n\
+         - 闲聊、别人之间的事,看完不说话完全正常。但**有人在等你**的时候必须接:问了你(或「找本人的」)的问题、\
+         找你拍板、交了活等你验收(看它的结论和证据,不够就要)、答应的事到点没动静 —— 回答、验收、拍板或追,别只在日志里记一笔。\n\
          {who}\
          - 消息前的 `#…` 是消息 id,给 --reply / react 用。「(AI)」是 bot 发的,「(本人)」是指令来源,「(你自己)」是你之前发的。\n\
          - 要在某个时间回头看某件事:写进工作目录的 followups.json(数组,每项 {{\"at\": \"带时区的 RFC3339\", \"conv\": \"会话 id\", \"note\": \"要做什么\"}}),到点会叫醒你;做完就删掉那一项。\n\
@@ -883,6 +972,65 @@ fn child_env(client: &Client, me: &str, journal: &Path, dry: bool) -> Vec<(Strin
         if let Ok(joined) = std::env::join_paths(paths) {
             env.push(("PATH".into(), joined.to_string_lossy().into_owned()));
         }
+    }
+    env
+}
+
+/// The login a turn starts on — see [`Ctx::seat_pref`]. When it is not the
+/// preferred one, the loop's log says which and why each login before it was
+/// passed over.
+async fn pick_seat(ctx: &Ctx) -> Option<crate::accounts::Account> {
+    if !ctx.seats {
+        return None;
+    }
+    let choice = crate::accounts::choose(ctx.seat_pref.as_deref(), ctx.opts.model.as_deref()).await;
+    if let Some(note) = choice.note() {
+        println!("inbox: {note}");
+    }
+    Some(choice.account)
+}
+
+/// A finished attempt that ended on its login (full window, refused sign-in):
+/// remember that for the login and name the next one that can take the turn,
+/// with the line that says so. None = nothing to fail over — the run ended on
+/// something else, or no other login can take it (then the attempt's own
+/// error stands, and the log says why each login was passed over).
+async fn next_seat(
+    cur: Option<&crate::accounts::Account>,
+    attempt: &Result<crate::harness::TurnOutcome>,
+    tried: &[String],
+    model: Option<&str>,
+) -> Option<(crate::accounts::Account, String)> {
+    use crate::agent::Handover;
+    let (cur, Ok(o)) = (cur?, attempt) else { return None };
+    let cause = crate::agent::handover_cause(o)?;
+    let (next, why) = match &cause {
+        Handover::Limit(hit) => crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model).await,
+        Handover::SignedOut => crate::accounts::failover_signed_out(&cur.name, model).await,
+    };
+    let Some(next) = next.filter(|n| !tried.contains(&n.name)) else {
+        let line = why.iter().map(|(n, w)| format!("`{n}` {w}")).collect::<Vec<_>>().join("; ");
+        println!(
+            "inbox: ⛔ login `{}` {} — no other login can take over{}",
+            cur.name,
+            cause.what(),
+            if line.is_empty() { String::new() } else { format!(" ({line})") }
+        );
+        return None;
+    };
+    let note = format!("↻ login `{}` {} — continuing on `{}`", cur.name, cause.what(), next.name);
+    println!("inbox: {note}");
+    Some((next, note))
+}
+
+/// The turn's environment: the loop's own plus its login's
+/// (`CLAUDE_SECURESTORAGE_CONFIG_DIR`). The default login has no variable,
+/// which is why `run` takes the one it was started with out of the process.
+fn with_seat(base: &[(String, String)], seat: Option<&crate::accounts::Account>) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> =
+        base.iter().filter(|(k, _)| k != crate::accounts::ENV).cloned().collect();
+    if let Some(a) = seat {
+        env.extend(a.env());
     }
     env
 }
@@ -973,6 +1121,15 @@ struct Ctx {
     ask_chat: Option<String>,
     env: Vec<(String, String)>,
     journal: PathBuf,
+    /// Whether turns pick a Claude login (`crate::accounts`) at all: a Claude
+    /// Code loop started on a login this machine knows. Anything else keeps
+    /// the one environment it was started with, exactly as before.
+    seats: bool,
+    /// The login this loop prefers — the one it was started on. Each turn runs
+    /// on it unless its window is full or its sign-in was refused, then on the
+    /// next login that can take the turn: the daemon's own `accounts::choose`
+    /// before the turn and `accounts::failover` during it. None = default login.
+    seat_pref: Option<String>,
 }
 
 /// Messages that arrived while a turn runs, and that it should hear now: the
@@ -1082,7 +1239,9 @@ async fn look(
         for m in &new {
             markers.add(&tl, m);
         }
-        if new.is_empty() {
+        // Nothing from anyone else (only my own lines, or an agent still
+        // writing): nothing to read — marked read, but no reason for a turn.
+        if new.iter().all(|m| sender(m) == ctx.me_lc) {
             continue;
         }
         let key = tl.key();
@@ -1157,7 +1316,14 @@ async fn look(
     };
     let past = if patrol { decisions_digest(&ctx.workdir) } else { String::new() };
     let ask_mode = ctx.opts.patrol_mode == "ask";
-    let brief = Patrol { overview: &seen, window_hours: ctx.opts.patrol_window, ask: ask_mode, decisions: &past };
+    let card_pending = state.pending_ask.is_some();
+    let brief = Patrol {
+        overview: &seen,
+        window_hours: ctx.opts.patrol_window,
+        ask: ask_mode,
+        card_pending,
+        decisions: &past,
+    };
     if patrol {
         // A stale file from a run that died must not come back as this patrol's finds.
         let _ = std::fs::remove_file(Path::new(&ctx.workdir).join("proposals.json"));
@@ -1191,22 +1357,7 @@ async fn look(
         .to_string_lossy()
         .into_owned();
     let cancel = Arc::new(Notify::new());
-    let turn = Turn {
-        prompt: prompt.clone(),
-        conv: String::new(),
-        surface: format!("inbox____{}", ctx.me_lc.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '-'), "_")),
-        draft: String::new(),
-        workdir: ctx.workdir.clone(),
-        session: if dry { None } else { state.session.clone() },
-        model: ctx.opts.model.clone(),
-        effort: ctx.opts.effort.clone(),
-        thinking: None,
-        cancel: cancel.clone(),
-        system: Some(preamble(&ctx.me, ctx.principal.as_deref())),
-        ask_file: None,
-        steer_file: Some(steer_file.clone()),
-        env: ctx.env.clone(),
-    };
+    let mut seat = pick_seat(ctx).await;
     for f in &due {
         state.fired.insert(f.key());
     }
@@ -1225,45 +1376,81 @@ async fn look(
     let mut tx_log = mafold_transcript::Transcript::new();
 
     let turn_keys: HashSet<String> = batches.iter().map(|b| b.tl.key()).collect();
-    let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let run = ctx.harness.run(turn, sink);
-    tokio::pin!(run);
-    let mut tick = tokio::time::interval(Duration::from_secs(STEER_EVERY));
-    tick.tick().await;
     let mut steered: Vec<(String, HashSet<String>)> = Vec::new();
     let mut session_seen: Option<String> = None;
+    let mut seats_tried: Vec<String> = seat.iter().map(|a| a.name.clone()).collect();
+    // One attempt per login. A run that ended on its SEAT — a full window, a
+    // refused sign-in — says nothing about the conversation: the transcript
+    // lives in the shared `~/.claude`, so the same session resumes under any
+    // other credential. Hand the turn to the next login instead of sitting out
+    // the window (a pinned loop once sat out three hours of one this way while
+    // another login on the machine was free). Each login is tried at most once.
     let outcome = loop {
-        tokio::select! {
-            out = &mut run => break out,
-            Some(ev) = rx.recv() => {
-                if let AgentEvent::Session(s) = &ev { session_seen = Some(s.clone()); }
-                write(event_json(&ev));
-                tx_log.push(&ev);
-            }
-            _ = tick.tick() => {
-                if let Some((text, ids)) = steer_check(ctx, &turn_keys, &mut markers, state, &cancel).await {
-                    use std::io::Write;
-                    let ok = std::fs::OpenOptions::new().create(true).append(true).open(&steer_file)
-                        .and_then(|mut f| writeln!(f, "{text}")).is_ok();
-                    if ok {
-                        let ev = AgentEvent::Steered(clip(&text, 400));
-                        write(event_json(&ev));
-                        tx_log.push(&ev);
-                        steered.push((text, ids));
-                    } else {
-                        markers.forget(&ids);
+        let turn = Turn {
+            prompt: prompt.clone(),
+            conv: String::new(),
+            surface: format!("inbox____{}", ctx.me_lc.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '-'), "_")),
+            draft: String::new(),
+            workdir: ctx.workdir.clone(),
+            session: session_seen.clone().or_else(|| if dry { None } else { state.session.clone() }),
+            model: ctx.opts.model.clone(),
+            effort: ctx.opts.effort.clone(),
+            thinking: None,
+            cancel: cancel.clone(),
+            system: Some(preamble(&ctx.me, ctx.principal.as_deref())),
+            ask_file: None,
+            steer_file: Some(steer_file.clone()),
+            env: with_seat(&ctx.env, seat.as_ref()),
+        };
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let run = ctx.harness.run(turn, sink);
+        tokio::pin!(run);
+        let mut tick = tokio::time::interval(Duration::from_secs(STEER_EVERY));
+        tick.tick().await;
+        let attempt = loop {
+            tokio::select! {
+                out = &mut run => break out,
+                Some(ev) = rx.recv() => {
+                    if let AgentEvent::Session(s) = &ev { session_seen = Some(s.clone()); }
+                    write(event_json(&ev));
+                    tx_log.push(&ev);
+                }
+                _ = tick.tick() => {
+                    if let Some((text, ids)) = steer_check(ctx, &turn_keys, &mut markers, state, &cancel).await {
+                        use std::io::Write;
+                        let ok = std::fs::OpenOptions::new().create(true).append(true).open(&steer_file)
+                            .and_then(|mut f| writeln!(f, "{text}")).is_ok();
+                        if ok {
+                            let ev = AgentEvent::Steered(clip(&text, 400));
+                            write(event_json(&ev));
+                            tx_log.push(&ev);
+                            steered.push((text, ids));
+                        } else {
+                            markers.forget(&ids);
+                        }
                     }
                 }
             }
+        };
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::Session(s) = &ev {
+                session_seen = Some(s.clone());
+            }
+            write(event_json(&ev));
+            tx_log.push(&ev);
         }
+        let Some((next, note)) = next_seat(seat.as_ref(), &attempt, &seats_tried, ctx.opts.model.as_deref()).await else {
+            break attempt;
+        };
+        if let Ok(o) = &attempt {
+            if let Some(s) = &o.session {
+                session_seen = Some(s.clone());
+            }
+        }
+        write(Some(json!({ "t": "seat", "v": note })));
+        seats_tried.push(next.name.clone());
+        seat = Some(next);
     };
-    while let Ok(ev) = rx.try_recv() {
-        if let AgentEvent::Session(s) = &ev {
-            session_seen = Some(s.clone());
-        }
-        write(event_json(&ev));
-        tx_log.push(&ev);
-    }
 
     // What never reached the model stays unread for the next look.
     if let Some(left) = crate::steer_hook::take(&steer_file) {
@@ -1301,7 +1488,10 @@ async fn look(
     if patrol && ok {
         let stamp = local(now, off).format("%Y%m%d-%H%M%S").to_string();
         if let Some(props) = load_proposals(&ctx.workdir) {
-            if ask_mode {
+            if ask_mode && card_pending {
+                // Told not to, did anyway: one open card at a time holds.
+                eprintln!("inbox: a card is still unanswered — ignoring {} new proposal(s)", props.len());
+            } else if ask_mode {
                 let card = render_ask_card(&props, &now_local);
                 carded = props.len();
                 if dry {
@@ -1383,6 +1573,13 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         .as_deref()
         .map(|p| p.trim().trim_start_matches('@').to_lowercase())
         .filter(|p| !p.is_empty());
+    let _ = ALIASES.set(
+        opts.aliases
+            .iter()
+            .map(|a| a.trim().trim_start_matches('@').to_lowercase())
+            .filter(|a| !a.is_empty() && *a != me_lc)
+            .collect(),
+    );
     let mut workdir = match workdir {
         Some(w) => w,
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
@@ -1427,6 +1624,24 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
     // one clears and reads it to know who IT spoke to.
     let journal = dir.join(if opts.dry_run { "journal-dry.jsonl" } else { "journal.jsonl" });
     let env = child_env(&client, &me, &journal, opts.dry_run);
+    // The login this process was started on (`CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+    // set by whatever launched it) becomes the loop's PREFERENCE rather than a
+    // pin, and leaves our own environment: every turn names its login
+    // explicitly, and the default login has no variable at all — a child that
+    // inherited the pin would run on it whatever the choice said. A directory
+    // the registry doesn't know stays a pin: there is nothing to fail over to
+    // that we could name.
+    let started_on = crate::accounts::Account::from_env(&[]);
+    let seats = harness.id() == "claude-code"
+        && (started_on.is_default() || crate::accounts::load().get(&started_on.name).is_some());
+    let seat_pref = (seats && !started_on.is_default()).then(|| started_on.name.clone());
+    if seats {
+        std::env::remove_var(crate::accounts::ENV);
+        println!(
+            "inbox: Claude login `{}` preferred — a full window or refused sign-in moves the turn to the next login on this machine",
+            started_on.name
+        );
+    }
     println!(
         "inbox: @{me} · harness {} · workdir {workdir} · principal {} · heartbeat {}s ({}s outside {}) · patrol {} · glance {}s · log {}{}{}",
         harness.id(),
@@ -1454,6 +1669,8 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         ask_chat,
         env,
         journal,
+        seats,
+        seat_pref,
     };
     let dry = ctx.opts.dry_run;
 
@@ -1519,11 +1736,11 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         let heartbeat = now.saturating_sub(state.last_look) >= every;
         // A patrol is a look that needs nothing new: the CEO going round to see
         // what should be moving and isn't. Active hours only.
-        // One open question at a time: while a proposal card waits for its
-        // answer there is no new patrol (and so no new card).
-        let patrol = state.pending_ask.is_none()
-            && ((first && ctx.opts.patrol_now)
-                || (ctx.opts.patrol > 0 && active && now.saturating_sub(state.last_patrol) >= ctx.opts.patrol));
+        // A patrol runs on schedule whatever the card is doing: following up
+        // (chasing, checking delivered work, answering) never waits on it. What
+        // an unanswered card blocks is only the NEXT card (see `look`).
+        let patrol = (first && ctx.opts.patrol_now)
+            || (ctx.opts.patrol > 0 && active && now.saturating_sub(state.last_patrol) >= ctx.opts.patrol);
         let was_first = std::mem::replace(&mut first, false);
 
         let mut reasons = Vec::new();
@@ -1630,6 +1847,64 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_is_the_same_person() {
+        let alias = vec!["opsdu".to_string()];
+        // The team @s the principal, not the clone: that wakes the clone.
+        let at = msg("1", "linsky", "human", "", "@opsdu 这个你定一下");
+        assert!(wakes_now_as(&at, "realopsdu", &alias, false));
+        assert!(!wakes_now_as(&at, "realopsdu", &[], false), "without the alias it's just chatter");
+        let mut reply = msg("2", "linsky", "human", "", "好的");
+        reply["reply_to_sender"] = json!("opsdu");
+        assert!(wakes_now_as(&reply, "realopsdu", &alias, false));
+        // An agent reporting to @opsdu (e.g. asking for a release) counts too.
+        let bot = msg("3", "opsdu:claude-code", "bot", "", "只差发版,要 @opsdu 点头");
+        assert!(wakes_now_as(&bot, "realopsdu", &alias, false));
+        // The principal's own messages never wake it through the alias.
+        let own = msg("4", "opsdu", "human", "", "@opsdu 备忘");
+        assert!(!wakes_now_as(&own, "realopsdu", &alias, false));
+    }
+
+    #[test]
+    fn an_agents_reply_is_read_by_its_conclusion() {
+        let trail = "{% mafold/run summary=\"Ran 40 shell commands\" %}\n".to_string()
+            + &"{% mafold/tool name=\"Bash\" detail=\"cargo test\" %}output line\n{% /mafold/tool %}\n".repeat(300)
+            + "{% /mafold/run %}\n";
+        let content = format!("{trail}开头一句。{}**结论**:PR #556 合了,只差 api 和 cli 发版,要 ops 点头。", "中间的叙述。".repeat(400));
+        let mut m = msg("9", "opsdu:claude-code", "bot", "2026-09-25T12:45:00Z", &content);
+        m["finalized_at"] = json!("2026-09-25T12:45:51Z");
+        let line = render_msg(&m, "realopsdu", Some("opsdu"), 8);
+        assert!(line.contains("只差 api 和 cli 发版,要 ops 点头"), "the ending survives");
+        assert!(!line.contains("output line") && !line.contains("mafold/tool"), "the trail is gone");
+        assert!(line.contains("中间省略"), "long prose is cut in the middle, not at the end");
+        assert!(line.chars().count() < BOT_HEAD + BOT_TAIL + 200);
+        // In the overview the END is what's kept, too.
+        let short = clip_body_tail(&line, 260);
+        assert!(short.contains("要 ops 点头") && short.starts_with("#9 "), "{short}");
+    }
+
+    #[test]
+    fn an_agents_unfinished_draft_is_not_read() {
+        let mut draft = msg("d", "opsdu:claude-code", "bot", "", "@realopsdu 还在写");
+        draft["finalized_at"] = Value::Null;
+        assert!(in_progress(&draft), "a bot message with no finalized_at is still being written");
+        assert!(!wakes_now_as(&draft, "realopsdu", &[], true));
+        let mut done = draft.clone();
+        done["finalized_at"] = json!("2026-09-25T12:00:00Z");
+        assert!(!in_progress(&done));
+        // A person's message never carries a finalized_at test: absent field ≠ null.
+        let person = msg("p", "linsky", "human", "", "在吗");
+        assert!(!in_progress(&person));
+    }
+
+    #[test]
+    fn a_patrol_with_an_open_card_only_follows_up() {
+        let pt = Patrol { overview: "", window_hours: 72, ask: true, card_pending: true, decisions: "" };
+        let p = build_prompt("2026-09-25 21:00", &["巡视"], false, &[], &[], &[], Some(&pt), None, "realopsdu", Some("opsdu"), 8);
+        assert!(p.contains("跟进不用等任何人批"));
+        assert!(p.contains("这一轮只跟进") && !p.contains("新活这一轮先别派"));
+    }
+
+    #[test]
     fn a_person_buzzes_on_dm_at_and_reply_an_ai_only_on_at() {
         let dm = msg("1", "linsky", "human", "", "在吗");
         assert!(wakes_now(&dm, "realopsdu", true));
@@ -1682,13 +1957,13 @@ mod tests {
     fn a_patrol_runs_on_nothing_new_and_carries_the_overview() {
         let ov = "\n== Mafold DEV · 24 人群 · #上架app · chat=c channel=ch ==\n#1 [09-25 09:00] @linsky: 审核还没过\n";
         let past = "- 09-25 11:14 提了 ①甲 ②乙 → 本人选了 ②\n";
-        let pt = Patrol { overview: ov, window_hours: 72, ask: true, decisions: past };
+        let pt = Patrol { overview: ov, window_hours: 72, ask: true, card_pending: false, decisions: past };
         let p = build_prompt("2026-09-25 11:00", &["巡视"], false, &[], &[], &[], Some(&pt), None, "realopsdu", Some("opsdu"), 8);
         assert!(p.contains("主动巡视") && p.contains("最近 72 小时"));
         assert!(p.contains("[全局概览]") && p.contains("#上架app") && p.contains("审核还没过"));
         assert!(p.contains("这一轮先别派") && p.contains("proposals.json"), "ask mode proposes");
         assert!(p.contains("[本人过去的取舍") && p.contains("本人选了 ②"));
-        let quiet = Patrol { overview: "  ", window_hours: 24, ask: false, decisions: "" };
+        let quiet = Patrol { overview: "  ", window_hours: 24, ask: false, card_pending: false, decisions: "" };
         let p = build_prompt("2026-09-25 11:00", &["巡视"], false, &[], &[], &[], Some(&quiet), None, "realopsdu", None, 8);
         assert!(p.contains("这段时间哪儿都没动静"));
         assert!(!p.contains("这一轮先别派") && p.contains("推的方式"), "auto mode hands out");
@@ -1915,6 +2190,26 @@ mod tests {
         assert!(p.contains("#1 [09-25 10:01] @linsky: @realopsdu 看下"));
         assert!(p.contains("只标已读") && p.contains("某群"));
         assert!(p.contains("[到期的跟进]") && p.contains("追 PR"));
+    }
+
+    /// A turn names its login explicitly: a named login's directory rides the
+    /// env, the default login carries NO variable (so a stale one from the
+    /// base env must not survive), and a loop without seats keeps its env as is.
+    #[test]
+    fn a_turn_env_names_its_login_and_nothing_else() {
+        use crate::accounts::{Account, ENV};
+        let base = vec![
+            ("MAFOLD_BASE".to_string(), "https://api".to_string()),
+            (ENV.to_string(), "/stale/pin".to_string()),
+        ];
+        let work = Account { name: "work".into(), dir: Some("/seats/work".into()), email: None, added_at: 0 };
+        let on_work = with_seat(&base, Some(&work));
+        assert!(on_work.contains(&(ENV.to_string(), "/seats/work".to_string())));
+        assert_eq!(on_work.iter().filter(|(k, _)| k == ENV).count(), 1, "one login, not two");
+        let on_default = with_seat(&base, Some(&Account::default_login()));
+        assert!(!on_default.iter().any(|(k, _)| k == ENV), "the default login has no variable");
+        assert!(on_default.contains(&("MAFOLD_BASE".to_string(), "https://api".to_string())));
+        assert!(!with_seat(&base, None).iter().any(|(k, _)| k == ENV));
     }
 
     /// 522 turns of @realopsdu never once opened a channel: the preamble taught

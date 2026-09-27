@@ -185,6 +185,87 @@ fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
+/// `mafold connection call`/`env`/`show --reveal` all run on the HUMAN session
+/// (`human_client`), because the vault only opens for its owner. But a
+/// self-hosted bot's turn shells out as that very human — so without this,
+/// every bot the owner runs (and therefore anyone who can drive that bot) could
+/// use any connection and read raw tokens, with none of the `connection.use:`
+/// grant the relayed `callConnection` path checks server-side. `MAFOLD_BOT_TOKEN`
+/// in the environment is how a turn says "I am acting as a bot": when it is set,
+/// the same grant is required here, and the denial reads exactly like the
+/// relay's so the two paths can't be told apart by probing.
+///
+/// Pure, so the decision is testable without a network: `bot` is `None` for a
+/// human at their own terminal (no gate), `Some(handle)` for a bot turn.
+/// `grants` is the owner's `(grantee, connection, can_use)` rows. Returns the
+/// denial message when the bot may not use `name`, else `None`.
+fn connection_use_denied(
+    bot: Option<&str>,
+    owner: &str,
+    name: &str,
+    grants: &[(String, String, bool)],
+) -> Option<String> {
+    let bot = bot?; // no bot token → the person's own terminal, their own vault
+    let granted = grants.iter().any(|(grantee, connection, can_use)| {
+        *can_use && grantee.eq_ignore_ascii_case(bot) && connection.eq_ignore_ascii_case(name)
+    });
+    if granted {
+        None
+    } else {
+        Some(format!(
+            "@{owner} hasn't allowed @{bot} to use their `{name}` — \
+             ask with requestConnectionAccess and let them approve the card"
+        ))
+    }
+}
+
+/// Enforce [`connection_use_denied`] against the live account, but only when a
+/// bot token is present in the environment. Fails CLOSED: a bot token we can't
+/// resolve, or grants we can't fetch, denies rather than falling through to the
+/// vault — the whole point is that a bot turn is not implicitly the owner.
+async fn require_connection_use(
+    base: &str,
+    human: &Client,
+    owner: &str,
+    name: &str,
+) -> Result<()> {
+    let Some(token) = std::env::var("MAFOLD_BOT_TOKEN").ok().filter(|t| !t.trim().is_empty())
+    else {
+        return Ok(()); // a human at a real terminal — the vault is theirs to open
+    };
+    let bot = match Client::new(base.to_string(), token).call("getMe", json!({})).await {
+        Ok(v) => s(&v, "username"),
+        Err(e) => bail!(
+            "running as a bot but couldn't confirm which one ({e}); \
+             refusing to touch @{owner}'s `{name}` without checking the grant"
+        ),
+    };
+    if bot.is_empty() {
+        bail!("running as a bot with no resolvable identity; refusing to touch @{owner}'s `{name}`");
+    }
+    let rows: Vec<(String, String, bool)> = human
+        .call("listConnectionGrants", json!({}))
+        .await
+        .context("couldn't check connection grants; refusing rather than assuming access")?
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|g| {
+            (
+                s(g, "grantee"),
+                s(g, "connection"),
+                g.get("can_use").and_then(|b| b.as_bool()).unwrap_or(false),
+            )
+        })
+        .collect();
+    if let Some(msg) = connection_use_denied(Some(&bot), owner, name, &rows) {
+        bail!(msg);
+    }
+    Ok(())
+}
+
 /// Mask everything but the last 4 — the same shape the api uses for bot
 /// secrets, so a masked value looks the same wherever it appears.
 fn mask_tail(v: &str) -> String {
@@ -397,8 +478,8 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
             add(&client, &sess, &name, &provider, import, from_env, oauth, url, auth_header, label)
                 .await
         }
-        ConnectionCmd::Show { name, reveal } => show(&client, &sess, &name, reveal).await,
-        ConnectionCmd::Env { name } => env(&client, &sess, &name).await,
+        ConnectionCmd::Show { name, reveal } => show(base, &client, &sess, &name, reveal).await,
+        ConnectionCmd::Env { name } => env(base, &client, &sess, &name).await,
         ConnectionCmd::Methods { name, schema } => {
             methods(base, &client, &sess, &name, schema).await
         }
@@ -1187,7 +1268,7 @@ fn machine_binding(sess: &session::Session) -> serde_json::Map<String, Value> {
     fields
 }
 
-async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool) -> Result<()> {
+async fn show(base: &str, client: &Client, sess: &session::Session, name: &str, reveal: bool) -> Result<()> {
     let conn = fetch(client, name).await?;
     println!("name      {}", s(&conn, "name"));
     println!("provider  {}", s(&conn, "provider"));
@@ -1197,6 +1278,8 @@ async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool
         println!("\n(secret withheld — `mafold connection show {name} --reveal` to decrypt here)");
         return Ok(());
     }
+    // `--reveal` decrypts the raw secret on this machine — same gate as `env`.
+    require_connection_use(base, client, &sess.username, name).await?;
     let (umk, key_id, _) = unlock(client, sess).await?;
     let fields = open_payload(&umk, &key_id, &conn)?;
     println!();
@@ -1215,7 +1298,10 @@ async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool
 /// Shell exports for a connection, so a local tool can consume it without a
 /// bespoke integration. Deliberately not written to any file: piping into
 /// `eval` keeps the plaintext in a process, not on disk.
-async fn env(client: &Client, sess: &session::Session, name: &str) -> Result<()> {
+async fn env(base: &str, client: &Client, sess: &session::Session, name: &str) -> Result<()> {
+    // Printing the raw secret is the same exposure as `call`, so it takes the
+    // same grant when a bot turn asks for it.
+    require_connection_use(base, client, &sess.username, name).await?;
     let conn = fetch(client, name).await?;
     let provider = s(&conn, "provider");
     let spec = descriptor(client, &provider).await?;
@@ -1822,6 +1908,10 @@ async fn call(
     if !args.is_object() {
         bail!("--params must be a JSON object, e.g. --params '{{\"query\":\"roadmap\"}}'");
     }
+    // A bot turn must hold the grant before the local vault runs the call — the
+    // relayed path checks it server-side, and the local fast-path must not be
+    // the way around that.
+    require_connection_use(base, client, &sess.username, name).await?;
     let mut rt = runtime(base, client, sess).await?;
     // Two places this can run, and the runtime already knows which: a
     // credential opens HERE (that is the whole vault), but a machine of yours
@@ -2247,6 +2337,39 @@ mod tests {
         enrich_oauth_payload(&spec, &mut fields);
         assert_eq!(fields["account_id"], "acc-original");
         assert_eq!(fields["expires_at"], "777");
+    }
+
+    /// The security property behind B: a bot turn (`MAFOLD_BOT_TOKEN` set →
+    /// `bot = Some`) may only touch a connection it was granted `connection.use`
+    /// for; a human at their own terminal (`bot = None`) is never gated. The
+    /// gate exists because the local vault would otherwise run the call as the
+    /// owner regardless of any grant.
+    #[test]
+    fn bot_needs_connection_use_grant_human_never_does() {
+        let grants = vec![
+            ("opsdu:8964".into(), "notion".into(), true),   // 8964 may use notion
+            ("opsdu:codex".into(), "figma".into(), false),  // present, but use=false
+        ];
+
+        // Human at a terminal: no bot token, no gate, ever.
+        assert_eq!(connection_use_denied(None, "opsdu", "notion", &grants), None);
+        assert_eq!(connection_use_denied(None, "opsdu", "stripe", &grants), None);
+
+        // Granted bot → allowed. Handle/name compare case-insensitively.
+        assert_eq!(connection_use_denied(Some("opsdu:8964"), "opsdu", "notion", &grants), None);
+        assert_eq!(connection_use_denied(Some("OPSDU:8964"), "opsdu", "NOTION", &grants), None);
+
+        // Bot with NO grant for that connection → denied, with the relay's words.
+        let d = connection_use_denied(Some("opsdu:8964"), "opsdu", "stripe", &grants)
+            .expect("a bot without the grant must be denied");
+        assert!(d.contains("@opsdu hasn't allowed @opsdu:8964 to use their `stripe`"), "{d}");
+        assert!(d.contains("requestConnectionAccess"), "{d}");
+
+        // A grant that exists but is `can_use=false` does NOT authorize.
+        assert!(connection_use_denied(Some("opsdu:codex"), "opsdu", "figma", &grants).is_some());
+
+        // A grant to a DIFFERENT bot doesn't carry over.
+        assert!(connection_use_denied(Some("linsky:opus48"), "opsdu", "notion", &grants).is_some());
     }
 
     /// Providers without a fixed OAuth client must pass through untouched —
