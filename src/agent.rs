@@ -987,12 +987,13 @@ fn socket_skipped(prev: u64, covered: u64) -> bool {
 /// durable events numbered BEFORE it, in order. Anything numbered after it is
 /// still on its way down the socket, and replaying it first would push the
 /// cursor past the frame we are holding — which the duplicate check would then
-/// throw away.
+/// throw away. An event with NO seq was rebuilt from the server's store (its
+/// backlog had lost it) and predates everything numbered, so it goes too.
 fn gap_fill(items: Vec<serde_json::Value>, before: u64) -> Vec<serde_json::Value> {
     items
         .into_iter()
         .filter(|u| is_durable_event(u["method"].as_str().unwrap_or("")))
-        .filter(|u| u["seq"].as_u64().is_some_and(|s| s < before))
+        .filter(|u| u["seq"].as_u64().is_none_or(|s| s < before))
         .collect()
 }
 
@@ -1008,10 +1009,10 @@ fn gap_fill(items: Vec<serde_json::Value>, before: u64) -> Vec<serde_json::Value
 /// lands on an upstream that is briefly 502 or just very slow. After a gap: the
 /// link was bad enough to lose frames in the first place. Either window is
 /// seconds long. Waiting it out costs nothing; not waiting costs messages.
-async fn fetch_missed(client: &Client, since: u64, what: &str) -> Result<crate::client::Updates> {
+async fn fetch_missed(client: &Client, since: u64, since_at: Option<&str>, what: &str) -> Result<crate::client::Updates> {
     let mut attempt = 0u32;
     loop {
-        match client.get_updates(since).await {
+        match client.get_updates(since, since_at).await {
             Ok(u) => return Ok(u),
             Err(e) if attempt < 4 => {
                 let wait = 2u64.pow(attempt + 1); // 2s, 4s, 8s, 16s
@@ -1059,8 +1060,35 @@ fn directed_at_me(content: &str, is_forward: bool, my_username: &str) -> bool {
 /// The pending-`/login` CODE relay upstream stays deliberately outside this
 /// rule — forwarding a pasted auth code in from another chat is a real way
 /// people relay one, so there a forward IS the sender's own input.
-fn slash_command(trimmed: &str, is_forward: bool) -> Option<(String, &str)> {
-    let rest = trimmed.strip_prefix('/').filter(|_| !is_forward)?;
+/// `@me /clear` → `/clear`. What a DM says as `/clear`, a group has to say to
+/// ONE bot by name: a bare slash command there is run by every daemon that
+/// lets the sender drive it (control commands need no mention — see the block
+/// that calls `slash_command`), so the inline picker sends `@bot /clear`.
+/// Only a leading `@me` followed by a `/…` is peeled; anything else comes back
+/// untouched.
+fn strip_self_address<'a>(text: &'a str, my_username: &str) -> &'a str {
+    let Some(after) = text.trim_start().strip_prefix('@') else {
+        return text;
+    };
+    let n = my_username.len();
+    let (Some(head), Some(rest)) = (after.get(..n), after.get(n..)) else {
+        return text;
+    };
+    // Whitespace right after the handle is what makes it the WHOLE handle —
+    // `@mybotty` is not `@mybot`.
+    if !head.eq_ignore_ascii_case(my_username) || !rest.starts_with(char::is_whitespace) {
+        return text;
+    }
+    let body = rest.trim_start();
+    if body.starts_with('/') {
+        body
+    } else {
+        text
+    }
+}
+
+fn slash_command<'a>(trimmed: &'a str, is_forward: bool, my_username: &str) -> Option<(String, &'a str)> {
+    let rest = strip_self_address(trimmed, my_username).strip_prefix('/').filter(|_| !is_forward)?;
     let mut it = rest.splitn(2, char::is_whitespace);
     let name = it.next().unwrap_or("").to_lowercase();
     Some((name, it.next().unwrap_or("").trim()))
@@ -1117,23 +1145,13 @@ async fn should_respond(
     }
     let cached = chat_states.lock().await.get(conv_id).and_then(|s| s.gate.clone());
 
-    // Kind first, and it is asked at most ONCE per conversation. Fail CLOSED on
-    // an API error: a failed `get_chat` must NOT make a group look like a DM
-    // (which would answer every message with no mention). Treat an error as "a
-    // group requiring a mention" and DON'T cache that verdict (so the next
-    // message re-checks instead of being stuck wrong).
-    let is_group = match cached.as_ref() {
-        Some(g) => g.is_group,
-        None => match client.get_chat(conv_id).await {
-            Ok(c) => c.get("kind").and_then(|k| k.as_str()) == Some("group"),
-            Err(_) => return false, // can't tell → treat as a group; require a mention
-        },
-    };
-    // A DM answers everything, and can never become a group — nothing left to ask
-    // here, ever again.
-    if !is_group {
-        remember_gate(chat_states, conv_id, ConvGate { is_group: false, always_on: None, bots: vec![] }).await;
-        return true;
+    // Kind first (`conv_is_group`: asked at most once per conversation, and an
+    // API error fails CLOSED — can't tell → a group requiring a mention). A DM
+    // answers everything, and can never become a group.
+    match conv_is_group(client, conv_id, chat_states).await {
+        None => return false,
+        Some(false) => return true,
+        Some(true) => {}
     }
     // A group, and a sender who pays: the two addressed doors above were the
     // only ones. Always-on is the owner's convenience for the free rungs.
@@ -1192,6 +1210,10 @@ async fn should_respond(
 /// got wrong in the round-table e2e by firing on a live agent.
 const FLOOR_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What a bot puts on a message it folded into a turn already running — the
+/// api's `rpc::methods::STEER_ACK`, one sign for both bot families.
+const STEER_ACK: &str = "👀";
+
 /// Who was addressed, in the order their handles appear in the text — the FLOOR.
 ///
 /// `.docs/a2a-v2.md`. Empty means "nothing special here": fewer than two agents
@@ -1231,6 +1253,23 @@ fn floor_roster(content: &str, is_forward: bool, sender_lc: &str, agents: &[Stri
 
 async fn remember_gate(chat_states: &ChatStates, conv_id: &str, gate: ConvGate) {
     chat_states.lock().await.entry(conv_id.to_string()).or_default().gate = Some(gate);
+}
+
+/// Is this conversation a group? A chat's kind never changes, so it is asked
+/// at most ONCE per conversation: a DM is remembered here; a group's gate is
+/// filled in by `should_respond`, which needs its bots too. `None` when the api
+/// can't say right now — callers fail CLOSED on that (a failed lookup must
+/// never make a group look like a DM) and nothing is cached, so the next
+/// message asks again.
+async fn conv_is_group(client: &Client, conv_id: &str, chat_states: &ChatStates) -> Option<bool> {
+    if let Some(g) = chat_states.lock().await.get(conv_id).and_then(|s| s.gate.clone()) {
+        return Some(g.is_group);
+    }
+    let is_group = client.get_chat(conv_id).await.ok()?.get("kind").and_then(|k| k.as_str()) == Some("group");
+    if !is_group {
+        remember_gate(chat_states, conv_id, ConvGate { is_group: false, always_on: None, bots: vec![] }).await;
+    }
+    Some(is_group)
 }
 
 /// The agents in this room, for `floor_roster` — fetched HERE when the cache
@@ -1590,6 +1629,40 @@ fn load_cursor(my_username: &str) -> u64 {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
+/// Beside the cursor, the SERVER time of the last message-bearing event this
+/// daemon consumed — what a catch-up hands the api as `since_at` so that, when
+/// its in-memory backlog can no longer reach the cursor (a restart empties
+/// it), it can rebuild what was sent after from its store.
+///
+/// Its own file rather than a field in the cursor's: the cursor file is read
+/// by every older binary as a bare number, and one that can't parse it starts
+/// from 0 — a `mafold rollback` would then replay the whole backlog.
+fn cursor_at_path(my_username: &str) -> PathBuf {
+    cursor_path(my_username).with_extension("at")
+}
+fn load_cursor_at(my_username: &str) -> Option<String> {
+    let s = std::fs::read_to_string(cursor_at_path(my_username)).ok()?;
+    let s = s.trim();
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|_| s.to_string())
+}
+fn save_cursor_at(my_username: &str, at: &str) {
+    let path = cursor_at_path(my_username);
+    let tmp = path.with_extension("at.tmp");
+    if std::fs::write(&tmp, at).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// The server time a message-bearing event stands for: when a person's
+/// message was sent, when a bot's reply FINISHED (`messageComplete` — the
+/// same clock the api's backfill orders by). None for events that carry no
+/// message (`chatCleared`).
+fn event_time(method: &str, params: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let m = if params.get("message").is_some_and(|v| v.is_object()) { &params["message"] } else { params };
+    let field = if method == "events.messageComplete" { "finalized_at" } else { "created_at" };
+    m[field].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+}
+
 fn save_cursor(my_username: &str, seq: u64) {
     // Atomic tmp+rename, mirroring save_sessions: a torn cursor would replay
     // (or skip) half the backlog on the next connect.
@@ -2394,33 +2467,92 @@ async fn maybe_update(http: &reqwest::Client, base: &str, coord: &Arc<ExecCoord>
     }
 }
 
+/// What running a control command does to what the chat already has. Declared
+/// per command in `CONTROL` — the group gate (`control_runs`) reads this, never
+/// a list of names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Effect {
+    /// Loses nothing: it reads, toggles or switches something that can be
+    /// switched back, or halts a reply that can simply be asked for again. Runs
+    /// bare in a group — `/stop` is the emergency brake, and a brake that waits
+    /// for someone to type a handle is no brake.
+    Reversible,
+    /// Discards something no command gives back: the conversation's context, or
+    /// a saved sign-in (dropped by `forget`, replaced by a new sign-in). In a
+    /// group it runs only when the message NAMES this bot — a bare one reached
+    /// every daemon there that lets the sender drive it, so one tap cleared
+    /// them all (2026-09-27, found fixing #580).
+    Irreversible,
+}
+
+/// Which harnesses advertise a control command in the chat menu. Every
+/// harness still HANDLES every command — `handle_control` explains the ones
+/// that don't apply — this is only what the menu offers.
+#[derive(Clone, Copy)]
+enum Menu {
+    All,
+    Only(&'static str),
+    Except(&'static str),
+    /// Handled but never advertised (`/compact` — the harness lists its own).
+    Hidden,
+}
+
+struct ControlCommand {
+    name: &'static str,
+    description: &'static str,
+    arg_hint: Option<&'static str>,
+    menu: Menu,
+    effect: Effect,
+}
+
 /// The daemon's own control commands — handled locally, never forwarded to the
-/// harness CLI. Listed first in the menu; see `handle_control`. Harness-aware:
-/// `/think` (extended-thinking budget) is a Claude Code feature, so a codex bot
-/// — whose depth is the owner-set Reasoning effort, not a per-chat budget —
-/// doesn't advertise it.
+/// harness CLI (`handle_control`; `/login` runs its own flow). The ONE table:
+/// the menu is rendered from it and the group gate reads each row's `effect`.
+const CONTROL: &[ControlCommand] = &[
+    ControlCommand { name: "clear", description: "Start a fresh conversation (clear context)", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible },
+    ControlCommand { name: "new", description: "Alias for /clear", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible },
+    ControlCommand { name: "stop", description: "Stop the reply that's currently running", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
+    ControlCommand { name: "model", description: "Switch the model for this chat", arg_hint: Some("name | reset"), menu: Menu::All, effect: Effect::Reversible },
+    // A Claude Code budget (MAX_THINKING_TOKENS); codex's depth is the owner-set effort.
+    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except("codex"), effect: Effect::Reversible },
+    ControlCommand { name: "resume", description: "Resume an earlier session (terminal ones pick up their live state)", arg_hint: Some("id | last"), menu: Menu::Only("claude-code"), effect: Effect::Reversible },
+    // Irreversible by its worst form: `forget` drops a saved login from the machine.
+    ControlCommand { name: "account", description: "Which Claude account this chat runs on — list, pin, forget", arg_hint: Some("name | reset | forget <name>"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible },
+    // A sign-in replaces the seat's stored token.
+    ControlCommand { name: "login", description: "Sign in to Anthropic — with a name, add a second Claude account", arg_hint: Some("[name]"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible },
+    ControlCommand { name: "compact", description: "Summarize this conversation's context to free tokens", arg_hint: None, menu: Menu::Hidden, effect: Effect::Irreversible },
+    ControlCommand { name: "status", description: "Agent, session, account & daemon info", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
+    ControlCommand { name: "cwd", description: "Show the working directory", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
+    ControlCommand { name: "access", description: "Who may use this bot, and who pays", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
+    ControlCommand { name: "help", description: "What this agent can do", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
+];
+
+/// The row for a control command, if `name` is one.
+fn control_command(name: &str) -> Option<&'static ControlCommand> {
+    CONTROL.iter().find(|c| c.name == name)
+}
+
+/// May a control command run on this message? Irreversible ones in a group
+/// need the message to name this bot; everything else runs as typed.
+fn control_runs(effect: Effect, in_group: bool, named: bool) -> bool {
+    effect == Effect::Reversible || !in_group || named
+}
+
+/// The control commands this harness advertises, listed first in the menu.
 fn control_commands(harness_id: &str) -> Vec<Value> {
-    let mut cmds = vec![
-        serde_json::json!({ "command": "clear",  "description": "Start a fresh conversation (clear context)" }),
-        serde_json::json!({ "command": "new",    "description": "Alias for /clear" }),
-        serde_json::json!({ "command": "stop",   "description": "Stop the reply that's currently running" }),
-        serde_json::json!({ "command": "model",  "description": "Switch the model for this chat", "arg_hint": "name | reset" }),
-    ];
-    if harness_id != "codex" {
-        cmds.push(serde_json::json!({ "command": "think", "description": "Toggle extended thinking for this chat", "arg_hint": "on | off | <tokens>" }));
-    }
-    if harness_id == "claude-code" {
-        cmds.push(serde_json::json!({ "command": "resume", "description": "Resume an earlier session (terminal ones pick up their live state)", "arg_hint": "id | last" }));
-        cmds.push(serde_json::json!({ "command": "account", "description": "Which Claude account this chat runs on — list, pin, forget", "arg_hint": "name | reset | forget <name>" }));
-        cmds.push(serde_json::json!({ "command": "login", "description": "Sign in to Anthropic — with a name, add a second Claude account", "arg_hint": "[name]" }));
-    }
-    cmds.extend([
-        serde_json::json!({ "command": "status", "description": "Agent, session, account & daemon info" }),
-        serde_json::json!({ "command": "cwd",    "description": "Show the working directory" }),
-        serde_json::json!({ "command": "access", "description": "Who may use this bot, and who pays" }),
-        serde_json::json!({ "command": "help",   "description": "What this agent can do" }),
-    ]);
-    cmds
+    CONTROL
+        .iter()
+        .filter(|c| match c.menu {
+            Menu::All => true,
+            Menu::Only(h) => harness_id == h,
+            Menu::Except(h) => harness_id != h,
+            Menu::Hidden => false,
+        })
+        .map(|c| match c.arg_hint {
+            Some(hint) => serde_json::json!({ "command": c.name, "description": c.description, "arg_hint": hint }),
+            None => serde_json::json!({ "command": c.name, "description": c.description }),
+        })
+        .collect()
 }
 
 /// Build the full command panel (control commands + discovered skills/commands)
@@ -3410,6 +3542,7 @@ async fn connect_and_run(
     // takes the normal arms below instead of vanishing (the socket only ever
     // carries live frames).
     let mut last_seq: u64 = load_cursor(my_username);
+    let mut last_at: Option<String> = load_cursor_at(my_username);
     let mut last_cursor_save = std::time::Instant::now();
     let mut replay: std::collections::VecDeque<serde_json::Value> = Default::default();
     // The highest seq a catch-up has vouched for: everything the server
@@ -3469,7 +3602,7 @@ async fn connect_and_run(
             } else if last_seq < head {
                 // Retried, not tried once (`fetch_missed`): one failed attempt
                 // used to be permanent loss.
-                match fetch_missed(client, last_seq, "catch-up").await {
+                match fetch_missed(client, last_seq, last_at.as_deref(), "catch-up").await {
                     Ok(u) => {
                         // Replay message-bearing events (+ chatCleared) only
                         // (`is_durable_event`): a stale inline query / probe /
@@ -3481,6 +3614,13 @@ async fn connect_and_run(
                             .collect();
                         if !items.is_empty() {
                             println!("↻ catch-up: replaying {} missed event(s) (seq {last_seq} → {head})", items.len());
+                        }
+                        if u.backfilled > 0 {
+                            println!(
+                                "↻ catch-up: {} of them rebuilt from the server's store — its backlog could not reach back to seq {last_seq} (since {})",
+                                u.backfilled,
+                                last_at.as_deref().unwrap_or("?")
+                            );
                         }
                         if u.truncated {
                             eprintln!("⚠ catch-up: part of (seq {last_seq}, {head}] had already aged out of the server's backlog — those events are gone");
@@ -3511,10 +3651,13 @@ async fn connect_and_run(
             // step below drops it, and it has nothing to say about gaps.)
             if let Some(s) = seq.filter(|&s| s > last_seq && socket_skipped(prev, last_seq.max(covered))) {
                 println!("⚠ gap: the socket skipped frame(s) before seq {s} — it follows {prev}, the last one seen was {last_seq}; fetching them");
-                match fetch_missed(client, last_seq, "gap").await {
+                match fetch_missed(client, last_seq, last_at.as_deref(), "gap").await {
                     Ok(u) => {
                         let items = gap_fill(u.items, s);
                         println!("↻ gap: replaying {} missed event(s) ahead of seq {s}", items.len());
+                        if u.backfilled > 0 {
+                            println!("↻ gap: {} of them rebuilt from the server's store", u.backfilled);
+                        }
                         if u.truncated {
                             eprintln!("⚠ gap: part of (seq {last_seq}, {s}) had already aged out of the server's backlog — those events are gone");
                         }
@@ -3553,6 +3696,23 @@ async fn connect_and_run(
             if pin_now || last_cursor_save.elapsed() >= Duration::from_secs(2) {
                 save_cursor(my_username, last_seq);
                 last_cursor_save = std::time::Instant::now();
+            }
+        }
+        // …and the server time it stood for, pinned the same way, for every
+        // message-bearing event consumed — including one rebuilt from the
+        // store, which has no seq and so never reaches the step above. Only
+        // ever forward: a replayed older event must not pull it back.
+        if is_durable_event(method) {
+            if let Some(t) = env.get("params").and_then(|p| event_time(method, p)) {
+                let newer = last_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_none_or(|have| t > have);
+                if newer {
+                    let s = t.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                    save_cursor_at(my_username, &s);
+                    last_at = Some(s);
+                }
             }
         }
         // A new cli release was published (server got the GitHub webhook) → check +
@@ -4097,11 +4257,38 @@ async fn connect_and_run(
             }
         }
 
+        // A reply to one of the bot's own messages counts as engaging it (same as
+        // an @-mention) — so you can just reply to Claude instead of @-ing it.
+        // Keyed on the server-stamped author of the replied-to message, so it
+        // holds across daemon restarts and for messages of any age (the old
+        // in-memory recent-ids set forgot every pre-restart message, silently
+        // dropping replies to them).
+        let reply_to_me = m
+            .reply_to_sender
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case(my_username))
+            .unwrap_or(false);
+
         // Daemon control commands (`/clear`, `/stop`, `/model`, …) are handled
         // locally and never reach claude. `/login` runs an interactive flow.
         // Any OTHER `/name …` falls through (emulated, mocked, or to claude).
         // (All reachable only by an allow-listed sender — gated above.)
-        if let Some((name, arg)) = slash_command(trimmed, is_forward) {
+        if let Some((name, arg)) = slash_command(trimmed, is_forward, my_username) {
+            // They skip the reply gate, which is what keeps a bare `/stop` a
+            // brake in a group. The irreversible ones don't get that pass: in
+            // a group they must name this bot — an @ in what the sender typed,
+            // or a reply to one of its messages — or this daemon leaves them be.
+            if let Some(cmd) = control_command(&name) {
+                let named = directed_at_me(&m.content, is_forward, my_username) || (!is_forward && reply_to_me);
+                // The chat's kind is only asked for when it can change the answer.
+                let in_group = cmd.effect == Effect::Irreversible
+                    && !named
+                    && conv_is_group(client, &m.conversation_id, chat_states).await.unwrap_or(true);
+                if !control_runs(cmd.effect, in_group, named) {
+                    println!("  (group · /{name} is irreversible and doesn't name @{my_username} → skip)");
+                    continue;
+                }
+            }
             if name == "login" {
                 // The whole flow (link, code prompt, result) answers in the
                 // channel `/login` was typed in — it is a conversation, not a
@@ -4114,7 +4301,7 @@ async fn connect_and_run(
                 tokio::spawn(async move { login_flow(client, chat_id, channel, arg, chat_states, login_owner, harness, me, owner_name).await; });
                 continue;
             }
-            if is_control(&name) {
+            if control_command(&name).is_some() {
                 // A control command arriving as a REPLY may be answering one of
                 // our finalized {% mafold/ask %} cards (e.g. the /resume picker, whose
                 // option labels are the commands themselves) — stamp the card
@@ -4132,18 +4319,6 @@ async fn connect_and_run(
                 continue;
             }
         }
-
-        // A reply to one of the bot's own messages counts as engaging it (same as
-        // an @-mention) — so you can just reply to Claude instead of @-ing it.
-        // Keyed on the server-stamped author of the replied-to message, so it
-        // holds across daemon restarts and for messages of any age (the old
-        // in-memory recent-ids set forgot every pre-restart message, silently
-        // dropping replies to them).
-        let reply_to_me = m
-            .reply_to_sender
-            .as_deref()
-            .map(|s| s.eq_ignore_ascii_case(my_username))
-            .unwrap_or(false);
 
         // Group reply gate: in a group, only answer when @-mentioned, replied-to,
         // or set always-on; DMs answer everything. (Control commands above already
@@ -4188,7 +4363,9 @@ async fn connect_and_run(
         let harness = harness.clone();
         let attachments = m.attachments.clone();
         let chat_id = m.conversation_id.clone();
-        let content = m.content.clone();
+        // `@me /usage` in a group is `/usage` in a DM — for the emulated
+        // commands below and for the harness's own (`strip_self_address`).
+        let content = strip_self_address(&m.content, my_username).to_string();
         // For rebuilding group context: the bot's own handle + the trigger msg id
         // (so the re-fetched history can exclude the bot + the triggering message).
         let me_user = my_username.to_string();
@@ -4350,6 +4527,12 @@ async fn connect_and_run(
                 ).await {
                     Some(Steered::Now { .. }) => {
                         println!("↩︎ steered the running turn in {chat_id}");
+                        // The reply this lands in was opened before it was
+                        // sent, so it sits ABOVE it and nothing ever appears
+                        // below — without a mark the chat ends on the person's
+                        // own words and reads as ignored. Same sign the api
+                        // puts on a hosted bot's (`ack_steered`).
+                        let _ = client.set_reaction(&trigger_id, STEER_ACK, false).await;
                         return;
                     }
                     // The running harness can't be corrected mid-flight, but the
@@ -4514,10 +4697,6 @@ const ACCESS_PAID_DISCLOSURE: &str = "把这个 bot 切到第二档之前，三�
 \n\
 点下面的卡片即同意这个安排。";
 
-/// Is this slash name one the daemon handles itself (vs a Claude Code skill)?
-fn is_control(name: &str) -> bool {
-    matches!(name, "clear" | "new" | "compact" | "resume" | "stop" | "model" | "think" | "status" | "cwd" | "account" | "access" | "help")
-}
 
 /// v0 inline-query handler. The full plumbing (client → API → daemon → API →
 /// client) is what this feature delivers; this handler is intentionally minimal:
@@ -4525,9 +4704,14 @@ fn is_control(name: &str) -> bool {
 /// inline round-trip is observable end-to-end. Results are message bodies (a
 /// result MAY contain `{% card %}` tags) — picking one sends it as a message.
 /// Richer, per-bot inline handlers (returning real cards) are a follow-up.
+///
+/// A `/…` query gets nothing from here: command completion is the api's, from
+/// the list this daemon published, and its rows are addressed (`@bot /clear`).
+/// An echo would sit under them as a BARE command — which in a group every
+/// daemon runs.
 fn inline_results(query: &str) -> Vec<String> {
     let q = query.trim();
-    if q.is_empty() {
+    if q.is_empty() || q.starts_with('/') {
         Vec::new()
     } else {
         vec![q.to_string()]
@@ -5570,15 +5754,18 @@ async fn login_flow(
     // `claude` to write the credential into it, and a half-finished sign-in
     // leaving a named-but-empty seat is harmless — it probes as "not logged
     // in" and a turn steps over it.
+    let mut added = false;
     let account = match (&wanted, harness.id()) {
         (Some(n), "claude-code") if n != crate::accounts::DEFAULT => {
             let mut reg = crate::accounts::load();
+            let existed = reg.get(n).is_some();
             match reg.add(n) {
                 Ok(a) => {
                     if let Err(e) = crate::accounts::save(&reg) {
                         let _ = client.send_to(dest(), &format!("Couldn't record the account: {e}")).await;
                         return;
                     }
+                    added = !existed;
                     Some(a)
                 }
                 Err(e) => {
@@ -5595,6 +5782,9 @@ async fn login_flow(
         _ => None,
     };
     let seat_env = account.as_ref().map(|a| a.env()).unwrap_or_default();
+    // Who holds this slot BEFORE the sign-in overwrites it — the receipt has
+    // to be able to say "replaced X", not just "signed in".
+    let before = crate::commands::login_identity(&seat_env).await;
     let opening = match &account {
         Some(a) => format!(
             "🔐 Starting Anthropic sign-in for a SECOND account, `{}`… I'll post the link here; approve it, then paste the Authentication Code back to me.\n⚠️ Sign in with the OTHER Anthropic account — your browser is probably still holding the first one, so use a private window.\nThis machine's existing login is untouched, and so are memory, skills and sessions: only the subscription is separate.",
@@ -5704,36 +5894,199 @@ async fn login_flow(
     // Whatever this seat's health was, it is stale now.
     let name = account.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| crate::accounts::DEFAULT.into());
     crate::accounts::forget_seat(&name);
-    let status = crate::commands::auth_status_line(&seat_env).await;
-    let Some(a) = account else {
-        let _ = client.send_to(dest(), &format!("✓ Signed in.{}", if status.is_empty() { String::new() } else { format!(" {status}") })).await;
-        return;
+    {
+        // A fresh sign-in lifts a remembered refusal outright.
+        let mut reg = crate::accounts::load();
+        if reg.signed_out.remove(&name).is_some() {
+            let _ = crate::accounts::save(&reg);
+        }
+    }
+    let after = crate::commands::login_identity(&seat_env).await;
+    let status = match &after {
+        crate::commands::WhoProbe::Known(_) => String::new(),
+        _ => crate::commands::auth_status_line(&seat_env).await,
     };
-    // Remember the email so the account is identifiable everywhere it is
-    // listed — `/account`, `/status`, the Customize menu — because a machine
-    // with two Claude subscriptions on it is exactly where "which one is
-    // this?" starts costing time.
-    let email = crate::commands::auth_status_json(&seat_env)
-        .await
-        .and_then(|v| v["email"].as_str().map(str::to_string));
-    crate::accounts::set_email(&a.name, email.clone());
-    // The sheet's account menu is built from the registry, so a new login has
-    // to re-publish it or the owner can see the account in chat and not in
-    // the Customize sheet — "in effect but invisible", the exact failure the
-    // schema-driven sheet exists to prevent.
-    ensure_customize_fields(&client, &my_username, owner_username.as_deref(), harness.id()).await;
-    let who = match &email {
-        Some(e) => format!(" ({e})"),
-        None => String::new(),
+    let reg = crate::accounts::load();
+    let names: Vec<String> = reg.accounts.iter().map(|a| a.name.clone()).collect();
+    // The other slots, asked who they hold: signing a second slot into the
+    // SAME subscription (the browser quietly reused the first account) looks
+    // like success and leaves nothing to switch to.
+    let twin = match &after {
+        crate::commands::WhoProbe::Known(me) => {
+            let others: Vec<&crate::accounts::Account> = reg.accounts.iter().filter(|a| a.name != name).collect();
+            let envs: Vec<Vec<(String, String)>> = others.iter().map(|a| a.env()).collect();
+            let who = futures_util::future::join_all(envs.iter().map(|e| crate::commands::login_identity(e))).await;
+            others
+                .iter()
+                .zip(who)
+                .find(|(_, w)| matches!(w, crate::commands::WhoProbe::Known(id) if id.same_as(me)))
+                .map(|(a, _)| a.name.clone())
+        }
+        _ => None,
     };
-    let _ = client
-        .send_to(dest(), &format!(
-            "✓ Signed in as account `{}`{who}.{}\n\nTurns keep running on the usual login and move here by themselves when a window fills up. To send THIS chat here now: `/account {}` — or set it for the whole bot in the Customize sheet.",
-            a.name,
-            if status.is_empty() { String::new() } else { format!(" {status}") },
-            a.name,
-        ))
-        .await;
+    if let (Some(a), crate::commands::WhoProbe::Known(id)) = (&account, &after) {
+        // Remember the email so the account is identifiable everywhere it is
+        // listed — `/account`, `/status`, the Customize menu. From the seat's
+        // own profile: `claude auth status` under a seat env reports the
+        // shared file's identity, i.e. the default login's.
+        crate::accounts::set_email(&a.name, id.email.clone());
+    }
+    if account.is_some() {
+        // The sheet's account menu is built from the registry, so a new login has
+        // to re-publish it or the owner can see the account in chat and not in
+        // the Customize sheet — "in effect but invisible", the exact failure the
+        // schema-driven sheet exists to prevent.
+        ensure_customize_fields(&client, &my_username, owner_username.as_deref(), harness.id()).await;
+    }
+    let receipt = login_receipt(&LoginOutcome {
+        named: account.as_ref().map(|a| a.name.as_str()),
+        added,
+        before: &before,
+        after: &after,
+        names: &names,
+        twin: twin.as_deref(),
+        status: &status,
+    });
+    let _ = client.send_to(dest(), &receipt).await;
+}
+
+/// The line under a usage wall no other login could take over: what each
+/// other login on the machine was passed over for — the seat that was skipped
+/// as "not logged in" is the one a user can fix — or that there is no other.
+/// Why a running turn moves to another login on this machine.
+#[derive(Debug, Clone, PartialEq)]
+enum Handover {
+    /// Its usage window is full.
+    Limit(crate::harness::LimitHit),
+    /// Anthropic refused its sign-in mid-run — a revoked refresh token on a
+    /// seat whose credential file still looked renewable. Marked signed out
+    /// on the spot ([`crate::accounts::failover_signed_out`]) so the next
+    /// turn doesn't walk into it again.
+    SignedOut,
+}
+
+impl Handover {
+    fn what(&self) -> String {
+        match self {
+            Handover::Limit(hit) => format!("hit its {} limit", hit.kind),
+            Handover::SignedOut => "had its sign-in refused".to_string(),
+        }
+    }
+}
+
+/// The seat problem a finished run ended on, if any. `/stop` is never one:
+/// the user ended it, not the account.
+fn handover_cause(o: &crate::harness::TurnOutcome) -> Option<Handover> {
+    if o.stopped {
+        return None;
+    }
+    if let Some(hit) = &o.limit {
+        return Some(Handover::Limit(hit.clone()));
+    }
+    o.error
+        .as_deref()
+        .filter(|e| crate::accounts::signed_out_error(e))
+        .map(|_| Handover::SignedOut)
+}
+
+/// The run ended on the ACCOUNT, not the conversation: a full window or a
+/// refused sign-in. Such a session is intact and must never be dropped.
+fn seat_trouble(o: &crate::harness::TurnOutcome) -> bool {
+    o.limit.is_some() || o.error.as_deref().is_some_and(crate::accounts::signed_out_error)
+}
+
+fn wall_footer(why: &[(String, String)], logins: usize) -> String {
+    if why.is_empty() {
+        return if logins <= 1 {
+            "\n_This machine has only one Claude login, so there was nowhere to move this turn — `/login <name>` adds another; `/account` shows them._".to_string()
+        } else {
+            "\n_No other Claude account on this machine could take over — `/account` shows them._".to_string()
+        };
+    }
+    let each = why.iter().map(|(n, w)| format!("`{n}` {w}")).collect::<Vec<_>>().join("; ");
+    format!("\n_No other Claude account on this machine could take over: {each}. `/account` shows them all._")
+}
+
+/// What a finished `/login` changed.
+struct LoginOutcome<'a> {
+    /// The named slot that was signed in; None = the machine's own login.
+    named: Option<&'a str>,
+    /// The name was new — this sign-in ADDED a login to the machine.
+    added: bool,
+    /// Who held the slot before, and who holds it now.
+    before: &'a crate::commands::WhoProbe,
+    after: &'a crate::commands::WhoProbe,
+    /// Every login on the machine afterwards, registry order.
+    names: &'a [String],
+    /// Another slot holding the very same subscription.
+    twin: Option<&'a str>,
+    /// `claude auth status` — said only when `after` couldn't be read.
+    status: &'a str,
+}
+
+/// The receipt for a finished `/login`, in words: WHICH subscription the slot
+/// holds now, what it held before, and whether the machine gained a login.
+///
+/// A bare "✓ Signed in." let a user replace their only login while believing
+/// they had added a second one (2026-09-25: a Windows bot, one login, sat on a
+/// full five-hour window with "no other Claude account could take over").
+fn login_receipt(o: &LoginOutcome) -> String {
+    use crate::commands::WhoProbe;
+    let now = match o.after {
+        WhoProbe::Known(id) => format!("**{}**", id.label()),
+        _ if !o.status.is_empty() => format!("a login I couldn't identify ({})", o.status),
+        _ => "a login I couldn't identify (the profile endpoint didn't answer)".to_string(),
+    };
+    let mut out = match (o.named, o.added) {
+        (Some(n), true) => format!("✓ Added account `{n}` — {now}."),
+        (Some(n), false) => format!("✓ Signed account `{n}` in again — it now holds {now}."),
+        (None, _) => format!("✓ Signed in — this machine's own login (`default`) is now {now}."),
+    };
+    if !o.added {
+        let was = match (o.before, o.after) {
+            (WhoProbe::Known(b), WhoProbe::Known(a)) if b.same_as(a) => {
+                "Same account as before; this only refreshed its sign-in.".to_string()
+            }
+            (WhoProbe::Known(b), WhoProbe::Known(_)) => {
+                format!("It **replaced** {}, which this slot no longer holds.", b.label())
+            }
+            (WhoProbe::Known(b), _) => format!("Before, it held {}.", b.label()),
+            (WhoProbe::SignedOut, _) => "Before this it wasn't signed in (or its sign-in had expired).".to_string(),
+            (WhoProbe::Unknown, _) => {
+                "I couldn't read who was signed in before, so I can't say whether this replaced anyone.".to_string()
+            }
+        };
+        out.push(' ');
+        out.push_str(&was);
+    }
+    let n = o.names.len();
+    let list = o.names.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ");
+    let plural = if n == 1 { "" } else { "s" };
+    out.push_str("\n\n");
+    if o.added {
+        out.push_str(&format!("This machine now has {n} Claude login{plural}: {list}."));
+    } else {
+        out.push_str(&format!("**No account was added** — this machine still has {n} Claude login{plural}: {list}."));
+    }
+    if let Some(t) = o.twin {
+        let again = match o.named {
+            Some(n) => format!("`/login {n}`"),
+            None => "`/login`".to_string(),
+        };
+        out.push_str(&format!(
+            "\n⚠️ That's the same subscription `{t}` holds — two slots, one account, so there is nothing to switch to when its window fills. Run {again} again and sign in with the OTHER Anthropic account (a private window stops the browser reusing this one)."
+        ));
+    }
+    out.push_str("\n\n");
+    match o.named {
+        Some(n) => out.push_str(&format!(
+            "Turns keep running on the usual login and move here by themselves when a window fills up. To send THIS chat here now: `/account {n}` — or set it for the whole bot in the Customize sheet."
+        )),
+        None => out.push_str(
+            "Bare `/login` always signs in THIS slot. To keep it and ADD another subscription next to it — turns then move between them by themselves when a window fills up — use `/login <name>`.",
+        ),
+    }
+    out
 }
 
 async fn clear_login(chat_states: &ChatStates, chat_id: &str) {
@@ -6030,6 +6383,24 @@ answer, stay quiet when you don't.\n\
 An @ only lands if that agent's owner allows you — you, or your owner, on its list. If one never \
 answers, that is usually why: say so instead of @-ing it again. And this all happens in the open \
 chat, not a side channel: the humans here read every turn and can cut in at any point.",
+    );
+    // Forum channels. A group (or a DM with forum on) can hold one `#channel`
+    // per topic, and anyone it allows — in Mafold DEV, every member — can open
+    // one with `mafold channels create`. Nothing here ever said so: the owner's
+    // clone ran 522 turns without opening a single channel, and every new piece
+    // of work it handed out landed in one DM, where unrelated threads interleave
+    // and none can be followed. Same discovery gap as connections and A2A above
+    // — name the command, and say where the work goes when the room won't allow
+    // it (`createChannel` answers "only managers may create channels here").
+    s.push_str(
+        "\n\nFORUM CHANNELS — ONE PIECE OF WORK, ONE CHANNEL: a group (or a DM with forum on) can \
+hold a `#channel` per topic. When you start a new topic there or hand work to someone, run \
+`mafold channels list <chat>` first; if no channel fits, open one — `mafold channels create <chat> \
+<short name>` — and do the work in it (`mafold send <chat> --channel <id or #name> …`, @-ing \
+whoever you hand it to). Don't pile unrelated work into the main timeline or a DM, where every \
+thread interleaves and none can be followed. If only managers may open channels in that room, use \
+the closest existing one and say so. When the work is done and accepted, `mafold channels close \
+<chat> <channel>` — only channels you opened.",
     );
     s
 }
@@ -6905,34 +7276,57 @@ async fn handle(
     // session kept (a limit is not a corrupt session — see the gates below).
     let mut seat_produced = matches!(&result, Ok(o) if o.produced);
     let mut seat_tried: Vec<String> = seat.iter().map(|a| a.name.clone()).collect();
+    // Why every other login was passed over when the last one hit its wall —
+    // said IN the reply, not only in the daemon log: "no other account could
+    // take over" alone can't tell "there is none" from "there is one and it
+    // was skipped", and the second is what a user can do something about.
+    let mut wall_why: Vec<(String, String)> = Vec::new();
+    // The turn ran into a seat problem nobody could take over from — it gets
+    // the footer that says why each other login was passed over.
+    let mut walled = false;
     loop {
-        let (cur, hit, session) = match (&seat, &result) {
-            (Some(cur), Ok(o)) if !o.stopped => match o.limit.clone() {
-                Some(hit) => (cur.clone(), hit, o.session.clone().or_else(|| prior.clone())),
+        let (cur, cause, session) = match (&seat, &result) {
+            (Some(cur), Ok(o)) => match handover_cause(o) {
+                Some(c) => (cur.clone(), c, o.session.clone().or_else(|| prior.clone())),
                 None => break,
             },
             _ => break,
         };
-        let (next, why) = crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model.as_deref()).await;
+        let (next, why) = match &cause {
+            Handover::Limit(hit) => {
+                crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model.as_deref()).await
+            }
+            Handover::SignedOut => crate::accounts::failover_signed_out(&cur.name, model.as_deref()).await,
+        };
         let Some(next) = next else {
-            let why = why.iter().map(|(n, w)| format!("`{n}` {w}")).collect::<Vec<_>>().join("; ");
+            let line = why.iter().map(|(n, w)| format!("`{n}` {w}")).collect::<Vec<_>>().join("; ");
             println!(
-                "⛔ account `{}` hit its {} limit — no other login can take over{}",
+                "⛔ account `{}` {} — no other login can take over{}",
                 cur.name,
-                hit.kind,
-                if why.is_empty() { String::new() } else { format!(" ({why})") }
+                cause.what(),
+                if line.is_empty() { String::new() } else { format!(" ({line})") }
             );
+            wall_why = why;
+            walled = true;
             break;
         };
         if seat_tried.contains(&next.name) {
             break;
         }
         seat_tried.push(next.name.clone());
-        let when = hit
-            .resets_at
-            .map(|t| format!(", {}", crate::accounts::reset_hint(t, crate::accounts::now())))
-            .unwrap_or_default();
-        let note = format!("↻ Account `{}` hit its {} limit{when} — continuing on `{}`", cur.name, hit.kind, next.name);
+        let note = match &cause {
+            Handover::Limit(hit) => {
+                let when = hit
+                    .resets_at
+                    .map(|t| format!(", {}", crate::accounts::reset_hint(t, crate::accounts::now())))
+                    .unwrap_or_default();
+                format!("↻ Account `{}` hit its {} limit{when} — continuing on `{}`", cur.name, hit.kind, next.name)
+            }
+            Handover::SignedOut => format!(
+                "↻ Account `{}` is signed out (Anthropic refused its sign-in — `/login {}` fixes that) — continuing on `{}`",
+                cur.name, cur.name, next.name
+            ),
+        };
         println!("{note}");
         // The seam, in the reply itself: the reader sees where the account
         // changed, the way a steer shows where a correction landed.
@@ -6960,10 +7354,14 @@ async fn handle(
             // say so, or the model re-answers a message it had half-answered.
             prompt: if seat_produced {
                 format!(
-                    "(your previous run on this message was cut off by a usage limit and has \
+                    "(your previous run on this message was cut off by {} and has \
                      moved to another account — the session and everything you did so far \
                      are intact. Continue from where you left off; the message you are \
-                     answering is repeated below.)\n\n{full_prompt}"
+                     answering is repeated below.)\n\n{full_prompt}",
+                    match &cause {
+                        Handover::Limit(_) => "a usage limit",
+                        Handover::SignedOut => "a sign-in failure on that account",
+                    }
                 )
             } else {
                 full_prompt.clone()
@@ -7091,10 +7489,12 @@ async fn handle(
     // stopped it, and when the run already PRODUCED output (a retry would redo
     // work that partly landed). A clean turn with no error and no output is the
     // separate empty-turn path above, retried on the SAME session.
-    // (A usage wall is NOT a corrupt session — the seat logic above already
-    // did what can be done about it — so it never drops the session here.)
+    // (A usage wall or a refused sign-in is NOT a corrupt session — the seat
+    // logic above already did what can be done about it, and a fresh session
+    // on the same login would fail identically — so it never drops the
+    // session here.)
     let resumed_errored = prior.is_some()
-        && matches!(&result, Ok(o) if o.error.is_some() && o.limit.is_none() && !o.stopped && !o.produced);
+        && matches!(&result, Ok(o) if o.error.is_some() && !seat_trouble(o) && !o.stopped && !o.produced);
     if resumed_errored {
         let why = result.as_ref().ok().and_then(|o| o.error.clone()).unwrap_or_default();
         println!("↻ resumed session errored ({why}) — dropping it + retrying once on a FRESH session");
@@ -7186,12 +7586,10 @@ async fn handle(
                 // next message resumes with context; only a resume that died
                 // before producing anything is dropped (see there).
                 final_content.push_str(&format!("{sep}⚠️ Agent stopped: {err}"));
-                if o.limit.is_some() {
+                if o.limit.is_some() || walled {
                     // Every login on this machine is out (or there is only
                     // one). Say what would have helped, right here.
-                    final_content.push_str(
-                        "\n_No other Claude account on this machine could take over — `/login <name>` adds one; `/account` shows them._",
-                    );
+                    final_content.push_str(&wall_footer(&wall_why, crate::accounts::load().accounts.len()));
                 }
             } else if !o.produced {
                 final_content.push_str("_(the agent produced no output)_");
@@ -7211,7 +7609,7 @@ async fn handle(
             // the next message ("继续") started on a blank session. A broken
             // session dies BEFORE producing anything; that is the only shape
             // this drop is for.
-            if o.error.is_some() && o.limit.is_none() && prior.is_some() && !o.produced {
+            if o.error.is_some() && !seat_trouble(&o) && prior.is_some() && !o.produced {
                 let mut s = sessions.lock().await;
                 if s.remove(&skey).is_some() { save_sessions(&s); }
             } else if let Some(sid) = o.session {
@@ -9092,6 +9490,19 @@ mod inbound_file_tests {
         );
     }
 
+    /// Opening a channel is the step no agent took on its own: the command has
+    /// to be named, next to where the work goes when a room won't allow it and
+    /// which channels an agent may close.
+    #[test]
+    fn the_preamble_teaches_one_channel_per_piece_of_work() {
+        let p = mafold_preamble("ops:claude", "ops", &[]);
+        assert!(p.contains("mafold channels list <chat>"));
+        assert!(p.contains("mafold channels create <chat>"));
+        assert!(p.contains("--channel <id or #name>"));
+        assert!(p.contains("only managers may open channels"), "no fallback when the room refuses");
+        assert!(p.contains("only channels you opened"), "an agent must not close other people's channels");
+    }
+
     #[test]
     fn the_preamble_offers_all_three_delivery_routes() {
         let p = mafold_preamble("ops:claude", "ops", &[]);
@@ -9330,7 +9741,8 @@ mod gate_tests {
     use super::{
         directed_at_me, floor_roster, gap_fill, is_durable_event, machine_authored, mentions_me,
         resolve_turn_workdir,
-        sanitize_attachment_name, should_respond, slash_command, socket_skipped,
+        inline_results, sanitize_attachment_name, should_respond, slash_command, socket_skipped,
+        strip_self_address,
         trigger_message, turn_session_key, AllowList, ChatStates, ConvGate,
     };
     use crate::client::Client;
@@ -9390,6 +9802,45 @@ mod gate_tests {
         ];
         let got: Vec<u64> = gap_fill(items, 105).iter().map(|u| u["seq"].as_u64().unwrap()).collect();
         assert_eq!(got, vec![102, 104]);
+    }
+
+    /// An event the server rebuilt from its store (the backlog had lost it)
+    /// carries no seq — it predates everything numbered, so a gap fill keeps
+    /// it instead of dropping it for failing the `seq < before` test.
+    #[test]
+    fn a_gap_fill_keeps_events_rebuilt_from_the_store() {
+        use serde_json::json;
+        let items = vec![
+            json!({"method": "events.messageNew", "params": {"id": "rebuilt"}}),
+            json!({"seq": 104, "method": "events.messageNew", "params": {"id": "n"}}),
+            json!({"seq": 106, "method": "events.messageNew", "params": {"id": "after"}}),
+        ];
+        let got: Vec<String> = gap_fill(items, 105).iter().map(|u| u["params"]["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(got, vec!["rebuilt", "n"]);
+    }
+
+    /// The clock `since_at` is kept in is the one the api's backfill orders
+    /// by: a person's message when it was sent, a bot's reply when it
+    /// finished, a thread reply through its `message`.
+    #[test]
+    fn an_events_server_time_is_the_backfills_clock() {
+        use serde_json::json;
+        let at = |method: &str, p: serde_json::Value| {
+            super::event_time(method, &p).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        };
+        let msg = json!({"id": "m", "created_at": "2026-09-26T21:19:55.769Z", "finalized_at": "2026-09-26T21:20:19.520Z"});
+        assert_eq!(at("events.messageNew", msg.clone()).as_deref(), Some("2026-09-26T21:19:55.769Z"));
+        assert_eq!(at("events.messageComplete", msg.clone()).as_deref(), Some("2026-09-26T21:20:19.520Z"));
+        assert_eq!(
+            at("events.threadReply", json!({"message": msg, "thread_summary": null})).as_deref(),
+            Some("2026-09-26T21:19:55.769Z")
+        );
+        assert_eq!(at("events.chatCleared", json!({"conversation_id": "c"})), None);
+        // The api writes whatever precision chrono chose; ordering must not
+        // depend on the string's length.
+        let a = super::event_time("events.messageNew", &json!({"created_at": "2026-09-26T21:19:55.7Z"})).unwrap();
+        let b = super::event_time("events.messageNew", &json!({"created_at": "2026-09-26T21:19:55.69Z"})).unwrap();
+        assert!(a > b);
     }
 
     /// A streamed reply is born empty and finishes as `messageComplete`. The
@@ -9464,6 +9915,42 @@ mod gate_tests {
             assert!(cc.contains(&cmd.to_string()), "claude-code missing /{cmd}");
             assert!(cx.contains(&cmd.to_string()), "codex missing /{cmd}");
         }
+        // The menu is rendered from the table now; it reads exactly as it did
+        // when it was a hand-written list (`/compact` handled, not advertised).
+        assert_eq!(cc, ["clear", "new", "stop", "model", "think", "resume", "account", "login", "status", "cwd", "access", "help"]);
+        assert_eq!(cx, ["clear", "new", "stop", "model", "status", "cwd", "access", "help"]);
+    }
+
+    /// Which control commands are irreversible is declared on each row of the
+    /// table — the gate never names a command. Irreversible = discards the
+    /// conversation's context (`/clear`, `/new`, `/compact`) or a saved sign-in
+    /// (`/account forget`, `/login` replacing a seat's token).
+    #[test]
+    fn the_table_declares_which_commands_are_irreversible() {
+        let irreversible: Vec<&str> = super::CONTROL
+            .iter()
+            .filter(|c| c.effect == super::Effect::Irreversible)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(irreversible, ["clear", "new", "account", "login", "compact"]);
+    }
+
+    /// A bare irreversible command in a group ran on every daemon there that
+    /// lets the sender drive it — one `/clear` cleared all of them. Now it has
+    /// to name the bot. `/stop` stays a bare brake, and a DM needs no naming.
+    #[test]
+    fn irreversible_commands_must_name_the_bot_in_a_group() {
+        let e = |n: &str| super::control_command(n).unwrap().effect;
+        let runs = super::control_runs;
+        // in a group, not named
+        assert!(!runs(e("clear"), true, false));
+        assert!(!runs(e("compact"), true, false));
+        assert!(runs(e("stop"), true, false), "the brake must stay bare");
+        assert!(runs(e("model"), true, false));
+        // in a group, named
+        assert!(runs(e("clear"), true, true));
+        // a DM
+        assert!(runs(e("clear"), false, false));
     }
 
     /// Build an AllowList directly (bypassing the env var) so the `allows` logic
@@ -9717,11 +10204,60 @@ mod gate_tests {
     /// pasted auth code by forwarding it is a real thing people do.
     #[test]
     fn a_forwarded_slash_command_is_not_a_command() {
-        assert_eq!(slash_command("/clear", false), Some(("clear".into(), "")));
-        assert_eq!(slash_command("/model opus  ", false), Some(("model".into(), "opus")));
-        assert_eq!(slash_command("/clear", true), None);
-        assert_eq!(slash_command("/cwd C:/somewhere", true), None);
-        assert_eq!(slash_command("не команда", false), None);
+        assert_eq!(slash_command("/clear", false, "mybot"), Some(("clear".into(), "")));
+        assert_eq!(slash_command("/model opus  ", false, "mybot"), Some(("model".into(), "opus")));
+        assert_eq!(slash_command("/clear", true, "mybot"), None);
+        assert_eq!(slash_command("/cwd C:/somewhere", true, "mybot"), None);
+        assert_eq!(slash_command("не команда", false, "mybot"), None);
+    }
+
+    /// In a group a command is ADDRESSED — `@bot /clear` — because a bare one
+    /// runs on every daemon in the room that lets the sender drive it (control
+    /// commands need no mention). The inline picker sends commands in exactly
+    /// this form; the daemon used to hand it to the model as a prompt instead.
+    #[test]
+    fn an_addressed_slash_command_is_a_command() {
+        assert_eq!(slash_command("@mybot /clear", false, "mybot"), Some(("clear".into(), "")));
+        assert_eq!(slash_command("@MyBot   /model opus", false, "mybot"), Some(("model".into(), "opus")));
+        assert_eq!(slash_command("@ops:claude /stop", false, "ops:claude"), Some(("stop".into(), "")));
+        // Someone else's command, or not a command at all.
+        assert_eq!(slash_command("@otherbot /clear", false, "mybot"), None);
+        assert_eq!(slash_command("@mybot2 /clear", false, "mybot"), None);
+        assert_eq!(slash_command("@mybot/clear", false, "mybot"), None);
+        assert_eq!(slash_command("@mybot 帮我 /clear 一下", false, "mybot"), None);
+        // Forwarded stays quoting, addressed or not.
+        assert_eq!(slash_command("@mybot /clear", true, "mybot"), None);
+    }
+
+    /// A `/…` query is command completion, which the api answers from the
+    /// published list — already addressed (`@bot /model `). Echoing it back as
+    /// well put a row under them that sent the BARE command, and a bare
+    /// command in a group runs on every daemon there: typing the argument after
+    /// an inserted `@bot /model ` offered exactly that row. Free text is
+    /// unchanged.
+    #[test]
+    fn a_command_query_is_never_echoed_back() {
+        assert!(inline_results("/").is_empty());
+        assert!(inline_results("/mo").is_empty());
+        assert!(inline_results(" /model opus").is_empty());
+        assert_eq!(inline_results("周报"), vec!["周报".to_string()]);
+        assert!(inline_results("   ").is_empty());
+    }
+
+    /// The turn path gets the same peeling, so `@bot /usage` (an emulated
+    /// command) and `@bot /some-skill` (the harness's own) behave in a group
+    /// the way `/usage` and `/some-skill` do in a DM. Anything that isn't
+    /// `@me` + a command comes back untouched.
+    #[test]
+    fn only_a_leading_self_address_before_a_command_is_peeled() {
+        assert_eq!(strip_self_address("@mybot /usage", "mybot"), "/usage");
+        assert_eq!(strip_self_address("  @MYBOT \t/review x", "mybot"), "/review x");
+        assert_eq!(strip_self_address("@mybot 你好", "mybot"), "@mybot 你好");
+        assert_eq!(strip_self_address("@other /usage", "mybot"), "@other /usage");
+        assert_eq!(strip_self_address("@mybotty /usage", "mybot"), "@mybotty /usage");
+        assert_eq!(strip_self_address("/usage", "mybot"), "/usage");
+        assert_eq!(strip_self_address("@myb", "mybot"), "@myb");
+        assert_eq!(strip_self_address("@我的机器人 /x", "我的"), "@我的机器人 /x");
     }
 
     /// The reply gate matches `@handle` against the sender's PROSE: every card
@@ -10954,5 +11490,153 @@ mod steer_tests {
             "the mailbox reordered what the user said: {mailbox}"
         );
         let _ = std::fs::remove_file(&f);
+    }
+}
+
+#[cfg(test)]
+mod login_receipt_tests {
+    use super::{login_receipt, LoginOutcome};
+    use crate::commands::{LoginIdentity, WhoProbe};
+
+    fn id(email: &str, org: &str) -> WhoProbe {
+        WhoProbe::Known(LoginIdentity {
+            account_uuid: Some(format!("acct-{email}")),
+            email: Some(email.into()),
+            org_uuid: Some(format!("org-{org}")),
+            org_name: Some(org.into()),
+            org_type: Some("claude_team".into()),
+            tier: Some("default_claude_max_5x".into()),
+        })
+    }
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn receipt(named: Option<&str>, added: bool, before: &WhoProbe, after: &WhoProbe, all: &[String], twin: Option<&str>) -> String {
+        login_receipt(&LoginOutcome { named, added, before, after, names: all, twin, status: "" })
+    }
+
+    /// 2026-09-25, the case that started this: bare `/login` on a one-login
+    /// machine swapped the subscription and answered "✓ Signed in." — read as
+    /// "added". The receipt must say it REPLACED, and that nothing was added.
+    #[test]
+    fn bare_login_over_another_account_says_replaced_and_nothing_added() {
+        let r = receipt(None, false, &id("old@x.com", "Old Co"), &id("new@x.com", "New Co"), &names(&["default"]), None);
+        assert!(r.contains("this machine's own login (`default`) is now **new@x.com — New Co · Team · Max (5x)**"), "{r}");
+        assert!(r.contains("It **replaced** old@x.com — Old Co · Team · Max (5x)"), "{r}");
+        assert!(r.contains("**No account was added** — this machine still has 1 Claude login: `default`."), "{r}");
+        assert!(r.contains("`/login <name>`"), "the way to ADD one has to be in the receipt: {r}");
+    }
+
+    #[test]
+    fn bare_login_into_the_same_account_says_it_only_refreshed() {
+        let r = receipt(None, false, &id("a@x.com", "A"), &id("a@x.com", "A"), &names(&["default", "work"]), None);
+        assert!(r.contains("Same account as before; this only refreshed its sign-in."), "{r}");
+        assert!(r.contains("still has 2 Claude logins: `default`, `work`."), "{r}");
+        assert!(!r.contains("replaced"), "{r}");
+    }
+
+    #[test]
+    fn bare_login_onto_an_expired_slot_says_so() {
+        let r = receipt(None, false, &WhoProbe::SignedOut, &id("a@x.com", "A"), &names(&["default"]), None);
+        assert!(r.contains("wasn't signed in (or its sign-in had expired)"), "{r}");
+    }
+
+    #[test]
+    fn a_new_name_says_added_and_the_new_count() {
+        let r = receipt(Some("team"), true, &WhoProbe::SignedOut, &id("b@x.com", "B"), &names(&["default", "team"]), None);
+        assert!(r.starts_with("✓ Added account `team` — **b@x.com — B · Team · Max (5x)**."), "{r}");
+        assert!(r.contains("This machine now has 2 Claude logins: `default`, `team`."), "{r}");
+        assert!(!r.contains("No account was added"), "{r}");
+        assert!(r.contains("`/account team`"), "{r}");
+    }
+
+    #[test]
+    fn an_existing_name_signed_in_again_is_not_an_addition() {
+        let r = receipt(Some("team"), false, &id("b@x.com", "B"), &id("c@x.com", "C"), &names(&["default", "team"]), None);
+        assert!(r.starts_with("✓ Signed account `team` in again — it now holds **c@x.com"), "{r}");
+        assert!(r.contains("It **replaced** b@x.com"), "{r}");
+        assert!(r.contains("**No account was added**"), "{r}");
+    }
+
+    /// The browser reused the first account: two slots, one subscription.
+    #[test]
+    fn a_second_slot_on_the_same_subscription_is_flagged() {
+        let r = receipt(Some("team"), true, &WhoProbe::SignedOut, &id("a@x.com", "A"), &names(&["default", "team"]), Some("default"));
+        assert!(r.contains("⚠️ That's the same subscription `default` holds"), "{r}");
+        assert!(r.contains("Run `/login team` again"), "{r}");
+    }
+
+    #[test]
+    fn an_unreadable_profile_falls_back_to_the_cli_status_and_says_so() {
+        let all = names(&["default"]);
+        let r = login_receipt(&LoginOutcome {
+            named: None,
+            added: false,
+            before: &WhoProbe::Unknown,
+            after: &WhoProbe::Unknown,
+            names: &all,
+            twin: None,
+            status: "Login method: Claude Team account",
+        });
+        assert!(r.contains("is now a login I couldn't identify (Login method: Claude Team account)"), "{r}");
+        assert!(r.contains("I couldn't read who was signed in before"), "{r}");
+        assert!(r.contains("**No account was added**"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod wall_footer_tests {
+    use super::wall_footer;
+
+    /// 2026-09-27: the footer said "no other account could take over" while
+    /// the other login had simply been skipped as "not logged in" — the one
+    /// thing the user could have fixed, and the reply didn't say it.
+    #[test]
+    fn every_passed_over_login_is_named_with_its_reason() {
+        let why = vec![
+            ("new5x".to_string(), "isn't logged in — `/login <name>` fixes that".to_string()),
+            ("work".to_string(), "is exhausted (weekly_all) — resets in 2d 03h".to_string()),
+        ];
+        let f = wall_footer(&why, 3);
+        assert!(f.contains("`new5x` isn't logged in — `/login <name>` fixes that"), "{f}");
+        assert!(f.contains("`work` is exhausted (weekly_all)"), "{f}");
+    }
+
+    #[test]
+    fn a_single_login_machine_says_there_is_no_other() {
+        let f = wall_footer(&[], 1);
+        assert!(f.contains("only one Claude login"), "{f}");
+        assert!(f.contains("`/login <name>`"), "{f}");
+    }
+
+    fn ended_on(error: &str) -> crate::harness::TurnOutcome {
+        crate::harness::TurnOutcome { error: Some(error.into()), produced: true, ..Default::default() }
+    }
+
+    /// The owner's rule (2026-09-27): a run refused on sign-in moves to the
+    /// next login like a full window does — it does not end the turn on
+    /// "Please run /login" while another login sits there.
+    #[test]
+    fn a_refused_sign_in_hands_the_turn_over_like_a_full_window() {
+        use super::{handover_cause, seat_trouble, Handover};
+        let refused = ended_on("API Error: 401 Invalid API key · Please run /login");
+        assert_eq!(handover_cause(&refused), Some(Handover::SignedOut));
+        assert!(seat_trouble(&refused), "the session is intact — never dropped for this");
+
+        let full = crate::harness::TurnOutcome {
+            limit: Some(crate::harness::LimitHit { kind: "five_hour".into(), resets_at: Some(9) }),
+            ..ended_on("You've hit your session limit")
+        };
+        assert!(matches!(handover_cause(&full), Some(Handover::Limit(h)) if h.kind == "five_hour"));
+
+        // Not the account's fault: nothing moves, and the session rules stay as they were.
+        let transient = ended_on("Failed to refresh OAuth token: another Claude Code process is refreshing it");
+        assert_eq!(handover_cause(&transient), None);
+        assert!(!seat_trouble(&transient));
+        assert_eq!(handover_cause(&ended_on("API Error: 529 overloaded")), None);
+        let stopped = crate::harness::TurnOutcome { stopped: true, ..refused };
+        assert_eq!(handover_cause(&stopped), None, "/stop is the user's, not the account's");
     }
 }

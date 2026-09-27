@@ -90,15 +90,6 @@ pub async fn auth_status_line(env: &[(String, String)]) -> String {
         .to_string()
 }
 
-/// `claude auth status --json` for the seat `env` selects — the email, org
-/// and plan behind a login, straight from Claude Code. None when the CLI
-/// can't run or that seat isn't logged in.
-pub(crate) async fn auth_status_json(env: &[(String, String)]) -> Option<serde_json::Value> {
-    let out = run_claude(&["auth", "status", "--json"], 8, env).await;
-    let v: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
-    v["loggedIn"].as_bool().unwrap_or(false).then_some(v)
-}
-
 // ───────────────────────── config dumps ─────────────────────────
 
 /// `/config` `/settings` — a structured summary card of the EFFECTIVE config
@@ -1120,35 +1111,87 @@ fn now_ms() -> i64 {
 /// NOT use the refresh token — minting credentials is Claude Code's job, and an
 /// expired one simply drops us to the cached copy on the next line.
 pub(crate) fn oauth_token(env: &[(String, String)]) -> Option<String> {
-    let acct = crate::accounts::Account::from_env(env);
-    let raw = match std::fs::read_to_string(acct.credentials_file()) {
-        Ok(s) => s,
-        Err(_) => {
-            if !cfg!(target_os = "macos") {
-                return None;
-            }
-            let out = std::process::Command::new("security")
-                .args([
-                    "find-generic-password",
-                    "-s",
-                    &acct.keychain_service(),
-                    "-w",
-                ])
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            String::from_utf8(out.stdout).ok()?
-        }
-    };
-    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    let o = &v["claudeAiOauth"];
-    match o["expiresAt"].as_i64() {
-        Some(exp) if exp <= now_ms() => return None,
-        _ => {}
+    match stored_login(env) {
+        StoredLogin::Fresh(t) => Some(t),
+        StoredLogin::Stale | StoredLogin::Missing => None,
     }
-    o["accessToken"].as_str().map(str::to_string)
+}
+
+/// What the seat's stored credential says, before anything is asked upstream.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StoredLogin {
+    /// An unexpired access token.
+    Fresh(String),
+    /// The access token has lapsed but the refresh token is there. This is
+    /// NOT a logged-out seat: the access token lives 8 hours (measured
+    /// 2026-09-27 — Keychain write time to `expiresAt`, 8.00h on two seats)
+    /// and Claude Code renews it on its next run. Any login nobody has run
+    /// for 8 hours looks like this — which is to say, every BACKUP seat, the
+    /// exact seat failover exists for. Reading it as "not logged in" skipped
+    /// it forever: it only renews by being run, and it was never run because
+    /// it was skipped (a Muse turn on 2026-09-27 hit a full window with a
+    /// second login sitting at 0%).
+    Stale,
+    /// No credential, an unreadable one, or no way to renew it.
+    Missing,
+}
+
+pub(crate) fn stored_login(env: &[(String, String)]) -> StoredLogin {
+    match read_credential(env) {
+        Some(raw) => stored_login_from(&raw, now_ms()),
+        None => StoredLogin::Missing,
+    }
+}
+
+/// The seat's stored credential blob: `<dir>/.credentials.json`, else (macOS)
+/// the Keychain item Claude Code names after the directory.
+fn read_credential(env: &[(String, String)]) -> Option<String> {
+    let acct = crate::accounts::Account::from_env(env);
+    if let Ok(s) = std::fs::read_to_string(acct.credentials_file()) {
+        return Some(s);
+    }
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", &acct.keychain_service(), "-w"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// Which credential the seat holds, as a short hash of its refresh token —
+/// never the token itself. A new sign-in writes a new refresh token, so a
+/// changed fingerprint is how a remembered refusal
+/// ([`crate::accounts::SignedOut`]) learns it no longer applies.
+pub(crate) fn credential_fingerprint(env: &[(String, String)]) -> Option<String> {
+    fingerprint_of(&read_credential(env)?)
+}
+
+/// [`credential_fingerprint`] on a blob already read.
+pub(crate) fn fingerprint_of(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let r = v["claudeAiOauth"]["refreshToken"].as_str().filter(|s| !s.is_empty())?;
+    Some(crate::accounts::hash8(r))
+}
+
+/// [`stored_login`] on a credential blob already read — split out so the
+/// verdict is testable without a Keychain.
+pub(crate) fn stored_login_from(raw: &str, now_ms: i64) -> StoredLogin {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return StoredLogin::Missing;
+    };
+    let o = &v["claudeAiOauth"];
+    let renewable = o["refreshToken"].as_str().is_some_and(|s| !s.is_empty());
+    match (o["accessToken"].as_str(), o["expiresAt"].as_i64()) {
+        (Some(t), Some(exp)) if exp > now_ms => StoredLogin::Fresh(t.to_string()),
+        (Some(t), None) => StoredLogin::Fresh(t.to_string()),
+        _ if renewable => StoredLogin::Stale,
+        _ => StoredLogin::Missing,
+    }
 }
 
 /// `GET /api/oauth/usage` — the exact request Claude Code makes to refresh its
@@ -1168,8 +1211,13 @@ pub(crate) enum UtilizationProbe {
     Ok(serde_json::Value),
     /// Upstream answered with a non-2xx status.
     Http(u16),
-    /// No readable / unexpired credential on this machine — no request was made.
+    /// No readable credential on this machine, or one that can't be renewed —
+    /// no request was made.
     NoCredential,
+    /// The access token has lapsed but can be renewed ([`StoredLogin::Stale`]):
+    /// the seat is signed in, its windows just can't be read until Claude
+    /// Code runs on it. No request was made.
+    Stale,
     /// Never got an answer (DNS, TLS, timeout), or the body wasn't JSON.
     Unreachable,
 }
@@ -1180,8 +1228,10 @@ pub(crate) enum UtilizationProbe {
 /// seat-health and the pre-turn seat check want the failure taxonomy, and two
 /// probes of the same endpoint would drift (§0).
 pub(crate) async fn probe_utilization(env: &[(String, String)]) -> UtilizationProbe {
-    let Some(token) = oauth_token(env) else {
-        return UtilizationProbe::NoCredential;
+    let token = match stored_login(env) {
+        StoredLogin::Fresh(t) => t,
+        StoredLogin::Stale => return UtilizationProbe::Stale,
+        StoredLogin::Missing => return UtilizationProbe::NoCredential,
     };
     let res = match reqwest::Client::new()
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -1200,6 +1250,118 @@ pub(crate) async fn probe_utilization(env: &[(String, String)]) -> UtilizationPr
     match res.json::<serde_json::Value>().await {
         Ok(v) => UtilizationProbe::Ok(v),
         Err(_) => UtilizationProbe::Unreachable,
+    }
+}
+
+/// Who a login belongs to, per `GET /api/oauth/profile` asked with THAT
+/// seat's own token.
+///
+/// Not `claude auth status --json`: under `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+/// it reports the email and organization from the SHARED `~/.claude.json`
+/// (whoever signed the default seat in) next to the seat's own plan, so every
+/// named seat came out wearing the same identity. Seen on 2026-09-26: `work`
+/// and `personal` both recorded as `ops@…` — same person, different
+/// organizations, and the organization is the part that tells them apart.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LoginIdentity {
+    pub account_uuid: Option<String>,
+    pub email: Option<String>,
+    pub org_uuid: Option<String>,
+    pub org_name: Option<String>,
+    /// `claude_team`, `claude_max`, `claude_pro`, …
+    pub org_type: Option<String>,
+    /// `default_claude_max_5x`, …
+    pub tier: Option<String>,
+}
+
+impl LoginIdentity {
+    pub fn from_profile(v: &serde_json::Value) -> Self {
+        let s = |x: &serde_json::Value| x.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        LoginIdentity {
+            account_uuid: s(&v["account"]["uuid"]),
+            email: s(&v["account"]["email"]),
+            org_uuid: s(&v["organization"]["uuid"]),
+            org_name: s(&v["organization"]["name"]),
+            org_type: s(&v["organization"]["organization_type"]),
+            tier: s(&v["organization"]["rate_limit_tier"]),
+        }
+    }
+
+    /// "ops@x.com — RedQ Holdings · Team · Max (5x)". The organization is
+    /// always said: one person routinely holds several subscriptions under the
+    /// same email, and the organization is the only thing that differs.
+    pub fn label(&self) -> String {
+        let plan = self.org_type.as_deref().map(|t| match t {
+            "claude_team" => "Team".to_string(),
+            "claude_enterprise" => "Enterprise".to_string(),
+            "claude_max" => "Max".to_string(),
+            "claude_pro" => "Pro".to_string(),
+            other => cap_first(other.strip_prefix("claude_").unwrap_or(other)),
+        });
+        let tier = self.tier.as_deref().map(tier_label);
+        let mut org: Vec<String> = self.org_name.clone().into_iter().collect();
+        match (plan, tier) {
+            // "Max · Max (20x)" says the same thing twice — keep the precise one.
+            (Some(p), Some(t)) if t == p || t.starts_with(&format!("{p} (")) => org.push(t),
+            (p, t) => org.extend(p.into_iter().chain(t)),
+        }
+        match (&self.email, org.is_empty()) {
+            (Some(e), false) => format!("{e} — {}", org.join(" · ")),
+            (Some(e), true) => e.clone(),
+            (None, false) => org.join(" · "),
+            (None, true) => "an unnamed Anthropic login".to_string(),
+        }
+    }
+
+    /// The same subscription: the same account in the same organization.
+    /// Falls back to email + organization name when a uuid is missing.
+    pub fn same_as(&self, other: &LoginIdentity) -> bool {
+        match (&self.account_uuid, &other.account_uuid, &self.org_uuid, &other.org_uuid) {
+            (Some(a), Some(b), Some(o), Some(p)) => a == b && o == p,
+            _ => self.email.is_some() && self.email == other.email && self.org_name == other.org_name,
+        }
+    }
+}
+
+/// Outcome of [`login_identity`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WhoProbe {
+    Known(LoginIdentity),
+    /// No readable, unexpired credential for the seat, or upstream said 401.
+    SignedOut,
+    /// Couldn't tell (network, an unexpected status, an unreadable body).
+    Unknown,
+}
+
+/// `GET /api/oauth/profile` for the seat `env` selects — the same quota-free,
+/// token-only kind of call as [`probe_utilization`].
+pub(crate) async fn login_identity(env: &[(String, String)]) -> WhoProbe {
+    let token = match stored_login(env) {
+        StoredLogin::Fresh(t) => t,
+        // Signed in, just not renewed yet — who it is can't be asked with a
+        // lapsed token, and "not signed in" would be false.
+        StoredLogin::Stale => return WhoProbe::Unknown,
+        StoredLogin::Missing => return WhoProbe::SignedOut,
+    };
+    let res = match reqwest::Client::new()
+        .get("https://api.anthropic.com/api/oauth/profile")
+        .bearer_auth(token)
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return WhoProbe::Unknown,
+    };
+    match res.status().as_u16() {
+        401 => return WhoProbe::SignedOut,
+        s if !(200..300).contains(&s) => return WhoProbe::Unknown,
+        _ => {}
+    }
+    match res.json::<serde_json::Value>().await {
+        Ok(v) => WhoProbe::Known(LoginIdentity::from_profile(&v)),
+        Err(_) => WhoProbe::Unknown,
     }
 }
 
@@ -1227,13 +1389,17 @@ fn cached_utilization() -> Option<(serde_json::Value, i64)> {
 pub(crate) fn plan_tier() -> Option<String> {
     let raw = std::fs::read_to_string(home().join(".claude.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let t = v["oauthAccount"]["organizationRateLimitTier"].as_str()?;
+    Some(tier_label(v["oauthAccount"]["organizationRateLimitTier"].as_str()?))
+}
+
+/// `default_claude_max_20x` → "Max (20x)".
+pub(crate) fn tier_label(t: &str) -> String {
     let t = t.strip_prefix("default_").unwrap_or(t);
     let t = t.strip_prefix("claude_").unwrap_or(t);
-    Some(match t.split_once('_') {
+    match t.split_once('_') {
         Some((base, mult)) if mult.ends_with('x') => format!("{} ({mult})", cap_first(base)),
         _ => cap_first(t),
-    })
+    }
 }
 
 /// Render the structured utilization payload into `limit|`/`kv|` card lines.
@@ -2499,5 +2665,108 @@ Last 7d · 7983 requests · 30 sessions
         let ctx = session_context_tokens("/Users/ops/Desktop/mafold", &sid);
         println!("session {sid} → context {ctx:?}");
         assert!(ctx.is_some());
+    }
+}
+
+#[cfg(test)]
+mod login_identity_tests {
+    use super::{tier_label, LoginIdentity};
+
+    /// Shape of `GET /api/oauth/profile`, from a live call on 2026-09-26
+    /// (uuids replaced).
+    fn team() -> serde_json::Value {
+        serde_json::json!({
+            "account": {"uuid": "acct-1", "email": "ops@redqholdings.com", "display_name": "Ops", "has_claude_max": true},
+            "organization": {"uuid": "org-team", "name": "RedQ Holdings", "organization_type": "claude_team",
+                             "rate_limit_tier": "default_claude_max_5x", "seat_tier": "team_tier_1"},
+            "application": {"name": "Claude Code"}
+        })
+    }
+
+    #[test]
+    fn a_team_seat_names_its_organization_plan_and_tier() {
+        let id = LoginIdentity::from_profile(&team());
+        assert_eq!(id.label(), "ops@redqholdings.com — RedQ Holdings · Team · Max (5x)");
+    }
+
+    #[test]
+    fn a_personal_max_seat_keeps_the_multiplier_and_says_max_once() {
+        let mut v = team();
+        v["organization"] = serde_json::json!({"uuid": "org-me", "name": "ops@redqholdings.com's Organization",
+            "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"});
+        let id = LoginIdentity::from_profile(&v);
+        assert_eq!(id.label(), "ops@redqholdings.com — ops@redqholdings.com's Organization · Max (20x)");
+    }
+
+    /// The case `claude auth status` could not tell apart: one person, one
+    /// email, two subscriptions.
+    #[test]
+    fn same_email_in_another_organization_is_another_login() {
+        let a = LoginIdentity::from_profile(&team());
+        let mut v = team();
+        v["organization"]["uuid"] = "org-me".into();
+        v["organization"]["name"] = "ops@redqholdings.com's Organization".into();
+        let b = LoginIdentity::from_profile(&v);
+        assert!(!a.same_as(&b));
+        assert!(a.same_as(&LoginIdentity::from_profile(&team())));
+    }
+
+    #[test]
+    fn an_empty_profile_still_labels_without_panicking() {
+        let id = LoginIdentity::from_profile(&serde_json::json!({}));
+        assert_eq!(id, LoginIdentity::default());
+        assert_eq!(id.label(), "an unnamed Anthropic login");
+        assert!(!id.same_as(&LoginIdentity::default()), "two unknowns are not proof of one account");
+    }
+
+    #[test]
+    fn tier_labels() {
+        assert_eq!(tier_label("default_claude_max_20x"), "Max (20x)");
+        assert_eq!(tier_label("default_raven"), "Raven");
+    }
+}
+
+#[cfg(test)]
+mod stored_login_tests {
+    use super::{stored_login_from, StoredLogin};
+
+    const NOW: i64 = 1_790_450_000_000;
+
+    fn cred(access: Option<&str>, refresh: Option<&str>, expires: Option<i64>) -> String {
+        let mut o = serde_json::Map::new();
+        if let Some(a) = access { o.insert("accessToken".into(), a.into()); }
+        if let Some(r) = refresh { o.insert("refreshToken".into(), r.into()); }
+        if let Some(e) = expires { o.insert("expiresAt".into(), e.into()); }
+        serde_json::json!({ "claudeAiOauth": o }).to_string()
+    }
+
+    #[test]
+    fn an_unexpired_token_is_fresh() {
+        assert_eq!(stored_login_from(&cred(Some("a"), Some("r"), Some(NOW + 60_000)), NOW), StoredLogin::Fresh("a".into()));
+    }
+
+    /// The backup-seat case: 8 hours without a run. Signed in, not renewed.
+    #[test]
+    fn a_lapsed_token_with_a_refresh_token_is_stale_not_missing() {
+        let nine_hours_ago = NOW - 9 * 3_600_000;
+        assert_eq!(stored_login_from(&cred(Some("a"), Some("r"), Some(nine_hours_ago)), NOW), StoredLogin::Stale);
+    }
+
+    #[test]
+    fn a_lapsed_token_nothing_can_renew_is_missing() {
+        assert_eq!(stored_login_from(&cred(Some("a"), None, Some(NOW - 1)), NOW), StoredLogin::Missing);
+        assert_eq!(stored_login_from(&cred(Some("a"), Some(""), Some(NOW - 1)), NOW), StoredLogin::Missing);
+    }
+
+    /// A long-lived token (`claude setup-token`) carries no expiry: unchanged.
+    #[test]
+    fn a_token_without_an_expiry_is_fresh() {
+        assert_eq!(stored_login_from(&cred(Some("a"), None, None), NOW), StoredLogin::Fresh("a".into()));
+    }
+
+    #[test]
+    fn junk_is_missing() {
+        assert_eq!(stored_login_from("not json", NOW), StoredLogin::Missing);
+        assert_eq!(stored_login_from("{}", NOW), StoredLogin::Missing);
     }
 }

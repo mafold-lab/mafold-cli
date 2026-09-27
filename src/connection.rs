@@ -1579,8 +1579,34 @@ async fn finish_linking(
 /// it, opens the vault, calls the provider, answers. Nothing here inspects the
 /// event beyond handing it over — the whole point is that every device answers
 /// with the same Rust.
+/// The server pings every 25s. A link that has said NOTHING for this long is
+/// dead whatever the socket says: a laptop that slept, a proxy that dropped the
+/// flow, an api restart whose RST never arrived. Both listeners used to wait on
+/// such a link forever — process alive, calls unanswered, "listening" to no
+/// one (@fei_pota's Mac, 2026-09-27: a Connect sent to it went 20s unanswered;
+/// this Mac on 2026-09-23: seven hours of silence in supervisor.log).
+const LISTEN_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The next frame of a listener's link, or `None` once the link is over:
+/// closed, errored, or silent for `idle`. The caller reconnects on `None`.
+async fn next_live<S>(
+    ws: &mut S,
+    idle: std::time::Duration,
+) -> Option<tokio_tungstenite::tungstenite::Message>
+where
+    S: futures_util::Stream<
+            Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+        > + Unpin,
+{
+    use futures_util::StreamExt;
+    match tokio::time::timeout(idle, ws.next()).await {
+        Ok(Some(Ok(frame))) => Some(frame),
+        _ => None,
+    }
+}
+
 async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<()> {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
     // Unlocked once, used twice: the core answers calls with the key, and a
@@ -1600,9 +1626,9 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
                 continue;
             }
         };
-        while let Some(frame) = ws.next().await {
+        while let Some(frame) = next_live(&mut ws, LISTEN_IDLE).await {
             match frame {
-                Ok(WsMsg::Text(t)) => {
+                WsMsg::Text(t) => {
                     if mafold_core::connections::handle_event(&mut rt, &t).await {
                         println!("· answered a connection call");
                     } else if handle_link_event(client, sess, &umk, &key_id, &t).await {
@@ -1612,14 +1638,14 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
                 // The server pings every 25s and treats silence as death; an
                 // unanswered ping here would look like "listen is on but calls
                 // time out", which is the worst version of off.
-                Ok(WsMsg::Ping(p)) => {
+                WsMsg::Ping(p) => {
                     let _ = ws.send(WsMsg::Pong(p)).await;
                 }
-                Ok(WsMsg::Close(_)) | Err(_) => break,
-                Ok(_) => {}
+                WsMsg::Close(_) => break,
+                _ => {}
             }
         }
-        eprintln!("ws dropped — reconnecting in 2s");
+        eprintln!("ws dropped or went silent — reconnecting in 2s");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
@@ -1634,7 +1660,7 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
 /// so running `mafold connection unlock` later brings this to life without
 /// restarting the supervisor.
 pub async fn supervise_listener(base: String, username: String) {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
     let mut said_locked = false;
     loop {
@@ -1671,9 +1697,9 @@ pub async fn supervise_listener(base: String, username: String) {
                     break; // re-check session + key, then come back
                 }
             };
-            while let Some(frame) = ws.next().await {
+            while let Some(frame) = next_live(&mut ws, LISTEN_IDLE).await {
                 match frame {
-                    Ok(WsMsg::Text(t)) => {
+                    WsMsg::Text(t) => {
                         if mafold_core::connections::handle_event(&mut rt, &t).await {
                             println!("· connections: answered a call");
                         } else {
@@ -1683,11 +1709,11 @@ pub async fn supervise_listener(base: String, username: String) {
                             handle_link_event(&client, &sess, &umk, &key_id, &t).await;
                         }
                     }
-                    Ok(WsMsg::Ping(p)) => {
+                    WsMsg::Ping(p) => {
                         let _ = ws.send(WsMsg::Pong(p)).await;
                     }
-                    Ok(WsMsg::Close(_)) | Err(_) => break,
-                    Ok(_) => {}
+                    WsMsg::Close(_) => break,
+                    _ => {}
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -2097,6 +2123,32 @@ async fn recover(client: &Client, sess: &session::Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link that goes silent ends, so the listener reconnects — instead of
+    /// waiting forever on a socket nobody is at the other end of (@fei_pota's
+    /// Mac, 2026-09-27). A link that keeps talking is left alone.
+    #[tokio::test]
+    async fn a_silent_link_ends_and_a_talking_one_does_not() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{protocol::Role, Message as WsMsg};
+        use tokio_tungstenite::WebSocketStream;
+        let idle = std::time::Duration::from_millis(150);
+
+        let (a, b) = tokio::io::duplex(4096);
+        let mut listener = WebSocketStream::from_raw_socket(a, Role::Client, None).await;
+        let _server = WebSocketStream::from_raw_socket(b, Role::Server, None).await; // says nothing
+        let over = tokio::time::timeout(std::time::Duration::from_secs(2), next_live(&mut listener, idle))
+            .await
+            .expect("a silent link must end, not hang");
+        assert!(over.is_none());
+
+        let (a, b) = tokio::io::duplex(4096);
+        let mut listener = WebSocketStream::from_raw_socket(a, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(b, Role::Server, None).await;
+        server.send(WsMsg::Ping(vec![1].into())).await.unwrap();
+        let frame = next_live(&mut listener, idle).await;
+        assert!(matches!(frame, Some(WsMsg::Ping(_))), "{frame:?}");
+    }
 
     /// The registry is served now, so a test that links must have one in the
     /// process — the mock api serves connection calls, not packs.

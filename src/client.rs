@@ -111,6 +111,10 @@ pub struct Updates {
     /// Part of the window had already aged out of the server's backlog —
     /// `items` is what is left of it, not all of it.
     pub truncated: bool,
+    /// How many of `items` the server rebuilt from its store because the
+    /// backlog could not reach back far enough (an api restart empties it).
+    /// Those carry no `seq`. 0 from an older server.
+    pub backfilled: usize,
 }
 
 /// Durable trigger facts needed by the daemon after reconnect. Used both by
@@ -271,12 +275,22 @@ impl Client {
     /// Items are
     /// `{seq, method, params}` in the exact shape WS frames arrive, so a
     /// reconnect replays what it missed through the same handling path.
-    pub async fn get_updates(&self, since: u64) -> Result<Updates> {
-        let v = self.post("getUpdates", json!({ "since": since, "methods": REPLAY_METHODS })).await?;
+    ///
+    /// `since_at` — the server time of the last message-bearing event this
+    /// daemon consumed. With it, a server whose backlog cannot reach `since`
+    /// rebuilds the missing messages from its store instead of only saying
+    /// they are gone; an older server ignores it.
+    pub async fn get_updates(&self, since: u64, since_at: Option<&str>) -> Result<Updates> {
+        let mut body = json!({ "since": since, "methods": REPLAY_METHODS });
+        if let Some(at) = since_at {
+            body["since_at"] = json!(at);
+        }
+        let v = self.post("getUpdates", body).await?;
         Ok(Updates {
             items: v["updates"].as_array().cloned().unwrap_or_default(),
             head: v["seq"].as_u64().unwrap_or(since),
             truncated: v["truncated"].as_bool().unwrap_or(false),
+            backfilled: v["backfilled"].as_u64().unwrap_or(0) as usize,
         })
     }
 

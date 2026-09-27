@@ -214,6 +214,27 @@ pub struct Registry {
     /// account name → the window that is full right now.
     #[serde(default)]
     pub exhausted: BTreeMap<String, Exhausted>,
+    /// account name → Anthropic refused its sign-in on a real run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub signed_out: BTreeMap<String, SignedOut>,
+}
+
+/// A seat whose sign-in was refused mid-turn — a revoked refresh token, a
+/// login undone from claude.ai. Its credential file still LOOKS renewable
+/// (lapsed access token + refresh token = [`SeatState::Idle`]), so without
+/// this mark every turn would pick it, fail on "Please run /login", and do it
+/// again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedOut {
+    /// When the refusal happened.
+    pub at: i64,
+    /// Fingerprint of the credential that was refused
+    /// ([`crate::commands::credential_fingerprint`]). A different one on file
+    /// means someone signed in again — `/login`, a terminal, anywhere — and
+    /// the mark no longer applies. None = it couldn't be read; the mark then
+    /// holds until a probe gets a live answer from the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 impl Registry {
@@ -273,7 +294,30 @@ impl Registry {
         let n = self.accounts.len();
         self.accounts.retain(|a| a.name != name);
         self.exhausted.remove(name);
+        self.signed_out.remove(name);
         self.accounts.len() != n
+    }
+
+    /// Remember that `name`'s sign-in was refused, against the credential
+    /// that was refused.
+    pub fn mark_signed_out(&mut self, name: &str, credential: Option<String>) {
+        self.signed_out.insert(name.to_string(), SignedOut { at: now(), credential });
+    }
+
+    /// Is `name` still the login that was refused? `now_fp` is the credential
+    /// on file now. The mark applies while that is the credential that was
+    /// refused (or either side couldn't be read); a different one means a
+    /// fresh sign-in happened. A live answer from the seat clears the mark
+    /// outright — see `first_usable`.
+    pub fn refused(&self, name: &str, now_fp: Option<&str>) -> bool {
+        match self.signed_out.get(name) {
+            None => false,
+            Some(m) => match (&m.credential, now_fp) {
+                (Some(was), Some(is)) => was == is,
+                (None, _) => true,
+                (Some(_), None) => true,
+            },
+        }
     }
 
     pub fn mark_exhausted(&mut self, name: &str, kind: &str, until: i64, scope: Option<String>) {
@@ -350,6 +394,27 @@ pub fn reset_hint(until: i64, now: i64) -> String {
     }
 }
 
+/// A run's error text says Anthropic refused the seat's SIGN-IN — the shape a
+/// revoked refresh token takes once the turn is already running on it.
+/// Phrasings taken from the Claude Code 2.1.282 binary:
+/// `API Error: 401 Invalid API key · Please run /login` and
+/// `Not logged in · Please run /login`, plus the API's own
+/// `authentication_error`.
+///
+/// NOT `Failed to refresh OAuth token: another Claude Code process is
+/// refreshing it…` — that one is transient by its own account ("retry in a
+/// minute"), and marking a seat signed out over it would hide a good login.
+pub fn signed_out_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("another claude code process is refreshing") {
+        return false;
+    }
+    lower.contains("please run /login")
+        || lower.contains("authentication_error")
+        || (lower.contains("401") && lower.contains("invalid api key"))
+        || lower.contains("not logged in")
+}
+
 /// A run's error text says the seat's usage limit was hit — `Some(the reset
 /// epoch, when the text carried one)`. Claude Code prints
 /// `Claude usage limit reached|<epoch>` as its whole reason on stdout, or ends
@@ -391,6 +456,12 @@ pub enum SeatState {
     Rejected(u16),
     /// Couldn't tell (network, an unexpected status): let the turn try.
     Unknown,
+    /// Signed in, but nobody has run Claude Code on it for 8 hours: the
+    /// access token has lapsed and the refresh token is intact
+    /// ([`crate::commands::StoredLogin::Stale`]). Claude Code renews it on
+    /// the turn's own run, so the seat is usable — its windows just can't be
+    /// read until then. Every idle backup seat is in this state.
+    Idle,
 }
 
 /// A usage window found full.
@@ -489,6 +560,7 @@ impl SeatSnapshot {
             SeatState::NoCredential => "not logged in".into(),
             SeatState::Rejected(s) => format!("rejected upstream ({s})"),
             SeatState::Unknown => "unknown (couldn't reach the usage endpoint)".into(),
+            SeatState::Idle => "idle — signed in, renews on its next run (usage unknown until then)".into(),
         }
     }
 }
@@ -580,6 +652,7 @@ async fn probe_seat(acct: &Account) -> SeatSnapshot {
     match crate::commands::probe_utilization(&acct.env()).await {
         P::Ok(v) => snapshot_from_usage(&v, now()),
         P::NoCredential | P::Http(401) => SeatSnapshot::bare(SeatState::NoCredential),
+        P::Stale => SeatSnapshot::bare(SeatState::Idle),
         P::Http(403) => SeatSnapshot::bare(SeatState::Rejected(403)),
         P::Http(_) | P::Unreachable => SeatSnapshot::bare(SeatState::Unknown),
     }
@@ -593,7 +666,16 @@ pub async fn list_states() -> Vec<(Account, SeatSnapshot, Option<Exhausted>)> {
     reg.accounts
         .iter()
         .zip(probes)
-        .map(|(a, s)| (a.clone(), s, reg.exhausted_at(&a.name, now).cloned()))
+        .map(|(a, mut s)| {
+            // A refused sign-in outranks what the credential file suggests —
+            // the same rule the turn's own seat choice applies.
+            if matches!(s.state, SeatState::Idle | SeatState::Unknown)
+                && reg.refused(&a.name, crate::commands::credential_fingerprint(&a.env()).as_deref())
+            {
+                s.state = SeatState::NoCredential;
+            }
+            (a.clone(), s, reg.exhausted_at(&a.name, now).cloned())
+        })
         .collect()
 }
 
@@ -661,6 +743,11 @@ async fn first_usable(
             // The probe reached the account: whatever it says now supersedes
             // what the last turn remembered.
             SeatState::Ok | SeatState::Exhausted { .. } => {
+                // A live token answered, so the seat is signed in, whatever a
+                // refusal once said about an older credential.
+                if reg.signed_out.remove(&acct.name).is_some() {
+                    dirty = true;
+                }
                 // What gets REMEMBERED is what the probe saw about the seat —
                 // not what blocks this particular turn. Storing the
                 // model-specific answer would make one Sonnet turn erase a
@@ -689,14 +776,33 @@ async fn first_usable(
                     }
                 }
             }
-            // No answer from upstream: the remembered wall is all we have.
-            SeatState::Unknown => match marked.filter(|x| x.stops(model)) {
-                Some(x) => skipped.push((
-                    acct.name.clone(),
-                    format!("is exhausted ({}) — {}", x.kind, reset_hint(x.until, now)),
-                )),
-                None => return (Some(acct.clone()), dirty),
-            },
+            // No answer from upstream — or no question asked, because the
+            // seat's token has to be renewed by a run first: the remembered
+            // wall is all we have. And the remembered refusal: an Idle seat
+            // whose sign-in Anthropic already turned down still LOOKS
+            // renewable on disk, and would take every turn only to fail it.
+            SeatState::Unknown | SeatState::Idle => {
+                if reg.signed_out.contains_key(&acct.name) {
+                    let fp = crate::commands::credential_fingerprint(&acct.env());
+                    if reg.refused(&acct.name, fp.as_deref()) {
+                        skipped.push((
+                            acct.name.clone(),
+                            "isn't logged in — Anthropic refused its sign-in; `/login <name>` fixes that".into(),
+                        ));
+                        continue;
+                    }
+                    // Signed in again since: a different credential on file.
+                    reg.signed_out.remove(&acct.name);
+                    dirty = true;
+                }
+                match marked.filter(|x| x.stops(model)) {
+                    Some(x) => skipped.push((
+                        acct.name.clone(),
+                        format!("is exhausted ({}) — {}", x.kind, reset_hint(x.until, now)),
+                    )),
+                    None => return (Some(acct.clone()), dirty),
+                }
+            }
         }
     }
     (None, dirty)
@@ -752,11 +858,40 @@ pub async fn failover(
     let until = resets_at.filter(|t| *t > now).unwrap_or(now + 3600);
     let mut reg = load();
     reg.mark_exhausted(current, kind, until, model_in_kind(kind));
+    let out = hand_over(&mut reg, current, now, model).await;
+    let _ = save(&reg);
+    out
+}
+
+/// The seat behind a running turn had its SIGN-IN refused (a revoked
+/// refresh token): mark it signed out — against the credential that was
+/// refused, so a fresh sign-in anywhere lifts the mark — and hand back the
+/// next seat that can take the turn over, exactly as [`failover`] does for a
+/// full window.
+pub async fn failover_signed_out(current: &str, model: Option<&str>) -> (Option<Account>, Vec<(String, String)>) {
+    let mut reg = load();
+    let fp = reg
+        .get(current)
+        .cloned()
+        .and_then(|a| crate::commands::credential_fingerprint(&a.env()));
+    reg.mark_signed_out(current, fp);
+    let out = hand_over(&mut reg, current, now(), model).await;
+    let _ = save(&reg);
+    out
+}
+
+/// Everyone but `current`, in registry order: the first that can take the
+/// turn, and why each one before it couldn't.
+async fn hand_over(
+    reg: &mut Registry,
+    current: &str,
+    now: i64,
+    model: Option<&str>,
+) -> (Option<Account>, Vec<(String, String)>) {
     forget_seat(current);
     let order: Vec<Account> = reg.ordered(None).into_iter().filter(|a| a.name != current).collect();
     let mut skipped: Vec<(String, String)> = Vec::new();
-    let (pick, _) = first_usable(&mut reg, &order, now, model, &mut skipped).await;
-    let _ = save(&reg);
+    let (pick, _) = first_usable(reg, &order, now, model, &mut skipped).await;
     (pick, skipped)
 }
 
@@ -885,7 +1020,7 @@ mod tests {
                 Account { name: "a".into(), dir: Some("/tmp/a2".into()), email: None, added_at: 0 },
                 Account { name: "Bad Name".into(), dir: Some("/tmp/bad".into()), email: None, added_at: 0 },
             ],
-            exhausted: BTreeMap::new(),
+            ..Default::default()
         };
         r.normalize();
         assert_eq!(names(&r), vec!["default", "a"]);
@@ -1160,6 +1295,56 @@ mod tests {
         assert!(dirty && !reg.exhausted.contains_key("default"), "stale hold must be forgotten");
     }
 
+    /// 2026-09-27, Muse: `default` hit its five-hour window while a second
+    /// login on the machine sat at 0%, and the turn reported "no other Claude
+    /// account on this machine could take over". That login just hadn't run
+    /// for 8 hours, so its access token had lapsed — the refresh token was
+    /// intact, and Claude Code renews on its next run. Read as "not logged
+    /// in", it was skipped by every turn, so it never ran and never renewed.
+    ///
+    /// Probed for real here — through the credential file, not a seeded
+    /// answer — because the bug lived in reading that file.
+    #[tokio::test]
+    async fn a_backup_login_idle_past_its_token_lifetime_still_takes_the_turn() {
+        let _turn = cache_turn().await;
+        let now = now();
+        let dir = std::env::temp_dir().join(format!("mafold-idle-seat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lapsed_ms = (now - 9 * 3600) * 1000;
+        let cred = serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-lapsed", "refreshToken": "sk-ant-ort01-intact",
+            "expiresAt": lapsed_ms, "scopes": ["user:inference", "user:profile"] } });
+        std::fs::write(dir.join(".credentials.json"), cred.to_string()).unwrap();
+
+        let mut reg = seeded(&[("default", full("five_hour", now + 1800, None))]);
+        let idle = Account { name: "idle-backup".into(), dir: Some(dir.to_string_lossy().into_owned()), email: None, added_at: 0 };
+        forget_seat(&idle.name);
+        reg.accounts.push(idle);
+        let order = reg.ordered(None);
+        let mut skipped = vec![];
+        let (pick, _) = first_usable(&mut reg, &order, now, Some("opus"), &mut skipped).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pick.map(|a| a.name).as_deref(), Some("idle-backup"), "passed over as: {skipped:?}");
+    }
+
+    /// Idle is not a free pass: a wall the registry remembers for that seat
+    /// still stops a turn on the walled model, exactly as for Unknown.
+    #[tokio::test]
+    async fn an_idle_seat_with_a_remembered_wall_is_still_passed_over() {
+        let _turn = cache_turn().await;
+        let now = 1_788_600_000;
+        let mut reg = seeded(&[
+            ("default", full("five_hour", now + 1800, None)),
+            ("idle-held", SeatSnapshot { state: SeatState::Idle, worst: None, walls: vec![] }),
+        ]);
+        reg.mark_exhausted("idle-held", "weekly_all", now + 86400, None);
+        let order = reg.ordered(None);
+        let mut skipped = vec![];
+        let (pick, _) = first_usable(&mut reg, &order, now, Some("opus"), &mut skipped).await;
+        assert!(pick.is_none(), "{skipped:?}");
+        assert!(skipped[1].1.contains("is exhausted (weekly_all)"), "{skipped:?}");
+    }
+
     #[test]
     fn a_choice_explains_why_it_moved() {
         let c = Choice {
@@ -1172,5 +1357,96 @@ mod tests {
         assert!(n.contains("`b`") && n.contains("`default` is exhausted"), "{n}");
         let same = Choice { preferred: "b".into(), ..c };
         assert_eq!(same.note(), None);
+    }
+
+    /// An Idle seat (lapsed access token + refresh token) on disk, whose
+    /// refresh token is `refresh` — the credential a refusal is pinned to.
+    fn idle_on_disk(name: &str, refresh: &str) -> Account {
+        let dir = std::env::temp_dir().join(format!("mafold-refused-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred = serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-lapsed", "refreshToken": refresh,
+            "expiresAt": (now() - 9 * 3600) * 1000 } });
+        std::fs::write(dir.join(".credentials.json"), cred.to_string()).unwrap();
+        Account { name: name.into(), dir: Some(dir.to_string_lossy().into_owned()), email: None, added_at: 0 }
+    }
+
+    /// The phrasings a refused sign-in comes back in (Claude Code 2.1.282),
+    /// and the transient refresh race that must NOT count as one.
+    #[test]
+    fn a_refused_sign_in_is_told_apart_from_a_transient_refresh_race() {
+        assert!(signed_out_error("API Error: 401 Invalid API key · Please run /login"));
+        assert!(signed_out_error("Not logged in · Please run /login"));
+        assert!(signed_out_error(r#"{"type":"error","error":{"type":"authentication_error","message":"..."}}"#));
+        assert!(!signed_out_error(
+            "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. \
+             This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again"
+        ));
+        assert!(!signed_out_error("You've hit your session limit · resets 11:30am (America/Los_Angeles)"));
+        assert!(!signed_out_error("API Error: 529 overloaded"));
+    }
+
+    /// The owner's rule (2026-09-27): a seat whose refresh token was revoked
+    /// still looks renewable on disk, so once Anthropic refuses it the seat
+    /// is marked signed out and later turns step over it instead of failing
+    /// on it again — while the other seat takes the turn.
+    #[tokio::test]
+    async fn a_seat_whose_sign_in_was_refused_is_stepped_over_until_it_signs_in_again() {
+        let _turn = cache_turn().await;
+        let now = now();
+        let refused = idle_on_disk("revoked", "sk-ant-ort01-revoked");
+        let mut reg = seeded(&[("default", healthy())]);
+        reg.accounts.push(refused.clone());
+        forget_seat("revoked");
+        let fp = crate::commands::credential_fingerprint(&refused.env());
+        assert!(fp.is_some(), "the refused credential is fingerprinted");
+        reg.mark_signed_out("revoked", fp);
+
+        // Preferred, and on disk it looks like any idle backup — still passed over.
+        let order = reg.ordered(Some("revoked"));
+        let mut skipped = vec![];
+        let (pick, _) = first_usable(&mut reg, &order, now, None, &mut skipped).await;
+        assert_eq!(pick.map(|a| a.name).as_deref(), Some("default"), "{skipped:?}");
+        assert!(
+            skipped.iter().any(|(n, w)| n == "revoked" && w.contains("isn't logged in") && w.contains("refused")),
+            "{skipped:?}"
+        );
+
+        // Signed in again (a new refresh token on file): the mark lifts and
+        // the seat takes turns again.
+        let dir = refused.dir.clone().unwrap();
+        let fresh = serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-lapsed", "refreshToken": "sk-ant-ort01-new-login",
+            "expiresAt": (now - 9 * 3600) * 1000 } });
+        std::fs::write(std::path::Path::new(&dir).join(".credentials.json"), fresh.to_string()).unwrap();
+        forget_seat("revoked");
+        let mut skipped = vec![];
+        let (pick, dirty) = first_usable(&mut reg, &order, now, None, &mut skipped).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pick.map(|a| a.name).as_deref(), Some("revoked"), "{skipped:?}");
+        assert!(dirty && !reg.signed_out.contains_key("revoked"), "the stale mark is dropped and saved");
+    }
+
+    /// A live answer from the seat is proof it is signed in: the mark goes,
+    /// whatever credential it was pinned to.
+    #[tokio::test]
+    async fn a_live_answer_clears_a_refusal() {
+        let _turn = cache_turn().await;
+        let now = 1_788_600_000;
+        let mut reg = seeded(&[("default", full("five_hour", now + 1800, None)), ("back", healthy())]);
+        reg.mark_signed_out("back", None);
+        let order = reg.ordered(None);
+        let mut skipped = vec![];
+        let (pick, dirty) = first_usable(&mut reg, &order, now, None, &mut skipped).await;
+        assert_eq!(pick.map(|a| a.name).as_deref(), Some("back"), "{skipped:?}");
+        assert!(dirty && reg.signed_out.is_empty());
+    }
+
+    /// Files written before the field existed read back with no marks.
+    #[test]
+    fn a_registry_from_an_earlier_build_has_no_refusals() {
+        let r: Registry = serde_json::from_str(r#"{"accounts":[],"exhausted":{}}"#).unwrap();
+        assert!(r.signed_out.is_empty());
+        assert!(!serde_json::to_string(&r).unwrap().contains("signed_out"), "empty marks aren't written");
     }
 }

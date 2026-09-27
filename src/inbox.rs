@@ -844,6 +844,7 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
          \u{20} · 发消息:`mafold send <chat_id> [--channel <channel_id>] [--reply <消息id>] <正文>`。一次一条;要连发就调多次。像人一样说话:短、口语、一条一个意思;不要 markdown 标题、表格、卡片。\n\
          \u{20} · 表情:`mafold react <消息id> <emoji>`——很多时候回个表情就够了。\n\
          \u{20} · 要更多上下文:`mafold read <chat_id> [--channel <channel_id>] --ids --limit 30`;所有会话:`mafold chats`。\n\
+         \u{20} · 分派工作 = 一件事一个频道:群是论坛(有频道)时,先 `mafold channels list <chat_id>` 找对应这件事的频道;没有就 `mafold channels create <chat_id> <名字>` 开一个(名字就写这件事,短),再用 `--channel` 在里面说、@ 人。别把不相干的事堆进私聊或主时间线。开不了(只有管理员能开)就用最接近的现有频道,并说明一句。事情结了,`mafold channels close <chat_id> <频道>` 关掉你自己开的那个。\n\
          - 看完什么都不说,是完全正常的结果。只在你这个身份真的会开口的时候开口。\n\
          {who}\
          - 消息前的 `#…` 是消息 id,给 --reply / react 用。「(AI)」是 bot 发的,「(本人)」是指令来源,「(你自己)」是你之前发的。\n\
@@ -1914,5 +1915,18 @@ mod tests {
         assert!(p.contains("#1 [09-25 10:01] @linsky: @realopsdu 看下"));
         assert!(p.contains("只标已读") && p.contains("某群"));
         assert!(p.contains("[到期的跟进]") && p.contains("追 PR"));
+    }
+
+    /// 522 turns of @realopsdu never once opened a channel: the preamble taught
+    /// `send --channel` into channels that already existed and nothing else, so
+    /// every new piece of work landed in one DM. The command to open one must be
+    /// named, alongside where the work goes when it can't be.
+    #[test]
+    fn preamble_teaches_one_channel_per_piece_of_work() {
+        let p = preamble("realopsdu", Some("opsdu"));
+        assert!(p.contains("mafold channels list <chat_id>"));
+        assert!(p.contains("mafold channels create <chat_id> <名字>"));
+        assert!(p.contains("mafold channels close <chat_id> <频道>"));
+        assert!(p.contains("别把不相干的事堆进私聊或主时间线"));
     }
 }
