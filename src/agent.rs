@@ -739,6 +739,58 @@ struct TurnHandle {
     can_steer: bool,
 }
 
+/// A message on its way to becoming a turn.
+///
+/// `turns` only learns about a turn once its draft exists, and between a
+/// message arriving and that draft there are several round trips — the quoted
+/// message, the stored config, the group context, the draft itself. A second
+/// message from the same person on the same surface that lands inside that
+/// window finds nothing to steer and starts a SECOND turn of the agent, in the
+/// same working directory, on the same task. 2026-09-27 #失败不可见: two @s the
+/// socket had skipped came back together in one gap replay, and two of us
+/// opened PR 1 in one worktree — one overwrote the other's `health.rs`.
+///
+/// So the dispatch loop, which reads frames strictly one after another, marks
+/// the message here BEFORE it spawns the task; the next message's task waits
+/// for every earlier one of theirs on that surface to either open its turn or
+/// give up on having one, and only then looks for a turn to steer.
+struct Arrival {
+    /// Dispatch order. A task waits only on arrivals EARLIER than its own, so
+    /// two can never wait on each other.
+    order: u64,
+    /// The message this is — how its turn takes it out when the draft opens.
+    trigger: String,
+    /// The lowercased sender. Only their own later words wait on it, the same
+    /// line steering draws.
+    owner: String,
+    channel: Option<String>,
+    thread: Option<String>,
+    /// Dead once the task has ended, whether or not it ever opened a turn — a
+    /// slash command, a floor seat that stayed quiet, a refused draft, a panic.
+    alive: std::sync::Weak<()>,
+}
+
+impl Arrival {
+    fn blocks(&self, order: u64, owner: &str, channel: Option<&str>, thread: Option<&str>) -> bool {
+        self.order < order
+            && self.owner == owner
+            && self.channel.as_deref() == channel
+            && self.thread.as_deref() == thread
+            && self.alive.strong_count() > 0
+    }
+}
+
+/// The task's end of an [`Arrival`]: held for its lifetime, never read.
+struct Arrived {
+    order: u64,
+    _alive: Arc<()>,
+}
+
+/// How long a message waits for an earlier one to open its turn before it
+/// stops waiting and runs on its own. The window it covers is seconds; this is
+/// for the arrival that never resolves, so a stuck lookup can't mute the chat.
+const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
 // `model` overrides the model for this chat (`/model …`). Conversation-scoped;
 // the in-flight turns live in `turns` (keyed by draft message id).
 #[derive(Default)]
@@ -764,6 +816,9 @@ struct ChatState {
     login_channel: Option<String>,
     /// In-flight turns, keyed by their draft message id. Concurrent turns coexist.
     turns: HashMap<String, TurnHandle>,
+    /// Messages already handed to their task whose turn has not opened its
+    /// draft yet — what `turns` cannot see. See [`Arrival`].
+    arriving: Vec<Arrival>,
     /// Cached group-dispatch gate for this conversation (kind + always-on),
     /// refreshed at most once per 60s so the reply gate stays ~free.
     gate: Option<ConvGate>,
@@ -4428,7 +4483,18 @@ async fn connect_and_run(
         };
         // mafold awareness for this turn: identity + peer + embeddable cards.
         let preamble = mafold_preamble(my_username, &m.sender.username, &card_tags);
+        // Here, before the spawn: the next frame is not read until this line
+        // has run, so its task is guaranteed to see this one (`Arrival`).
+        let arrived = arrive(
+            &chat_states, &chat_id, &trigger_id, &turn_sender,
+            channel_id.as_deref(), thread_root.as_deref(),
+        )
+        .await;
         tokio::spawn(async move {
+            // Held until the task ends: a task that returns without a turn
+            // (a quiet floor seat, a slash command, a refused draft) stops
+            // holding up the messages behind it right there.
+            let arrived = arrived;
             // ── The floor's wait (`.docs/a2a-v2.md`) ── Seat 0 falls straight
             // through; every seat behind it sleeps its slot out first and then
             // asks the ONE question that matters: has anybody opened this
@@ -4524,8 +4590,11 @@ async fn connect_and_run(
             // working, saying it to a SECOND copy of itself in the same working
             // directory is the wrong answer. Steer the one that's running.
             if !content.trim().is_empty() {
-                match steer_turn(
-                    &chat_states, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
+                // In order: a message of theirs that came in just before this
+                // one and is still opening its draft is the running turn this
+                // one belongs to — it just isn't in `turns` yet.
+                match steer_in_order(
+                    &chat_states, &arrived, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
                     &turn_sender, reply_to_id.as_deref(), &content,
                     // Borrows only — the normal-turn path below still owns both,
                     // and re-downloads nothing: whatever this fetched is already
@@ -4986,6 +5055,81 @@ async fn steer_turn<Fut: std::future::Future<Output = String>>(
         chat_states, chat_id, channel, thread, sender_lc, reply_to, text, Seam::User, body,
     )
     .await
+}
+
+/// Mark a message as on its way to a turn (see [`Arrival`]). Called by the
+/// dispatch loop BEFORE it spawns the message's task — the loop reads frames
+/// one at a time, so this is what puts the next message's task behind it.
+async fn arrive(
+    chat_states: &ChatStates,
+    chat_id: &str,
+    trigger: &str,
+    sender_lc: &str,
+    channel: Option<&str>,
+    thread: Option<&str>,
+) -> Arrived {
+    static ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let order = ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let alive = Arc::new(());
+    let mut states = chat_states.lock().await;
+    let st = states.entry(chat_id.to_string()).or_default();
+    // Tasks that ended without a turn leave a dead entry; sweep them here, the
+    // one place entries are added, so the list never outgrows what's in flight.
+    st.arriving.retain(|a| a.alive.strong_count() > 0);
+    st.arriving.push(Arrival {
+        order,
+        trigger: trigger.to_string(),
+        owner: sender_lc.to_string(),
+        channel: channel.map(str::to_string),
+        thread: thread.map(str::to_string),
+        alive: Arc::downgrade(&alive),
+    });
+    Arrived { order, _alive: alive }
+}
+
+/// The arrival's turn is registered: take it out (called with the map locked).
+fn settle_arrival(st: &mut ChatState, trigger: &str) {
+    st.arriving.retain(|a| a.trigger != trigger);
+}
+
+/// [`steer_turn`], after every earlier message of theirs on this surface has
+/// settled into a turn or out of needing one.
+#[allow(clippy::too_many_arguments)]
+async fn steer_in_order<Fut: std::future::Future<Output = String>>(
+    chat_states: &ChatStates,
+    arrived: &Arrived,
+    chat_id: &str,
+    channel: Option<&str>,
+    thread: Option<&str>,
+    sender_lc: &str,
+    reply_to: Option<&str>,
+    text: &str,
+    body: impl FnOnce(String) -> Fut,
+) -> Option<Steered> {
+    // Polled, not signalled: an arrival resolves in one of two places (its turn
+    // registers, or its task ends — by any of a dozen returns, or a panic), and
+    // a tick over a map this small costs nothing next to the round trips it is
+    // waiting out. Tokio's clock, so the tests can fast-forward it.
+    let started = tokio::time::Instant::now();
+    loop {
+        let held = chat_states.lock().await.get(chat_id).is_some_and(|st| {
+            st.arriving
+                .iter()
+                .any(|a| a.blocks(arrived.order, sender_lc, channel, thread))
+        });
+        if !held {
+            break;
+        }
+        if started.elapsed() >= ARRIVAL_WAIT {
+            eprintln!(
+                "⚠ an earlier message from {sender_lc} in {chat_id} still hasn't opened its turn after {}s — running this one on its own",
+                ARRIVAL_WAIT.as_secs()
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    steer_turn(chat_states, chat_id, channel, thread, sender_lc, reply_to, text, body).await
 }
 
 /// The body of the above, with the SEAM left open.
@@ -7261,6 +7405,12 @@ async fn handle(
                 can_steer: harness.can_steer(),
             },
         );
+        // Under the same lock: from here on the turn itself is what the
+        // messages behind this one find, so there is no instant in which
+        // neither is visible.
+        if let Some(t) = trigger_id {
+            settle_arrival(st, t);
+        }
     }
 
     // Say "alive" NOW, in the same breath as opening the draft. This used to
@@ -11254,6 +11404,121 @@ mod steer_tests {
         ));
         assert!(std::fs::read_to_string(&f).unwrap().contains("no, the other file"));
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// What `handle` does once the draft exists: the turn goes in, the arrival
+    /// comes out, under one lock.
+    async fn register(s: &ChatStates, draft: &str, t: TurnHandle, trigger: &str) {
+        let mut g = s.lock().await;
+        let st = g.entry("c1".into()).or_default();
+        st.turns.insert(draft.into(), t);
+        settle_arrival(st, trigger);
+    }
+
+    async fn steer_after(s: &ChatStates, a: &Arrived, who: &str, channel: Option<&str>, text: &str) -> Option<Steered> {
+        steer_in_order(s, a, "c1", channel, None, who, None, text, |t| async move { t }).await
+    }
+
+    /// 2026-09-27 #失败不可见, the whole incident in one test. Two @s from the
+    /// same person reach the daemon in the same instant; the first is still
+    /// opening its draft (quoted message, config, context — seconds) when the
+    /// second looks for a running turn. Before, it found none and became a
+    /// second agent in the same worktree. It has to land in the first one's.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_inside_the_previous_ones_setup_goes_to_that_turn() {
+        let s: ChatStates = Default::default();
+        let a = arrive(&s, "c1", "mA", "ops", None, None).await;
+        let b = arrive(&s, "c1", "mB", "ops", None, None).await;
+        let s2 = s.clone();
+        let second = tokio::spawn(async move { steer_after(&s2, &b, "ops", None, "再补两点要求").await });
+        // The first has nothing to steer — it IS the first — so it goes on to
+        // open its own turn, which takes a while.
+        assert!(steer_after(&s, &a, "ops", None, "照这个做").await.is_none());
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let (t, f) = turn("ops", None, true);
+        register(&s, "dA", t, "mA").await;
+        assert!(
+            matches!(second.await.unwrap(), Some(Steered::Now { .. })),
+            "the second message started a turn of its own beside the first"
+        );
+        assert!(std::fs::read_to_string(&f).unwrap().contains("再补两点要求"));
+        drop(a);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// A turn is already running and two corrections come in together; the
+    /// first has a quote to look up, so it reaches its steer later than the
+    /// second. The mailbox is append-only — whatever lands first stays first —
+    /// so without waiting, "B" is read before the "A" it was said after.
+    #[tokio::test(start_paused = true)]
+    async fn two_corrections_that_arrive_together_reach_the_turn_in_the_order_said() {
+        let (t0, f) = turn("ops", None, true);
+        let s = states(vec![("d0", t0)]).await;
+        let a = arrive(&s, "c1", "mA", "ops", None, None).await;
+        let b = arrive(&s, "c1", "mB", "ops", None, None).await;
+        let (sa, sb) = (s.clone(), s.clone());
+        let first = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await; // the quoted message
+            steer_after(&sa, &a, "ops", None, "A 先说的").await
+        });
+        let second = tokio::spawn(async move { steer_after(&sb, &b, "ops", None, "B 后说的").await });
+        assert!(matches!(first.await.unwrap(), Some(Steered::Now { .. })));
+        assert!(matches!(second.await.unwrap(), Some(Steered::Now { .. })));
+        let mail = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            mail.find("A 先说的").unwrap() < mail.find("B 后说的").unwrap(),
+            "mailbox reads out of order: {mail:?}"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// An earlier message that never becomes a turn — a slash command, a floor
+    /// seat that stayed quiet, a refused draft — stops holding the next one
+    /// the moment its task ends, not after the wait.
+    #[tokio::test(start_paused = true)]
+    async fn an_earlier_message_that_never_opens_a_turn_lets_the_next_one_go_at_once() {
+        let s: ChatStates = Default::default();
+        let a = arrive(&s, "c1", "mA", "ops", None, None).await;
+        let b = arrive(&s, "c1", "mB", "ops", None, None).await;
+        let t0 = tokio::time::Instant::now();
+        let s2 = s.clone();
+        let second = tokio::spawn(async move { steer_after(&s2, &b, "ops", None, "hi").await });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        drop(a);
+        assert!(second.await.unwrap().is_none(), "nothing to steer → its own turn");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3), "held for {:?}", t0.elapsed());
+    }
+
+    /// Order is what makes this safe: the first never waits on the ones behind
+    /// it, and nobody else's message — or theirs on another channel — waits at all.
+    #[tokio::test(start_paused = true)]
+    async fn only_their_own_earlier_words_on_this_surface_hold_a_message() {
+        let s: ChatStates = Default::default();
+        let a = arrive(&s, "c1", "mA", "ops", None, None).await;
+        let _b = arrive(&s, "c1", "mB", "ops", None, None).await;
+        let other = arrive(&s, "c1", "mC", "eons", None, None).await;
+        let elsewhere = arrive(&s, "c1", "mD", "ops", Some("ch2"), None).await;
+        let t0 = tokio::time::Instant::now();
+        assert!(steer_after(&s, &a, "ops", None, "first").await.is_none());
+        assert!(steer_after(&s, &other, "eons", None, "someone else").await.is_none());
+        assert!(steer_after(&s, &elsewhere, "ops", Some("ch2"), "another channel").await.is_none());
+        assert_eq!(t0.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// An arrival that never resolves (a lookup that hangs) must not mute the
+    /// person for good: after `ARRIVAL_WAIT` the next message runs on its own.
+    #[tokio::test(start_paused = true)]
+    async fn an_arrival_that_never_resolves_stops_holding_the_line_after_the_wait() {
+        let s: ChatStates = Default::default();
+        let _a = arrive(&s, "c1", "mA", "ops", None, None).await;
+        let b = arrive(&s, "c1", "mB", "ops", None, None).await;
+        let t0 = tokio::time::Instant::now();
+        assert!(steer_after(&s, &b, "ops", None, "still there?").await.is_none());
+        let waited = t0.elapsed();
+        assert!(
+            waited >= ARRIVAL_WAIT && waited < ARRIVAL_WAIT + std::time::Duration::from_secs(1),
+            "waited {waited:?}"
+        );
     }
 
     /// Two corrections in a row are two things they said — the second must not

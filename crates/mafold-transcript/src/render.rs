@@ -11,7 +11,20 @@ use crate::event::AgentEvent;
 /// The prefixes of the one-line notices this renderer writes on a producer's or
 /// the driver's behalf — a usage limit, a compaction, a steer seam. Named so the
 /// writer and the reader ([`is_notice_line`]) can never disagree by a byte.
+/// What older builds wrote for a usage limit (a plain text line). Still read as
+/// a notice so history full of them never starts counting as answers; no
+/// longer written — see [`RATE_LIMIT_CARD`].
 pub(crate) const RATE_LIMIT_PREFIX: &str = "_⏳ ";
+/// A usage limit is now a card: the reset time travels as a timestamp and the
+/// reader's device renders it in the reader's own time zone and language.
+pub(crate) const RATE_LIMIT_CARD: &str = "{% mafold/ratelimit ";
+/// Cards that ARE notices: written on the producer's behalf, never an answer.
+/// The one list both readers derive from — [`is_notice_line`] and the fold's
+/// "did the model answer after its last tool group?" (`has_own_card`). When
+/// the usage limit became a card, the fold kept its own list and read the
+/// card as the model answering in cards: a turn that ended on tools and a
+/// limit folded its last group out of sight.
+pub(crate) const NOTICE_CARDS: [&str; 1] = ["mafold/ratelimit"];
 pub(crate) const COMPACTED_PREFIX: &str = "_🗜️ ";
 pub(crate) const STEER_PREFIX: &str = "> ↩︎ ";
 /// A driver notice ([`AgentEvent::Notice`]): something that happened AROUND the
@@ -97,8 +110,21 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // Matched by prefix, not by equality: an unknown future status is
         // shown rather than swallowed — silence is only for the states we
         // know are non-events.
-        AgentEvent::RateLimited { kind, resets_at, status } => (!status.starts_with("allowed")).then(|| {
-            format!("\n{RATE_LIMIT_PREFIX}Usage limit reached ({kind}){}_\n", reset_hint(*resets_at, now_unix()))
+        //
+        // A card, not a sentence: the time the limit lifts is handed over as a
+        // unix timestamp and the READER's device renders it — only it knows
+        // the reader's time zone. A relative "resets in ~42m" baked in here
+        // was wrong for anyone scrolling back to it, and the hosted path had
+        // its own hand-written sentence with no time at all.
+        AgentEvent::RateLimited { kind, resets_at, status, fallback } => (!status.starts_with("allowed")).then(|| {
+            let mut attrs = format!("kind=\"{}\" status=\"{}\"", attr_esc(kind), attr_esc(status));
+            if let Some(at) = resets_at {
+                attrs.push_str(&format!(" resets_at=\"{at}\""));
+            }
+            if let Some(f) = fallback.as_deref().filter(|f| !f.trim().is_empty()) {
+                attrs.push_str(&format!(" fallback=\"{}\"", attr_esc(f)));
+            }
+            format!("\n{RATE_LIMIT_CARD}{attrs} /%}}\n")
         }),
         // Not rendered as new content — the render loop stamps it into the
         // already-emitted ask card via `stamp_ask_answered`.
@@ -773,6 +799,7 @@ pub fn is_transcript_card(name: &str) -> bool {
             | "mafold/todo"
             | "mafold/thinking"
             | "mafold/compact"
+            | "mafold/ratelimit"
             | "mafold/result"
             | "mafold/generating"
             | "mafold/bgtasks"
@@ -796,6 +823,7 @@ pub fn strip_transcript_cards(md: &str) -> String {
 pub fn is_notice_line(line: &str) -> bool {
     let t = line.trim_start();
     [RATE_LIMIT_PREFIX, COMPACTED_PREFIX, STEER_PREFIX, NOTICE_PREFIX].iter().any(|p| t.starts_with(p))
+        || NOTICE_CARDS.iter().any(|c| t.strip_prefix("{% ").is_some_and(|r| r.starts_with(c) && r[c.len()..].starts_with(' ')))
 }
 
 /// `md` with every notice line ([`is_notice_line`]) removed.
@@ -882,30 +910,6 @@ fn fmt_count(n: u64) -> String {
     if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// " · resets in ~42m" for a usage limit, from its unix reset timestamp. Empty
-/// when there is nothing useful to say — no timestamp, or a time already past
-/// (a stale reset would otherwise render as "resets in ~0m", which reads as
-/// "you're already back" when we don't actually know that).
-fn reset_hint(resets_at: Option<i64>, now: i64) -> String {
-    let Some(at) = resets_at else { return String::new() };
-    let secs = at - now;
-    if secs <= 0 {
-        return String::new();
-    }
-    let mins = (secs + 59) / 60; // round UP: 30s left is "~1m", never "~0m"
-    match (mins / 60, mins % 60) {
-        (0, m) => format!(" · resets in ~{m}m"),
-        (h, 0) => format!(" · resets in ~{h}h"),
-        (h, m) => format!(" · resets in ~{h}h{m}m"),
-    }
-}
 
 /// Close inline-code spans and fences the model left OPEN in its own prose.
 ///
@@ -1322,33 +1326,10 @@ mod generating_tests {
 mod notice_tests {
     use super::*;
 
-    const NOW: i64 = 1_785_900_000;
-
-    #[test]
-    fn a_reset_within_the_hour_reads_in_minutes() {
-        assert_eq!(reset_hint(Some(NOW + 30 * 60), NOW), " · resets in ~30m");
-    }
-
-    #[test]
-    fn a_longer_reset_reads_in_hours() {
-        assert_eq!(reset_hint(Some(NOW + 2 * 3600), NOW), " · resets in ~2h");
-        assert_eq!(reset_hint(Some(NOW + 2 * 3600 + 15 * 60), NOW), " · resets in ~2h15m");
-    }
-
-    /// Rounding UP matters: 30 seconds left rendered as "~0m" reads as "you're
-    /// already back", which is the one thing we know isn't true yet.
-    #[test]
-    fn a_sub_minute_reset_rounds_up_never_to_zero() {
-        assert_eq!(reset_hint(Some(NOW + 30), NOW), " · resets in ~1m");
-    }
-
-    /// Nothing useful to say → say nothing, rather than print a stale or absent
-    /// timestamp as if it were information.
-    #[test]
-    fn a_past_or_missing_reset_says_nothing() {
-        assert_eq!(reset_hint(Some(NOW - 60), NOW), "");
-        assert_eq!(reset_hint(None, NOW), "");
-    }
+    // The relative "resets in ~Xm" formatter and its four tests left with the
+    // text line. Their one lasting rule — a time already past is not news, and
+    // must not read as "you're back" — now lives in `cards/ratelimit`, which
+    // does the formatting on the reader's device.
 
     #[test]
     fn a_compaction_renders_with_the_size_it_compacted() {
@@ -1389,12 +1370,70 @@ mod notice_tests {
     fn a_usage_limit_renders_its_kind() {
         let mut names = HashMap::new();
         let out = render(
-            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into() },
+            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into(), fallback: None },
             &mut names,
         )
         .unwrap();
-        assert!(out.contains("five_hour"), "{out}");
-        assert!(out.contains("Usage limit reached"), "{out}");
+        assert!(out.contains("kind=\"five_hour\""), "{out}");
+        assert!(out.contains(RATE_LIMIT_CARD), "{out}");
+    }
+
+    /// The reset time goes to the CLIENT as a timestamp, not into the text as
+    /// "resets in ~1h45m". Only the reader's device knows the reader's time
+    /// zone (the api has no such field anywhere), and a relative time baked in
+    /// at render time is wrong the moment someone scrolls back to it.
+    /// 2026-09-28: a bot told a reader in UTC+8 at 01:47 that it was the 27th.
+    #[test]
+    fn a_usage_limit_hands_its_reset_time_to_the_card() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited {
+                kind: "five_hour".into(),
+                resets_at: Some(1790537400),
+                status: "rejected".into(),
+                fallback: Some("deepseek-v4-pro".into()),
+            },
+            &mut names,
+        )
+        .unwrap();
+        assert!(out.contains("{% mafold/ratelimit "), "not a card: {out}");
+        assert!(out.contains("resets_at=\"1790537400\""), "the timestamp must reach the card: {out}");
+        assert!(out.contains("fallback=\"deepseek-v4-pro\""), "who answered instead is missing: {out}");
+        assert!(out.contains("kind=\"five_hour\"") && out.contains("status=\"rejected\""), "{out}");
+        assert!(!out.contains("resets in"), "a relative time was baked into the text: {out}");
+    }
+
+    #[test]
+    fn a_usage_limit_with_no_stand_in_says_so_by_omission() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "5h".into(), resets_at: None, status: "rejected".into(), fallback: None },
+            &mut names,
+        )
+        .unwrap();
+        assert!(out.contains("{% mafold/ratelimit "), "{out}");
+        assert!(!out.contains("fallback="), "no stand-in, no attribute: {out}");
+        assert!(!out.contains("resets_at="), "no timestamp, no attribute — never a made-up one: {out}");
+    }
+
+    /// The card is the renderer's own machinery (a model must not be taught to
+    /// write it from its history) and a NOTICE (it must not count as the
+    /// model's answer). Lines written by an older build — plain "_⏳ Usage
+    /// limit reached_" text — are still notices, or history full of them would
+    /// start reading as answers.
+    #[test]
+    fn the_ratelimit_card_is_machinery_and_a_notice_old_lines_too() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "5h".into(), resets_at: Some(1), status: "rejected".into(), fallback: None },
+            &mut names,
+        )
+        .unwrap();
+        assert!(is_transcript_card("mafold/ratelimit"));
+        let line = out.lines().find(|l| !l.trim().is_empty()).expect("a line");
+        assert!(is_notice_line(line), "the card line must be a notice: {line}");
+        assert!(is_notice_line("_⏳ Usage limit reached (five_hour) · resets in ~42m_"), "old lines too");
+        assert!(strip_notices(&format!("Answer.{out}")).trim() == "Answer.", "{out}");
     }
 
     /// `allowed_warning` = utilization crossed a threshold and the request
@@ -1411,6 +1450,7 @@ mod notice_tests {
                     kind: "seven_day".into(),
                     resets_at: Some(1786712400),
                     status: "allowed_warning".into(),
+                    fallback: None,
                 },
                 &mut names,
             ),
@@ -1424,11 +1464,11 @@ mod notice_tests {
     fn an_unknown_status_still_speaks() {
         let mut names = HashMap::new();
         let out = render(
-            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "something_new".into() },
+            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "something_new".into(), fallback: None },
             &mut names,
         )
         .expect("an unrecognized status must not be swallowed");
-        assert!(out.contains("Usage limit reached"), "{out}");
+        assert!(out.contains(RATE_LIMIT_CARD) && out.contains("status=\"something_new\""), "{out}");
     }
 
     /// Every notice the renderer writes is recognised by the reader that strips
@@ -1438,7 +1478,7 @@ mod notice_tests {
     fn notice_lines_strip_and_prose_stays() {
         let mut names = HashMap::new();
         let limit = render(
-            &AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into() },
+            &AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into(), fallback: None },
             &mut names,
         )
         .unwrap();

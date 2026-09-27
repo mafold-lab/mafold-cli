@@ -327,7 +327,10 @@ impl Harness for ClaudeCode {
                     if status == "rejected" {
                         limit = Some(super::LimitHit { kind: kind.clone(), resets_at });
                     }
-                    let _ = sink.send(AgentEvent::RateLimited { kind, resets_at, status });
+                    // No stand-in model here: the daemon's answer to a refused
+                    // seat is moving the turn to another login (`LimitHit`),
+                    // which is a different mechanism from a profile fallback.
+                    let _ = sink.send(AgentEvent::RateLimited { kind, resets_at, status, fallback: None });
                 }
                 continue;
             }

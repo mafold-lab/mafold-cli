@@ -74,7 +74,7 @@ fn has_own_card(md: &str) -> bool {
             continue; // a close tag names a card already counted at its open
         }
         let name = inner.split_whitespace().next().unwrap_or("");
-        if !name.is_empty() && !DRIVER_CARDS.contains(&name) {
+        if !name.is_empty() && !DRIVER_CARDS.contains(&name) && !render::NOTICE_CARDS.contains(&name) {
             return true;
         }
     }
@@ -1203,7 +1203,7 @@ mod fold_tests {
         t.push(&result("b", "y"));
         t.push(&AgentEvent::Text("Here is the answer.".into()));
         assert_eq!(
-            t.push(&AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into() }),
+            t.push(&AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into(), fallback: None }),
             Advance::Immediate
         );
         t.push(&done());
@@ -1212,7 +1212,7 @@ mod fold_tests {
         let answer = md.find("Here is the answer").expect("answer");
         assert!(answer > close, "answer buried under the lid:\n{md}");
         assert!(!md.contains("summary=\"Details\""), "a notice is not a tool group:\n{md}");
-        assert!(md.find("Usage limit").expect("notice") > answer, "notice keeps its time order:\n{md}");
+        assert!(md.find("{% mafold/ratelimit").expect("notice") > answer, "notice keeps its time order:\n{md}");
         assert_eq!(md.matches("{% mafold/run ").count(), 2, "{md}");
     }
 
@@ -1249,13 +1249,13 @@ mod fold_tests {
         t.push(&AgentEvent::Text("Now the edit.".into()));
         t.push(&call("b", "Bash", json!({"command": "cargo test"})));
         t.push(&result("b", "ok"));
-        t.push(&AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into() });
+        t.push(&AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into(), fallback: None });
         t.push(&done());
         let md = t.finish_folded();
         let close = md.find("{% /mafold/trace %}").expect("folded");
         let last = md.find("cargo test").expect("last group");
         assert!(last > close, "last group must stay visible:\n{md}");
-        assert!(md.find("Usage limit").expect("notice") > last, "{md}");
+        assert!(md.find("{% mafold/ratelimit").expect("notice") > last, "{md}");
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
     }
 

@@ -106,7 +106,14 @@ pub enum AgentEvent {
     ///   request went through anyway. Claude Code repeats this every turn
     ///   until the window resets, i.e. for days, so it is a signal for the
     ///   seat logic and NOT something to render (see `render`).
-    RateLimited { kind: String, resets_at: Option<i64>, status: String },
+    ///
+    /// `fallback`: the model that answered THIS turn instead, when the profile
+    /// declared one and the kernel switched to it. `None` = nothing stood in —
+    /// the reader is told the limit and when it lifts, and no answer follows.
+    /// One event for both the daemon's seat limits and a hosted bot's router
+    /// 429, rendered by one renderer — there used to be a second, hand-written
+    /// sentence for the hosted case that never said when the limit lifted.
+    RateLimited { kind: String, resets_at: Option<i64>, status: String, fallback: Option<String> },
     /// End-of-turn summary.
     Done {
         duration_ms: Option<f64>,
