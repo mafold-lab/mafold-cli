@@ -31,6 +31,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "answerConnectionCall",
     "answerConnectionCallChunk",
     "answerInlineQuery",
+    "appBinaryRegister",
     "appBundleCheck",
     "appBundleDownload",
     "appBundlePublish",

@@ -8759,6 +8759,29 @@ fn arm_bg_wakeup(
 /// the real tool/output cards. Assistant TEXT separates groups: narration flushes
 /// the current group first, so it reads `…text… [run group] …text… [run group]`.
 /// AskUserQuestion flushes immediately (it blocks until answered).
+/// Who the turn is parked on once `ev` has happened, for the generating card.
+///
+/// An open ask card — a question the model asked, or a permission prompt —
+/// BLOCKS the turn until its owner answers, so the stream goes silent for as
+/// long as that takes. That silence is not a producer gone quiet, and the card
+/// must not read it as one («No signal» on a turn that was only waiting for a
+/// tap). Silence itself (a Pulse) therefore keeps the wait; the answer, or the
+/// turn visibly moving on without one — a hook that timed out, text, the next
+/// tool — ends it.
+fn awaiting_after(ev: &AgentEvent, current: Option<String>, owner: &str) -> Option<String> {
+    match ev {
+        AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => {
+            Some(owner.to_string())
+        }
+        AgentEvent::AskAnswered(_)
+        | AgentEvent::Text(_)
+        | AgentEvent::Thinking(_)
+        | AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolResult { .. } => None,
+        _ => current,
+    }
+}
+
 async fn render_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     client: Client,
@@ -8849,6 +8872,9 @@ async fn render_loop(
     // headless claude exposes no completion lifecycle; completions surface via
     // the next turn's queued notification (the 0.9.46 empty-turn retry).
     let mut shells: u64 = 0;
+    // Whose tap the turn is parked on, while an ask card is open — see
+    // `awaiting_after`. Rides the generating card as `awaiting=`.
+    let mut awaiting: Option<String> = None;
     /// Bump the heartbeat AND stamp it. Every `beat += 1` goes through here so
     /// the counter and its timestamp can never drift apart.
     macro_rules! bump_beat {
@@ -8864,12 +8890,13 @@ async fn render_loop(
         () => {
             // Built by the shared renderer, so the api's server-side brains
             // emit a byte-identical indicator.
-            mafold_transcript::render::generating_tag(
+            mafold_transcript::render::generating_tag_awaiting(
                 started_ms,
                 beat,
                 beat_at_ms,
                 tokens_real.unwrap_or(chars / 4),
                 shells,
+                awaiting.as_deref(),
             )
         };
     }
@@ -8911,6 +8938,20 @@ async fn render_loop(
                 // same as content. Session ids, the ask answer and the end-of-
                 // turn stamp are not the harness making progress, so they don't
                 // bump — a frozen beat has to mean "the stream stalled".
+                //
+                // Parked on a person: only the turn's owner can answer its card
+                // (`deliver_ask_answer`), so that is who the card waits on.
+                let owner = match &ev {
+                    AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => chat_states
+                        .lock()
+                        .await
+                        .get(&chat_id)
+                        .and_then(|s| s.turns.get(&msg_id))
+                        .map(|t| t.owner.clone())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                awaiting = awaiting_after(&ev, awaiting.take(), &owner);
                 match &ev {
                     AgentEvent::Session(_) | AgentEvent::AskAnswered(_) | AgentEvent::Done { .. }
                     | AgentEvent::Stats(_) | AgentEvent::ToolStatus { .. } => {}
@@ -9043,6 +9084,19 @@ async fn render_loop(
                     continue;
                 }
 
+                // A settled ask releases the turn. A tap already did this in
+                // `deliver_ask_answer`; an EXPIRED permission prompt (stamped by
+                // the harness, nobody tapped) has no one else to. Left armed,
+                // the next reply to this draft was taken as the answer to a card
+                // that had stopped listening — swallowed instead of steering.
+                if let AgentEvent::AskAnswered(_) = &ev {
+                    if let Some(st) = chat_states.lock().await.get_mut(&chat_id) {
+                        if let Some(t) = st.turns.get_mut(&msg_id) {
+                            t.ask_file = None;
+                        }
+                    }
+                }
+
                 match tx.push(&ev) {
                     // No content of its own. A Pulse still moved the liveness
                     // props, so let the throttle carry them out; a session id
@@ -9106,6 +9160,30 @@ async fn render_loop(
     let out = tx.finish_folded();
     let _ = client.edit_draft(&msg_id, &out).await;
     *final_md.lock().unwrap() = out;
+}
+
+#[cfg(test)]
+mod awaiting_tests {
+    use super::*;
+
+    /// From the moment the card is up until it is answered, the turn is
+    /// waiting on its owner — including through the minutes of silence that
+    /// used to turn the generating card into «No signal».
+    #[test]
+    fn an_open_ask_parks_the_turn_on_its_owner_until_answered() {
+        let ask = AgentEvent::ToolCall { id: "p1".into(), name: "AskUserQuestion".into(), input: serde_json::json!({}) };
+        let w = awaiting_after(&ask, None, "linsky");
+        assert_eq!(w.as_deref(), Some("linsky"));
+        let w = awaiting_after(&AgentEvent::Pulse { chars: 0, tokens: None }, w, "linsky");
+        assert_eq!(w.as_deref(), Some("linsky"), "silence is the wait, not the end of it");
+        assert_eq!(awaiting_after(&AgentEvent::AskAnswered("allow".into()), w.clone(), "linsky"), None);
+        // No answer ever came (the model's own ask timed out) — the turn moving
+        // on ends the wait all the same.
+        assert_eq!(awaiting_after(&AgentEvent::Text("换个办法".into()), w, "linsky"), None);
+        // An ordinary tool call parks nothing.
+        let bash = AgentEvent::ToolCall { id: "b".into(), name: "Bash".into(), input: serde_json::json!({}) };
+        assert_eq!(awaiting_after(&bash, None, "linsky"), None);
+    }
 }
 
 /// The one gate both answer roads pass through — a chat reply to the draft, and

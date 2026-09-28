@@ -163,8 +163,31 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
 /// Old cards ignore unknown attrs and old producers emitted the bare tag, so
 /// both directions degrade safely.
 pub fn generating_tag(started_ms: u64, beat: u64, beat_at_ms: u64, tokens: u64, shells: u64) -> String {
+    generating_tag_awaiting(started_ms, beat, beat_at_ms, tokens, shells, None)
+}
+
+/// [`generating_tag`] for a turn that may be parked on a person.
+///
+///   * `awaiting` the handle of whoever has to answer the open `ask` card before
+///                the turn can go on. The beat is frozen for as long as that
+///                takes, and without this the card could only read the silence
+///                one way — «No signal» — about a turn that was simply waiting
+///                for a tap. Only the daemon knows the turn is parked, and on
+///                whom, so it says so.
+pub fn generating_tag_awaiting(
+    started_ms: u64,
+    beat: u64,
+    beat_at_ms: u64,
+    tokens: u64,
+    shells: u64,
+    awaiting: Option<&str>,
+) -> String {
+    let awaiting = match awaiting.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(who) => format!(" awaiting=\"{}\"", attr_esc(who)),
+        None => String::new(),
+    };
     format!(
-        "\n{{% mafold/generating started={started_ms} beat={beat} beatAt={beat_at_ms} tokens={tokens} shells={shells} /%}}\n"
+        "\n{{% mafold/generating started={started_ms} beat={beat} beatAt={beat_at_ms} tokens={tokens} shells={shells}{awaiting} /%}}\n"
     )
 }
 
@@ -624,6 +647,35 @@ fn ask_tag(input: &Value) -> String {
             let multi = if q["multiSelect"].as_bool().unwrap_or(false) { 1 } else { 0 };
             let question = cell_esc(q["question"].as_str().unwrap_or(""));
             body.push_str(&format!("q|{header}|{multi}|{question}\n"));
+            // `detail` (optional): text that must reach the card EXACTLY. A cell
+            // is flattened and capped, which is fine for a question and wrong
+            // for the one thing a permission prompt asks you to judge — a shell
+            // command with its pipes turned into spaces is not the command that
+            // will run. One `d|` row per line, verbatim; `d~|<n>` when the tail
+            // had to go, so the card can say so instead of passing it off whole.
+            if let Some(detail) = q["detail"].as_str().filter(|d| !d.trim().is_empty()) {
+                let total = detail.chars().count();
+                let kept: String = detail.chars().take(DETAIL_CAP).collect();
+                for line in kept.lines() {
+                    body.push_str(&format!("d|{}\n", line.trim_end_matches('\r')));
+                }
+                if total > DETAIL_CAP {
+                    body.push_str(&format!("d~|{}\n", total - DETAIL_CAP));
+                }
+            }
+            // `rule` / `ruleSource` (optional): the permission rule that stopped
+            // the call and the settings file it is written in — the WHY a
+            // permission prompt leads with. The rule is the row's last field
+            // and keeps its pipes; only the source is a plain cell.
+            if let Some(rule) = q["rule"].as_str().filter(|r| !r.trim().is_empty()) {
+                let source = cell_esc(q["ruleSource"].as_str().unwrap_or(""));
+                body.push_str(&format!("r|{source}|{}\n", line_esc(rule)));
+            }
+            // `summary` (optional): what the call is FOR, in the agent's own
+            // words (a Bash call's `description`). One line, pipes kept.
+            if let Some(summary) = q["summary"].as_str().filter(|s| !s.trim().is_empty()) {
+                body.push_str(&format!("s|{}\n", line_esc(summary)));
+            }
             if let Some(opts) = q["options"].as_array() {
                 for o in opts {
                     let label = cell_esc(o["label"].as_str().unwrap_or(""));
@@ -644,6 +696,10 @@ fn ask_tag(input: &Value) -> String {
     };
     format!("\n{{% mafold/ask{action} %}}\n{}{{% /mafold/ask %}}\n", block_esc(&body))
 }
+
+/// How much of an ask's `detail` goes into the card. Under `block_esc`'s 4000 so
+/// the question and its options always survive the body cap after it.
+const DETAIL_CAP: usize = 3000;
 
 /// One pipe-delimited cell: newlines/tabs/pipes collapse to spaces (the `|`
 /// delimiter must stay unambiguous), trimmed and length-capped.
@@ -1161,6 +1217,69 @@ mod pairing_tests {
 }
 
 #[cfg(test)]
+mod ask_tag_tests {
+    use super::{ask_tag, DETAIL_CAP};
+    use serde_json::json;
+
+    fn prompt(detail: &str) -> String {
+        ask_tag(&json!({
+            "action": "perm:answer",
+            "questions": [{
+                "header": "Bash", "multiSelect": false, "question": detail, "detail": detail,
+                "options": [{ "label": "Allow", "description": "" }, { "label": "Deny", "description": "" }],
+            }],
+        }))
+    }
+
+    /// The question cell flattens pipes and newlines (it has to — `|` is the
+    /// delimiter). The `d|` rows are what the card shows, so they don't.
+    #[test]
+    fn detail_rides_verbatim_beside_the_flattened_question() {
+        let md = prompt("ls shots | grep png\nrm -f shots/*.png");
+        assert!(md.contains("q|Bash|0|ls shots   grep png rm -f shots/*.png\n"), "{md}");
+        assert!(md.contains("d|ls shots | grep png\nd|rm -f shots/*.png\n"), "{md}");
+        assert!(md.contains("o|Allow|\no|Deny|\n"), "{md}");
+        assert!(!md.contains("d~|"), "nothing was cut: {md}");
+    }
+
+    /// Past the cap the tail goes, and the card is told how much — a truncated
+    /// command must not be offered for approval as if it were whole.
+    #[test]
+    fn a_cut_detail_says_how_much_is_missing() {
+        let long = "x".repeat(DETAIL_CAP + 42);
+        let md = prompt(&long);
+        assert!(md.contains("d~|42\n"), "{}", &md[md.len() - 200..]);
+        assert!(md.contains("o|Deny|"), "the options survive the body cap");
+    }
+
+    /// WHY the reader is being asked comes before what — so the rule that
+    /// stopped the call, and where it is written, ride their own row. The rule
+    /// goes LAST in that row and is not flattened: `Bash(ls | grep *)` with its
+    /// pipe turned into a space is a rule nobody wrote.
+    #[test]
+    fn the_rule_and_the_summary_ride_their_own_rows() {
+        let md = ask_tag(&json!({
+            "action": "perm:answer",
+            "questions": [{
+                "header": "Bash", "question": "rm x", "detail": "rm x",
+                "rule": "Bash(ls | grep *)", "ruleSource": "~/.claude/settings.json",
+                "summary": "清掉旧截图\n再重截",
+                "options": [{ "label": "allow" }, { "label": "deny" }],
+            }],
+        }));
+        assert!(md.contains("r|~/.claude/settings.json|Bash(ls | grep *)\n"), "{md}");
+        assert!(md.contains("s|清掉旧截图 再重截\n"), "one line, words intact: {md}");
+    }
+
+    /// A question the MODEL asked has no `detail`, and its body is unchanged.
+    #[test]
+    fn an_ordinary_ask_has_no_detail_rows() {
+        let md = ask_tag(&json!({ "questions": [{ "header": "Deploy", "question": "Ship?", "options": [{ "label": "Yes" }] }] }));
+        assert_eq!(md, "\n{% mafold/ask %}\nq|Deploy|0|Ship?\no|Yes|\n{% /mafold/ask %}\n");
+    }
+}
+
+#[cfg(test)]
 mod stamp_tests {
     use super::{stamp_ask_answered, stamp_unanswered_ask};
 
@@ -1295,7 +1414,19 @@ mod strip_tests {
 
 #[cfg(test)]
 mod generating_tests {
-    use super::generating_tag;
+    use super::{generating_tag, generating_tag_awaiting};
+
+    /// A turn parked on a question is not a producer gone quiet: its beat is
+    /// frozen because a PERSON has the next move. The card can only tell those
+    /// apart if the tag says who it is waiting on.
+    #[test]
+    fn a_turn_waiting_on_a_person_says_who() {
+        let tag = generating_tag_awaiting(1, 2, 3, 4, 0, Some("linsky"));
+        assert!(tag.contains(" awaiting=\"linsky\" "), "{tag}");
+        assert!(tag.trim_end().ends_with("/%}"), "still self-closing: {tag}");
+        // Nobody to wait on ⇒ the tag the api's brains already emit, unchanged.
+        assert_eq!(generating_tag_awaiting(1, 2, 3, 4, 0, None), generating_tag(1, 2, 3, 4, 0));
+    }
 
     /// The props are the card's only evidence. A tag missing `beat` makes the
     /// card assume "live" forever, so a dead producer is indistinguishable from

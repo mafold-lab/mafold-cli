@@ -974,6 +974,18 @@ fn permission_watcher(file: String, sink: UnboundedSender<AgentEvent>) -> PermWa
             for line in body.lines().skip(drawn) {
                 drawn += 1;
                 let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+                // Nobody answered in time: stamp the open card, so it stops
+                // offering Allow for a call that has already been refused. The
+                // stamp lands on the last UNANSWERED ask, which is this one —
+                // prompts are sequential and each is answered or expired before
+                // the next is published.
+                if crate::permission_mcp::is_expiry(&record) {
+                    let closed = AgentEvent::AskAnswered(crate::permission_mcp::EXPIRED.into());
+                    if sink.send(closed).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let id = record["tool_use_id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -1434,6 +1446,55 @@ mod permission_tests {
         assert!(md.contains("rm .obsidian/app.json.bak"), "{md}");
         assert!(md.contains(&format!("o|{}|", crate::permission_mcp::ALLOW)), "{md}");
         assert!(md.contains(&format!("o|{}|", crate::permission_mcp::DENY)), "{md}");
+    }
+
+    /// A prompt nobody answered is CLOSED, end to end: the expiry line
+    /// `permission_mcp` appends on timeout comes off the watcher as the card's
+    /// stamp — not as a second question — and the renderer freezes that card as
+    /// `answered="Expired"`, which the card draws as "nobody approved it, so it
+    /// didn't run". Without it the card kept offering Allow for a call the agent
+    /// had already been refused.
+    #[tokio::test]
+    async fn an_expired_prompt_is_stamped_closed_not_redrawn() {
+        let file = std::env::temp_dir()
+            .join(format!("mafold-permexpire-{}.jsonl", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&file);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = permission_watcher(file.clone(), tx);
+        std::fs::write(
+            &file,
+            "{\"tool_name\":\"Bash\",\"input\":{\"command\":\"rm -f shots/*.png\"},\"tool_use_id\":\"toolu_7\"}\n\
+             {\"tool_use_id\":\"toolu_7\",\"expired\":true}\n",
+        )
+        .unwrap();
+
+        let mut tx = Transcript::new();
+        for want in ["question", "expiry"] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the watcher never sent the {want}"))
+                .expect("sink closed");
+            match (want, &ev) {
+                ("question", AgentEvent::ToolCall { name, .. }) => assert_eq!(name, "AskUserQuestion"),
+                ("expiry", AgentEvent::AskAnswered(a)) => assert_eq!(a, crate::permission_mcp::EXPIRED),
+                _ => panic!("expected the {want}, got {ev:?}"),
+            }
+            tx.push(&ev);
+        }
+        let md = tx.finish();
+        assert!(
+            md.contains(&format!(
+                "{{% mafold/ask action=\"{}\" answered=\"{}\" %}}",
+                crate::permission_mcp::ACTION,
+                crate::permission_mcp::EXPIRED
+            )),
+            "{md}"
+        );
+        assert_eq!(md.matches("{% mafold/ask").count(), 1, "one card, closed — not a second one: {md}");
+        drop(watch);
+        let _ = std::fs::remove_file(&file);
     }
 
     /// The watcher stops with the turn. It polls forever by construction, so a
