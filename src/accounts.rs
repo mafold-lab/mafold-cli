@@ -122,15 +122,24 @@ impl Account {
     /// directory the registry doesn't know (someone set the variable by hand)
     /// still resolves, named after its last path component.
     pub fn from_env(env: &[(String, String)]) -> Account {
+        // A daemon pinned to one login by its OWN environment (the
+        // supervisor's per-daemon `env` map) is "default" to its turns — an
+        // empty turn env inherits, and what it inherits is that directory —
+        // so the credential lookups must follow it too.
+        Self::from_env_inheriting(env, std::env::var(ENV).ok())
+    }
+
+    /// [`Account::from_env`] with what the process would inherit passed IN
+    /// rather than read: the one piece of it that depends on where it runs.
+    /// Tests call this, so they say what the process env is instead of
+    /// picking up whichever login the machine running them is pinned to — a
+    /// test run inside a daemon turn inherits that turn's seat.
+    fn from_env_inheriting(env: &[(String, String)], inherited: Option<String>) -> Account {
         let dir = env
             .iter()
             .find(|(k, _)| k == ENV)
             .map(|(_, v)| v.to_string())
-            // A daemon pinned to one login by its OWN environment (the
-            // supervisor's per-daemon `env` map) is "default" to its turns —
-            // an empty turn env inherits, and what it inherits is that
-            // directory — so the credential lookups must follow it too.
-            .or_else(|| std::env::var(ENV).ok())
+            .or(inherited)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         let Some(dir) = dir else { return Self::default_login() };
@@ -970,9 +979,29 @@ mod tests {
         assert!(Account::default_login().env().is_empty());
         let a = Account { name: "x".into(), dir: Some("/tmp/x".into()), email: None, added_at: 0 };
         assert_eq!(a.env(), vec![(ENV.to_string(), "/tmp/x".to_string())]);
-        assert_eq!(Account::from_env(&a.env()).dir.as_deref(), Some("/tmp/x"));
-        assert!(Account::from_env(&[]).is_default());
-        assert!(Account::from_env(&[(ENV.into(), "  ".into())]).is_default());
+        // The process env is stated, never read: inside a daemon turn it
+        // carries that turn's seat, and this test used to fail there.
+        let bare = || None::<String>;
+        assert_eq!(Account::from_env_inheriting(&a.env(), bare()).dir.as_deref(), Some("/tmp/x"));
+        assert!(Account::from_env_inheriting(&[], bare()).is_default());
+        assert!(Account::from_env_inheriting(&[(ENV.into(), "  ".into())], bare()).is_default());
+    }
+
+    /// A daemon pinned to one login by its own environment: a turn with no
+    /// seat of its own inherits that login — but a turn that names one, even
+    /// as blank, is not overruled by it.
+    #[test]
+    fn an_empty_turn_env_inherits_the_process_login() {
+        let pinned = || Some("/tmp/pinned-seat".to_string());
+        assert_eq!(
+            Account::from_env_inheriting(&[], pinned()).dir.as_deref(),
+            Some("/tmp/pinned-seat")
+        );
+        assert_eq!(
+            Account::from_env_inheriting(&[(ENV.into(), "/tmp/x".into())], pinned()).dir.as_deref(),
+            Some("/tmp/x")
+        );
+        assert!(Account::from_env_inheriting(&[(ENV.into(), " ".into())], pinned()).is_default());
     }
 
     #[test]

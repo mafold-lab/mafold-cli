@@ -63,7 +63,11 @@ impl Harness for ClaudeCode {
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "mafold".into());
-            let Built { mut cmd, hook_settings, bash_only } = build_cmd(&shape, &exe);
+            // Built the way the turn it is for will need it: a turn that finds
+            // its session already running (`cc_conn::lease`) only takes a
+            // process that forks.
+            let Built { mut cmd, hook_settings, bash_only, forks } =
+                build_cmd(&shape, &exe, cc_conn::is_leased(&sid));
             let id = cc_conn::oneshot_id();
             cmd.env("MAFOLD_TURN", crate::turnenv::path_for(&id));
             let fallback = hook_settings.as_ref().map(|s| {
@@ -82,6 +86,7 @@ impl Harness for ClaudeCode {
                 else { return };
                 c = c2;
             }
+            c.forks = forks;
             // A connection only answers for the session it actually holds, and
             // a prewarmed one has not spoken yet — so claim the session the turn
             // will ask to resume. It was passed `--resume` with exactly that id.
@@ -132,7 +137,17 @@ impl Harness for ClaudeCode {
             system: system.clone(),
             env: env.clone(),
         };
-        let Built { mut cmd, hook_settings, bash_only } = build_cmd(&shape, &exe);
+        // Held for the whole run. Taken BEFORE the command is built, so the
+        // answer to "is another turn of ours on this session" is settled and
+        // claimed in one step — the build then forks if it has to.
+        let (_lease, must_fork) = cc_conn::lease(session.as_deref());
+        if must_fork {
+            eprintln!(
+                "[cc-pool] session {} is already running another turn here — this one forks it",
+                session.as_deref().unwrap_or("")
+            );
+        }
+        let Built { mut cmd, hook_settings, bash_only, forks } = build_cmd(&shape, &exe, must_fork);
         // The reply being streamed right now — `mafold attach <file>` hangs
         // media on it. Kept in the env for an OLDER `mafold` on the agent's
         // $PATH; ours reads the turn file, which is current on every turn.
@@ -150,9 +165,10 @@ impl Harness for ClaudeCode {
 
         // A WARM connection for this exact configuration, or a new process.
         // `take` removes it from the pool, so a second concurrent turn in the
-        // same conversation finds nothing and opens its own — which is what
-        // happens today (turns already run concurrently and fork the session).
-        let mut conn = match cc_conn::take_or_wait(&key, session.as_deref()).await {
+        // same conversation finds nothing and opens its own — forking the
+        // session when the first is still on it (`must_fork`), and taking a
+        // warm one only if that one was spawned to fork too.
+        let mut conn = match cc_conn::take_or_wait(&key, session.as_deref(), must_fork).await {
             Some(c) => c,
             None => {
                 let id = cc_conn::oneshot_id();
@@ -186,6 +202,7 @@ impl Harness for ClaudeCode {
                         c = cc_conn::Conn::spawn(key.clone(), id, draft.clone(), f, &workdir).await?;
                     }
                 }
+                c.forks = forks;
                 c
             }
         };
@@ -1112,6 +1129,8 @@ struct Built {
     hook_settings: Option<String>,
     /// The Bash hook alone — always attached (see `cc_conn`'s callback ids).
     bash_only: String,
+    /// It resumes with `--fork-session` (see `cc_conn::Conn::forks`).
+    forks: bool,
 }
 
 /// Build the command for a turn's SHAPE. Nothing per-turn goes in here: the
@@ -1119,7 +1138,10 @@ struct Built {
 /// turn, while this process may serve many, and they reach the child through
 /// `turnenv` instead. That is what lets [`ClaudeCode::prewarm`] build the same
 /// process before there is a message to answer.
-fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
+///
+/// `must_fork`: another turn of ours is running on the session this resumes
+/// (`cc_conn::lease`).
+fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         let mut cmd = tokio::process::Command::new(super::program("claude"));
         // `-p` with NO prompt argument: the prompt goes in on stdin instead (see
         // the write below). It is the one input here that grows without bound —
@@ -1259,6 +1281,7 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
             hook_settings = Some(serde_json::json!({ "hooks": hooks }).to_string());
         }
         cmd.kill_on_drop(true);
+        let mut forks = false;
         if let Some(sid) = &shape.session {
             cmd.arg("--resume").arg(sid);
             // Somebody else is holding this exact transcript right now (a VS
@@ -1271,11 +1294,18 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
             // words all along. The new id arrives on the stream (`session_id`)
             // and is what the caller stores, so this costs one fork, not one
             // per turn.
-            if crate::commands::session_held_elsewhere(sid) {
+            //
+            // …and the somebody can be US. That check skips our own processes
+            // on purpose (they are how the daemon runs at all), so it never
+            // saw a second turn of this daemon on the same session, and the
+            // two braided exactly like a daemon and an editor would. The
+            // lease is what sees it (`cc_conn::lease`).
+            if must_fork || crate::commands::session_held_elsewhere(sid) {
                 cmd.arg("--fork-session");
+                forks = true;
             }
         }
-        Built { cmd, hook_settings, bash_only }
+        Built { cmd, hook_settings, bash_only, forks }
 }
 
 /// The first non-empty line of `t`, bounded — a subagent's report can be pages
@@ -1518,6 +1548,40 @@ mod permission_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resuming(sid: &str) -> super::super::TurnShape {
+        super::super::TurnShape {
+            conv: "c1".into(),
+            surface: "s1".into(),
+            workdir: "/tmp".into(),
+            session: Some(sid.into()),
+            model: None,
+            effort: None,
+            thinking: None,
+            system: None,
+            env: vec![],
+        }
+    }
+
+    fn args(b: &Built) -> Vec<String> {
+        b.cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    /// A turn whose session another turn of ours is running resumes it as a
+    /// FORK; one that has it to itself resumes it as-is. Before, both resumed
+    /// as-is and wrote into one transcript.
+    #[test]
+    fn a_turn_on_a_held_session_forks_it() {
+        let sid = format!("fork-test-{}", std::process::id());
+        let alone = build_cmd(&resuming(&sid), "mafold", false);
+        assert!(!alone.forks);
+        assert!(args(&alone).windows(2).any(|w| w == ["--resume", sid.as_str()]));
+        assert!(!args(&alone).iter().any(|a| a == "--fork-session"));
+        let second = build_cmd(&resuming(&sid), "mafold", true);
+        assert!(second.forks);
+        assert!(args(&second).windows(2).any(|w| w == ["--resume", sid.as_str()]));
+        assert!(args(&second).iter().any(|a| a == "--fork-session"));
+    }
 
     /// The exact shape claude emitted at 13:45:08 on the field machine, right
     /// after a stopped turn left a `<task-notification>` in the session queue.

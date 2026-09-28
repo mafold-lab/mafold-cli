@@ -35,7 +35,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -216,6 +216,11 @@ pub struct Conn {
     /// caller knows it does NOT also need the `--settings` command hooks (which
     /// would fire a second, duplicate copy of every one of them).
     pub control_hooks: bool,
+    /// Spawned with `--fork-session`: its first turn continues the session it
+    /// was asked to resume under a NEW id, leaving the original to whoever is
+    /// already writing it. Set by the caller that added the flag. Only such a
+    /// connection may serve a turn whose session another turn holds ([`lease`]).
+    pub forks: bool,
 }
 
 /// Callback ids we register. Prefixed because they share a namespace with any
@@ -307,6 +312,7 @@ impl Conn {
             last_used: Instant::now(),
             turns: 0,
             control_hooks: false,
+            forks: false,
         })
     }
 
@@ -414,6 +420,14 @@ impl Conn {
 
     pub fn session_id(&self) -> Option<String> {
         self.shared.session.lock().unwrap().clone()
+    }
+
+    /// Its next turn resumes as a fork. Only the FIRST turn of a process
+    /// spawned with `--fork-session` does: after it, the process is the one
+    /// writer of the new session, and handing it to a turn beside another on
+    /// that session is two writers again.
+    pub fn will_fork(&self) -> bool {
+        self.forks && self.turns == 0
     }
 
     /// Live in-process work → this connection must not be evicted.
@@ -784,15 +798,66 @@ pub fn clone_cmd(src: &Command) -> Command {
     c
 }
 
+/// Sessions a turn in THIS process is running right now → how many turns.
+fn leased() -> &'static Mutex<HashMap<String, usize>> {
+    static L: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A turn's hold on the session it resumes, released when the turn ends.
+pub struct SessionLease(Option<String>);
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let Some(sid) = self.0.take() else { return };
+        let mut l = leased().lock().unwrap();
+        if let Some(n) = l.get_mut(&sid) {
+            *n -= 1;
+            if *n == 0 {
+                l.remove(&sid);
+            }
+        }
+    }
+}
+
+/// Hold `sid` for the length of a turn. True in the second place when another
+/// turn of ours ALREADY holds it — which means this one must fork.
+///
+/// Print-mode `--resume` does not fork (`commands::session_held_elsewhere`),
+/// and that check deliberately skips our own SDK processes, so two turns of
+/// this daemon on one session each resumed it as-is: two processes appending
+/// to one transcript, the resume pointer landing wherever the last write did
+/// (2026-09-28: two people in one channel, two copies of the agent, one
+/// braided session). Most of those overlaps are now one turn (a mid-turn
+/// message goes INTO the running turn, `agent::pick_turn`); the ones that
+/// can't be — a thread turn beside the channel's, a billed sender beside a
+/// free one — fork here. Check and claim are one step under one lock, so two
+/// turns starting in the same instant can't both see "free".
+pub fn lease(sid: Option<&str>) -> (SessionLease, bool) {
+    let Some(sid) = sid else { return (SessionLease(None), false) };
+    let mut l = leased().lock().unwrap();
+    let n = l.entry(sid.to_string()).or_insert(0);
+    let contended = *n > 0;
+    *n += 1;
+    (SessionLease(Some(sid.to_string())), contended)
+}
+
+/// Is a turn of ours running on `sid` right now? For a prewarm, which holds
+/// nothing itself but must be spawned the way the turn it is for will need.
+pub fn is_leased(sid: &str) -> bool {
+    leased().lock().unwrap().contains_key(sid)
+}
+
 /// Take the warm connection for `key`, if there is a live one. Taking REMOVES
 /// it: a second concurrent turn in the same conversation finds nothing and
-/// opens its own process, which is exactly what happens today (turns in one
-/// conversation already run concurrently and fork the session).
+/// opens its own process.
 /// `want_session` is the transcript this turn asked to resume. A warm
 /// connection is only the right one when it is ALREADY on that session —
 /// otherwise the turn would silently continue a different conversation thread.
 /// `None` means "no prior session" (a first turn, or a deliberate reset), which
 /// never reuses: starting fresh is exactly what was asked for.
+/// `must_fork`: another turn holds that session ([`lease`]), so only a
+/// connection spawned to fork it will do.
 /// [`take`], but if a prewarm for this key is still on its way, WAIT for it
 /// instead of racing it.
 ///
@@ -802,8 +867,8 @@ pub fn clone_cmd(src: &Command) -> Command {
 /// ~1.3s to come up. The turn then starts its own — two processes for one key,
 /// one of them useless. Waiting costs nothing over that: the alternative was
 /// paying the same startup on a process nobody else can use.
-pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>) -> Option<Conn> {
-    if let Some(c) = take(key, want_session) {
+pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>, must_fork: bool) -> Option<Conn> {
+    if let Some(c) = take(key, want_session, must_fork) {
         return Some(c);
     }
     // Bounded by what a spawn costs, not by hope: past this the prewarm is not
@@ -817,7 +882,7 @@ pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>) -> Option<C
             break; // nothing in flight — don't wait on something that isn't coming
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
-        if let Some(c) = take(key, want_session) {
+        if let Some(c) = take(key, want_session, must_fork) {
             // The half of the startup this turn still had to pay for. Subtract
             // it from the prewarm's own duration (logged when it lands) and the
             // rest is what the overlap actually hid.
@@ -825,16 +890,19 @@ pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>) -> Option<C
             return Some(c);
         }
     }
-    take(key, want_session)
+    take(key, want_session, must_fork)
 }
 
-pub fn take(key: &PoolKey, want_session: Option<&str>) -> Option<Conn> {
+pub fn take(key: &PoolKey, want_session: Option<&str>, must_fork: bool) -> Option<Conn> {
     let want = want_session?;
     let mut p = pool().lock().unwrap();
     sweep(&mut p);
-    let i = p
-        .iter()
-        .position(|c| &c.key == key && c.alive() && c.session_id().as_deref() == Some(want))?;
+    let i = p.iter().position(|c| {
+        &c.key == key
+            && c.alive()
+            && c.session_id().as_deref() == Some(want)
+            && (!must_fork || c.will_fork())
+    })?;
     let c = p.remove(i);
     let (pid, turns, warm) = (c.pid(), c.turns, p.len());
     drop(p);
@@ -1017,7 +1085,31 @@ mod tests {
     #[test]
     fn a_turn_with_no_prior_session_never_takes_a_warm_one() {
         let k = key("opus");
-        assert!(take(&k, None).is_none(), "no session asked for → no reuse");
+        assert!(take(&k, None, false).is_none(), "no session asked for → no reuse");
+    }
+
+    /// Two turns of ours on one session: the first holds it as-is, every one
+    /// after it is told to fork, and the hold ends with the turn — the next
+    /// turn after both have finished resumes plainly again.
+    #[test]
+    fn a_second_turn_on_a_held_session_is_told_to_fork() {
+        let sid = format!("lease-test-{}", std::process::id());
+        let (first, contended) = lease(Some(&sid));
+        assert!(!contended, "the first turn on a session forks nothing");
+        assert!(is_leased(&sid));
+        let (second, contended) = lease(Some(&sid));
+        assert!(contended, "a second writer on one transcript");
+        drop(first);
+        assert!(is_leased(&sid), "the second still holds it");
+        let (third, contended) = lease(Some(&sid));
+        assert!(contended);
+        drop(second);
+        drop(third);
+        assert!(!is_leased(&sid), "a hold that outlives its turn forks every turn after it");
+        assert!(!lease(Some(&sid)).1);
+        // No session = nothing to share.
+        assert!(!lease(None).1);
+        assert!(!lease(None).1);
     }
 
     #[test]
@@ -1166,6 +1258,22 @@ mod tests {
 
     const REPLY: &str =
         r#"{"type":"control_response","response":{"subtype":"%S","request_id":"mf-init-t1"}}"#;
+
+    /// A process spawned to fork a held session forks ONCE — its first turn.
+    /// Parked after that it is the only writer of the new session, and a turn
+    /// that must fork has to be given a different process, not this one.
+    #[tokio::test]
+    async fn a_forking_process_forks_only_its_first_turn() {
+        let mut plain = stub("cat > /dev/null").await;
+        assert!(!plain.will_fork(), "spawned without --fork-session");
+        let mut fork = stub("cat > /dev/null").await;
+        fork.forks = true;
+        assert!(fork.will_fork());
+        fork.end_turn();
+        assert!(!fork.will_fork(), "already writing its own session — a second writer again");
+        plain.kill();
+        fork.kill();
+    }
 
     #[tokio::test]
     async fn a_cli_that_answers_the_handshake_registers_control_hooks() {
