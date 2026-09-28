@@ -121,6 +121,21 @@ fn log_path(name: &str) -> PathBuf {
 fn load() -> Config {
     fs::read_to_string(cfg_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
+
+/// The owner changed `name`'s token (`revokeBotToken`) and the server left the
+/// new one for this machine. If this machine runs that bot, swap the token into
+/// its entry — workdir, harness and env untouched — and say so. If it doesn't,
+/// change nothing: the same notice goes to every machine the owner is signed
+/// into, and only one of them is where the bot lives.
+fn take_rotation(c: &mut Config, name: &str, token: &str) -> bool {
+    match c.daemons.iter_mut().find(|d| d.name.eq_ignore_ascii_case(name)) {
+        Some(d) if !token.is_empty() => {
+            d.token = token.to_string();
+            true
+        }
+        _ => false,
+    }
+}
 fn store(c: &Config) -> Result<()> {
     let p = cfg_path();
     if let Some(dir) = p.parent() { fs::create_dir_all(dir)?; }
@@ -894,6 +909,27 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
     // One-click runtime installs queued from New-Bot (`requestRuntimeInstall`).
     // Run each official installer headlessly, then re-report immediately so the
     // web's availability poll flips without waiting for the 30s cadence.
+    // Tokens the owner just changed. The old one is already dead — the server
+    // hangs its sockets up within a heartbeat — so the daemon is restarted on
+    // the new one right away rather than drained: it can't finish a turn on a
+    // credential that no longer works.
+    let rotations = resp.pointer("/result/rotations").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    for it in rotations {
+        let name = it["bot_username"].as_str().unwrap_or_default().to_string();
+        let token = it["token"].as_str().unwrap_or_default().to_string();
+        let mut c = load();
+        if !take_rotation(&mut c, &name, &token) {
+            continue; // not a bot this machine runs
+        }
+        match store(&c) {
+            Ok(()) => {
+                let _ = stop_one(&name);
+                println!("↻ @{name}: its token was changed — new one in place, restarting it");
+            }
+            Err(e) => eprintln!("✗ @{name}: couldn't save its new token: {e}"),
+        }
+    }
+
     let installs = resp.pointer("/result/installs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     if !installs.is_empty() {
         for rt in installs.iter().filter_map(|v| v.as_str()) {
@@ -1119,6 +1155,39 @@ mod tests {
 
     fn cfg(name: &str) -> DaemonCfg {
         DaemonCfg { name: name.into(), token: "mb_x".into(), workdir: "/tmp".into(), harness: None, env: Default::default() }
+    }
+
+    /// 2026-09-28: five leaked tokens were rotated by hand — revoke, `mafold
+    /// add` with the new one, kill the old process — once per bot. The server
+    /// now leaves the new token for the owner's machines; the one running the
+    /// bot takes it and keeps everything else about the daemon.
+    #[test]
+    fn a_rotation_for_a_bot_this_machine_runs_swaps_only_the_token() {
+        let mut c = Config::default();
+        let mut d = cfg("ops:claude333");
+        d.workdir = "/Users/ops/.mafold/work/claude333".into();
+        d.harness = Some("claude-code".into());
+        d.env.insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), "/x/work".into());
+        c.daemons.push(d);
+        c.daemons.push(cfg("ops:codex"));
+        assert!(take_rotation(&mut c, "Ops:Claude333", "mb_new"), "usernames compare case-insensitively");
+        let d = &c.daemons[0];
+        assert_eq!(d.token, "mb_new");
+        assert_eq!(d.workdir, "/Users/ops/.mafold/work/claude333");
+        assert_eq!(d.harness.as_deref(), Some("claude-code"));
+        assert_eq!(d.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"], "/x/work");
+        assert_eq!(c.daemons[1].token, "mb_x", "the other bot is untouched");
+    }
+
+    /// Every machine the owner is signed into gets the notice. The ones that
+    /// don't run the bot must not start one.
+    #[test]
+    fn a_rotation_for_a_bot_this_machine_does_not_run_changes_nothing() {
+        let mut c = Config::default();
+        c.daemons.push(cfg("ops:codex"));
+        assert!(!take_rotation(&mut c, "ops:claude333", "mb_new"));
+        assert_eq!(c.daemons.len(), 1);
+        assert_eq!(c.daemons[0].token, "mb_x");
     }
 
     /// `--env` pairs become the daemon's extra environment; a leading `~/`
