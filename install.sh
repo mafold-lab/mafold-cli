@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Install + run mafold (Mafold terminal client + Claude Code agent).
-#   cd ~/your-project
-#   bash <(curl -fsSL https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.sh) \
-#     agent --detach --token mb_xxxx
+#   bash <(curl -fsSL https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.sh) login
+#   cd ~/your-project && mafold add <your-bot>
 # Any args after the script are forwarded to mafold (working dir = where you run this).
 set -euo pipefail
 REPO="mafold-lab/mafold-cli"
@@ -51,5 +50,6 @@ fi
 if [ "$#" -gt 0 ]; then
   exec "$bindir/mafold" "$@"
 else
-  echo "run:  mafold agent --detach --token mb_xxx        # works in the current folder"
+  echo "run:  mafold login         # pair this computer (approve it on the web)"
+  echo "      mafold add <bot>     # then, from its project folder, run your bot here"
 fi

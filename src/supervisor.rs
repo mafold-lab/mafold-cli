@@ -697,8 +697,8 @@ pub fn up(base: &str, no_auto_update: bool) -> Result<()> {
     // the web can only provision onto a machine whose supervisor is up.
     if c.daemons.is_empty() && crate::session::load().is_none() {
         println!("Nothing to do yet — this machine has no login and no daemons. Either:");
-        println!("  mafold login                                    # connect it (bots you create on the web then auto-install)");
-        println!("  mafold --token mb_… add <bot> --workdir /path   # or wire a bot by hand");
+        println!("  mafold login          # connect it (bots you create on the web then auto-install)");
+        println!("  mafold add <bot>      # then, from its project folder, run one you already have");
         return Ok(());
     }
     if autostart_current(base, no_auto_update) {

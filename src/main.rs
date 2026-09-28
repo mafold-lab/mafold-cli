@@ -11,6 +11,7 @@ mod agent;
 mod apps;
 mod ask_hook;
 mod bash_hook;
+mod bot_token;
 mod cards;
 mod cardtags;
 mod channels;
@@ -263,12 +264,15 @@ enum Cmd {
     },
 
     // ── multi-daemon supervisor: one daemon per bot ──
-    /// Add a bot daemon to the local config (token from --token).
+    /// Add a bot daemon to the local config. Signed in (`mafold login`) as the
+    /// bot's owner, the name is all it takes — the token comes from your login;
+    /// otherwise pass --token.
     Add {
         /// The bot username (also the daemon's pid/log name).
         name: String,
+        /// Where it works. Default: the folder you run this in.
         #[arg(long, env = "MAFOLD_WORKDIR")]
-        workdir: String,
+        workdir: Option<String>,
         /// Local harness hint; the server (getMe) is authoritative at runtime.
         #[arg(long)]
         harness: Option<String>,
@@ -594,7 +598,27 @@ async fn main() -> Result<()> {
             env,
         } => {
             let env = supervisor::parse_env(&env)?;
-            supervisor::add(name, bot_token?, workdir, harness, env, &cli.base, cli.no_auto_update)?
+            // A token given wins. Without one, this machine's login for the
+            // bot's owner asks the server for it — nothing to paste, and
+            // nothing that ever went through a chat (`bot_token`).
+            let token = match cli.token.clone().filter(|t| !t.trim().is_empty()) {
+                Some(t) => t,
+                None => {
+                    let logins = session::all();
+                    let login = bot_token::login_for(&name, cli.account.as_deref(), &logins).context(
+                        "not signed in on this machine — run `mafold login` (approve it on the web), then `mafold add` again; or pass --token",
+                    )?;
+                    bot_token::fetch(&cli.base, &name, login).await?
+                }
+            };
+            let workdir = match workdir {
+                Some(w) => w,
+                None => std::env::current_dir()
+                    .context("no --workdir and no current folder")?
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
         Cmd::Chats => chats(&Client::new(cli.base, token?)).await?,
         Cmd::Read { chat: c, limit, channel, media, json, unread, ids } => {

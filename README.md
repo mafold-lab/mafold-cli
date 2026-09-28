@@ -15,15 +15,17 @@ Auth is a **bot token** (`mb_…`) — create a bot in the Mafold app — via
 ## Install
 
 ```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.sh) login
 cd ~/your-project   # the folder the agent should work in
-bash <(curl -fsSL https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.sh) \
-  agent --detach --token mb_xxxx
+mafold add <your-bot>
 ```
 
-It runs in the **background** (detached from the terminal — keeps running after
-you close the shell), in the current folder (add `--workdir /path` for another), logging to `~/.mafold/agent.log`. Manage it with
-`mafold status` and `mafold stop`. Drop `--detach` to run in the
-foreground. Or build from source: `cargo build --release`.
+`login` pairs this computer with your account (approve it on the web — one
+click). `mafold add` then fetches the bot's token through that login, so there
+is nothing to copy or paste: a token never has to pass through a chat. The bot
+runs under the supervisor — in the background, across reboots — logging to
+`~/.mafold/daemons/<bot>/log`; `mafold logs <bot>` / `mafold rm <bot>` manage it. Or
+build from source: `cargo build --release`.
 
 **Windows** (PowerShell — `irm | iex` is the `curl | bash` of this side):
 
@@ -36,7 +38,8 @@ Arguments can't cross a `| iex` pipe, so the second command is its own line. To
 pass them in one go the way the `bash` form does:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.ps1))) agent --detach --token mb_xxxx
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.ps1))) login
+mafold add <your-bot>
 ```
 
 `install.ps1` drops the binary in `~\.mafold`, verifies its published SHA256,
