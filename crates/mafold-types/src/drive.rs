@@ -410,6 +410,191 @@ pub struct DriveChanged {
     pub rev: i64,
 }
 
+// MARK: - Moving an existing bot's memory into its drive
+
+/// One memory file the bot's daemon found in a folder it used before its
+/// memory lived in the drive (`.docs/bot-drive-v1.md` §5.6). `path` is
+/// relative to that memory folder (`MEMORY.md`, `topics/x.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateFile {
+    pub path: String,
+    pub sha: String,
+    pub size: u64,
+    #[serde(default)]
+    pub mtime_ms: i64,
+    /// Why it can't go into the drive (looks like a credential, not text…);
+    /// set by the server, which re-checks every file. None = it may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
+}
+
+/// One old memory folder: `dir` is the working directory it belongs to, so
+/// the owner recognises which project's memory this is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateSource {
+    pub dir: String,
+    #[serde(default)]
+    pub files: Vec<CandidateFile>,
+}
+
+/// `reportDriveCandidates` — the bot, about its own old memory: the whole
+/// current set (it replaces the last one).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ReportCandidates {
+    #[serde(default)]
+    pub sources: Vec<CandidateSource>,
+}
+
+/// `listDriveCandidates` — what the owner can pick from.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CandidateListing {
+    pub memory_mounted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<i64>,
+    #[serde(default)]
+    pub sources: Vec<CandidateSource>,
+}
+
+/// One file the owner ticked: which folder, which file in it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AdoptPick {
+    pub dir: String,
+    pub path: String,
+    /// The start of the sha the owner was SHOWN (a card carries it). When
+    /// the bot has since reported a newer version, the pick is refused rather
+    /// than bringing in text the owner never saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+}
+
+/// `adoptDriveMemory` — the owner's decision: these files go into
+/// `memory/`, and from then on the bot's memory lives in the drive. Picking
+/// none is a decision too (start the drive's memory empty).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AdoptMemory {
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub picks: Vec<AdoptPick>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdoptResult {
+    pub adopted: u32,
+    pub rev: i64,
+}
+
+/// The card a bot sends its owner to offer its old memory:
+/// `{% mafold/drive-memory bot="…" %}` with one line per folder and file —
+///
+/// ```text
+/// d|/path/of/the/working/dir
+/// f|MEMORY.md|1234|9f86d081884c|first words of the file…   (can be ticked; sha start)
+/// x|keys.md|300|looks like it contains a credential         (listed, can't)
+/// ```
+///
+/// Written by the daemon ([`offer_body`]) and read back by the SERVER when the
+/// owner taps ([`offer_picks`]): the tap sends only the positions of the
+/// ticked `f|` lines, so it can name nothing the card didn't show.
+pub const OFFER_CARD: &str = "mafold/drive-memory";
+
+/// One line of text, safe inside a card body: no line breaks, no Markdoc tag
+/// delimiters, at most `max` characters.
+fn one_line(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ").replace("{%", "{ %").replace("%}", "% }");
+    match flat.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &flat[..i]),
+        None => flat,
+    }
+}
+
+/// Whether a folder or file name survives being one line of an offer card
+/// unchanged. The card's text IS what a tap is resolved against, so a name
+/// the card would reshape (whitespace runs, tag delimiters, over-long) could
+/// be shown but never picked: the daemon doesn't offer it, the server
+/// refuses it in a report.
+pub fn offer_safe(name: &str) -> bool {
+    !name.is_empty() && one_line(name, 400) == name && !name.contains('|')
+}
+
+/// Characters of a file's sha an offer card carries.
+pub const OFFER_SHA_CHARS: usize = 12;
+
+/// The card body for `sources`. `preview(dir, path)` gives a file's opening
+/// words (the daemon has the files); previews are dropped when the list is
+/// long, so the card stays a readable size.
+pub fn offer_body(sources: &[CandidateSource], preview: impl Fn(&str, &str) -> Option<String>) -> String {
+    let count: usize = sources.iter().map(|s| s.files.len()).sum();
+    let room = if count > 120 { 0 } else if count > 40 { 60 } else { 140 };
+    let mut out = String::new();
+    for s in sources {
+        out.push_str(&format!("d|{}\n", one_line(&s.dir, 400)));
+        for f in &s.files {
+            match &f.blocked {
+                Some(why) => out.push_str(&format!("x|{}|{}|{}\n", f.path, f.size, one_line(why, 120))),
+                None => {
+                    let p = if room == 0 { String::new() } else { preview(&s.dir, &f.path).map(|t| one_line(&t, room)).unwrap_or_default() };
+                    let sha: String = f.sha.chars().take(OFFER_SHA_CHARS).collect();
+                    out.push_str(&format!("f|{}|{}|{sha}|{p}\n", f.path, f.size));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The body of the last not-yet-answered offer card in `content`.
+fn open_offer(content: &str) -> Option<(usize, usize, &str)> {
+    let open = format!("{{% {OFFER_CARD}");
+    let close = format!("{{% /{OFFER_CARD} %}}");
+    let start = content.rfind(&open)?;
+    let tag_end = start + content[start..].find("%}")? + 2;
+    // The ATTRIBUTE, not the word: a bot may well be called `approver`.
+    if content[start..tag_end].contains(" approve=") {
+        return None;
+    }
+    let body_end = tag_end + content[tag_end..].find(&close)?;
+    Some((start, tag_end, &content[tag_end..body_end]))
+}
+
+/// The tickable files of the offer card in `content`, in card order — what a
+/// tap's positions index into. None = no unanswered offer card there.
+pub fn offer_picks(content: &str) -> Option<Vec<AdoptPick>> {
+    let (_, _, body) = open_offer(content)?;
+    let mut dir = String::new();
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if let Some(d) = line.strip_prefix("d|") {
+            dir = d.to_string();
+        } else if let Some(rest) = line.strip_prefix("f|") {
+            let mut it = rest.split('|');
+            let path = it.next().unwrap_or_default();
+            let sha = it.nth(1).filter(|s| !s.is_empty()).map(str::to_string);
+            if !dir.is_empty() && !path.is_empty() {
+                out.push(AdoptPick { dir: dir.clone(), path: path.to_string(), sha });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The `bot="…"` the unanswered offer card in `content` names.
+pub fn offer_bot(content: &str) -> Option<String> {
+    let (start, tag_end, _) = open_offer(content)?;
+    let tag = &content[start..tag_end];
+    let from = tag.find(" bot=\"")? + 6;
+    let len = tag[from..].find('"')?;
+    Some(tag[from..from + len].to_string())
+}
+
+/// `content` with its offer card marked answered (`approve="<n brought in>"`).
+pub fn stamp_offer(content: &str, adopted: u32) -> Option<String> {
+    let (_, tag_end, _) = open_offer(content)?;
+    let mut out = content.to_string();
+    out.insert_str(tag_end - 2, &format!("approve=\"{adopted}\" "));
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +750,50 @@ mod library_tests {
         assert!(!is_script("SKILL.md"));
         assert!(!is_script("fonts/Inter.ttf"));
         assert!(!is_script("Makefile"));
+    }
+
+    /// The offer card round-trips: what the daemon writes is exactly what the
+    /// server reads back on a tap — tickable files only, in card order — and a
+    /// card, once answered, offers nothing more.
+    #[test]
+    fn an_offer_card_names_exactly_the_files_it_shows() {
+        let f = |p: &str, blocked: Option<&str>| CandidateFile {
+            path: p.into(),
+            sha: "s".into(),
+            size: 10,
+            mtime_ms: 0,
+            blocked: blocked.map(str::to_string),
+        };
+        let sources = vec![
+            CandidateSource { dir: "/w/app".into(), files: vec![f("MEMORY.md", None), f("keys.md", Some("looks like it contains a credential"))] },
+            CandidateSource { dir: "/w/old".into(), files: vec![f("notes/a.md", None)] },
+        ];
+        let body = offer_body(&sources, |_, p| Some(format!("line one\n{{% html %}} of {p} | with a pipe")));
+        assert!(!body.contains("{%"), "a preview can't open a tag inside the card: {body}");
+        assert_eq!(body.lines().count(), 5);
+        // A bot whose NAME contains the attribute's word is still answerable.
+        let msg = format!("Pick what comes with me:\n{{% {OFFER_CARD} bot=\"ada:approver\" %}}\n{body}{{% /{OFFER_CARD} %}}\n");
+        assert_eq!(offer_bot(&msg).as_deref(), Some("ada:approver"));
+        let picks = offer_picks(&msg).unwrap();
+        let s = Some("s".to_string());
+        assert_eq!(
+            picks,
+            [
+                AdoptPick { dir: "/w/app".into(), path: "MEMORY.md".into(), sha: s.clone() },
+                AdoptPick { dir: "/w/old".into(), path: "notes/a.md".into(), sha: s }
+            ]
+        );
+        let stamped = stamp_offer(&msg, 2).unwrap();
+        assert!(stamped.contains("bot=\"ada:approver\" approve=\"2\" %}"), "{stamped}");
+        assert!(offer_picks(&stamped).is_none() && stamp_offer(&stamped, 1).is_none(), "answered once");
+        assert!(offer_picks("no card here").is_none());
+        // Names a card line would reshape can't be offered (the tap could never find them).
+        assert!(offer_safe("/Users/ada/My Project") && offer_safe("笔记/周报.md"));
+        for bad in ["/w/two  spaces", "/w/x{%y", "/w/a|b", "/w/tab\there", ""] {
+            assert!(!offer_safe(bad), "{bad:?}");
+        }
+        // A long list drops previews rather than growing a huge card.
+        let many = vec![CandidateSource { dir: "/w".into(), files: (0..150).map(|i| f(&format!("m{i}.md"), None)).collect() }];
+        assert!(offer_body(&many, |_, _| Some("x".repeat(200))).lines().all(|l| l.len() < 40));
     }
 }

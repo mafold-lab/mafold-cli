@@ -2250,6 +2250,16 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     if !std::path::Path::new(&workdir).is_dir() {
         eprintln!("⚠️  working directory does not exist: {workdir} — the harness will fail. Check --workdir.");
     }
+    // A Claude Code bot from before drives: offer its owner the memory it kept
+    // (its default directory now; each directory a turn runs in, as they run).
+    if let Some(m) = crate::drive::current().filter(|_| harness.id() == "claude-code") {
+        m.note_workdir(&workdir).await;
+        tokio::spawn(async move {
+            if let Err(e) = m.offer_old_memory().await {
+                eprintln!("drive: old memory not offered yet ({e:#})");
+            }
+        });
+    }
     if !harness.available() {
         eprintln!("⚠️  harness `{}` CLI not found on PATH — replies will fail until it's installed.", harness.id());
         if harness.id() == "claude-code" {
@@ -7534,6 +7544,14 @@ async fn handle(
     // has moved it, the memory folder the agent process is pointed at — and
     // whether THIS turn may change that memory (only the owner's may).
     let drive = crate::drive::current();
+    // Until its memory is the drive's, a Claude Code bot's memory lives in the
+    // folder of each directory it works in — note this one, so it can be
+    // offered to the owner (`Mirror::offer_old_memory`). Only Claude Code
+    // keeps memory that way: another harness sharing a directory with
+    // someone's Claude Code would otherwise offer THAT person's notes.
+    if let Some(d) = drive.as_ref().filter(|_| harness.id() == "claude-code") {
+        d.note_workdir(workdir).await;
+    }
     let mount = crate::drive::mount(drive.as_deref()).await;
     let owner_turn = drive.as_ref().is_some_and(|d| d.is_owner(turn_sender));
     let memory_guard = mount.memory_dir.clone().filter(|_| !owner_turn);

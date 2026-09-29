@@ -47,6 +47,12 @@ pub trait DriveApi: Send + Sync {
     async fn have(&self, shas: &[String]) -> Result<Vec<String>>;
     async fn upload(&self, bytes: &[u8]) -> Result<String>;
     async fn commit(&self, changes: Vec<DriveChange>) -> Result<DriveCommitResult>;
+    /// Report the old memory this bot found (`reportDriveCandidates`).
+    async fn report_candidates(&self, r: &wire::ReportCandidates) -> Result<()>;
+    /// That report as the server holds it — with its verdict on every file.
+    async fn candidates(&self) -> Result<wire::CandidateListing>;
+    /// Send the owner the offer card, in their chat with the bot.
+    async fn offer(&self, owner: &str, text: &str) -> Result<()>;
 }
 
 /// The real server, as the bot itself (the daemon's token): `account` is left
@@ -82,6 +88,18 @@ impl DriveApi for Remote {
             .await?;
         Ok(serde_json::from_value(v)?)
     }
+    async fn report_candidates(&self, r: &wire::ReportCandidates) -> Result<()> {
+        self.0.call("reportDriveCandidates", serde_json::to_value(r)?).await?;
+        Ok(())
+    }
+    async fn candidates(&self) -> Result<wire::CandidateListing> {
+        Ok(serde_json::from_value(self.0.call("listDriveCandidates", json!({})).await?)?)
+    }
+    async fn offer(&self, owner: &str, text: &str) -> Result<()> {
+        let chat = self.0.resolve_chat(&format!("@{owner}")).await?;
+        self.0.send_to(crate::client::Dest::chat(&chat), text).await?;
+        Ok(())
+    }
 }
 
 /// One file as the mirror last saw it on BOTH sides.
@@ -101,6 +119,17 @@ struct State {
     rev: i64,
     memory_mounted: bool,
     files: BTreeMap<String, Known>,
+    /// Working directories this bot has run in while its memory wasn't in the
+    /// drive yet: their Claude Code memory folders are what it offers its
+    /// owner (`offer_old_memory`).
+    #[serde(default)]
+    dirs: std::collections::BTreeSet<String>,
+    /// Digest of the last old-memory report the server accepted.
+    #[serde(default)]
+    reported: Option<String>,
+    /// Digest of what the last offer card showed, and when it was sent.
+    #[serde(default)]
+    offered: Option<(String, i64)>,
 }
 
 /// What a pull changed.
@@ -113,11 +142,16 @@ pub struct Pulled {
 pub struct Mirror {
     api: Arc<dyn DriveApi>,
     root: PathBuf,
+    /// The bot, as its offer card names it.
+    bot: String,
     /// Plugin name the skills are listed under (`<label>:<skill>`).
     label: String,
     /// The bot's owner (lowercase): whose turns may change its memory.
     owner: Option<String>,
     state: tokio::sync::Mutex<State>,
+    /// Held while an old-memory offer is being made: the startup check and a
+    /// finishing turn can both reach it, and must not both send a card.
+    offering: tokio::sync::Mutex<()>,
 }
 
 fn sha_hex(b: &[u8]) -> String {
@@ -195,9 +229,11 @@ impl Mirror {
         let m = Arc::new(Self {
             api,
             root,
+            bot: bot.trim_start_matches('@').to_string(),
             label: plugin_label(bot),
             owner: owner.map(|o| o.to_lowercase()),
             state: tokio::sync::Mutex::new(state),
+            offering: tokio::sync::Mutex::new(()),
         });
         m.pull().await?;
         // Empty shells left under skills/ before removals pruned their folders
@@ -528,6 +564,166 @@ impl Mirror {
         }
         Ok(undone)
     }
+
+    // ---- an existing bot's old memory (`.docs/bot-drive-v1.md` §5.6) ----
+
+    /// A turn is about to run in `dir`: until the memory is the drive's, its
+    /// Claude Code memory folder is part of what this bot offers its owner.
+    pub async fn note_workdir(&self, dir: &str) {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            return;
+        }
+        let mut s = self.state.lock().await;
+        if s.memory_mounted || !s.dirs.insert(dir.to_string()) {
+            return;
+        }
+        let _ = self.save(&s).await;
+    }
+
+    /// Offer the owner the memory this bot kept before it had a drive.
+    pub async fn offer_old_memory(&self) -> Result<()> {
+        self.offer_old_memory_in(&claude_home()).await
+    }
+
+    /// Read (never change) the memory folders of the directories this bot has
+    /// worked in; when that differs from the last report, upload what the
+    /// server lacks and report it; send the owner the offer card the first
+    /// time — and again only when there is something new AND a day has
+    /// passed, so a bot that keeps writing its old memory doesn't keep
+    /// knocking. The owner answers on the card; until then nothing changes.
+    pub(crate) async fn offer_old_memory_in(&self, claude_home: &Path) -> Result<()> {
+        let Ok(_one_at_a_time) = self.offering.try_lock() else { return Ok(()) };
+        let (dirs, reported, offered) = {
+            let s = self.state.lock().await;
+            if s.memory_mounted {
+                return Ok(());
+            }
+            (s.dirs.clone(), s.reported.clone(), s.offered.clone())
+        };
+        let home = claude_home.to_path_buf();
+        let (sources, bodies, previews) = tokio::task::spawn_blocking(move || scan_old_memory(&home, &dirs)).await?;
+        if sources.is_empty() {
+            return Ok(()); // nothing was ever remembered: nothing to ask about
+        }
+        let digest = sha_hex(
+            sources
+                .iter()
+                .flat_map(|s| s.files.iter().map(move |f| format!("{}\0{}\0{}\n", s.dir, f.path, f.sha)))
+                .collect::<String>()
+                .as_bytes(),
+        );
+        if reported.as_deref() != Some(digest.as_str()) {
+            let shas: Vec<String> = bodies.keys().cloned().collect();
+            let mut have = std::collections::BTreeSet::new();
+            for chunk in shas.chunks(500) {
+                have.extend(self.api.have(chunk).await?);
+            }
+            for (sha, bytes) in &bodies {
+                if !have.contains(sha) {
+                    self.api.upload(bytes).await?;
+                }
+            }
+            self.api.report_candidates(&wire::ReportCandidates { sources }).await?;
+            let mut s = self.state.lock().await;
+            s.reported = Some(digest.clone());
+            self.save(&s).await?;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let due = match &offered {
+            None => true,
+            Some((seen, at)) => *seen != digest && now - at >= OFFER_AGAIN_SECS,
+        };
+        let Some(owner) = self.owner.as_deref().filter(|_| due) else { return Ok(()) };
+        let listing = self.api.candidates().await?;
+        if listing.memory_mounted {
+            return Ok(());
+        }
+        let body = wire::offer_body(&listing.sources, |d, p| previews.get(&(d.to_string(), p.to_string())).cloned());
+        let card = wire::OFFER_CARD;
+        let text = format!("{{% {card} bot=\"{}\" %}}\n{body}{{% /{card} %}}", self.bot);
+        self.api.offer(owner, &text).await?;
+        let mut s = self.state.lock().await;
+        s.offered = Some((digest, now));
+        self.save(&s).await?;
+        println!("☁ drive: offered {} old memory file(s) to @{owner}", listing.sources.iter().map(|x| x.files.len()).sum::<usize>());
+        Ok(())
+    }
+}
+
+/// A memory file bigger than this can't go into a drive's `memory/`: it isn't
+/// offered (nor uploaded — no point shipping bytes that will be refused).
+const MAX_OFFER_FILE_BYTES: usize = 256 << 10;
+/// What one report may carry (the server's limits).
+const MAX_OFFER_DIRS: usize = 16;
+const MAX_OFFER_FILES: usize = 1_000;
+
+type Scanned = (Vec<wire::CandidateSource>, BTreeMap<String, Vec<u8>>, BTreeMap<(String, String), String>);
+
+/// Read the old memory folders of `dirs` (never write them). Leaves out what
+/// the drive would refuse by NAME — so one odd file can't sink the whole
+/// offer — and what a card line couldn't show unchanged; what the drive may
+/// refuse by CONTENT (a credential in a note) is the server's verdict.
+fn scan_old_memory(claude_home: &Path, dirs: &std::collections::BTreeSet<String>) -> Scanned {
+    let mut sources = Vec::new();
+    let mut bodies: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut previews: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut count = 0usize;
+    for dir in dirs.iter().filter(|d| wire::offer_safe(d)) {
+        if sources.len() == MAX_OFFER_DIRS {
+            eprintln!("drive: more than {MAX_OFFER_DIRS} old memory folders; offering the first {MAX_OFFER_DIRS}");
+            break;
+        }
+        let root = cc_memory_dir(claude_home, dir);
+        let mut files = Vec::new();
+        for f in walk(&root) {
+            let Ok(r) = f.strip_prefix(&root) else { continue };
+            let parts: Vec<String> = r.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            if parts.iter().any(|p| p.starts_with('.')) {
+                continue; // .DS_Store and friends
+            }
+            let path = wire::normalize(&parts.join("/"));
+            if wire::validate_path(&format!("{}/{path}", wire::AREA_MEMORY)).is_err() || !wire::offer_safe(&path) {
+                eprintln!("drive: not offering {dir}: `{path}` (a name the drive or the card can't hold)");
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&f) else { continue };
+            if bytes.len() > MAX_OFFER_FILE_BYTES {
+                continue;
+            }
+            if count == MAX_OFFER_FILES {
+                eprintln!("drive: more than {MAX_OFFER_FILES} old memory files; offering the first {MAX_OFFER_FILES}");
+                break;
+            }
+            count += 1;
+            let sha = sha_hex(&bytes);
+            previews.insert((dir.clone(), path.clone()), String::from_utf8_lossy(&bytes[..bytes.len().min(600)]).into_owned());
+            files.push(wire::CandidateFile { path, sha: sha.clone(), size: bytes.len() as u64, mtime_ms: mtime_ms(&f), blocked: None });
+            bodies.insert(sha, bytes);
+        }
+        if !files.is_empty() {
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            sources.push(wire::CandidateSource { dir: dir.clone(), files });
+        }
+    }
+    (sources, bodies, previews)
+}
+/// Something new in the old memory re-offers it at most this often.
+const OFFER_AGAIN_SECS: i64 = 24 * 3600;
+
+/// Where Claude Code keeps its config: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+pub fn claude_home() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default().join(".claude")
+    })
+}
+
+/// The memory folder Claude Code keeps for working directory `cwd`: under
+/// `projects/`, named after the path with every character that isn't an
+/// ASCII letter or digit turned into `-`.
+pub fn cc_memory_dir(claude_home: &Path, cwd: &str) -> PathBuf {
+    let name: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    claude_home.join("projects").join(name).join("memory")
 }
 
 /// Remove every empty folder under `dir`, deepest first — `dir` itself stays.
@@ -684,6 +880,11 @@ pub async fn after_turn(owner_turn: bool) {
         eprintln!("drive: a non-owner turn ended while an owner turn runs — its memory changes (if any) are left for that turn to push");
     }
     refresh(&m).await;
+    // Memory not in the drive yet: keep the owner's offer current (a no-op
+    // when nothing changed, or for a harness that noted no directories).
+    if let Err(e) = m.offer_old_memory().await {
+        eprintln!("drive: old memory not offered yet ({e:#})");
+    }
 }
 
 /// Catch up with the server; when skills changed, retire warm agent processes
