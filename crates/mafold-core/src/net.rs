@@ -342,6 +342,67 @@ pub async fn http_post(
     }
 }
 
+/// GET, for provider REST surfaces a native driver reads (Gmail, Calendar).
+/// Same reply shape and the same transport errors as [`http_post`].
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn http_get(url: &str, headers: &[(String, String)]) -> Result<HttpReply, RpcError> {
+    let mut req = client().get(url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req.send().await.map_err(|e| {
+        if e.is_connect() {
+            RpcError::Connect(e.to_string())
+        } else {
+            RpcError::Transport(e.to_string())
+        }
+    })?;
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string())))
+        .collect();
+    let body = resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?;
+    Ok(HttpReply { status, headers, body })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn http_get(url: &str, headers: &[(String, String)]) -> Result<HttpReply, RpcError> {
+    use futures::future::{select, Either};
+    use gloo_net::http::Request;
+
+    let controller = web_sys::AbortController::new()
+        .map_err(|_| RpcError::Transport("AbortController unavailable".into()))?;
+    let signal = controller.signal();
+    let mut builder = Request::get(url).abort_signal(Some(&signal));
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    let work = Box::pin(async move {
+        let resp = builder.send().await.map_err(|e| RpcError::Transport(e.to_string()))?;
+        let status = resp.status();
+        let headers = resp
+            .headers()
+            .entries()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v))
+            .collect();
+        let body = resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?;
+        Ok(HttpReply { status, headers, body })
+    });
+    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(RPC_TIMEOUT_MS as u32));
+    match select(work, deadline).await {
+        Either::Left((out, _)) => out,
+        Either::Right(((), _)) => {
+            controller.abort();
+            Err(RpcError::Transport(format!(
+                "no response in {}s from {url}",
+                RPC_TIMEOUT_MS / 1000
+            )))
+        }
+    }
+}
+
 // ── streaming HTTP, for provider surfaces that answer as SSE ───────────────
 //
 // Same two-transport split as everything above, with one honest asymmetry: the

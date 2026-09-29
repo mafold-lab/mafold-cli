@@ -200,6 +200,9 @@ impl Mirror {
             state: tokio::sync::Mutex::new(state),
         });
         m.pull().await?;
+        // Empty shells left under skills/ before removals pruned their folders
+        // (cli 0.9.130), or made by hand: a restart clears them.
+        remove_empty_dirs_under(&m.root.join(wire::AREA_SKILLS));
         Ok(m)
     }
 
@@ -229,6 +232,26 @@ impl Mirror {
             p.push(seg);
         }
         p
+    }
+
+    /// After a file left the mirror: remove the folders it leaves empty, from
+    /// its own upward, stopping at the first that still holds something and
+    /// never touching an area root (`skills/`, `memory/` — the latter is the
+    /// agent's memory directory). Only that one chain is looked at, so a folder
+    /// the agent just made elsewhere is never swept from under it.
+    fn prune_empty_parents(&self, file: &Path) {
+        let roots = [self.root.join(wire::AREA_SKILLS), self.root.join(wire::AREA_MEMORY)];
+        let mut dir = file.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(&self.root) || d == self.root || roots.iter().any(|r| r == d) {
+                break;
+            }
+            // Fails on a folder that isn't empty (or is already gone): stop there.
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
     }
 
     async fn save(&self, s: &State) -> Result<()> {
@@ -349,15 +372,17 @@ impl Mirror {
                 // Deleted there, edited here: the edit survives as a new file.
                 self.keep_conflict(&path)?;
             } else {
-                let _ = std::fs::remove_file(self.local(&path));
+                let p = self.local(&path);
+                let _ = std::fs::remove_file(&p);
+                self.prune_empty_parents(&p);
             }
             match wire::area(&path) {
                 Some(wire::AREA_SKILLS) => out.skills = true,
                 _ => out.memory = true,
             }
         }
-        // Skills files nobody knows about (left over, or dropped in by hand) go:
-        // the folder is the server's.
+        // Skills files nobody knows about (left over, or dropped in by hand) go,
+        // and so do the empty folders that leaves: the folder is the server's.
         if full {
             for f in walk(&self.root.join(wire::AREA_SKILLS)) {
                 if let Some(rel) = self.rel(&f) {
@@ -367,6 +392,7 @@ impl Mirror {
                     }
                 }
             }
+            remove_empty_dirs_under(&self.root.join(wire::AREA_SKILLS));
         }
         s.rev = listing.rev;
         self.save(&s).await?;
@@ -473,6 +499,7 @@ impl Mirror {
             match s.files.get(&rel) {
                 None => {
                     std::fs::remove_file(&f)?;
+                    self.prune_empty_parents(&f);
                     undone += 1;
                 }
                 Some(k) if !self.unchanged(&rel, k) => {
@@ -500,6 +527,28 @@ impl Mirror {
             self.save(&s).await?;
         }
         Ok(undone)
+    }
+}
+
+/// Remove every empty folder under `dir`, deepest first — `dir` itself stays.
+/// Only for `skills/`, which is the server's: an empty folder there is never
+/// anybody's work in progress (the agent can't write skills).
+fn remove_empty_dirs_under(dir: &Path) {
+    let mut dirs = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(e.path());
+                dirs.push(e.path());
+            }
+        }
+    }
+    // Longest paths first: a child always goes before its parent is tried.
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for d in dirs {
+        let _ = std::fs::remove_dir(&d); // fails (and stays) unless empty
     }
 }
 

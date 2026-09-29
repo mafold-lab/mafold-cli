@@ -258,6 +258,71 @@ async fn a_turn_that_was_not_the_owners_is_undone() {
     assert_eq!(f.body("memory/MEMORY.md").as_deref(), Some("truth"));
 }
 
+/// Uninstalling a skill takes its folder with it, not just the files: an
+/// empty `skills/<slug>/examples/` shell left behind looks like a broken
+/// skill. Every way a file leaves the mirror (a server delete, the sweep of a
+/// full listing, undoing a non-owner turn) prunes only the folders it emptied
+/// — never one still holding something, never the area roots.
+#[tokio::test]
+async fn a_removed_file_leaves_no_empty_folders_behind() {
+    let f = Arc::new(Fake::default());
+    f.s.lock().unwrap().mounted = true;
+    f.put("skills/comms/SKILL.md", "s");
+    f.put("skills/comms/examples/a.md", "a");
+    f.put("skills/tea/SKILL.md", "t");
+    f.put("memory/notes/one.md", "1");
+    f.put("memory/notes/two.md", "2");
+    let dir = tmp("prune");
+    let m = Mirror::open(f.clone(), &dir, "ada:bot", Some("ada".into())).await.unwrap();
+    // Uninstall = the server deletes every file of the skill.
+    f.del("skills/comms/SKILL.md");
+    f.del("skills/comms/examples/a.md");
+    f.del("memory/notes/one.md");
+    m.pull().await.unwrap();
+    assert!(!m.local("skills/comms").exists(), "the uninstalled skill's folder is gone");
+    assert!(m.local("skills/tea/SKILL.md").exists());
+    assert!(m.local("memory/notes/two.md").exists(), "a folder still holding a file stays");
+    f.del("memory/notes/two.md");
+    m.pull().await.unwrap();
+    assert!(!m.local("memory/notes").exists());
+    assert!(m.local("memory").is_dir(), "the area root stays: it is the agent's memory directory");
+    // A stray swept by a full listing goes with its folder…
+    touch(&m, "skills/tea/stray/deep/x.md", "x");
+    f.s.lock().unwrap().reset_next = true;
+    m.pull().await.unwrap();
+    assert!(!m.local("skills/tea/stray").exists());
+    assert!(m.local("skills/tea/SKILL.md").exists());
+    // …and so does what a non-owner turn planted in memory.
+    touch(&m, "memory/planted/deep/p.md", "p");
+    m.revert_memory().await.unwrap();
+    assert!(!m.local("memory/planted").exists());
+    // The last skill going empties `skills/` — the root itself stays.
+    f.del("skills/tea/SKILL.md");
+    m.pull().await.unwrap();
+    assert!(!m.local("skills/tea").exists());
+    assert!(m.local("memory").is_dir() && m.local("skills").is_dir());
+}
+
+/// Empty folders already left under `skills/` — by a daemon before the prune
+/// above existed (cli 0.9.130), or made by hand — go when the mirror opens:
+/// `skills/` is the server's, so an empty folder there is never anybody's
+/// work in progress. `memory/` is the agent's and is left alone.
+#[tokio::test]
+async fn opening_the_mirror_clears_empty_skill_folders_left_from_before() {
+    let f = Arc::new(Fake::default());
+    f.put("skills/tea/SKILL.md", "t");
+    let dir = tmp("stale-empty");
+    let m = Mirror::open(f.clone(), &dir, "ada:bot", None).await.unwrap();
+    for d in ["skills/comms/examples", "skills/tea/empty", "memory/drafts"] {
+        std::fs::create_dir_all(m.local(d)).unwrap();
+    }
+    let m = Mirror::open(f.clone(), &dir, "ada:bot", None).await.unwrap();
+    assert!(!m.local("skills/comms").exists(), "the shell a 0.9.130 uninstall left");
+    assert!(!m.local("skills/tea/empty").exists());
+    assert!(m.local("skills/tea/SKILL.md").exists());
+    assert!(m.local("memory/drafts").is_dir(), "memory is the agent's: an empty folder there may be on purpose");
+}
+
 /// The hook that keeps a non-owner turn out of the bot's memory: refuses a
 /// write into the guarded folder however the path is spelled, lets everything
 /// else through, and says nothing at all on a turn that isn't guarded.

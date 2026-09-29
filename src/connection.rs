@@ -551,19 +551,29 @@ async fn list(client: &Client) -> Result<()> {
         return Ok(());
     }
     println!("{:<16} {:<20} {:<10} {}", "NAME", "PROVIDER", "STATUS", "LABEL");
-    for c in items {
-        // The provider is printed VERBATIM and the row always reads `linked`,
-        // because that is exactly what the server asserted by returning it. It
-        // used to say `unknown` whenever this binary's compiled-in table had no
-        // such id — which described the CLI's build, not the connection, and
-        // told a user whose link had just succeeded that it hadn't.
+    let mut dead = Vec::new();
+    for c in &items {
+        // The provider is printed VERBATIM, because that is exactly what the
+        // server asserted by returning it. The status used to say `unknown`
+        // whenever this binary's compiled-in table had no such id — which
+        // described the CLI's build, not the connection. It says something
+        // other than `linked` only when a device has LEARNED otherwise: a
+        // renewal the provider refused (`relink_at`).
+        let expired = c.get("relink_at").and_then(Value::as_i64).is_some();
+        if expired {
+            dead.push((s(c, "name"), s(c, "relink_reason")));
+        }
         println!(
             "{:<16} {:<20} {:<10} {}",
-            s(&c, "name"),
-            s(&c, "provider"),
-            "linked",
-            s(&c, "label")
+            s(c, "name"),
+            s(c, "provider"),
+            if expired { "expired" } else { "linked" },
+            s(c, "label")
         );
+    }
+    for (name, why) in dead {
+        let why = if why.is_empty() { String::new() } else { format!(" ({why})") };
+        println!("\n  {name}: the provider no longer accepts this sign-in{why} — reconnect it in Settings ▸ Connections");
     }
     Ok(())
 }
@@ -1280,6 +1290,8 @@ async fn show(base: &str, client: &Client, sess: &session::Session, name: &str, 
     }
     // `--reveal` decrypts the raw secret on this machine — same gate as `env`.
     require_connection_use(base, client, &sess.username, name).await?;
+    let spec = descriptor(client, &s(&conn, "provider")).await?;
+    refuse_if_spend_only(name, &spec)?;
     let (umk, key_id, _) = unlock(client, sess).await?;
     let fields = open_payload(&umk, &key_id, &conn)?;
     println!();
@@ -1295,6 +1307,20 @@ async fn show(base: &str, client: &Client, sess: &session::Session, name: &str, 
     Ok(())
 }
 
+/// A spend-only row (see `credential_stays_inside`) is used through its
+/// methods and never printed — checked before the vault is even opened.
+fn refuse_if_spend_only(name: &str, spec: &ProviderInfo) -> Result<()> {
+    if mafold_core::connections::credential_stays_inside(spec) {
+        return Err(anyhow!(
+            "`{name}` ({}) is never revealed or exported: its token is only used inside \
+             `mafold connection call {name} …`, so nothing that runs here ever holds it. \
+             See what it can do: `mafold connection methods {name}`",
+            spec.display
+        ));
+    }
+    Ok(())
+}
+
 /// Shell exports for a connection, so a local tool can consume it without a
 /// bespoke integration. Deliberately not written to any file: piping into
 /// `eval` keeps the plaintext in a process, not on disk.
@@ -1305,6 +1331,7 @@ async fn env(base: &str, client: &Client, sess: &session::Session, name: &str) -
     let conn = fetch(client, name).await?;
     let provider = s(&conn, "provider");
     let spec = descriptor(client, &provider).await?;
+    refuse_if_spend_only(name, &spec)?;
     let (umk, key_id, _) = unlock(client, sess).await?;
     let fields = open_payload(&umk, &key_id, &conn)?;
     let var = spec

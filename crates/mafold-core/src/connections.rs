@@ -43,6 +43,27 @@ const RENEW_MARGIN_MS: i64 = 60 * 1000;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+/// Why a renewal did not produce a token — and whether that is the person's
+/// problem or ours.
+#[derive(Debug)]
+pub(crate) enum RenewError {
+    /// The provider says the grant itself is gone (`invalid_grant`): expired,
+    /// revoked, or spent by another device. Only consenting again fixes it.
+    /// Carries the provider's own words, trimmed.
+    Refused(String),
+    /// Anything else — the network, a 5xx, a malformed answer. Says nothing
+    /// about whether the grant is still good.
+    Failed(String),
+}
+
+impl std::fmt::Display for RenewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenewError::Refused(m) | RenewError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
 struct Cached {
     methods: Vec<MethodSpec>,
     at: i64,
@@ -315,6 +336,11 @@ impl Runtime {
         if spec.native_api.as_deref() == Some(crate::computer::DRIVER) {
             return Ok(crate::computer::method_specs());
         }
+        // Same for Google: the tools are this build's, and asking for them
+        // must not spend a token.
+        if spec.native_api.as_deref() == Some(crate::google::DRIVER) {
+            return Ok(crate::google::method_specs());
+        }
         // Open before asking where to send: a delegating row keeps its address
         // in the payload.
         let payload = self.refreshed_payload(name, &conn, &spec).await?;
@@ -322,11 +348,17 @@ impl Runtime {
 
         let methods = match self.catalog(&url, &spec, &payload).await {
             Ok(m) => m,
-            // The credential was refused even after any renewal above, so the
-            // grant itself is gone (revoked at the provider, or a refresh token
-            // that has been spent). Nothing to retry.
+            // Refused on a credential that looked current: renew once and ask
+            // again. `recover_refused` settles the revoked case (and marks the
+            // row); a refusal that survives the renewal is the provider not
+            // admitting this client, which reconnecting would not change.
             Err(McpError::Unauthorized(m)) => {
-                return Err(unauthorized_msg(name, &spec, &m));
+                let fresh = self.recover_refused(name, &conn, &spec, &payload, &m).await?;
+                match self.catalog(&url, &spec, &fresh).await {
+                    Ok(m) => m,
+                    Err(McpError::Unauthorized(m)) => return Err(still_refused_msg(name, &spec, &m)),
+                    Err(e) => return Err(e.to_string()),
+                }
             }
             Err(e) => return Err(e.to_string()),
         };
@@ -382,6 +414,8 @@ impl Runtime {
             if let Some(driver) = spec.native_api.as_deref() {
                 return Ok(if driver == crate::computer::DRIVER {
                     crate::computer::catalog()
+                } else if driver == crate::google::DRIVER {
+                    crate::google::catalog()
                 } else {
                     serde_json::json!({ "tools": [] })
                 });
@@ -416,6 +450,9 @@ impl Runtime {
             },
             Some(d) if d == crate::computer::DRIVER => {
                 self.run_computer(name, &conn, method, params).await
+            }
+            Some(d) if d == crate::google::DRIVER => {
+                crate::google::run(self, name, &conn, &spec, method, params).await
             }
             // The ONE case where "update the app" is still the honest answer:
             // the pack can name a driver, but a driver is code. Everything else
@@ -542,15 +579,28 @@ impl Runtime {
     pub async fn call(&mut self, name: &str, method: &str, params: Value) -> Result<Value> {
         let conn = self.get(name).await?;
         let spec = self.descriptor_of(&conn).await?;
-        let payload = self.refreshed_payload(name, &conn, &spec).await?;
+        let mut payload = self.refreshed_payload(name, &conn, &spec).await?;
         let url = Self::endpoint(&spec, &payload)?;
 
-        let mut client =
-            McpClient::new(&url, &Self::auth_for(&spec, &payload), &credential(&spec, &payload));
-        client.initialize().await.map_err(|e| match e {
-            McpError::Unauthorized(m) => unauthorized_msg(name, &spec, &m),
-            e => e.to_string(),
-        })?;
+        // At most two sessions: the one we had, and — if the provider refused
+        // it — one on a renewed credential. A second refusal is the answer.
+        let mut renewed = false;
+        let mut client = loop {
+            let mut client = McpClient::new(
+                &url,
+                &Self::auth_for(&spec, &payload),
+                &credential(&spec, &payload),
+            );
+            match client.initialize().await {
+                Ok(_) => break client,
+                Err(McpError::Unauthorized(m)) if !renewed => {
+                    payload = self.recover_refused(name, &conn, &spec, &payload, &m).await?;
+                    renewed = true;
+                }
+                Err(McpError::Unauthorized(m)) => return Err(still_refused_msg(name, &spec, &m)),
+                Err(e) => return Err(e.to_string()),
+            }
+        };
         client
             .call_tool(method, params)
             .await
@@ -579,11 +629,82 @@ impl Runtime {
         }
         match self.renew(name, conn, spec, &payload).await {
             Ok(fresh) => Ok(fresh),
-            // A failed renewal is not necessarily fatal: the old token may
-            // still have seconds on it, and the provider is the authority on
-            // that. Try the call; if it really is dead, the 401 path explains
-            // what to do with words from the provider itself.
-            Err(_) => Ok(payload),
+            // The provider said the grant is gone. That is not "try the call
+            // and see": the refresh token is dead, so the access token dies
+            // with its margin, and a call now would only fail later with a
+            // vaguer sentence.
+            Err(RenewError::Refused(why)) => self.settle_refusal(name, conn, spec, &why).await,
+            // Merely failed — a network hiccup, a 5xx, the broker restarting.
+            // Not fatal: the old token may still have seconds on it, and the
+            // provider is the authority on that. Try the call; if it really is
+            // dead, the 401 path renews once more and learns which it was.
+            Err(RenewError::Failed(_)) => Ok(payload),
+        }
+    }
+
+    /// A refresh was refused. Mark the row — unless it moved on meanwhile.
+    ///
+    /// The mark carries the `updated_at` this device opened, and the server
+    /// applies it only if the row is still that version. The case it exists
+    /// for: providers that rotate refresh tokens on every use, and two devices
+    /// renewing the same row. The loser's refresh is refused, yet the row is
+    /// perfectly healthy — the winner already stored a new grant. Marking it
+    /// would tell a person to reconnect something that works; instead the
+    /// loser re-reads the row and carries on with the newer credential.
+    ///
+    /// Returns the payload to continue with, or the reconnect instruction.
+    pub(crate) async fn settle_refusal(
+        &self,
+        name: &str,
+        conn: &Value,
+        spec: &ProviderInfo,
+        why: &str,
+    ) -> Result<Map<String, Value>> {
+        let seen = conn.get("updated_at").and_then(Value::as_i64).unwrap_or(0);
+        let marked = self
+            .rpc(
+                "markConnectionRelink",
+                serde_json::json!({ "name": name, "reason": why, "updated_at": seen }),
+            )
+            .await
+            .map(|v| v.get("marked").and_then(Value::as_bool).unwrap_or(true))
+            // A server that can't record the mark (older api, network) does not
+            // make the grant any less dead — the person still has to hear it.
+            .unwrap_or(true);
+        if !marked {
+            let latest = self.get(name).await?;
+            if latest.get("blob") != conn.get("blob") {
+                return self.open(&latest);
+            }
+        }
+        Err(relink_msg(name, spec, why))
+    }
+
+    /// The provider refused a credential mid-call. Renew ONCE and hand back
+    /// the result to retry with — or say why there is nothing to retry.
+    ///
+    /// Two refusals look identical on the wire and mean opposite things. A
+    /// revoked grant: the renewal is refused too, and only the person can fix
+    /// it. A client the provider won't admit (Figma's MCP server, to any app
+    /// outside its catalog): the renewal SUCCEEDS and the retry is refused
+    /// again — reconnecting would change nothing, and saying otherwise sends
+    /// someone round a loop. The caller tells the second case apart by
+    /// retrying; this only settles the first.
+    pub(crate) async fn recover_refused(
+        &self,
+        name: &str,
+        conn: &Value,
+        spec: &ProviderInfo,
+        payload: &Map<String, Value>,
+        detail: &str,
+    ) -> Result<Map<String, Value>> {
+        if !renewable(payload) {
+            return Err(unauthorized_msg(name, spec, detail));
+        }
+        match self.renew(name, conn, spec, payload).await {
+            Ok(fresh) => Ok(fresh),
+            Err(RenewError::Refused(why)) => self.settle_refusal(name, conn, spec, &why).await,
+            Err(RenewError::Failed(_)) => Err(unauthorized_msg(name, spec, detail)),
         }
     }
 
@@ -600,12 +721,13 @@ impl Runtime {
         conn: &Value,
         spec: &ProviderInfo,
         payload: &Map<String, Value>,
-    ) -> Result<Map<String, Value>> {
+    ) -> std::result::Result<Map<String, Value>, RenewError> {
+        use RenewError::Failed;
         let get = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let (refresh_token, client_id, endpoint) =
             (get("refresh_token"), get("client_id"), get("token_endpoint"));
         if refresh_token.is_empty() || client_id.is_empty() || endpoint.is_empty() {
-            return Err("this connection has nothing to renew with".into());
+            return Err(Failed("this connection has nothing to renew with".into()));
         }
 
         let form = format!(
@@ -622,14 +744,28 @@ impl Runtime {
             &form,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Failed(e.to_string()))?;
         let grant: Value = serde_json::from_str(&reply.body)
-            .map_err(|_| format!("the token endpoint answered HTTP {}", reply.status))?;
+            .map_err(|_| Failed(format!("the token endpoint answered HTTP {}", reply.status)))?;
+        // RFC 6749 §5.2: `invalid_grant` is the one error that is about the
+        // GRANT — expired, revoked, already spent — rather than about this
+        // request. Google's 7-day testing grants, a user pressing "remove
+        // access", a refresh token another device consumed: all arrive as
+        // exactly this. Everything else (`invalid_client`, a broker that is
+        // missing its secret, a 5xx) is ours to fix, not the person's.
+        if grant.get("error").and_then(Value::as_str) == Some("invalid_grant") {
+            let why = grant
+                .get("error_description")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("invalid_grant");
+            return Err(RenewError::Refused(why.chars().take(200).collect()));
+        }
         let access = grant
             .get("access_token")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| "the token endpoint returned no access token".to_string())?;
+            .ok_or_else(|| Failed("the token endpoint returned no access token".to_string()))?;
 
         let mut fresh = payload.clone();
         fresh.insert("access_token".into(), Value::String(access.to_string()));
@@ -651,8 +787,10 @@ impl Runtime {
         // Last writer wins. Two devices renewing at the same moment is
         // self-correcting rather than destructive: whichever grant the provider
         // honours is the one that gets stored, and the loser's next call
-        // re-reads this row before doing anything with it.
-        self.store(name, conn, spec, &fresh).await?;
+        // re-reads this row before doing anything with it. Storing is also
+        // what clears a "needs reconnecting" mark: every write is a fresh
+        // credential, so the server drops the mark on any write.
+        self.store(name, conn, spec, &fresh).await.map_err(Failed)?;
         Ok(fresh)
     }
 
@@ -833,9 +971,53 @@ fn unauthorized_msg(name: &str, spec: &ProviderInfo, detail: &str) -> String {
     }
     format!(
         "{} refused this credential: {detail}\n  \
-         re-link it:  mafold connection add {name} --provider {}",
+         reconnect it from Settings ▸ Connections, or:  mafold connection add {name} --provider {}",
         spec.display, spec.id
     )
+}
+
+/// The grant is gone at the provider — the person has to consent again.
+///
+/// Web first, and only the web: reconnecting is one click in Settings for
+/// every provider a browser can link, and naming a terminal command here would
+/// tell the person who has no mafold-cli that they are stuck.
+fn relink_msg(name: &str, spec: &ProviderInfo, why: &str) -> String {
+    format!(
+        "`{name}` needs reconnecting: {} no longer accepts its sign-in ({why}). \
+         Reconnect it in Settings ▸ Connections — one click.",
+        spec.display
+    )
+}
+
+/// Refused even on a freshly renewed credential: the account is connected,
+/// but the provider does not let this client in. Said plainly, because the
+/// natural next move — reconnecting — would produce the same grant and the
+/// same refusal.
+pub(crate) fn still_refused_msg(name: &str, spec: &ProviderInfo, detail: &str) -> String {
+    format!(
+        "{} still refused `{name}` after its sign-in was renewed ({detail}). The account is \
+         connected; {} just doesn't let this connection in — reconnecting will not change that.",
+        spec.display, spec.display
+    )
+}
+
+/// Rows whose credential is only ever SPENT on this device, never handed out
+/// — no `env`, no `show --reveal`.
+///
+/// The Google driver is the whole of that row's surface: four tools, each a
+/// fixed request. A token printed into a turn would let an agent act on the
+/// mailbox with no catalog, no grant check and no trace in between — and a
+/// model reading a prompt-injected email is exactly who should not hold it.
+/// Data names the driver; this is the one place that decides what that means.
+pub fn credential_stays_inside(spec: &ProviderInfo) -> bool {
+    spec.native_api.as_deref() == Some(crate::google::DRIVER)
+}
+
+/// Whether a payload carries everything a renewal needs, wherever it runs.
+fn renewable(payload: &Map<String, Value>) -> bool {
+    ["refresh_token", "client_id", "token_endpoint"]
+        .iter()
+        .all(|k| payload.get(*k).and_then(Value::as_str).is_some_and(|s| !s.is_empty()))
 }
 
 /// Percent-encode one `application/x-www-form-urlencoded` value.
@@ -843,7 +1025,7 @@ fn unauthorized_msg(name: &str, spec: &ProviderInfo, detail: &str) -> String {
 /// Hand-rolled to keep a dependency out of a crate that compiles to wasm. Only
 /// unreserved characters survive unescaped, which is stricter than required and
 /// therefore safe for tokens whose alphabet we don't control.
-fn form_encode(s: &str) -> String {
+pub(crate) fn form_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -1218,6 +1400,18 @@ mod tests {
     /// — sent with them.
     #[cfg(not(target_arch = "wasm32"))]
     async fn fake_mcp_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>) {
+        fake_mcp_server_refusing(None).await
+    }
+
+    /// The same server, but one that answers **401** to a credential it no
+    /// longer honours: `Some("dead")` refuses exactly `Bearer dead` (a revoked
+    /// grant — a renewed token gets in), `Some("*")` refuses everything (a
+    /// provider that accepts the account but not this client, as Figma's MCP
+    /// server does for any app outside its catalog).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn fake_mcp_server_refusing(
+        refuse: Option<&'static str>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1238,12 +1432,19 @@ mod tests {
                         .filter_map(|l| l.split_once(':'))
                         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
                         .collect();
+                    let refused = match refuse {
+                        Some("*") => true,
+                        Some(tok) => headers.get("authorization").map(String::as_str)
+                            == Some(format!("Bearer {tok}").as_str()),
+                        None => false,
+                    };
                     sink.lock().unwrap().push(headers);
                     let rpc: Value = serde_json::from_str(body).unwrap_or(Value::Null);
                     let id = rpc.get("id").cloned();
                     let method = rpc.get("method").and_then(Value::as_str).unwrap_or("");
                     // A notification has no id and gets no body.
                     let (status, reply) = match (id, method) {
+                        _ if refused => (401, "Unauthorized".to_string()),
                         (None, _) => (202, String::new()),
                         (Some(id), "initialize") => (200, json!({ "jsonrpc": "2.0", "id": id, "result": {
                             "protocolVersion": PROTOCOL_VERSION_FOR_TESTS, "capabilities": {},
@@ -1692,6 +1893,189 @@ mod tests {
         assert!(
             !reqs.iter().any(|r| r.path == "/claimConnectionCall"),
             "declining happens before the claim: {reqs:?}"
+        );
+    }
+
+    /// A Google token is spent inside the driver and never handed out — not by
+    /// `env`, not by `show --reveal` — so an agent gets mail, not the key to
+    /// the mailbox. Rows without that driver keep today's behaviour.
+    #[test]
+    fn only_a_spend_only_driver_withholds_its_credential() {
+        // Any row the Google driver answers for — the registry names the
+        // driver, and the driver is what decides.
+        let mut driven = info("github");
+        driven.native_api = Some(crate::google::DRIVER.to_string());
+        assert!(credential_stays_inside(&driven));
+        for id in ["figma-oauth", "github", "notion", "anthropic-api", "codex-oauth", "mcp"] {
+            assert!(!credential_stays_inside(&info(id)), "{id}");
+        }
+    }
+
+    // ── a grant the provider stopped honouring ──────────────────────────────
+    //
+    // Five cases, because "the credential was refused" has five different
+    // truths behind it and only two of them mean the person must reconnect.
+
+    /// A renewable row of the self-described provider, as a link flow seals
+    /// it, with `updated_at` so a mark can say which version it is about.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn renewable_row(umk: &Key, endpoint: &str, token_endpoint: &str, access: &str, expires_at: i64, updated_at: i64) -> String {
+        let payload = json!({
+            "endpoint": endpoint,
+            "access_token": access,
+            "refresh_token": "r-1",
+            "client_id": "cid",
+            "token_endpoint": token_endpoint,
+            "expires_at": expires_at.to_string(),
+        });
+        let sealed = vault::seal_payload(umk, &payload.to_string());
+        json!({ "items": [{
+            "name": "stripe",
+            "provider": "mcp",
+            "label": "127.0.0.1",
+            "blob": sealed.blob,
+            "wrapped_dek": sealed.wrapped_dek,
+            "key_id": "k1",
+            "updated_at": updated_at,
+        }]})
+        .to_string()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    const INVALID_GRANT: &str =
+        r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+
+    /// The 7-day case: the access token is due, the refresh answers
+    /// `invalid_grant`. The row is marked (with the version the device saw, so
+    /// a newer credential can't be marked by an older device), the caller is
+    /// told to reconnect in Settings, and the provider is never called with a
+    /// token already known to be dead.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_refused_renewal_marks_the_row_and_says_reconnect() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let (endpoint, seen) = fake_mcp_server().await;
+        let umk = Key::random();
+        let tok = spawn_mock(vec![(400, INVALID_GRANT.into())]);
+        let row = renewable_row(&umk, &endpoint, &format!("{}/token", tok.base), "old", 1, 100);
+        let mock = spawn_mock(vec![ok(&row), ok(r#"{"marked":true}"#)]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk);
+
+        let err = rt.call("stripe", "echo", json!({})).await.expect_err("a dead grant is an error");
+        assert!(err.contains("Settings ▸ Connections"), "{err}");
+        assert!(err.contains("expired or revoked"), "the provider's own words: {err}");
+
+        let reqs = mock.requests.lock().unwrap();
+        let mark = reqs.iter().find(|r| r.path == "/markConnectionRelink").expect("the row was marked");
+        let body: Value = serde_json::from_str(&mark.body).unwrap();
+        assert_eq!(body["name"], "stripe");
+        assert_eq!(body["updated_at"], 100, "the version this device saw");
+        assert!(body["reason"].as_str().unwrap().contains("expired or revoked"));
+        assert!(seen.lock().unwrap().is_empty(), "no call with a token known to be dead");
+    }
+
+    /// A token endpoint that is merely DOWN says nothing about the grant. No
+    /// mark, and the call goes ahead on the token it has — which may well
+    /// still be good for the minute of margin renewal runs ahead by.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_renewal_that_merely_failed_marks_nothing() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let (endpoint, _seen) = fake_mcp_server().await;
+        let umk = Key::random();
+        let tok = spawn_mock(vec![(503, "upstream unavailable".into())]);
+        let row = renewable_row(&umk, &endpoint, &format!("{}/token", tok.base), "old", 1, 100);
+        let mock = spawn_mock(vec![ok(&row)]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk);
+
+        let out = rt.call("stripe", "echo", json!({"x": 1})).await.expect("the old token still works");
+        assert_eq!(out["echoed"]["x"], 1);
+        let reqs = mock.requests.lock().unwrap();
+        assert!(!reqs.iter().any(|r| r.path == "/markConnectionRelink"), "{reqs:?}");
+    }
+
+    /// Revoked at the provider while the access token still had time on it:
+    /// the call is refused, ONE renewal is tried, the refresh is refused too —
+    /// that is the definitive answer, and the row is marked.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_refused_call_renews_once_and_marks_when_the_grant_is_gone() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let (endpoint, _seen) = fake_mcp_server_refusing(Some("dead")).await;
+        let umk = Key::random();
+        let tok = spawn_mock(vec![(400, INVALID_GRANT.into())]);
+        let far = now_ms() + 3_600_000;
+        let row = renewable_row(&umk, &endpoint, &format!("{}/token", tok.base), "dead", far, 100);
+        let mock = spawn_mock(vec![ok(&row), ok(r#"{"marked":true}"#)]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk);
+
+        let err = rt.call("stripe", "echo", json!({})).await.expect_err("revoked");
+        assert!(err.contains("Settings ▸ Connections"), "{err}");
+        assert_eq!(tok.requests.lock().unwrap().len(), 1, "one renewal, not a loop");
+        let reqs = mock.requests.lock().unwrap();
+        assert!(reqs.iter().any(|r| r.path == "/markConnectionRelink"), "{reqs:?}");
+    }
+
+    /// Figma's shape: the renewal SUCCEEDS and the server still refuses. The
+    /// grant is fine — this client just isn't let in — so marking it "needs
+    /// reconnecting" would send the person round a loop that cannot end. The
+    /// fresh token is stored, nothing is marked, and the error says so.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_refusal_that_survives_a_renewal_is_not_a_reconnect() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let (endpoint, seen) = fake_mcp_server_refusing(Some("*")).await;
+        let umk = Key::random();
+        let tok = spawn_mock(vec![(200, r#"{"access_token":"fresh","expires_in":3600}"#.into())]);
+        let far = now_ms() + 3_600_000;
+        let row = renewable_row(&umk, &endpoint, &format!("{}/token", tok.base), "fine", far, 100);
+        let mock = spawn_mock(vec![ok(&row), ok(r#"{"connection":{}}"#)]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk);
+
+        let err = rt.call("stripe", "echo", json!({})).await.expect_err("still refused");
+        assert!(err.contains("will not change that"), "{err}");
+        let reqs = mock.requests.lock().unwrap();
+        assert!(reqs.iter().any(|r| r.path == "/putConnection"), "the renewed token is kept: {reqs:?}");
+        assert!(!reqs.iter().any(|r| r.path == "/markConnectionRelink"), "{reqs:?}");
+        let tried = seen.lock().unwrap();
+        assert!(
+            tried.iter().any(|h| h.get("authorization").map(String::as_str) == Some("Bearer fresh")),
+            "the retry carried the renewed token: {tried:?}"
+        );
+    }
+
+    /// Two devices, one rotating refresh token: the other device renewed first,
+    /// so this one's refresh is refused — but the ROW is fine. The server
+    /// declines the mark (the version moved on), and this device picks up the
+    /// newer credential instead of telling anyone to reconnect.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_refusal_another_device_already_healed_marks_nothing() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        // The stale token really is dead at the server — only the healed row's
+        // token gets in, so passing proves the healed row is what was used.
+        let (endpoint, _seen) = fake_mcp_server_refusing(Some("old")).await;
+        let umk = Key::random();
+        let tok = spawn_mock(vec![(400, INVALID_GRANT.into())]);
+        let token_ep = format!("{}/token", tok.base);
+        let stale = renewable_row(&umk, &endpoint, &token_ep, "old", 1, 100);
+        let healed = renewable_row(&umk, &endpoint, &token_ep, "new", now_ms() + 3_600_000, 200);
+        let mock = spawn_mock(vec![ok(&stale), ok(r#"{"marked":false}"#), ok(&healed)]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk);
+
+        let out = rt.call("stripe", "echo", json!({"x": 2})).await.expect("the healed row works");
+        assert_eq!(out["echoed"]["x"], 2);
+        let reqs = mock.requests.lock().unwrap();
+        assert!(reqs.iter().any(|r| r.path == "/markConnectionRelink"), "it asked: {reqs:?}");
+        assert_eq!(
+            reqs.iter().filter(|r| r.path == "/listConnections").count(),
+            2,
+            "and re-read the row when the server said it had moved on: {reqs:?}"
         );
     }
 }

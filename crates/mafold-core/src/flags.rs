@@ -46,6 +46,20 @@ pub struct FlagMeta {
 /// The registry. Keys must match the server's control-plane records and the
 /// gate code on every client.
 pub static KNOWN_FLAGS: &[FlagMeta] = &[
+    // `provider:<id>` holds a connection provider back for a cohort: "add a
+    // connection" offers it only where the flag resolves on (web's
+    // `providerOffered`). Google's app is in Testing — Google lets only listed
+    // test accounts consent — so its rollout is an account list, not a percent.
+    FlagMeta {
+        key: "provider:google",
+        default: false,
+        dev_default: true,
+        label: "Google connection",
+        description: "Offers Google (Gmail + Calendar) under Add connection. Its Google app is in \
+                      Testing: only invited test accounts can consent.",
+        owner: "ops",
+        added: "2026-09",
+    },
     FlagMeta {
         key: "starterTutorial",
         default: false,

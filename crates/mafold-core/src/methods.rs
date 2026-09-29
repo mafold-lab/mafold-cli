@@ -179,6 +179,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "listTokens",
     "listVaultDevices",
     "markChannelRead",
+    "markConnectionRelink",
     "markRead",
     "markThreadRead",
     "moments/commentCreate",

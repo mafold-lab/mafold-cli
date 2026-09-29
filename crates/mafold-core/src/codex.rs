@@ -18,7 +18,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::connections::Runtime;
+use crate::connections::{RenewError, Runtime};
 use crate::net;
 use mafold_types::connections::{codex, ProviderInfo};
 
@@ -133,12 +133,19 @@ async fn run_at(
             .map_err(|e| e.to_string())?;
 
         if reply.status == 401 && attempt == 0 {
-            payload = rt.renew(name, conn, spec, &payload).await.map_err(|e| {
-                format!(
-                    "Codex refused this credential and it couldn't be refreshed here ({e}) — \
-                     re-link it: mafold connection add {name} --provider codex-oauth --oauth"
-                )
-            })?;
+            payload = match rt.renew(name, conn, spec, &payload).await {
+                Ok(fresh) => fresh,
+                // The grant is gone (signed out, revoked, spent elsewhere):
+                // mark the row so every surface says "reconnect", unless
+                // another device already healed it.
+                Err(RenewError::Refused(why)) => rt.settle_refusal(name, conn, spec, &why).await?,
+                Err(RenewError::Failed(e)) => {
+                    return Err(format!(
+                        "Codex refused this credential and it couldn't be refreshed here ({e}) — \
+                         re-link it: mafold connection add {name} --provider codex-oauth --oauth"
+                    ))
+                }
+            };
             continue;
         }
         if reply.status >= 400 {
@@ -205,12 +212,19 @@ async fn images_at(
             .map_err(|e| e.to_string())?;
 
         if reply.status == 401 && attempt == 0 {
-            payload = rt.renew(name, conn, spec, &payload).await.map_err(|e| {
-                format!(
-                    "Codex refused this credential and it couldn't be refreshed here ({e}) — \
-                     re-link it: mafold connection add {name} --provider codex-oauth --oauth"
-                )
-            })?;
+            payload = match rt.renew(name, conn, spec, &payload).await {
+                Ok(fresh) => fresh,
+                // The grant is gone (signed out, revoked, spent elsewhere):
+                // mark the row so every surface says "reconnect", unless
+                // another device already healed it.
+                Err(RenewError::Refused(why)) => rt.settle_refusal(name, conn, spec, &why).await?,
+                Err(RenewError::Failed(e)) => {
+                    return Err(format!(
+                        "Codex refused this credential and it couldn't be refreshed here ({e}) — \
+                         re-link it: mafold connection add {name} --provider codex-oauth --oauth"
+                    ))
+                }
+            };
             continue;
         }
 

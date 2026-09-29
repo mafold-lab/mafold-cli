@@ -1407,6 +1407,16 @@ pub struct ConnectionMeta {
     pub key_id: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Set when a device tried to renew this credential and the provider said
+    /// the grant is gone (`invalid_grant`: expired, revoked). Unix seconds;
+    /// absent = nothing known to be wrong. Cleared by any write of the row,
+    /// since every write is a fresh credential. Every surface reads it the
+    /// same way: this row needs its owner to reconnect it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relink_at: Option<i64>,
+    /// The provider's own words for why, bounded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub relink_reason: String,
 }
 
 /// A device enrolled in the user's vault.
