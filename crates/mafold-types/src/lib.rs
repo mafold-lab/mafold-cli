@@ -14,6 +14,9 @@ use uuid::Uuid;
 
 pub mod connections;
 pub mod drive;
+/// Mid-turn words: which running turn takes them, and how they are framed —
+/// one rule for the daemon and the hosted brains (`steer.rs`).
+pub mod steer;
 pub use connections::{
     provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
     PROVIDERS,

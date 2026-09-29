@@ -5060,24 +5060,24 @@ impl Steered {
     }
 }
 
-/// Who a mid-turn message is from, as far as finding its turn goes.
-#[derive(Clone, Copy)]
-struct Speaker<'a> {
-    /// Lowercased — what a turn's `owner` is compared against.
-    lc: &'a str,
-    /// As they write it: the seam and the model's frame name them by it.
-    handle: &'a str,
-    /// An AI account (a2a). Its frame says so, because an @ back to it is what
-    /// hands it the mic.
-    ai: bool,
-    /// Billed per reply. Never folded into anyone else's turn (`pick_turn`).
-    pays: bool,
-}
+// The steering rule is shared with the hosted brains — one rule per Account,
+// whoever runs the bot (`mafold_types::steer`).
+use mafold_core::mafold_types::steer::{self as steering, Speaker};
 
-impl<'a> Speaker<'a> {
-    /// A free human by that handle — the turn's own sender, reporting in.
-    fn person(lc: &'a str) -> Self {
-        Self { lc, handle: lc, ai: false, pays: false }
+/// A turn, as the shared rule sees it.
+impl steering::Running for TurnHandle {
+    type Id = str;
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+    fn channel(&self) -> Option<&str> {
+        self.channel.as_deref()
+    }
+    fn thread(&self) -> Option<&str> {
+        self.thread.as_deref()
+    }
+    fn pays(&self) -> bool {
+        self.pays
     }
 }
 
@@ -5165,17 +5165,10 @@ async fn steer_turn<Fut: std::future::Future<Output = String>>(
     .await
 }
 
-/// The running turn a message belongs in, or None for a turn of its own.
-///
-/// 1. The turn it REPLIES to, when that is the sender's own — explicit, and the
-///    only way to pick between two of their own turns.
-/// 2. The sender's own turn on this surface.
-/// 3. Someone else's turn on this surface — the same agent, in the same
-///    session, and a second one beside it is exactly the fork this exists to
-///    prevent. The one replied to, if it is here; else any. Not when either
-///    side is billed (`TurnHandle::pays`): folded in, a paying sender is
-///    served free, or a payer is charged for someone else's answer. That pair
-///    runs as two turns, and the second forks the session.
+/// The running turn a message belongs in (`steering::pick` — the rule the
+/// hosted brains apply too), among this conversation's turns. That pair
+/// `pick` keeps apart — a billed sender beside a free one — runs as two turns,
+/// and the second forks the session (`cc_conn::lease`).
 fn pick_turn<'s>(
     st: &'s ChatState,
     from: &Speaker<'_>,
@@ -5183,39 +5176,8 @@ fn pick_turn<'s>(
     channel: Option<&str>,
     thread: Option<&str>,
 ) -> Option<&'s TurnHandle> {
-    let here = |t: &TurnHandle| t.channel.as_deref() == channel && t.thread.as_deref() == thread;
     let replied = reply_to.and_then(|r| st.turns.get(r));
-    if let Some(t) = replied.filter(|t| t.owner == from.lc) {
-        return Some(t);
-    }
-    if let Some(t) = st.turns.values().find(|t| t.owner == from.lc && here(t)) {
-        return Some(t);
-    }
-    if from.pays {
-        return None;
-    }
-    let shared = |t: &&TurnHandle| here(t) && !t.pays;
-    replied.filter(shared).or_else(|| st.turns.values().find(shared))
-}
-
-/// What the model is told about words from someone OTHER than the person its
-/// turn is for. Without it they would read as that person's own correction —
-/// the hook says "sent while you were working", and nothing else says by whom.
-fn cross_frame(from: &Speaker<'_>, owner: &str, body: &str) -> String {
-    let (who, mic) = if from.ai {
-        (
-            format!("@{} (an authorized AI account)", from.handle),
-            " An @ to them in your reply hands them the mic; leave it out unless you need them to answer.",
-        )
-    } else {
-        (format!("@{}", from.handle), "")
-    };
-    format!(
-        "[From {who} — NOT @{owner}, whom this turn is for. Sent on this same surface while \
-you were working, by someone who may talk to you here too: it is their own message, so \
-answer it as well, in this reply. It does not change or cancel what @{owner} asked for \
-unless @{owner} says so.{mic}]\n{body}"
-    )
+    steering::pick(st.turns.values(), replied, from, channel, thread)
 }
 
 /// Mark a message as on its way to a turn (see [`Arrival`]). Called by the
@@ -5360,10 +5322,10 @@ async fn inject_into_live_turn<Fut: std::future::Future<Output = String>>(
     // Someone else's words say so — to the model. A background wrap-up is not
     // anyone's words; its prompt already says what it is.
     let body = match seam {
-        Seam::User if cross => cross_frame(&from, &owner, &body),
+        Seam::User if cross => steering::cross_frame(&from, &owner, &body),
         _ => body,
     };
-    let body = crate::steer_hook::said(&body);
+    let body = steering::mailbox::said(&body);
     // That await is SECONDS (`Client::download` retries five times with backoff)
     // and the turn we picked can finish inside it. The end of a turn is ordered:
     // `drop_turn` takes the handle out of the map FIRST, the mailbox drain
@@ -5406,13 +5368,9 @@ async fn inject_into_live_turn<Fut: std::future::Future<Output = String>>(
         // Their TEXT, never `body`: this line is drawn into the VISIBLE reply
         // (`mafold-transcript` `steer_line`), and `body` carries absolute paths
         // on this machine — C:\Users\…\.mafold\attachments\… pasted into a group.
-        //
-        // Someone else's words carry their name, because the reply they land in
-        // is visibly another person's turn. Bare, never `@name`: an @ in the
-        // reply is how an agent is summoned, and the seam must not summon.
+        // Someone else's words carry their name (`steering::seam`).
         let _ = events.send(match seam {
-            Seam::User if cross => AgentEvent::Steered(format!("{}: {}", from.handle, text.trim())),
-            Seam::User => AgentEvent::Steered(text.trim().to_string()),
+            Seam::User => AgentEvent::Steered(steering::seam(&from, &owner, text)),
             Seam::Notice(line) => AgentEvent::Notice(line),
         });
         Some(Steered::Now { mailbox: steer_file, owner })
@@ -5449,11 +5407,9 @@ async fn note_in_running_turns(
     const MAILBOX_CAP: u64 = 512 * 1024;
     let states = chat_states.lock().await;
     let Some(st) = states.get(chat_id) else { return 0 };
-    let entry = crate::steer_hook::background(line);
+    let entry = steering::mailbox::background(line);
     let mut n = 0;
-    for t in st.turns.values().filter(|t| {
-        t.can_steer && t.channel.as_deref() == channel && t.thread.as_deref() == thread
-    }) {
+    for t in st.turns.values().filter(|t| t.can_steer && listens(t, channel, thread)) {
         if std::fs::metadata(&t.steer_file).is_ok_and(|m| m.len() > MAILBOX_CAP) {
             continue;
         }
@@ -5480,20 +5436,19 @@ async fn feed_background(
 ) {
     // Every message in every group comes through here, and almost always
     // nothing is running where it was said — so look before reading it.
+    let (channel, thread) = (m.channel_id.as_deref(), m.thread_root_id.as_deref());
     let listening = chat_states.lock().await.get(&m.conversation_id).is_some_and(|st| {
-        st.turns.values().any(|t| {
-            t.can_steer
-                && t.channel.as_deref() == m.channel_id.as_deref()
-                && t.thread.as_deref() == m.thread_root_id.as_deref()
-        })
+        st.turns.values().any(|t| t.can_steer && listens(t, channel, thread))
     });
     if !listening {
         return;
     }
-    let Some(line) = background_line(
+    // Read the way the opening RECENT CONVERSATION block reads it: the model's
+    // view of the body, the attachment label; the line itself is the shared one.
+    let Some(line) = steering::background_line(
         &m.sender.username,
-        &m.content,
-        raw_attachments,
+        &model_view(&m.content),
+        &attachment_label(raw_attachments),
         m.reply_to_sender.as_deref(),
         forwarded,
     ) else {
@@ -5512,49 +5467,10 @@ async fn feed_background(
     }
 }
 
-/// A message as a background line: `@who (replying to @x): text [attached: …]`,
-/// read the way the opening RECENT CONVERSATION block reads it (`model_view`,
-/// the same per-message cap, head and tail kept). None when there is nothing
-/// to read — a sticker the label can't name, an empty body.
-fn background_line(
-    who: &str,
-    content: &str,
-    attachments: &[serde_json::Value],
-    reply_to_sender: Option<&str>,
-    forwarded: bool,
-) -> Option<String> {
-    let view = model_view(content);
-    let attach = attachment_label(attachments);
-    let text = clip_head_tail(&view, RECENT_MAX_CHARS);
-    let body = match (text.is_empty(), attach.is_empty()) {
-        (true, true) => return None,
-        (true, false) => format!("[{attach}]"),
-        (false, true) => text,
-        (false, false) => format!("{text}\n[{attach}]"),
-    };
-    let note = match (reply_to_sender, forwarded) {
-        (_, true) => " (forwarded)".to_string(),
-        (Some(r), false) => format!(" (replying to @{r})"),
-        (None, false) => String::new(),
-    };
-    Some(format!("@{who}{note}: {body}"))
-}
-
-/// Per-message cap for anything quoted into the model's view of the room.
-/// One uniform budget for every sender — see `recent_group_context`.
-const RECENT_MAX_CHARS: usize = 2000;
-
-/// `text` if it fits in `max` chars, else its head and tail. Long agent
-/// messages put their conclusion at the end, so a plain cut loses exactly the
-/// part worth reading.
-fn clip_head_tail(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let head: String = chars[..max * 3 / 4].iter().collect();
-    let tail: String = chars[chars.len() - max / 4..].iter().collect();
-    format!("{head}\n…[truncated]…\n{tail}")
+/// Does this turn hear the room on this surface? The same surface rule `pick`
+/// uses, so what a turn is steered from and what it hears never disagree.
+fn listens(t: &TurnHandle, channel: Option<&str>, thread: Option<&str>) -> bool {
+    steering::on_surface(t.channel.as_deref(), t.thread.as_deref(), channel, thread)
 }
 
 /// Cancel ONE turn by its draft message id (the run-card Stop button → it stops
@@ -7153,7 +7069,7 @@ async fn recent_group_context(
     // long message's conclusion survives (see below); the cards themselves no
     // longer reach it (`model_view`). Shared with the background lines a
     // running turn gets later (`background_line`): the same room, read alike.
-    const MAX_CHARS: usize = RECENT_MAX_CHARS;
+    const MAX_CHARS: usize = steering::MESSAGE_MAX_CHARS;
     // Whole-block cap: a card-heavy chat could otherwise inject 30 × MAX_CHARS.
     // Past this, OLDEST rows are dropped first.
     const TOTAL_BUDGET: usize = 24_000;
@@ -7266,7 +7182,7 @@ async fn recent_group_context(
         let body = if text.is_empty() {
             if attach.is_empty() { continue; } else { format!("[{attach}]") }
         } else {
-            clip_head_tail(text, MAX_CHARS)
+            steering::head_tail(text, MAX_CHARS)
         };
         // Text AND a file is the normal case ("看看我发的这个" + the file), and the
         // text alone never says which file — so the label rides along with it.
@@ -8279,7 +8195,7 @@ async fn handle(
     // Claimed by the same atomic rename the hook uses: exactly one of the two
     // ever gets a given message. The room's background alone is not a message
     // anyone sent it, and goes with the temp file (`steer_hook::followup`).
-    let leftover = crate::steer_hook::take(&steer_file).and_then(|raw| crate::steer_hook::followup(&raw));
+    let leftover = crate::steer_hook::take(&steer_file).and_then(|raw| steering::mailbox::followup(&raw));
     let _ = std::fs::remove_file(&steer_file);
     match client.finish_draft(&msg_id, &final_content, if clean_end { trigger_id } else { None }).await {
         Ok(true) => println!("→ finalized reply for chat {chat_id}"),
@@ -12138,36 +12054,12 @@ mod steer_tests {
         let s = states(vec![("d1", t)]).await;
         note_in_running_turns(&s, "c1", None, None, "@fei: 午饭吃啥").await;
         let raw = std::fs::read_to_string(&f).unwrap();
-        assert_eq!(crate::steer_hook::followup(&raw), None, "small talk bought a reply");
+        assert_eq!(steering::mailbox::followup(&raw), None, "small talk bought a reply");
         steer(&s, "c1", None, None, "eons", None, "帮我也看下 README").await;
         let raw = crate::steer_hook::take(&f).unwrap();
-        let next = crate::steer_hook::followup(&raw).unwrap();
+        let next = steering::mailbox::followup(&raw).unwrap();
         assert!(next.find("午饭吃啥").unwrap() < next.find("帮我也看下 README").unwrap(), "{next}");
         assert!(next.contains("From @eons — NOT @ops"), "{next}");
-    }
-
-    /// A background line reads the way the opening RECENT CONVERSATION rows do:
-    /// who, what they were replying to, what they said, what they attached.
-    #[test]
-    fn a_background_line_reads_like_a_recent_conversation_row() {
-        assert_eq!(
-            background_line("fei", "好的", &[], Some("ops"), false).as_deref(),
-            Some("@fei (replying to @ops): 好的")
-        );
-        let photo = serde_json::json!([{ "kind": "photo" }]);
-        assert_eq!(
-            background_line("fei", "看这个", photo.as_array().unwrap(), None, false).as_deref(),
-            Some("@fei: 看这个\n[attached: a photo]")
-        );
-        assert_eq!(
-            background_line("fei", "", photo.as_array().unwrap(), None, true).as_deref(),
-            Some("@fei (forwarded): [attached: a photo]")
-        );
-        assert_eq!(background_line("fei", "   ", &[], None, false), None);
-        let long = format!("{}END", "字".repeat(5000));
-        let line = background_line("fei", &long, &[], None, false).unwrap();
-        assert!(line.contains("…[truncated]…") && line.ends_with("END"), "the conclusion was cut");
-        assert!(line.chars().count() < 2100);
     }
 
     /// Channel scope, the same one `/stop` respects: a turn running in another

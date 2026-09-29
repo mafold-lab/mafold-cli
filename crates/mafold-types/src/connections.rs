@@ -427,6 +427,59 @@ pub mod github {
     pub const SECRET_ENV: &str = "GITHUB_OAUTH_CLIENT_SECRET";
 }
 
+// MARK: - Google OAuth constants
+//
+// Mafold's registered Google app, brokered for the same measured reason as
+// GitHub and Figma. Probed 2026-09-29:
+//
+//   GET https://accounts.google.com/.well-known/openid-configuration
+//     → no `registration_endpoint`, and `token_endpoint_auth_methods_supported`
+//       is only `client_secret_post` / `client_secret_basic`
+//
+// So a browser cannot finish the exchange alone and the secret lives on the api
+// host. The client is a "Web application" whose authorized redirect is the page
+// below (and the dev server's), registered by its owner in Google Cloud.
+//
+// ⚠️ The project behind this client is, for now, fei's TEST project (publishing
+// status "Testing", test users added by hand) — owner ruling 2026-09-29. That
+// has two consequences worth knowing before debugging anything:
+//   * only listed test users can consent at all; everyone else is stopped at
+//     Google's consent screen, which is the correct place for it;
+//   * Google expires a Testing app's refresh tokens after 7 days. The renewal
+//     is then answered `invalid_grant`, the row is marked "needs reconnecting",
+//     and the Connections row offers one click — that is the designed path,
+//     not a fault.
+// Moving to a Mafold-owned production project is a new `CLIENT_ID` + secret;
+// grants minted for this one then fail renewal at the broker (unknown client
+// id), get marked, and are reconnected once.
+//
+// This is NOT the "Sign in with Google" binding (`identity_api.rs`): a
+// different project, a different secret, and a different review lifecycle.
+pub mod google {
+    pub const CLIENT_ID: &str =
+        "163267733042-rnrfhj2eo62veu36a6vi31ibt87a9h1g.apps.googleusercontent.com";
+    pub const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+    /// Mafold's broker, NOT Google — see [`super::BrokerSpec`].
+    pub const TOKEN_ENDPOINT: &str = "https://api.mafold.com/api/exchangeConnectionToken";
+    /// Google mints and renews at one URL.
+    pub const UPSTREAM_TOKEN: &str = "https://oauth2.googleapis.com/token";
+    pub const UPSTREAM_REFRESH: &str = "https://oauth2.googleapis.com/token";
+    /// The page we serve; the browser finishes the link alone.
+    pub const REDIRECT_URI: &str = "https://mafold.com/app/link/callback";
+    /// Read mail, send mail, read the calendar — the owner-agreed set, and the
+    /// calendar half read-only AT THE GRANT: a token that could write a
+    /// calendar could be made to, whatever tools a catalog lists.
+    ///
+    /// `gmail.readonly` is a RESTRICTED scope. In Testing that costs nothing;
+    /// publishing to everyone means Google's restricted-scope review plus an
+    /// annual CASA assessment. `gmail.send` and `calendar.readonly` are only
+    /// sensitive.
+    pub const SCOPES: &str = "https://www.googleapis.com/auth/gmail.readonly \
+        https://www.googleapis.com/auth/gmail.send \
+        https://www.googleapis.com/auth/calendar.readonly";
+    pub const SECRET_ENV: &str = "GOOGLE_CONNECTION_CLIENT_SECRET";
+}
+
 /// What a `computer` connection holds. Nothing here is a secret in the sense
 /// the rest of this file means — a device id is not a password, and holding it
 /// grants nothing. It is sealed anyway, and that is the point: **the binding is
@@ -939,6 +992,53 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 upstream_token: github::UPSTREAM_TOKEN,
                 upstream_refresh: github::UPSTREAM_REFRESH,
                 secret_env: github::SECRET_ENV,
+            }),
+        }),
+    },
+    // Gmail and Calendar, one consent, one row — see `google` above for why it
+    // is brokered, why its project is a TEST project for now, and what the
+    // weekly `invalid_grant` means.
+    //
+    // A native driver rather than `mcp_url`: Google's own MCP servers
+    // (`gmailmcp.googleapis.com`, `calendarmcp.googleapis.com`) are Developer
+    // Preview only, the Gmail one cannot send (drafts only) and demands the
+    // restricted `gmail.compose`, and they are two endpoints — two links for
+    // one account. The OAuth half below is exactly what an MCP row would need
+    // too; the day those servers can do the job, this row gains an `mcp_url`
+    // and drops the driver, and linking does not change.
+    ProviderSpec {
+        id: "google",
+        display: "Google",
+        blurb: "Read and send Gmail, read your calendar",
+        // Google's own "G", on white at the size the other marks use.
+        badge: "google",
+        kind: ProviderKind::OAuth,
+        fields: OAUTH_RENEWABLE_BAG,
+        import_path: None,
+        env_var: None,
+        auth: BEARER,
+        // Brokered, so it must not claim the browser-alone flag — same as
+        // `github` and `figma-oauth`.
+        oauth_capable: false,
+        // Where the person reviews or removes what they granted.
+        help_url: Some("https://myaccount.google.com/connections"),
+        mcp_url: None,
+        native_api: Some("google-workspace"),
+        device_bound: false,
+        oauth_client: Some(OAuthClientSpec {
+            client_id: google::CLIENT_ID,
+            authorize_url: google::AUTHORIZE_URL,
+            token_endpoint: google::TOKEN_ENDPOINT,
+            redirect_uri: google::REDIRECT_URI,
+            scopes: google::SCOPES,
+            // Both or no refresh token: `offline` asks for one, `consent`
+            // makes Google hand it out again on a RE-connect (it otherwise
+            // returns one only on the very first consent).
+            extra_params: &[("access_type", "offline"), ("prompt", "consent")],
+            broker: Some(BrokerSpec {
+                upstream_token: google::UPSTREAM_TOKEN,
+                upstream_refresh: google::UPSTREAM_REFRESH,
+                secret_env: google::SECRET_ENV,
             }),
         }),
     },
@@ -1490,6 +1590,7 @@ mod tests {
                 "figma",
                 "figma-oauth",
                 "github",
+                "google",
                 "computer",
                 "mcp",
             ]
@@ -2155,5 +2256,62 @@ mod tests {
             !scopes.contains(&"write:packages"),
             "publishing packages is not something connecting should grant"
         );
+    }
+
+    /// Google is ONE row, linked by the browser alone, through the broker —
+    /// Google issues no public web client and its token endpoint accepts only
+    /// `client_secret_basic` / `client_secret_post` (probed 2026-09-29).
+    #[test]
+    fn google_is_one_brokered_row_the_browser_can_finish_alone() {
+        let ids: Vec<&str> = PROVIDERS.iter().filter(|p| p.id.starts_with("google")).map(|p| p.id).collect();
+        assert_eq!(ids, vec!["google"], "§3.6: one provider, one way in");
+
+        let info = provider_infos().into_iter().find(|i| i.id == "google").unwrap();
+        assert!(info.oauth && info.browser_linkable && !info.device_link);
+        assert_eq!(info.native_api.as_deref(), Some("google-workspace"));
+        assert!(info.mcp_url.is_none(), "Google's MCP servers are preview-only and cannot send");
+        let fixed = info.oauth_fixed.expect("the browser needs the fixed client parameters");
+        assert!(fixed.token_endpoint.contains("exchangeConnectionToken"));
+        assert_eq!(fixed.client_id, google::CLIENT_ID);
+
+        let b = provider("google").unwrap().oauth_client.unwrap().broker.unwrap();
+        assert_eq!(b.upstream_token, "https://oauth2.googleapis.com/token");
+        assert_eq!(b.upstream_refresh, b.upstream_token);
+        // NOT the sign-in binding's secret: a different Google project, and a
+        // different lifecycle (this one heads for restricted-scope review).
+        assert_eq!(b.secret_env, "GOOGLE_CONNECTION_CLIENT_SECRET");
+        assert!(google::REDIRECT_URI.starts_with("https://mafold.com/"));
+    }
+
+    /// The agreed scopes, exactly — and read-only at the GRANT for the
+    /// calendar, not merely in the tool list: a token that can write a
+    /// calendar can be made to, whatever the catalog says (owner, 09-29).
+    #[test]
+    fn google_asks_for_exactly_the_agreed_scopes_and_cannot_write_a_calendar() {
+        let scopes: Vec<&str> = google::SCOPES.split(' ').collect();
+        assert_eq!(
+            scopes,
+            vec![
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.send",
+                "https://www.googleapis.com/auth/calendar.readonly",
+            ]
+        );
+        for s in scopes.iter().filter(|s| s.contains("/auth/calendar")) {
+            assert!(s.ends_with(".readonly"), "{s} would let the token change a calendar");
+        }
+        assert!(!google::SCOPES.contains("mail.google.com"), "full mailbox access is not agreed");
+    }
+
+    /// Google hands out a refresh token only for `access_type=offline`, and on
+    /// a repeat consent only with `prompt=consent`. Without both, a connection
+    /// works for an hour and then can never renew — and a RE-connect (the
+    /// "needs reconnecting" button) would come back with no refresh token at
+    /// all, because the person already consented once.
+    #[test]
+    fn google_asks_for_a_refresh_token_every_time() {
+        let oc = provider("google").unwrap().oauth_client.unwrap();
+        assert!(oc.extra_params.contains(&("access_type", "offline")));
+        assert!(oc.extra_params.contains(&("prompt", "consent")));
     }
 }

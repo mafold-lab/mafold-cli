@@ -342,6 +342,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "walletTransferDecline",
     "walletTransferOffer",
     "ws",
+    "wsFocus",
 ];
 
 /// Is `method` in the api's route table? (Binary search — the list is sorted.)

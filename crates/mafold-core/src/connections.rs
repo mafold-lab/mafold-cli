@@ -1906,6 +1906,8 @@ mod tests {
         let mut driven = info("github");
         driven.native_api = Some(crate::google::DRIVER.to_string());
         assert!(credential_stays_inside(&driven));
+        // …and the real `google` row is one of them: its token is spent, never shown.
+        assert!(credential_stays_inside(&info("google")));
         for id in ["figma-oauth", "github", "notion", "anthropic-api", "codex-oauth", "mcp"] {
             assert!(!credential_stays_inside(&info(id)), "{id}");
         }

@@ -1288,7 +1288,11 @@ retry {attempt}/{} in {delay:?}…",
             .base
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1);
-        format!("{ws}/api/ws")
+        // `nodrafts`: this process acts on finished messages only (see
+        // REPLAY_METHODS), so the server keeps every streaming draft snapshot,
+        // token delta and typing ping off this socket — they were ~all of its
+        // traffic (six daemons on one Mac took ~940MB each in 32 minutes).
+        format!("{ws}/api/ws?caps=nodrafts")
     }
 
     /// The WS handshake request — sends the bot token via an `Authorization:
