@@ -356,13 +356,22 @@ impl<S: Storage> Store<S> {
     /// `reconcile` runs the optimistic-send scan (skipped by `replace_messages`,
     /// which just cleared the window — there's nothing to reconcile against, and
     /// scanning per insert is what made the batch O(n²)).
+    /// A finalize is terminal, so it decides first: a finished copy is later
+    /// than every draft copy, and revisions only order two copies on the same
+    /// side of it. They can't order across an api restart — a streaming
+    /// draft's revision lives in the server's memory until finalize, and a
+    /// restarted process renumbers it from 1. The TypeScript twin of this rule
+    /// is `client-shared/messageVersion.ts`.
     fn older_message(incoming: &CoreMessage, current: &CoreMessage) -> bool {
         let revision = |m: &CoreMessage| m.payload.as_deref()
             .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
             .and_then(|p| p.get("content_revision").and_then(|v| v.as_u64()))
             .unwrap_or(0);
-        (current.finalized_at_ms.is_some() && incoming.finalized_at_ms.is_none())
-            || revision(incoming) < revision(current)
+        match (incoming.finalized_at_ms.is_some(), current.finalized_at_ms.is_some()) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => revision(incoming) < revision(current),
+        }
     }
 
     async fn upsert_message_locked(&self, m: &CoreMessage, reconcile: bool) {
@@ -1213,6 +1222,39 @@ mod tests {
             new.payload = Some(r#"{"content_revision":5}"#.into());
             s.upsert_message(&new).await;
             assert_eq!(s.messages("conv").await[0].content, "edited");
+        });
+    }
+
+    /// 2026-09-29: an api restart renumbers a streaming draft from 1 (its
+    /// revision lives in the server's memory until finalize), so the finished
+    /// reply came back at revision 786 while this cache held the pre-restart
+    /// draft at 1500 — and kept it, through every upsert AND every history
+    /// replacement. A finalize is terminal: the finished copy wins whatever the
+    /// revisions say, and a draft still never reopens a finished one.
+    #[test]
+    fn a_finalized_copy_outranks_any_draft_copy_whatever_the_revisions() {
+        let s = store();
+        pollster::block_on(async {
+            let mut draft = msg("e8a03cfc", "chan", None, 100, None);
+            draft.finalized_at_ms = None;
+            draft.content = "Ran 81 tools … generating".into();
+            draft.payload = Some(r#"{"content_revision":1500}"#.into());
+            let mut done = draft.clone();
+            done.finalized_at_ms = Some(200);
+            done.content = "Ran 119 tools … ⏹ Stopped.".into();
+            done.payload = Some(r#"{"content_revision":786}"#.into());
+
+            s.upsert_message(&draft).await;
+            s.upsert_message(&done).await;
+            assert_eq!(s.messages("chan").await[0].content, "Ran 119 tools … ⏹ Stopped.", "upsert");
+
+            s.replace_messages("chan", &[draft.clone()]).await;
+            assert_eq!(s.messages("chan").await[0].content, "Ran 119 tools … ⏹ Stopped.", "a draft never reopens it");
+
+            let other = store();
+            other.upsert_message(&draft).await;
+            other.replace_messages("chan", &[done.clone()]).await;
+            assert_eq!(other.messages("chan").await[0].content, "Ran 119 tools … ⏹ Stopped.", "history replacement");
         });
     }
 

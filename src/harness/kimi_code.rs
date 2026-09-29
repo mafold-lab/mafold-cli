@@ -72,6 +72,10 @@ impl Harness for KimiCode {
             conv,
             surface: _,
             draft,
+            // Claude Code's today; Kimi's `extra_skill_dirs` is wired after it
+            // is measured (`.docs/bot-drive-v1.md` §5.5).
+            mount: _,
+            memory_guard: _,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");

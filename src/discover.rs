@@ -183,9 +183,23 @@ pub fn all(workdir: &str) -> Value {
     let home = home_dir();
     scan_commands(&home.join(".claude/commands"), "", &mut found);
     scan_skills(&home.join(".claude/skills"), "", &mut found);
-    // 3. Installed plugins.
+    // 3. The plugin folders every turn is mounted with (`crate::drive`):
+    //    Mafold's own and the bot's drive, named `<plugin>:<skill>` exactly as
+    //    the agent sees them (the plugin name is the manifest's, not the folder's).
+    let mounted = std::iter::once(crate::drive::mafold_plugin_dir())
+        .chain(crate::drive::current().map(|m| PathBuf::from(m.root())));
+    for dir in mounted {
+        let name = std::fs::read(dir.join(".claude-plugin").join("plugin.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v["name"].as_str().map(str::to_string));
+        if let Some(name) = name {
+            scan_skills(&dir.join("skills"), &format!("{name}:"), &mut found);
+        }
+    }
+    // 4. Installed plugins.
     scan_plugins(&home, &mut found);
-    // 4. Built-ins.
+    // 5. Built-ins.
     for (cmd, desc) in BUILTINS {
         found.entry((*cmd).to_string()).or_insert(Found {
             description: (*desc).to_string(),

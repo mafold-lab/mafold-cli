@@ -138,6 +138,14 @@ impl PoolKey {
             sys_sig.unwrap_or_else(|| "-".into()),
         ))
     }
+
+    /// What the process is pointed at (`super::Mount`): its plugin folders and
+    /// memory folder are fixed at spawn, so a process started with one mount
+    /// never serves a turn that needs another — e.g. the moment a bot's memory
+    /// moves into its drive.
+    pub fn with_mount(self, mount: &super::Mount) -> Self {
+        Self(format!("{}\u{1}{}", self.0, mount.signature()))
+    }
 }
 
 /// State the reader task keeps current for the whole life of the connection —
@@ -233,6 +241,7 @@ pub struct Conn {
 /// as still running forever. It stays a command hook, where that contract holds.
 const CB_ASK: &str = "mf-ask";
 const CB_STEER: &str = "mf-steer";
+const CB_MEMGUARD: &str = "mf-memguard";
 
 impl Conn {
     /// Spawn a process for `key`. `configure` receives the `Command` so the
@@ -339,6 +348,11 @@ impl Conn {
         if ask {
             pre.push(serde_json::json!({ "matcher": "AskUserQuestion", "hookCallbackIds": [CB_ASK] }));
         }
+        // File writes, so a turn the bot's owner didn't trigger can't change
+        // its memory (`crate::drive::guard_response`). Registered for every
+        // process: which turns are guarded is decided per turn (`TurnEnv::
+        // memory_ro`), and a pooled process serves many turns.
+        pre.push(serde_json::json!({ "matcher": "Write|Edit|MultiEdit|NotebookEdit", "hookCallbackIds": [CB_MEMGUARD] }));
         let mut hooks = serde_json::Map::new();
         if !pre.is_empty() {
             hooks.insert("PreToolUse".into(), Value::Array(pre));
@@ -652,6 +666,10 @@ async fn handle_hook(shared: Arc<Shared>, out: UnboundedSender<String>, v: Value
         CB_STEER => {
             let f = shared.turn.lock().unwrap().steer.clone();
             if f.is_empty() { None } else { crate::steer_hook::response(&f) }
+        }
+        CB_MEMGUARD => {
+            let guarded = shared.turn.lock().unwrap().memory_ro.clone();
+            crate::drive::guard_response(&req["input"]["tool_input"], &guarded)
         }
         _ => None,
     };
@@ -969,6 +987,24 @@ fn orphaned_text_preview(frames: &[Value]) -> String {
     }
     let shown: String = flat.chars().take(PREVIEW).collect();
     format!("{shown}{}", if flat.chars().count() > PREVIEW { "…" } else { "" })
+}
+
+/// Retire the parked processes that could be started afresh at no cost: the
+/// bot's skills changed, and a process lists its skills once, at start. One
+/// running in-process work (a subagent, a workflow) is kept — killing it would
+/// kill that work; it picks up the new skills when it's next replaced.
+/// Returns how many went.
+pub fn drop_idle() -> usize {
+    let mut p = pool().lock().unwrap();
+    let before = p.len();
+    p.retain_mut(|c| {
+        if c.busy_with_tasks() {
+            return true;
+        }
+        c.kill();
+        false
+    });
+    before - p.len()
 }
 
 /// Drop everything — called before the daemon re-execs itself so an update

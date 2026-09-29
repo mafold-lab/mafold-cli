@@ -17,3 +17,7 @@ chrono = { version = "0.4", default-features = false, features = ["serde"] }
 # only way to guarantee that is one function in the crate both depend on.
 # Pure computation, no getrandom — the crate stays wasm-clean.
 sha2 = { version = "0.10", default-features = false }
+# NFC for drive paths (`drive::validate_path`): one file must have one spelling
+# on every mirror, and APFS hands back decomposed names. Pure tables — the
+# crate stays wasm-clean.
+unicode-normalization = "0.1.25"

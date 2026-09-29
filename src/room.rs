@@ -429,15 +429,30 @@ async fn resolve_app(client: &Client, conv: &str, app: Option<String>) -> Result
     }
 }
 
-/// Install the `mafold-room` skill into the agent's Claude Code skills dir so the
-/// bot's claude discovers it. Idempotent; called on daemon startup.
+/// Install the `mafold-room` skill into the daemon's OWN plugin
+/// (`~/.mafold/plugins/mafold`, handed to claude as a second `--plugin-dir`
+/// beside the bot's drive — `crate::drive`), where the agent sees it as
+/// `mafold:mafold-room`. Idempotent; called on daemon startup.
+///
+/// It used to be written into `~/.claude/skills`, the owner's GLOBAL skills:
+/// every Claude Code session on the machine picked it up, TUI included, and so
+/// did Kimi (it reads that folder too). The copy left there by an older daemon
+/// is removed — but only if it is byte-for-byte ours.
 pub fn install_skill() -> Result<()> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("no HOME"))?;
-    let dir = home.join(".claude").join("skills").join("mafold-room");
+    let plugin = crate::drive::mafold_plugin_dir();
+    let dir = plugin.join("skills").join("mafold-room");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("SKILL.md"), SKILL_MD)?;
+    let manifest = plugin.join(".claude-plugin");
+    std::fs::create_dir_all(&manifest)?;
+    std::fs::write(manifest.join("plugin.json"), r#"{"name":"mafold"}"#)?;
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        let old = home.join(".claude").join("skills").join("mafold-room");
+        if std::fs::read_to_string(old.join("SKILL.md")).is_ok_and(|s| s == SKILL_MD) {
+            let _ = std::fs::remove_file(old.join("SKILL.md"));
+            let _ = std::fs::remove_dir(&old);
+        }
+    }
     Ok(())
 }
 

@@ -23,6 +23,7 @@ mod connection;
 mod daemon;
 mod discover;
 mod drafts;
+mod drive;
 mod harness;
 mod inbox;
 mod install;
@@ -334,6 +335,10 @@ enum Cmd {
     /// Not for humans.
     #[command(hide = true)]
     SteerHook,
+    /// (internal) PreToolUse hook claude runs on file writes — refuses writes
+    /// into the bot's memory on a turn its owner didn't trigger. Not for humans.
+    #[command(hide = true)]
+    DriveHook,
     /// (internal) The stdio MCP server claude asks when a permission RULE says a
     /// human has to approve a tool call — puts the question in the chat as an
     /// ask card and blocks on the tap. Not for humans.
@@ -382,6 +387,9 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::SteerHook) {
         return steer_hook::run();
+    }
+    if matches!(cli.cmd, Cmd::DriveHook) {
+        return drive::run_hook();
     }
     if matches!(cli.cmd, Cmd::PermissionMcp) {
         return permission_mcp::run();
@@ -663,7 +671,7 @@ async fn main() -> Result<()> {
         | Cmd::Account { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
-        | Cmd::SteerHook | Cmd::PermissionMcp => unreachable!(),
+        | Cmd::SteerHook | Cmd::DriveHook | Cmd::PermissionMcp => unreachable!(),
     }
     Ok(())
 }

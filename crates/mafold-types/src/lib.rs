@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod connections;
+pub mod drive;
 pub use connections::{
     provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
     PROVIDERS,

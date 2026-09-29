@@ -85,6 +85,36 @@ pub struct TurnShape {
     pub thinking: Option<u32>,
     pub system: Option<String>,
     pub env: Vec<(String, String)>,
+    pub mount: Mount,
+}
+
+/// What the agent PROCESS is pointed at besides its workdir: the plugin
+/// folders its skills come from (Mafold's own, then the bot's drive) and, once
+/// the bot's memory lives in its drive, the folder its memory goes to
+/// (`crate::drive`). Process-level: a warm process started with one mount
+/// never serves a turn that needs another (it's part of the pool key).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Mount {
+    pub plugin_dirs: Vec<String>,
+    pub memory_dir: Option<String>,
+}
+
+impl Mount {
+    /// Stable text for the pool key.
+    pub fn signature(&self) -> String {
+        format!("{}|{}", self.plugin_dirs.join(","), self.memory_dir.as_deref().unwrap_or(""))
+    }
+
+    /// Merge `autoMemoryDirectory` into a `--settings` JSON blob. Merged, not
+    /// passed as a second `--settings`: one process takes one settings blob.
+    pub fn settings(&self, blob: &str) -> String {
+        let Some(dir) = &self.memory_dir else { return blob.to_string() };
+        let mut v: serde_json::Value = serde_json::from_str(blob).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(o) = v.as_object_mut() {
+            o.insert("autoMemoryDirectory".into(), serde_json::Value::String(dir.clone()));
+        }
+        v.to_string()
+    }
 }
 
 pub struct Turn {
@@ -136,6 +166,14 @@ pub struct Turn {
     /// (`CODEX_HOME`) goes through the same door. Applied verbatim on top of
     /// the daemon's own env; empty = the harness's default login.
     pub env: Vec<(String, String)>,
+    /// See [`Mount`].
+    pub mount: Mount,
+    /// The bot's memory folder, when THIS turn may not change it — someone
+    /// other than the owner triggered it (owner call 2026-09-29: the bot's
+    /// memory is read by every conversation, so only its owner's turns write
+    /// it). A PreToolUse hook refuses file writes under it; the daemon undoes
+    /// whatever slips past once the turn ends.
+    pub memory_guard: Option<String>,
 }
 
 /// The seat behind a turn said no: its usage window is full.

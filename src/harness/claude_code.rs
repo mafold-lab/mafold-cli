@@ -49,7 +49,8 @@ impl Harness for ClaudeCode {
         let key = cc_conn::PoolKey::new(
             &shape.conv, &shape.surface, &shape.workdir, shape.model.as_deref(),
             shape.effort.as_deref(), shape.thinking, shape.system.as_deref(), &shape.env,
-        );
+        )
+        .with_mount(&shape.mount);
         // Nothing to gain when one is already warm (or already on its way), and
         // a second process for the same key would just sit out its TTL.
         let Some(sid) = shape.session.clone() else { return };
@@ -101,7 +102,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount, memory_guard } = turn;
         let _ = sink.send(AgentEvent::Stats(RunStats {
             effort: effort.clone(), ..Default::default()
         }));
@@ -121,7 +122,8 @@ impl Harness for ClaudeCode {
             thinking,
             system.as_deref(),
             &env,
-        );
+        )
+        .with_mount(&mount);
         let exe = std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
@@ -136,6 +138,7 @@ impl Harness for ClaudeCode {
             thinking,
             system: system.clone(),
             env: env.clone(),
+            mount: mount.clone(),
         };
         // Held for the whole run. Taken BEFORE the command is built, so the
         // answer to "is another turn of ours on this session" is settled and
@@ -216,6 +219,7 @@ impl Harness for ClaudeCode {
             steer: steer_file.clone().unwrap_or_default(),
             perm: ask_file.as_ref().map(|af| format!("{af}.perm")).unwrap_or_default(),
             surface: surface.clone(),
+            memory_ro: memory_guard.clone().unwrap_or_default(),
         };
         crate::turnenv::write(&crate::turnenv::path_for(&conn.id), &tenv);
         // An OLDER `mafold` on the agent's $PATH still reads `MAFOLD_DRAFT` from
@@ -1168,6 +1172,13 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
             // which pops a Python dock icon and adds seconds of startup latency
             // per reply. The daemon passes no --mcp-config, so this loads none.
             .arg("--strict-mcp-config");
+        // The skills this bot has: Mafold's own plugin, then the bot's drive
+        // (`crate::drive`). Per PROCESS — a `--resume` that leaves them out has
+        // no skills at all (measured, CC 2.1.282) — so every spawn path, one-shot,
+        // resumed and pre-warmed alike, goes through here.
+        for d in &shape.mount.plugin_dirs {
+            cmd.arg("--plugin-dir").arg(d);
+        }
         if let Some(m) = &shape.model {
             cmd.arg("--model").arg(m);
         }
@@ -1235,8 +1246,19 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
             "matcher": "Bash",
             "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
         });
-        let bash_only = serde_json::json!({ "hooks": { "PreToolUse": [bash_hook.clone()] } }).to_string();
+        // `autoMemoryDirectory` rides in whichever settings blob the process
+        // gets (`Mount::settings`) — one blob per process, so merged, not added.
+        let bash_only = shape.mount.settings(&serde_json::json!({ "hooks": { "PreToolUse": [bash_hook.clone()] } }).to_string());
         pre.push(bash_hook);
+        // A turn someone other than the owner triggered may not change the
+        // bot's memory. In-process this is a control-channel hook (`cc_conn`);
+        // this is its command form, for a CLI that can't do those.
+        if shape.mount.memory_dir.is_some() {
+            pre.push(serde_json::json!({
+                "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+                "hooks": [{ "type": "command", "command": format!("\"{exe}\" drive-hook") }]
+            }));
+        }
         {
             pre.push(serde_json::json!({
                 "matcher": "AskUserQuestion",
@@ -1278,7 +1300,7 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
             // to read the CURRENT turn rather than the environment this process
             // was born with), so this is kept as the fallback for a CLI that
             // can't do that. Attaching both would fire every hook twice.
-            hook_settings = Some(serde_json::json!({ "hooks": hooks }).to_string());
+            hook_settings = Some(shape.mount.settings(&serde_json::json!({ "hooks": hooks }).to_string()));
         }
         cmd.kill_on_drop(true);
         let mut forks = false;
@@ -1560,11 +1582,49 @@ mod tests {
             thinking: None,
             system: None,
             env: vec![],
+            mount: Default::default(),
         }
     }
 
     fn args(b: &Built) -> Vec<String> {
         b.cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    /// The drive mount is per PROCESS and `--resume` doesn't carry it (measured,
+    /// CC 2.1.282: no `--plugin-dir` on a resume = no skills), so every way a
+    /// process starts — fresh, resumed, forked — must carry both plugin folders
+    /// and the memory folder, and the memory folder must be in BOTH settings
+    /// blobs (control-hook and command-hook processes get different ones).
+    #[test]
+    fn every_spawn_path_carries_the_drive_mount() {
+        let mount = super::super::Mount {
+            plugin_dirs: vec!["/h/.mafold/plugins/mafold".into(), "/h/.mafold/drives/0123456789ab".into()],
+            memory_dir: Some("/h/.mafold/drives/0123456789ab/memory".into()),
+        };
+        let sid = format!("mount-test-{}", std::process::id());
+        let fresh = super::super::TurnShape { session: None, mount: mount.clone(), ..resuming(&sid) };
+        let resumed = super::super::TurnShape { mount: mount.clone(), ..resuming(&sid) };
+        for (label, b) in [
+            ("fresh", build_cmd(&fresh, "mafold", false)),
+            ("resumed", build_cmd(&resumed, "mafold", false)),
+            ("forked", build_cmd(&resumed, "mafold", true)),
+        ] {
+            let a = args(&b);
+            let dirs: Vec<&str> = a.windows(2).filter(|w| w[0] == "--plugin-dir").map(|w| w[1].as_str()).collect();
+            assert_eq!(dirs, ["/h/.mafold/plugins/mafold", "/h/.mafold/drives/0123456789ab"], "{label}");
+            for blob in [Some(b.bash_only.clone()), b.hook_settings.clone()].into_iter().flatten() {
+                let v: Value = serde_json::from_str(&blob).unwrap();
+                assert_eq!(v["autoMemoryDirectory"], "/h/.mafold/drives/0123456789ab/memory", "{label}: {blob}");
+                assert!(v["hooks"]["PreToolUse"].is_array(), "the hooks are still there: {blob}");
+            }
+            let hooks = b.hook_settings.clone().unwrap_or_default();
+            assert!(hooks.contains("drive-hook"), "{label}: the command-form memory guard is registered");
+        }
+        // Without a memory folder nothing about memory is said at all.
+        let plain = build_cmd(&resuming(&sid), "mafold", false);
+        assert!(!plain.bash_only.contains("autoMemoryDirectory"));
+        assert!(!plain.hook_settings.clone().unwrap_or_default().contains("drive-hook"));
+        assert!(!args(&plain).iter().any(|a| a == "--plugin-dir"));
     }
 
     /// A turn whose session another turn of ours is running resumes it as a

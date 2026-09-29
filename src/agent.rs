@@ -2169,6 +2169,25 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // hard gate before any turn / control / pending-ask / login relay. See AllowList.
     let owner_username = me["parent_username"].as_str().map(str::to_string);
 
+    // The bot's drive — its skills and memory, kept on the server and mirrored
+    // here (`crate::drive`, `.docs/bot-drive-v1.md` §5). Best-effort: a server
+    // without drives, or one that can't be reached right now, leaves the bot
+    // running exactly as it did before drives existed.
+    match crate::drive::Mirror::open(
+        Arc::new(crate::drive::Remote(client.clone())),
+        &crate::drive::drives_dir(),
+        &my_username,
+        owner_username.clone(),
+    )
+    .await
+    {
+        Ok(m) => {
+            println!("☁ drive mirrored at {}{}", m.root(), if m.memory_dir().await.is_some() { " (memory lives here)" } else { "" });
+            crate::drive::install(m);
+        }
+        Err(e) => eprintln!("drive: not mounted ({e:#})"),
+    }
+
     // Cloud-first owner config: the bot reads its OWNER-set config from the server
     // and uses it to drive the harness defaults (model / system prompt / workdir).
     // Precedence everywhere is: explicit CLI flag > server owner-config > built-in
@@ -3974,6 +3993,14 @@ async fn connect_and_run(
         // Our bot was deleted server-side (owner hit "Delete this bot") — the
         // account and token are gone, so this daemon can never work again.
         // Tell the caller to deprovision instead of reconnect-looping forever.
+        // The bot's drive moved (the owner installed a skill, edited a memory
+        // in the web app, another machine running this bot pushed): catch up.
+        if method == "events.driveChanged" {
+            if let Some(m) = crate::drive::current() {
+                tokio::spawn(async move { crate::drive::refresh(&m).await });
+            }
+            continue;
+        }
         if method == "events.botDeleted" {
             let gone = env["params"]["username"].as_str().unwrap_or("");
             if gone.eq_ignore_ascii_case(my_username) {
@@ -7587,7 +7614,24 @@ async fn handle(
     sender_pays: bool,
 ) -> Result<Option<String>> {
     let pays = sender_pays && trigger_id.is_some();
+    // The bot's drive (`crate::drive`): the plugin folders and, once the owner
+    // has moved it, the memory folder the agent process is pointed at — and
+    // whether THIS turn may change that memory (only the owner's may).
+    let drive = crate::drive::current();
+    let mount = crate::drive::mount(drive.as_deref()).await;
+    let owner_turn = drive.as_ref().is_some_and(|d| d.is_owner(turn_sender));
+    let memory_guard = mount.memory_dir.clone().filter(|_| !owner_turn);
+    // Declared BEFORE the owner-turn marker so it drops AFTER it: by the time
+    // the settle runs, this turn no longer counts as an owner turn in flight.
+    let _settle = crate::drive::AfterTurn::new(owner_turn);
+    let _owner_turn = owner_turn.then(crate::drive::OwnerTurn::begin);
+    // Claude Code snapshots the memory folder into a session when it starts
+    // one, and `--resume` keeps that snapshot (measured, CC 2.1.282). A bot
+    // whose memory moved into its drive therefore needs NEW sessions — the
+    // same way a moved workdir does — or its old conversations keep writing to
+    // the old folder.
     let skey = turn_session_key(chat_id, channel_id, workdir_ns, workdir);
+    let skey = if mount.memory_dir.is_some() { format!("{skey}#drive") } else { skey };
     let prior = sessions.lock().await.get(&skey).cloned();
     // The surface this turn runs on — the (conversation, channel) pair the
     // session is keyed at, under the bot that owns the session. Exported to the
@@ -7612,6 +7656,7 @@ async fn handle(
         thinking,
         system: system.clone(),
         env: seat_env_for(harness.id(), account.as_deref()),
+        mount: mount.clone(),
     });
 
     // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
@@ -7783,6 +7828,8 @@ async fn handle(
         ask_file: Some(ask_file.clone()),
         steer_file: Some(steer_file.clone()),
         env: env.clone(),
+        mount: mount.clone(),
+        memory_guard: memory_guard.clone(),
     };
 
     // Renderer task: drain the harness's normalized events → batched, ordered
@@ -7950,6 +7997,8 @@ async fn handle(
             ask_file: Some(ask_file.clone()),
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
+            mount: mount.clone(),
+            memory_guard: memory_guard.clone(),
         };
         result = harness.run(again, ev_keep.clone()).await;
         drop_turn(chat_states, chat_id, &cancel).await;
@@ -8034,6 +8083,8 @@ async fn handle(
                 ask_file: Some(ask_file.clone()),
                 steer_file: Some(steer_file.clone()),
                 env: env.clone(),
+                mount: mount.clone(),
+                memory_guard: memory_guard.clone(),
             };
             result = harness.run(retry, ev_tx2).await;
             drop_turn(chat_states, chat_id, &cancel).await;
@@ -8122,6 +8173,8 @@ async fn handle(
             ask_file: Some(ask_file.clone()),
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
+            mount: mount.clone(),
+            memory_guard: memory_guard.clone(),
         };
         result = harness.run(fresh, ev_tx3).await;
         drop_turn(chat_states, chat_id, &cancel).await;

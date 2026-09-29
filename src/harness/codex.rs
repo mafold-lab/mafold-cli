@@ -73,6 +73,11 @@ impl Harness for Codex {
             conv,
             surface: _,
             draft,
+            // The drive mount is Claude Code's today (`--plugin-dir`,
+            // `autoMemoryDirectory`); how Codex takes an outside skills folder
+            // is measured before it is wired (`.docs/bot-drive-v1.md` §5.5).
+            mount: _,
+            memory_guard: _,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
