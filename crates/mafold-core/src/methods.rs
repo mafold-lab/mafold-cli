@@ -27,7 +27,6 @@ use crate::net::{self, RpcError};
 pub static KNOWN_METHODS: &[&str] = &[
     "addChatMembers",
     "addGroupBot",
-    "adoptDriveMemory",
     "answerCardAction",
     "answerConnectionCall",
     "answerConnectionCallChunk",
@@ -167,7 +166,6 @@ pub static KNOWN_METHODS: &[&str] = &[
     "listConnectionGrants",
     "listConnections",
     "listDrive",
-    "listDriveCandidates",
     "listDriveRevisions",
     "listFlags",
     "listHarnessHosts",
@@ -233,7 +231,6 @@ pub static KNOWN_METHODS: &[&str] = &[
     "renameChannel",
     "reorderFolders",
     "reportConnectionLink",
-    "reportDriveCandidates",
     "reportHarnessCaps",
     "reportHarnesses",
     "reportMessage",

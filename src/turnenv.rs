@@ -38,11 +38,6 @@ pub struct TurnEnv {
     /// per-turn `MAFOLD_SURFACE` of its own.
     #[serde(default)]
     pub surface: String,
-    /// The bot's memory folder when this turn may NOT change it (someone other
-    /// than the owner triggered it); empty = writable. Read by the drive guard
-    /// hook — in process and as `mafold drive-hook` alike (`crate::drive`).
-    #[serde(default)]
-    pub memory_ro: String,
 }
 
 /// The stable path for one connection. Named by the connection, not the turn —
@@ -95,13 +90,6 @@ pub fn perm_file() -> Option<String> {
     resolve(|t| &t.perm, "MAFOLD_PERM_FILE")
 }
 
-/// The memory folder this turn may not change (`crate::drive`). File only: a
-/// process's env names the turn that SPAWNED it, and guarding (or not) the
-/// wrong turn is exactly the mistake this must not make.
-pub fn memory_ro() -> Option<String> {
-    load().map(|t| t.memory_ro).filter(|s| !s.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +107,6 @@ mod tests {
                 steer: "s".into(),
                 perm: "/tmp/ask.perm".into(),
                 surface: "c1".into(),
-                memory_ro: String::new(),
             },
         );
         std::env::set_var("MAFOLD_TURN", &p);

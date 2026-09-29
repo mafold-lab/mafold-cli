@@ -241,7 +241,6 @@ pub struct Conn {
 /// as still running forever. It stays a command hook, where that contract holds.
 const CB_ASK: &str = "mf-ask";
 const CB_STEER: &str = "mf-steer";
-const CB_MEMGUARD: &str = "mf-memguard";
 
 impl Conn {
     /// Spawn a process for `key`. `configure` receives the `Command` so the
@@ -348,11 +347,6 @@ impl Conn {
         if ask {
             pre.push(serde_json::json!({ "matcher": "AskUserQuestion", "hookCallbackIds": [CB_ASK] }));
         }
-        // File writes, so a turn the bot's owner didn't trigger can't change
-        // its memory (`crate::drive::guard_response`). Registered for every
-        // process: which turns are guarded is decided per turn (`TurnEnv::
-        // memory_ro`), and a pooled process serves many turns.
-        pre.push(serde_json::json!({ "matcher": "Write|Edit|MultiEdit|NotebookEdit", "hookCallbackIds": [CB_MEMGUARD] }));
         let mut hooks = serde_json::Map::new();
         if !pre.is_empty() {
             hooks.insert("PreToolUse".into(), Value::Array(pre));
@@ -666,10 +660,6 @@ async fn handle_hook(shared: Arc<Shared>, out: UnboundedSender<String>, v: Value
         CB_STEER => {
             let f = shared.turn.lock().unwrap().steer.clone();
             if f.is_empty() { None } else { crate::steer_hook::response(&f) }
-        }
-        CB_MEMGUARD => {
-            let guarded = shared.turn.lock().unwrap().memory_ro.clone();
-            crate::drive::guard_response(&req["input"]["tool_input"], &guarded)
         }
         _ => None,
     };

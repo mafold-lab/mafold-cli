@@ -2169,20 +2169,15 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // hard gate before any turn / control / pending-ask / login relay. See AllowList.
     let owner_username = me["parent_username"].as_str().map(str::to_string);
 
-    // The bot's drive — its skills and memory, kept on the server and mirrored
-    // here (`crate::drive`, `.docs/bot-drive-v1.md` §5). Best-effort: a server
+    // The bot's drive — its skills, kept on the server and mirrored here
+    // (`crate::drive`, `.docs/bot-drive-v1.md` §5). Best-effort: a server
     // without drives, or one that can't be reached right now, leaves the bot
     // running exactly as it did before drives existed.
-    match crate::drive::Mirror::open(
-        Arc::new(crate::drive::Remote(client.clone())),
-        &crate::drive::drives_dir(),
-        &my_username,
-        owner_username.clone(),
-    )
-    .await
+    match crate::drive::Mirror::open(Arc::new(crate::drive::Remote(client.clone())), &crate::drive::drives_dir(), &my_username)
+        .await
     {
         Ok(m) => {
-            println!("☁ drive mirrored at {}{}", m.root(), if m.memory_dir().await.is_some() { " (memory lives here)" } else { "" });
+            println!("☁ drive mirrored at {}", m.root());
             crate::drive::install(m);
         }
         Err(e) => eprintln!("drive: not mounted ({e:#})"),
@@ -2249,16 +2244,6 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
 
     if !std::path::Path::new(&workdir).is_dir() {
         eprintln!("⚠️  working directory does not exist: {workdir} — the harness will fail. Check --workdir.");
-    }
-    // A Claude Code bot from before drives: offer its owner the memory it kept
-    // (its default directory now; each directory a turn runs in, as they run).
-    if let Some(m) = crate::drive::current().filter(|_| harness.id() == "claude-code") {
-        m.note_workdir(&workdir).await;
-        tokio::spawn(async move {
-            if let Err(e) = m.offer_old_memory().await {
-                eprintln!("drive: old memory not offered yet ({e:#})");
-            }
-        });
     }
     if !harness.available() {
         eprintln!("⚠️  harness `{}` CLI not found on PATH — replies will fail until it's installed.", harness.id());
@@ -7540,32 +7525,15 @@ async fn handle(
     sender_pays: bool,
 ) -> Result<Option<String>> {
     let pays = sender_pays && trigger_id.is_some();
-    // The bot's drive (`crate::drive`): the plugin folders and, once the owner
-    // has moved it, the memory folder the agent process is pointed at — and
-    // whether THIS turn may change that memory (only the owner's may).
+    // The bot's drive (`crate::drive`): the plugin folders its skills come
+    // from. The agent's memory stays in its own folder.
     let drive = crate::drive::current();
-    // Until its memory is the drive's, a Claude Code bot's memory lives in the
-    // folder of each directory it works in — note this one, so it can be
-    // offered to the owner (`Mirror::offer_old_memory`). Only Claude Code
-    // keeps memory that way: another harness sharing a directory with
-    // someone's Claude Code would otherwise offer THAT person's notes.
-    if let Some(d) = drive.as_ref().filter(|_| harness.id() == "claude-code") {
-        d.note_workdir(workdir).await;
-    }
     let mount = crate::drive::mount(drive.as_deref()).await;
-    let owner_turn = drive.as_ref().is_some_and(|d| d.is_owner(turn_sender));
-    let memory_guard = mount.memory_dir.clone().filter(|_| !owner_turn);
-    // Declared BEFORE the owner-turn marker so it drops AFTER it: by the time
-    // the settle runs, this turn no longer counts as an owner turn in flight.
-    let _settle = crate::drive::AfterTurn::new(owner_turn);
-    let _owner_turn = owner_turn.then(crate::drive::OwnerTurn::begin);
-    // Claude Code snapshots the memory folder into a session when it starts
-    // one, and `--resume` keeps that snapshot (measured, CC 2.1.282). A bot
-    // whose memory moved into its drive therefore needs NEW sessions — the
-    // same way a moved workdir does — or its old conversations keep writing to
-    // the old folder.
+    let _settle = crate::drive::AfterTurn;
+    // (A bot whose memory once lived in its drive, cli 0.9.130–0.9.133, kept
+    // those conversations under `<key>#drive`. The plain key is the session
+    // from before — the one that uses the agent's own memory folder.)
     let skey = turn_session_key(chat_id, channel_id, workdir_ns, workdir);
-    let skey = if mount.memory_dir.is_some() { format!("{skey}#drive") } else { skey };
     let prior = sessions.lock().await.get(&skey).cloned();
     // The surface this turn runs on — the (conversation, channel) pair the
     // session is keyed at, under the bot that owns the session. Exported to the
@@ -7763,7 +7731,6 @@ async fn handle(
         steer_file: Some(steer_file.clone()),
         env: env.clone(),
         mount: mount.clone(),
-        memory_guard: memory_guard.clone(),
     };
 
     // Renderer task: drain the harness's normalized events → batched, ordered
@@ -7932,7 +7899,6 @@ async fn handle(
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
             mount: mount.clone(),
-            memory_guard: memory_guard.clone(),
         };
         result = harness.run(again, ev_keep.clone()).await;
         drop_turn(chat_states, chat_id, &cancel).await;
@@ -8018,7 +7984,6 @@ async fn handle(
                 steer_file: Some(steer_file.clone()),
                 env: env.clone(),
                 mount: mount.clone(),
-                memory_guard: memory_guard.clone(),
             };
             result = harness.run(retry, ev_tx2).await;
             drop_turn(chat_states, chat_id, &cancel).await;
@@ -8108,7 +8073,6 @@ async fn handle(
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
             mount: mount.clone(),
-            memory_guard: memory_guard.clone(),
         };
         result = harness.run(fresh, ev_tx3).await;
         drop_turn(chat_states, chat_id, &cancel).await;

@@ -2,9 +2,12 @@
 //!
 //! A drive is a small file tree that belongs to an account (bots have one by
 //! default) and lives on the server, so it follows the bot across machines and
-//! reinstalls: `skills/` is what the bot knows how to do, `memory/` is what it
-//! remembers. Daemons mirror it to a local folder; hosted bots read it in
-//! process. See `.docs/bot-drive-v1.md`.
+//! reinstalls: `skills/` is what the bot knows how to do. Daemons mirror it to
+//! a local folder; hosted bots read it in process. See `.docs/bot-drive-v1.md`.
+//!
+//! A drive holds NO memory (owner 2026-09-30, withdrawing `memory/`): an
+//! agent's memory stays in the agent's own folder until the owner decides
+//! otherwise. Adding an area back is a product decision, not a code change.
 //!
 //! The path rule lives HERE, not in the api or the daemon, for the same reason
 //! the provider-pack digest does: the server refuses a path when it is
@@ -16,10 +19,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The two top-level folders a drive has. Nothing lives outside them.
+/// The top-level folders a drive has. Nothing lives outside them.
 pub const AREA_SKILLS: &str = "skills";
-pub const AREA_MEMORY: &str = "memory";
-pub const AREAS: &[&str] = &[AREA_SKILLS, AREA_MEMORY];
+pub const AREAS: &[&str] = &[AREA_SKILLS];
 
 /// Longest drive-relative path, in UTF-16 code units — the unit Windows counts
 /// MAX_PATH in. Chosen so a mirror at
@@ -37,7 +39,7 @@ pub const MAX_SEGMENTS: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
     Empty,
-    /// Not under `skills/` or `memory/`, or names only the area itself.
+    /// Not under `skills/`, or names only the area itself.
     Area,
     TooLong,
     TooDeep,
@@ -58,7 +60,7 @@ impl std::fmt::Display for PathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PathError::Empty => write!(f, "the path is empty"),
-            PathError::Area => write!(f, "a drive path must be a file inside skills/ or memory/"),
+            PathError::Area => write!(f, "a drive path must be a file inside skills/"),
             PathError::TooLong => write!(f, "the path is longer than {MAX_PATH_UNITS} characters"),
             PathError::TooDeep => write!(f, "the path is nested deeper than {MAX_SEGMENTS} folders"),
             PathError::Segment(s) => write!(f, "`{s}` is not a usable file or folder name"),
@@ -284,7 +286,8 @@ pub fn is_script(path: &str) -> bool {
 pub enum DriveOrigin {
     /// Put there by the account that owns the drive's account (a bot's owner).
     Owner,
-    /// Written by the drive's own account (a bot writing its memory).
+    /// Written by the drive's own account. None since 2026-09-30 — a bot
+    /// writes nothing in its drive — kept so older revisions still read.
     Agent,
     /// Installed from the official skill library, pinned to `commit`.
     Library { skill: String, commit: String },
@@ -338,10 +341,9 @@ pub struct DriveListing {
     /// one a Windows path can't spend on the files inside.
     #[serde(default)]
     pub id: String,
-    /// Whether a daemon should point its agent's memory at this drive's
-    /// `memory/`. False for a bot that already had memory on some machine
-    /// until its owner has picked which of those files come along (owner call
-    /// 2026-09-29: 没勾完继续用老目录); true for a bot born with its drive.
+    /// Always false: a drive holds no memory (2026-09-30), the agent keeps
+    /// its own folder. Still sent because daemons up to cli 0.9.133 point
+    /// their agent's memory at the drive when this says true.
     #[serde(default)]
     pub memory_mounted: bool,
     pub rev: i64,
@@ -410,191 +412,6 @@ pub struct DriveChanged {
     pub rev: i64,
 }
 
-// MARK: - Moving an existing bot's memory into its drive
-
-/// One memory file the bot's daemon found in a folder it used before its
-/// memory lived in the drive (`.docs/bot-drive-v1.md` §5.6). `path` is
-/// relative to that memory folder (`MEMORY.md`, `topics/x.md`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CandidateFile {
-    pub path: String,
-    pub sha: String,
-    pub size: u64,
-    #[serde(default)]
-    pub mtime_ms: i64,
-    /// Why it can't go into the drive (looks like a credential, not text…);
-    /// set by the server, which re-checks every file. None = it may.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocked: Option<String>,
-}
-
-/// One old memory folder: `dir` is the working directory it belongs to, so
-/// the owner recognises which project's memory this is.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CandidateSource {
-    pub dir: String,
-    #[serde(default)]
-    pub files: Vec<CandidateFile>,
-}
-
-/// `reportDriveCandidates` — the bot, about its own old memory: the whole
-/// current set (it replaces the last one).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct ReportCandidates {
-    #[serde(default)]
-    pub sources: Vec<CandidateSource>,
-}
-
-/// `listDriveCandidates` — what the owner can pick from.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct CandidateListing {
-    pub memory_mounted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reported_at: Option<i64>,
-    #[serde(default)]
-    pub sources: Vec<CandidateSource>,
-}
-
-/// One file the owner ticked: which folder, which file in it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct AdoptPick {
-    pub dir: String,
-    pub path: String,
-    /// The start of the sha the owner was SHOWN (a card carries it). When
-    /// the bot has since reported a newer version, the pick is refused rather
-    /// than bringing in text the owner never saw.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha: Option<String>,
-}
-
-/// `adoptDriveMemory` — the owner's decision: these files go into
-/// `memory/`, and from then on the bot's memory lives in the drive. Picking
-/// none is a decision too (start the drive's memory empty).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct AdoptMemory {
-    #[serde(default)]
-    pub account: Option<String>,
-    #[serde(default)]
-    pub picks: Vec<AdoptPick>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AdoptResult {
-    pub adopted: u32,
-    pub rev: i64,
-}
-
-/// The card a bot sends its owner to offer its old memory:
-/// `{% mafold/drive-memory bot="…" %}` with one line per folder and file —
-///
-/// ```text
-/// d|/path/of/the/working/dir
-/// f|MEMORY.md|1234|9f86d081884c|first words of the file…   (can be ticked; sha start)
-/// x|keys.md|300|looks like it contains a credential         (listed, can't)
-/// ```
-///
-/// Written by the daemon ([`offer_body`]) and read back by the SERVER when the
-/// owner taps ([`offer_picks`]): the tap sends only the positions of the
-/// ticked `f|` lines, so it can name nothing the card didn't show.
-pub const OFFER_CARD: &str = "mafold/drive-memory";
-
-/// One line of text, safe inside a card body: no line breaks, no Markdoc tag
-/// delimiters, at most `max` characters.
-fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ").replace("{%", "{ %").replace("%}", "% }");
-    match flat.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &flat[..i]),
-        None => flat,
-    }
-}
-
-/// Whether a folder or file name survives being one line of an offer card
-/// unchanged. The card's text IS what a tap is resolved against, so a name
-/// the card would reshape (whitespace runs, tag delimiters, over-long) could
-/// be shown but never picked: the daemon doesn't offer it, the server
-/// refuses it in a report.
-pub fn offer_safe(name: &str) -> bool {
-    !name.is_empty() && one_line(name, 400) == name && !name.contains('|')
-}
-
-/// Characters of a file's sha an offer card carries.
-pub const OFFER_SHA_CHARS: usize = 12;
-
-/// The card body for `sources`. `preview(dir, path)` gives a file's opening
-/// words (the daemon has the files); previews are dropped when the list is
-/// long, so the card stays a readable size.
-pub fn offer_body(sources: &[CandidateSource], preview: impl Fn(&str, &str) -> Option<String>) -> String {
-    let count: usize = sources.iter().map(|s| s.files.len()).sum();
-    let room = if count > 120 { 0 } else if count > 40 { 60 } else { 140 };
-    let mut out = String::new();
-    for s in sources {
-        out.push_str(&format!("d|{}\n", one_line(&s.dir, 400)));
-        for f in &s.files {
-            match &f.blocked {
-                Some(why) => out.push_str(&format!("x|{}|{}|{}\n", f.path, f.size, one_line(why, 120))),
-                None => {
-                    let p = if room == 0 { String::new() } else { preview(&s.dir, &f.path).map(|t| one_line(&t, room)).unwrap_or_default() };
-                    let sha: String = f.sha.chars().take(OFFER_SHA_CHARS).collect();
-                    out.push_str(&format!("f|{}|{}|{sha}|{p}\n", f.path, f.size));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// The body of the last not-yet-answered offer card in `content`.
-fn open_offer(content: &str) -> Option<(usize, usize, &str)> {
-    let open = format!("{{% {OFFER_CARD}");
-    let close = format!("{{% /{OFFER_CARD} %}}");
-    let start = content.rfind(&open)?;
-    let tag_end = start + content[start..].find("%}")? + 2;
-    // The ATTRIBUTE, not the word: a bot may well be called `approver`.
-    if content[start..tag_end].contains(" approve=") {
-        return None;
-    }
-    let body_end = tag_end + content[tag_end..].find(&close)?;
-    Some((start, tag_end, &content[tag_end..body_end]))
-}
-
-/// The tickable files of the offer card in `content`, in card order — what a
-/// tap's positions index into. None = no unanswered offer card there.
-pub fn offer_picks(content: &str) -> Option<Vec<AdoptPick>> {
-    let (_, _, body) = open_offer(content)?;
-    let mut dir = String::new();
-    let mut out = Vec::new();
-    for line in body.lines() {
-        if let Some(d) = line.strip_prefix("d|") {
-            dir = d.to_string();
-        } else if let Some(rest) = line.strip_prefix("f|") {
-            let mut it = rest.split('|');
-            let path = it.next().unwrap_or_default();
-            let sha = it.nth(1).filter(|s| !s.is_empty()).map(str::to_string);
-            if !dir.is_empty() && !path.is_empty() {
-                out.push(AdoptPick { dir: dir.clone(), path: path.to_string(), sha });
-            }
-        }
-    }
-    Some(out)
-}
-
-/// The `bot="…"` the unanswered offer card in `content` names.
-pub fn offer_bot(content: &str) -> Option<String> {
-    let (start, tag_end, _) = open_offer(content)?;
-    let tag = &content[start..tag_end];
-    let from = tag.find(" bot=\"")? + 6;
-    let len = tag[from..].find('"')?;
-    Some(tag[from..from + len].to_string())
-}
-
-/// `content` with its offer card marked answered (`approve="<n brought in>"`).
-pub fn stamp_offer(content: &str, adopted: u32) -> Option<String> {
-    let (_, tag_end, _) = open_offer(content)?;
-    let mut out = content.to_string();
-    out.insert_str(tag_end - 2, &format!("approve=\"{adopted}\" "));
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,21 +419,22 @@ mod tests {
     #[test]
     fn ordinary_paths_pass() {
         for p in [
-            "memory/MEMORY.md",
-            "memory/用户偏好.md",
+            "skills/MEMORY.md",
+            "skills/用户偏好.md",
             "skills/pdf/SKILL.md",
             "skills/docx/scripts/office/schemas/ISO-IEC29500-4_2016/shared-documentPropertiesVariantTypes.xsd",
             "skills/theme-factory/themes/modern-minimalist.md",
             "skills/x/.gitignore",
-            "memory/notes v2.md",
+            "skills/notes v2.md",
         ] {
             assert_eq!(validate_path(p), Ok(()), "{p}");
         }
     }
 
     #[test]
-    fn paths_outside_the_two_areas_are_refused() {
-        for p in ["MEMORY.md", "skills", "memory", "other/a.md", "Skills/a.md", "/memory/a.md", "memory/a.md/"] {
+    fn paths_outside_skills_are_refused() {
+        // `memory/` was an area until 2026-09-30: a drive keeps skills only.
+        for p in ["MEMORY.md", "skills", "memory/MEMORY.md", "other/a.md", "Skills/a.md", "/skills/a.md", "skills/a.md/"] {
             assert!(validate_path(p).is_err(), "{p}");
         }
         assert_eq!(validate_path("notes/a.md"), Err(PathError::Area));
@@ -625,13 +443,13 @@ mod tests {
     #[test]
     fn windows_device_names_are_refused_with_any_extension() {
         for p in [
-            "memory/nul.md", "memory/CON", "memory/aux.tar.gz", "skills/x/com1.py", "skills/x/LPT9",
-            "skills/x/com¹.txt", "memory/nul .md", "skills/prn/SKILL.md",
+            "skills/nul.md", "skills/CON", "skills/aux.tar.gz", "skills/x/com1.py", "skills/x/LPT9",
+            "skills/x/com¹.txt", "skills/nul .md", "skills/prn/SKILL.md",
         ] {
             assert!(matches!(validate_path(p), Err(PathError::Reserved(_))), "{p}");
         }
         // Only the exact stem is a device: these are ordinary names.
-        for p in ["memory/null.md", "memory/console.md", "skills/x/com10.txt", "skills/comx/a.md", "memory/nu.l"] {
+        for p in ["skills/null.md", "skills/console.md", "skills/x/com10.txt", "skills/comx/a.md", "skills/nu.l"] {
             assert_eq!(validate_path(p), Ok(()), "{p}");
         }
     }
@@ -639,36 +457,36 @@ mod tests {
     #[test]
     fn characters_ntfs_refuses_are_refused() {
         for c in ['<', '>', ':', '"', '\\', '|', '?', '*', '\u{0}', '\u{1f}', '\u{7f}', '\u{202e}', '\u{200b}', '\u{feff}'] {
-            let p = format!("memory/a{c}b.md");
+            let p = format!("skills/a{c}b.md");
             assert_eq!(validate_path(&p), Err(PathError::Char(c)), "{c:?}");
         }
         // The handle separator is the one people will actually hit.
-        assert!(validate_path("memory/fei_pota:claude-code.md").is_err());
+        assert!(validate_path("skills/fei_pota:claude-code.md").is_err());
     }
 
     #[test]
     fn segment_edges_windows_strips_are_refused() {
-        for p in ["memory/a.md.", "memory/a.md ", "memory/ a.md", "memory/dir./a.md", "skills/x /a.md"] {
+        for p in ["skills/a.md.", "skills/a.md ", "skills/ a.md", "skills/dir./a.md", "skills/x /a.md"] {
             assert!(matches!(validate_path(p), Err(PathError::Edge(_))), "{p}");
         }
-        for p in ["memory//a.md", "memory/./a.md", "memory/../a.md"] {
+        for p in ["skills//a.md", "skills/./a.md", "skills/../a.md"] {
             assert!(matches!(validate_path(p), Err(PathError::Segment(_))), "{p}");
         }
     }
 
     #[test]
     fn length_depth_and_segment_budgets_hold() {
-        let ok = format!("memory/{}", "a".repeat(MAX_PATH_UNITS - "memory/".len()));
+        let ok = format!("skills/{}", "a".repeat(MAX_PATH_UNITS - "skills/".len()));
         assert_eq!(ok.encode_utf16().count(), MAX_PATH_UNITS);
         assert!(matches!(validate_path(&ok), Err(PathError::Segment(_))), "segment is over 64 bytes");
-        // "memory/" + 60 + "/" + 60 + "/" = 129 units before the file name.
-        let at_limit = format!("memory/{}/{}/{}", "a".repeat(60), "b".repeat(60), "c".repeat(MAX_PATH_UNITS - 129));
+        // "skills/" + 60 + "/" + 60 + "/" = 129 units before the file name.
+        let at_limit = format!("skills/{}/{}/{}", "a".repeat(60), "b".repeat(60), "c".repeat(MAX_PATH_UNITS - 129));
         assert_eq!(at_limit.encode_utf16().count(), MAX_PATH_UNITS);
         assert_eq!(validate_path(&at_limit), Ok(()));
-        let long = format!("memory/{}/{}/{}", "a".repeat(60), "b".repeat(60), "c".repeat(MAX_PATH_UNITS - 128));
+        let long = format!("skills/{}/{}/{}", "a".repeat(60), "b".repeat(60), "c".repeat(MAX_PATH_UNITS - 128));
         assert_eq!(validate_path(&long), Err(PathError::TooLong));
         // Counted in UTF-16 units, as Windows counts: every CJK char is one.
-        let cjk = format!("memory/{}.md", "记".repeat(20));
+        let cjk = format!("skills/{}.md", "记".repeat(20));
         assert_eq!(validate_path(&cjk), Ok(()));
         let deep = "skills/a/b/c/d/e/f/g/h.md";
         assert_eq!(validate_path(deep), Err(PathError::TooDeep));
@@ -677,20 +495,20 @@ mod tests {
 
     #[test]
     fn decomposed_names_are_refused_and_normalize_fixes_them() {
-        let nfd = "memory/cafe\u{301}.md";
+        let nfd = "skills/cafe\u{301}.md";
         assert_eq!(validate_path(nfd), Err(PathError::NotNfc));
         let fixed = normalize(nfd);
-        assert_eq!(fixed, "memory/caf\u{e9}.md");
+        assert_eq!(fixed, "skills/caf\u{e9}.md");
         assert_eq!(validate_path(&fixed), Ok(()));
-        assert_eq!(normalize("memory\\sub\\a.md"), "memory/sub/a.md");
+        assert_eq!(normalize("skills\\sub\\a.md"), "skills/sub/a.md");
     }
 
     #[test]
     fn case_variants_share_one_fold_key() {
-        assert_eq!(fold_key("memory/Notes.md"), fold_key("memory/notes.MD"));
-        assert_ne!(fold_key("memory/a.md"), fold_key("memory/b.md"));
+        assert_eq!(fold_key("skills/Notes.md"), fold_key("skills/notes.MD"));
+        assert_ne!(fold_key("skills/a.md"), fold_key("skills/b.md"));
         assert_eq!(area("skills/pdf/SKILL.md"), Some("skills"));
-        assert_eq!(area("memory/MEMORY.md"), Some("memory"));
+        assert_eq!(area("memory/MEMORY.md"), None);
     }
 
     #[test]
@@ -708,7 +526,7 @@ mod tests {
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["origin"]["kind"], "library");
         assert_eq!(serde_json::from_value::<DriveEntry>(v).unwrap(), e);
-        let c: DriveChange = serde_json::from_str(r#"{"path":"memory/a.md"}"#).unwrap();
+        let c: DriveChange = serde_json::from_str(r#"{"path":"skills/a.md"}"#).unwrap();
         assert_eq!((c.sha, c.expected_rev), (None, None));
     }
 }
@@ -750,50 +568,5 @@ mod library_tests {
         assert!(!is_script("SKILL.md"));
         assert!(!is_script("fonts/Inter.ttf"));
         assert!(!is_script("Makefile"));
-    }
-
-    /// The offer card round-trips: what the daemon writes is exactly what the
-    /// server reads back on a tap — tickable files only, in card order — and a
-    /// card, once answered, offers nothing more.
-    #[test]
-    fn an_offer_card_names_exactly_the_files_it_shows() {
-        let f = |p: &str, blocked: Option<&str>| CandidateFile {
-            path: p.into(),
-            sha: "s".into(),
-            size: 10,
-            mtime_ms: 0,
-            blocked: blocked.map(str::to_string),
-        };
-        let sources = vec![
-            CandidateSource { dir: "/w/app".into(), files: vec![f("MEMORY.md", None), f("keys.md", Some("looks like it contains a credential"))] },
-            CandidateSource { dir: "/w/old".into(), files: vec![f("notes/a.md", None)] },
-        ];
-        let body = offer_body(&sources, |_, p| Some(format!("line one\n{{% html %}} of {p} | with a pipe")));
-        assert!(!body.contains("{%"), "a preview can't open a tag inside the card: {body}");
-        assert_eq!(body.lines().count(), 5);
-        // A bot whose NAME contains the attribute's word is still answerable.
-        let msg = format!("Pick what comes with me:\n{{% {OFFER_CARD} bot=\"ada:approver\" %}}\n{body}{{% /{OFFER_CARD} %}}\n");
-        assert_eq!(offer_bot(&msg).as_deref(), Some("ada:approver"));
-        let picks = offer_picks(&msg).unwrap();
-        let s = Some("s".to_string());
-        assert_eq!(
-            picks,
-            [
-                AdoptPick { dir: "/w/app".into(), path: "MEMORY.md".into(), sha: s.clone() },
-                AdoptPick { dir: "/w/old".into(), path: "notes/a.md".into(), sha: s }
-            ]
-        );
-        let stamped = stamp_offer(&msg, 2).unwrap();
-        assert!(stamped.contains("bot=\"ada:approver\" approve=\"2\" %}"), "{stamped}");
-        assert!(offer_picks(&stamped).is_none() && stamp_offer(&stamped, 1).is_none(), "answered once");
-        assert!(offer_picks("no card here").is_none());
-        // Names a card line would reshape can't be offered (the tap could never find them).
-        assert!(offer_safe("/Users/ada/My Project") && offer_safe("笔记/周报.md"));
-        for bad in ["/w/two  spaces", "/w/x{%y", "/w/a|b", "/w/tab\there", ""] {
-            assert!(!offer_safe(bad), "{bad:?}");
-        }
-        // A long list drops previews rather than growing a huge card.
-        let many = vec![CandidateSource { dir: "/w".into(), files: (0..150).map(|i| f(&format!("m{i}.md"), None)).collect() }];
-        assert!(offer_body(&many, |_, _| Some("x".repeat(200))).lines().all(|l| l.len() < 40));
     }
 }
