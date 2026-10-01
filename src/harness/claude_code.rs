@@ -102,7 +102,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount, proc } = turn;
         let _ = sink.send(AgentEvent::Stats(RunStats {
             effort: effort.clone(), ..Default::default()
         }));
@@ -229,6 +229,9 @@ impl Harness for ClaudeCode {
         if reused && conn.spawn_draft != draft {
             let _ = std::fs::write(crate::agent::draft_ptr_path(&conn.spawn_draft), &draft);
         }
+        // From here until `run` returns, this process IS the turn: while it
+        // runs, a silent tool call is work in progress, not a producer gone.
+        let _serving = proc.serve(conn.pid());
         conn.begin_turn(&prompt, tenv).await?;
 
         let mut produced = false;

@@ -22,6 +22,44 @@ mod imp {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 
+    /// Is `pid` — a CHILD of this process — still running?
+    ///
+    /// Not [`pid_alive`]: a child that exited but that nobody has reaped yet is
+    /// a zombie, and a zombie answers `kill(pid, 0)`. tokio reaps a child only
+    /// when its owner awaits `wait()`, which a harness does after the turn's
+    /// stream ends — so between "the process died" and "the turn noticed", the
+    /// zombie is all there is, and it would read as alive.
+    ///
+    /// `waitid(…, WNOWAIT)` asks the kernel for the child's state WITHOUT
+    /// reaping it, so the exit status is still there for the `wait()` that owns
+    /// it. A pid that is no longer our child — reaped already, or since reused
+    /// by an unrelated process — answers `ECHILD`, so pid reuse can't fool this
+    /// either.
+    pub fn child_running(pid: u32) -> bool {
+        // SAFETY: `info` is a plain C struct the call fills in; zeroed first so
+        // "no state change" (the WNOHANG case) reads as si_pid == 0.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        r == 0 && siginfo_pid(&info) == 0
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+        // SAFETY: filled in by `waitid` (or zeroed), so the union reads a pid.
+        unsafe { info.si_pid() }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+        info.si_pid
+    }
+
     /// Ask `pid` to stop (SIGTERM — the process can clean up).
     pub fn terminate(pid: u32) {
         unsafe {
@@ -89,6 +127,27 @@ mod imp {
             }
             CloseHandle(h);
             true
+        }
+    }
+
+    /// Is `pid` — a CHILD of this process — still running?
+    ///
+    /// Not [`pid_alive`]: the `Child` that spawned it holds a handle, and an
+    /// exited process stays openable for as long as any handle to it is open.
+    /// Its exit code is the real answer — `STILL_ACTIVE` until it exits. (The
+    /// open handle also keeps the pid from being reused under us.)
+    pub fn child_running(pid: u32) -> bool {
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            ok && code == STILL_ACTIVE
         }
     }
 
@@ -254,5 +313,85 @@ pub fn reexec() -> std::io::Error {
             Ok(_) => std::process::exit(0),
             Err(e) => e,
         }
+    }
+}
+
+/// A child that sits there until it is killed — the stand-in for a harness
+/// process in tests, on every OS the daemon ships to. Stdio detached: were an
+/// assertion to leak one, it must not hold the test runner's output open for
+/// ten minutes.
+#[cfg(test)]
+pub fn idle_child() -> std::process::Child {
+    use std::process::Stdio;
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = Command::new("sleep");
+        c.arg("600");
+        c
+    };
+    // No `sleep` on Windows, and `timeout` refuses to run without a console;
+    // `ping` is on every install and waits a second between echoes.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("ping");
+        c.args(["-n", "601", "127.0.0.1"]);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn an idle child")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon's heartbeat asks this about the process running a turn, and
+    /// the hard case is the one in between: exited, but not yet let go of. On
+    /// unix that is a zombie, which still answers `kill(pid, 0)`; on Windows it
+    /// is a process object our `Child` still holds a handle to, which still
+    /// answers `OpenProcess`. `pid_alive` says yes to both; this must say no —
+    /// and must not reap, or the harness that owns the child loses its exit
+    /// status.
+    #[test]
+    fn child_running_sees_through_a_dead_unreleased_child() {
+        let mut child = idle_child();
+        let pid = child.id();
+        assert!(child_running(pid), "a live child");
+
+        child.kill().expect("kill it");
+        let t = std::time::Instant::now();
+        while child_running(pid) && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!child_running(pid), "dead, not yet reaped: not running");
+        assert!(pid_alive(pid), "positive control: the naive probe still calls it alive");
+
+        let status = child.wait().expect("the owner still reaps it");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "…and still gets its real exit status");
+        }
+        // std's `kill` is `TerminateProcess(handle, 1)`.
+        #[cfg(windows)]
+        assert_eq!(status.code(), Some(1), "…and still gets its real exit status");
+    }
+
+    /// `waitid` only answers for OUR children, which is what makes a reaped or
+    /// reused pid read as "not running". (Windows needs no such case: the
+    /// handle a harness holds keeps its pid from being reused at all.)
+    #[cfg(unix)]
+    #[test]
+    fn child_running_answers_only_for_our_own_children() {
+        let mut child = idle_child();
+        let pid = child.id();
+        child.kill().expect("kill it");
+        child.wait().expect("reap it");
+        assert!(!child_running(pid), "reaped");
+        assert!(!child_running(std::process::id()), "not our child: ourselves");
+        assert!(!child_running(1), "not our child: init");
     }
 }

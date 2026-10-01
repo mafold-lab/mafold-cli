@@ -3636,6 +3636,26 @@ async fn connect_and_run(
     // those, and report a gap that is not there.
     let mut covered: u64 = 0;
 
+    // Triggers a previous run (or a task that gave up on this one) never opened
+    // a draft for — the cursor already moved past them, so nothing else would
+    // ever bring them back (`crate::pending`). Fresh ones go through the arms
+    // again, ahead of the catch-up; stale ones are owed the notice.
+    {
+        let o = crate::pending::orphans(my_username);
+        if !o.replay.is_empty() {
+            println!("↻ pending: replaying {} message(s) that never got a reply draft opened", o.replay.len());
+        }
+        replay.extend(o.replay);
+        for e in o.owed {
+            let client = client.clone();
+            tokio::spawn(async move {
+                if let Err(err) = crate::pending::settle(&client, e).await {
+                    eprintln!("pending: lost-turn notice still undeliverable ({err:#}) — next connection retries");
+                }
+            });
+        }
+    }
+
     loop {
         // `live`: this frame came off the socket, not out of `replay` — only a
         // live frame can reveal that the socket skipped something (below).
@@ -4537,11 +4557,19 @@ async fn connect_and_run(
             channel_id.as_deref(), thread_root.as_deref(),
         )
         .await;
+        // The cursor already counts this frame as consumed; until the turn's
+        // draft is open, this entry is what still remembers it was owed one.
+        let pending = crate::pending::record(
+            my_username, &trigger_id, &chat_id,
+            channel_id.as_deref(), thread_root.as_deref(), &env,
+        );
         tokio::spawn(async move {
             // Held until the task ends: a task that returns without a turn
             // (a quiet floor seat, a slash command, a refused draft) stops
             // holding up the messages behind it right there.
             let arrived = arrived;
+            // Same lifetime, same reason: every early return below clears it.
+            let mut pending = pending;
             // ── The floor's wait (`.docs/a2a-v2.md`) ── Seat 0 falls straight
             // through; every seat behind it sleeps its slot out first and then
             // asks the ONE question that matters: has anybody opened this
@@ -4810,7 +4838,14 @@ async fn connect_and_run(
                     // `{e:#}` — the whole chain. The bare `{e}` printed only the
                     // outermost context ("botCreateDraft failed") and dropped the
                     // one thing worth having: WHY it failed.
-                    Err(e) => eprintln!("handle error: {e:#}"),
+                    Err(e) => {
+                        // Neither the draft nor the notice got through: leave
+                        // the entry for the next connection to send it.
+                        if e.downcast_ref::<crate::pending::NoticeOwed>().is_some() {
+                            pending.keep();
+                        }
+                        eprintln!("handle error: {e:#}")
+                    }
                 }
             }
         });
@@ -7599,14 +7634,24 @@ async fn handle(
             // There is no draft yet to write this into, so without a word here
             // the turn evaporates: the chat shows a bot that read the message
             // and said nothing, and the message itself is gone (the cursor moved
-            // before this ran). Answer on the surface it was asked on.
+            // before this ran). Answer on the surface it was asked on — and if
+            // that fails too, say so to the caller, which keeps the trigger
+            // journaled so the next connection sends the notice (`pending`).
             let dest = Dest::chat(chat_id).channel(channel_id).thread(thread_root);
             if let Err(e2) = client.announce_lost_turn(dest, &format!("{e:#}")).await {
                 eprintln!("lost-turn notice failed too: {e2:#}");
+                if trigger_id.is_some() {
+                    return Err(e.context(crate::pending::NoticeOwed));
+                }
             }
             return Err(e);
         }
     };
+    // The draft exists: a restart from here is the drafts outbox's to recover,
+    // and replaying the trigger would start a second turn for it.
+    if let Some(t) = trigger_id {
+        crate::pending::clear(bot, t);
+    }
     {
         let mut states = chat_states.lock().await;
         let st = states.entry(chat_id.to_string()).or_default();
@@ -7711,6 +7756,10 @@ async fn handle(
     };
     let mut env: Vec<(String, String)> = seat.as_ref().map(|a| a.env()).unwrap_or_default();
 
+    // Which process is running this turn, for the generating card's heartbeat
+    // (`Heartbeat::keepalive`). One for the whole turn: every attempt below —
+    // seat failover, empty-turn retry, fresh session — serves from it in turn.
+    let turn_proc = crate::harness::TurnProc::default();
     let turn = Turn {
         // Cloned: the empty-turn retry re-carries the user's message verbatim
         // (relying on it still being queued in the session lost it sometimes).
@@ -7731,6 +7780,7 @@ async fn handle(
         steer_file: Some(steer_file.clone()),
         env: env.clone(),
         mount: mount.clone(),
+        proc: turn_proc.clone(),
     };
 
     // Renderer task: drain the harness's normalized events → batched, ordered
@@ -7764,7 +7814,8 @@ async fn handle(
         let thread_root_owned = thread_root.map(str::to_string);
         let channel_owned = channel_id.map(str::to_string);
         let live_draft = live_draft.clone();
-        tokio::spawn(render_loop(ev_rx, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms))
+        let proc = turn_proc.clone();
+        tokio::spawn(render_loop(ev_rx, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc))
     };
 
     // A spare sender keeps the renderer alive across a seat failover (below):
@@ -7899,6 +7950,7 @@ async fn handle(
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
             mount: mount.clone(),
+            proc: turn_proc.clone(),
         };
         result = harness.run(again, ev_keep.clone()).await;
         drop_turn(chat_states, chat_id, &cancel).await;
@@ -7957,7 +8009,8 @@ async fn handle(
                 let thread_root_owned = thread_root.map(str::to_string);
                 let channel_owned = channel_id.map(str::to_string);
                 let live_draft = live_draft.clone();
-                tokio::spawn(render_loop(ev_rx2, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms))
+                let proc = turn_proc.clone();
+                tokio::spawn(render_loop(ev_rx2, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc))
             };
             let retry = Turn {
                 // Re-carry the user's message VERBATIM: the first attempt's
@@ -7984,6 +8037,7 @@ async fn handle(
                 steer_file: Some(steer_file.clone()),
                 env: env.clone(),
                 mount: mount.clone(),
+                proc: turn_proc.clone(),
             };
             result = harness.run(retry, ev_tx2).await;
             drop_turn(chat_states, chat_id, &cancel).await;
@@ -8055,7 +8109,8 @@ async fn handle(
             let thread_root_owned = thread_root.map(str::to_string);
             let channel_owned = channel_id.map(str::to_string);
             let live_draft = live_draft.clone();
-            tokio::spawn(render_loop(ev_rx3, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms))
+            let proc = turn_proc.clone();
+            tokio::spawn(render_loop(ev_rx3, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc))
         };
         let fresh = Turn {
             prompt: full_prompt.clone(),
@@ -8073,6 +8128,7 @@ async fn handle(
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
             mount: mount.clone(),
+            proc: turn_proc.clone(),
         };
         result = harness.run(fresh, ev_tx3).await;
         drop_turn(chat_states, chat_id, &cancel).await;
@@ -9012,6 +9068,70 @@ fn awaiting_after(ev: &AgentEvent, current: Option<String>, owner: &str) -> Opti
     }
 }
 
+/// The generating card's heartbeat: `beat`, and `beatAt` — when it last moved.
+///
+/// The card can only judge its producer by this. A beat that stops moving for
+/// the card's QUIET_MS (two minutes) reads «No signal», which is a claim that
+/// the producer is GONE, so it may only stop moving when that is true.
+///
+/// Two things move it:
+/// - **activity** — the harness streamed something (`bump`; which events
+///   count is the render loop's call);
+/// - **keepalive** — nothing has streamed for [`KEEPALIVE_MS`](Self::KEEPALIVE_MS)
+///   but the process running the turn is still there. That silence is a tool
+///   call at work: a ten-minute `copy-verify` emits nothing until it finishes,
+///   and before this it read «No signal» two minutes in (2026-10-01).
+///
+/// Gone still reads gone, through the same mechanism as before: once the
+/// process exits — killed, crashed, even exited-and-not-yet-reaped — or this
+/// daemon stops pushing at all (dead, asleep, offline), nothing moves the beat
+/// and the card reaches «No signal» on its own clock. Nothing on the card
+/// changed; the producer simply stopped under-reporting.
+///
+/// Stamps are wall-clock ms (what `beatAt` means to the card), passed in so the
+/// rule can be driven through minutes of silence without waiting for them.
+struct Heartbeat {
+    beat: u64,
+    /// WHEN `beat` last moved, on the wall clock. `beat` alone is a counter
+    /// with no history: a card mounting on a draft whose producer died hours
+    /// ago sees a number, cannot tell it is stale, and must sit and watch for
+    /// minutes to find out — and every remount (scrolling a virtualized list)
+    /// restarts that wait, so it may never conclude anything. Only the producer
+    /// knows this timestamp, and it costs one attribute, so it sends it.
+    at_ms: u64,
+}
+
+impl Heartbeat {
+    /// A quarter of the card's QUIET_MS: a client that misses a snapshot or
+    /// three still never sees a beat old enough to call quiet.
+    const KEEPALIVE_MS: u64 = 30_000;
+
+    fn new(started_ms: u64) -> Self {
+        Self { beat: 0, at_ms: started_ms }
+    }
+
+    /// Activity: bump the counter AND stamp it — together, so the two can never
+    /// drift apart. A clock that can't be read keeps the previous stamp.
+    fn bump(&mut self, now_ms: u64) {
+        self.beat += 1;
+        if now_ms != 0 {
+            self.at_ms = now_ms;
+        }
+    }
+
+    /// Silence: bump once [`KEEPALIVE_MS`](Self::KEEPALIVE_MS) has passed since
+    /// the last beat, if `running` says the turn's process is still there.
+    /// Returns whether it beat (the caller pushes the snapshot). `running` is
+    /// only asked when the beat is due — it is a syscall, not a field read.
+    fn keepalive(&mut self, now_ms: u64, running: impl FnOnce() -> bool) -> bool {
+        if now_ms.saturating_sub(self.at_ms) < Self::KEEPALIVE_MS || !running() {
+            return false;
+        }
+        self.bump(now_ms);
+        true
+    }
+}
+
 async fn render_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     client: Client,
@@ -9045,6 +9165,9 @@ async fn render_loop(
     // one origin: seed the clock here and the card's elapsed time would jump
     // backwards the first time this loop repainted it.
     started_ms: u64,
+    // Which process is running the turn — what lets a silent tool call keep
+    // the heartbeat (see `Heartbeat::keepalive`).
+    proc: crate::harness::TurnProc,
 ) {
     // Telegram `sendMessageDraft` model: keep the running FULL markdoc content
     // locally and push the whole snapshot (throttled ~300ms) via editDraft, with
@@ -9079,21 +9202,14 @@ async fn render_loop(
     }));
 
     // Live progress props on the generating card: `started` seeds the card's
-    // word + elapsed clock; `beat` bumps on EVERY harness event, so a frozen
-    // beat tells the card the stream stalled (its sparkle deflates); `tokens`
-    // prefers the harness's REAL output-token count (Pulse) with a chars/4
-    // estimate as fallback. Old cards ignore unknown attrs; old daemons emit
-    // the bare tag and the card degrades gracefully — both directions safe.
-    // `started_ms` arrives from `handle()` (see the parameter) so this loop
-    // continues the clock the first generating card already started.
-    let mut beat: u64 = 0;
-    // WHEN that beat last bumped, on the wall clock. `beat` alone is a counter
-    // with no history: a card mounting on a draft whose producer died hours ago
-    // sees a number, cannot tell it is stale, and must sit and watch for minutes
-    // to find out — and every remount (scrolling a virtualized list) restarts
-    // that wait, so it may never conclude anything. Only the producer knows this
-    // timestamp, and it costs one attribute, so it sends it.
-    let mut beat_at_ms = started_ms;
+    // word + elapsed clock; `beat`/`beatAt` are the producer's heartbeat (see
+    // `Heartbeat` for what moves it); `tokens` prefers the harness's REAL
+    // output-token count (Pulse) with a chars/4 estimate as fallback. Old cards
+    // ignore unknown attrs; old daemons emit the bare tag and the card degrades
+    // gracefully — both directions safe. `started_ms` arrives from `handle()`
+    // (see the parameter) so this loop continues the clock the first
+    // generating card already started.
+    let mut hb = Heartbeat::new(started_ms);
     let mut chars: u64 = 0;
     let mut tokens_real: Option<u64> = None;
     // Background shells STARTED this turn (Bash with run_in_background) — the
@@ -9105,16 +9221,10 @@ async fn render_loop(
     // Whose tap the turn is parked on, while an ask card is open — see
     // `awaiting_after`. Rides the generating card as `awaiting=`.
     let mut awaiting: Option<String> = None;
-    /// Bump the heartbeat AND stamp it. Every `beat += 1` goes through here so
-    /// the counter and its timestamp can never drift apart.
     macro_rules! bump_beat {
-        () => {{
-            beat += 1;
-            beat_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(beat_at_ms);
-        }};
+        () => {
+            hb.bump(mafold_transcript::stats::now_ms())
+        };
     }
     macro_rules! generating_tag {
         () => {
@@ -9122,8 +9232,8 @@ async fn render_loop(
             // emit a byte-identical indicator.
             mafold_transcript::render::generating_tag_awaiting(
                 started_ms,
-                beat,
-                beat_at_ms,
+                hb.beat,
+                hb.at_ms,
                 tokens_real.unwrap_or(chars / 4),
                 shells,
                 awaiting.as_deref(),
@@ -9161,13 +9271,20 @@ async fn render_loop(
     }
 
     loop {
+        // The stream has been silent a while, but the process running the turn
+        // is still there: that is a tool call at work, so say so — at once,
+        // not at the next throttle window.
+        if hb.keepalive(mafold_transcript::stats::now_ms(), || proc.running()) {
+            push_running!(true);
+        }
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
             Ok(Some(ev)) => {
                 // ── daemon-only bookkeeping, before the transcript sees it ──
                 // Liveness: `beat` bumps on stream ACTIVITY, which is not the
                 // same as content. Session ids, the ask answer and the end-of-
                 // turn stamp are not the harness making progress, so they don't
-                // bump — a frozen beat has to mean "the stream stalled".
+                // bump. (Silence while the process still runs is the
+                // keepalive's job, at the top of this loop.)
                 //
                 // Parked on a person: only the turn's owner can answer its card
                 // (`deliver_ask_answer`), so that is who the card waits on.
@@ -9413,6 +9530,157 @@ mod awaiting_tests {
         // An ordinary tool call parks nothing.
         let bash = AgentEvent::ToolCall { id: "b".into(), name: "Bash".into(), input: serde_json::json!({}) };
         assert_eq!(awaiting_after(&bash, None, "linsky"), None);
+    }
+}
+
+/// The «No signal» report (2026-10-01): bots ten and twenty minutes into
+/// `copy-verify` / `plan` were shown as disconnected. Driven through the same
+/// `Heartbeat` the render loop uses, at the render loop's own idle cadence,
+/// with a REAL process standing in for the harness — and judged by the card's
+/// own rule, read out of the card's source. Every OS the daemon ships to: the
+/// process probe underneath is a different syscall on each.
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use crate::harness::TurnProc;
+
+    /// The render loop's idle tick: its `rx.recv()` timeout.
+    const TICK_MS: u64 = 120;
+    const T0: u64 = 1_790_000_000_000;
+
+    /// The card's QUIET_MS, from `cards/generating/src/state.ts` itself — the
+    /// daemon is held to the threshold the reader's screen actually applies.
+    fn card_quiet_ms() -> u64 {
+        include_str!("../../cards/generating/src/state.ts")
+            .lines()
+            .find_map(|l| l.strip_prefix("export const QUIET_MS = "))
+            .expect("state.ts declares QUIET_MS")
+            .trim_end_matches(';')
+            .replace('_', "")
+            .parse()
+            .expect("QUIET_MS is a number")
+    }
+
+    /// What a card mounting at `now` concludes (`liveness` ∘ `lastBeatAt` with
+    /// nothing witnessed — the producer's `beatAt` is all it has): «No signal»
+    /// once that is QUIET_MS old.
+    fn card_says_no_signal(hb: &Heartbeat, now: u64) -> bool {
+        now - hb.at_ms.min(now) >= card_quiet_ms()
+    }
+
+    /// `ms` of silence from `from`, tick by tick as the render loop sees it.
+    /// Returns every offset at which the card would read «No signal».
+    fn silence(hb: &mut Heartbeat, proc: &TurnProc, from: u64, ms: u64) -> Vec<u64> {
+        let mut no_signal = Vec::new();
+        let mut now = from;
+        while now < from + ms {
+            now += TICK_MS;
+            hb.keepalive(now, || proc.running());
+            if card_says_no_signal(hb, now) {
+                no_signal.push(now - from);
+            }
+        }
+        no_signal
+    }
+
+    /// A stand-in harness process. Killed and reaped on drop, so a failing
+    /// assertion can't leak it.
+    struct Proc(std::process::Child);
+    impl Proc {
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+    }
+    impl Drop for Proc {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn harness_process() -> Proc {
+        Proc(crate::platform::idle_child())
+    }
+
+    /// A tool call that runs three minutes without a byte of output is work in
+    /// progress. The card must never call it «No signal».
+    #[test]
+    fn a_three_minute_silent_tool_call_never_reads_no_signal() {
+        let child = harness_process();
+        let proc = TurnProc::default();
+        let _serving = proc.serve(Some(child.id()));
+        let mut hb = Heartbeat::new(T0);
+        hb.bump(T0); // the tool call itself — the last event for three minutes
+
+        let no_signal = silence(&mut hb, &proc, T0, 3 * 60_000);
+
+        assert!(
+            no_signal.is_empty(),
+            "the harness process ran the whole time, yet the card read «No signal» from t+{}s on \
+             (beat stuck at {}, last stamped t+{}s)",
+            no_signal[0] / 1000,
+            hb.beat,
+            (hb.at_ms - T0) / 1000,
+        );
+        assert!(hb.beat >= 1 + 5, "three silent minutes should carry ~6 keepalives, got {}", hb.beat - 1);
+    }
+
+    /// The other half of the contract: the heartbeat is only kept while the
+    /// process is really there. Killed mid-tool, the beat must stop and the card
+    /// must reach «No signal» — even though the turn never ended (the stream is
+    /// still open: a child of the dead process holds it) and the dead process is
+    /// not yet let go of — a zombie, or a handle still open — which the naive
+    /// probe (`pid_alive`) still calls alive.
+    #[test]
+    fn a_killed_harness_process_reads_no_signal() {
+        let mut child = harness_process();
+        let pid = child.id();
+        let proc = TurnProc::default();
+        let _serving = proc.serve(Some(pid)); // never dropped: the turn is still open
+        let mut hb = Heartbeat::new(T0);
+        hb.bump(T0);
+
+        let alive = silence(&mut hb, &proc, T0, 60_000);
+        let before = hb.beat;
+        assert!(alive.is_empty(), "alive for a minute, yet «No signal» at t+{}s", alive.first().unwrap_or(&0) / 1000);
+        assert!(before > 1, "alive and silent for a minute, yet the beat never moved");
+
+        child.0.kill().expect("kill the harness process");
+        let gone = std::time::Instant::now();
+        while crate::platform::child_running(pid) && gone.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Positive control: this IS the dead-but-held case (a zombie on unix, a
+        // still-open process handle on Windows). A probe that trusted
+        // `pid_alive` would keep this dead turn «working» forever.
+        assert!(crate::platform::pid_alive(pid), "expected a dead-but-unreleased process here");
+
+        let killed_at = T0 + 60_000;
+        let no_signal = silence(&mut hb, &proc, killed_at, 3 * 60_000);
+
+        assert_eq!(hb.beat, before, "the beat kept moving after its process died");
+        let first = *no_signal.first().expect("the card never read «No signal» after the process died");
+        assert!(
+            first <= card_quiet_ms() + TICK_MS,
+            "«No signal» only {}s after the kill — later than the card's own QUIET_MS",
+            first / 1000
+        );
+        assert_eq!(no_signal.last(), Some(&(3 * 60_000)), "…and it must stay «No signal»");
+    }
+
+    /// Which process serves the turn changes under a failover; a late-dropping
+    /// guard from the first attempt must not orphan the second.
+    #[test]
+    fn the_turn_runs_only_while_a_live_process_serves_it() {
+        let proc = TurnProc::default();
+        assert!(!proc.running(), "nothing serves it yet (still spawning)");
+        let (a, b) = (harness_process(), harness_process());
+        let first = proc.serve(Some(a.id()));
+        assert!(proc.running());
+        let second = proc.serve(Some(b.id()));
+        drop(first);
+        assert!(proc.running(), "the first attempt's guard cleared the attempt that replaced it");
+        drop(second);
+        assert!(!proc.running(), "no attempt serves the turn any more");
     }
 }
 

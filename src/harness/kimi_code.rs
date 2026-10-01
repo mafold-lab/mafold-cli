@@ -75,6 +75,7 @@ impl Harness for KimiCode {
             // Claude Code's today; Kimi's `extra_skill_dirs` is wired after it
             // is measured (`.docs/bot-drive-v1.md` §5.5).
             mount: _,
+            proc,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
@@ -96,6 +97,7 @@ impl Harness for KimiCode {
             draft: &draft,
             cancel: &cancel,
             sink: &sink,
+            proc: &proc,
         };
         let out = run_once(&p, session.as_deref()).await?;
         // A stored session id can be foreign (the conversation carries a session
@@ -151,12 +153,13 @@ struct RunParams<'a> {
     draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
+    proc: &'a super::TurnProc,
 }
 
 /// One `kimi --print` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { full_prompt, workdir, model, thinking, conv, draft, cancel, sink } = *p;
+    let RunParams { full_prompt, workdir, model, thinking, conv, draft, cancel, sink, proc } = *p;
 
     let mut cmd = tokio::process::Command::new(super::program("kimi"));
     // `--print` runs one turn non-interactively (and implies `--yolo`, so tools
@@ -217,6 +220,8 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     // Register this run in the live-children set so a daemon shutdown kills exactly
     // THIS process (see harness::live_children); RAII deregisters on every path.
     let _child_guard = crate::harness::ChildGuard::new(child.id());
+    // …and as the process running this turn, for the heartbeat (`TurnProc`).
+    let _serving = proc.serve(child.id());
 
     let stdout = child.stdout.take().context("no stdout")?;
     let mut reader = BufReader::new(stdout);

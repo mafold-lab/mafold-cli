@@ -67,6 +67,15 @@ impl<'a> Dest<'a> {
     }
 }
 
+/// How long a turn waits for the link before its trigger is given up. Sized
+/// for a laptop that sleeps through a morning: on 2026-10-01 the 08:00 routine
+/// arrived during a dark wake and the next full wake was at 13:36.
+pub const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+/// How long the lost-turn notice waits before the journal takes it over.
+const NOTICE_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The longest single pause between connect attempts while the link is down.
+const LINK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The server refused to open a draft ON PURPOSE: a 403 whose `description`
 /// the server prefixes with `access_denied` (this sender may not drive the bot)
 /// or `payment_required` (they must authorize payment first, or are out of
@@ -844,9 +853,11 @@ retry {attempt}/{} in {delay:?}…",
     /// This POST is the reply pipeline's single point of failure: it runs before
     /// any state exists, and `handle()` propagates its error — so one flaky
     /// connect used to silently eat the user's message (bot "online but never
-    /// replies"). Connect-phase failures are retried a couple of times (observed
-    /// real-world cause: a local proxy killing fresh TLS connections right after
-    /// the WS reconnects).
+    /// replies"). A connect-phase failure never reached the server, so it is
+    /// retried until the link comes back, up to [`LINK_WAIT`]. Three tries in
+    /// 1.5s was not enough: on 2026-10-01 the 08:00 routine reached the daemon
+    /// in a 28-second dark wake of a sleeping laptop, before its network was up,
+    /// and the turn was dropped.
     ///
     /// `trigger_id` is the incoming message this reply answers. It is what lets
     /// the server decide, BEFORE any model runs, whether this turn is free,
@@ -859,6 +870,21 @@ retry {attempt}/{} in {delay:?}…",
         thread_root_id: Option<&str>,
         channel_id: Option<&str>,
         trigger_id: Option<&str>,
+    ) -> Result<String> {
+        let deadline = std::time::SystemTime::now() + LINK_WAIT;
+        self.create_draft_until(chat_id, thread_root_id, channel_id, trigger_id, deadline).await
+    }
+
+    /// [`Self::create_draft`] with the give-up time spelled out. Wall-clock on
+    /// purpose: a sleeping Mac's monotonic clock stands still, so an `Instant`
+    /// deadline would let a laptop that slept all night keep waiting.
+    pub(crate) async fn create_draft_until(
+        &self,
+        chat_id: &str,
+        thread_root_id: Option<&str>,
+        channel_id: Option<&str>,
+        trigger_id: Option<&str>,
+        deadline: std::time::SystemTime,
     ) -> Result<String> {
         // TYPED through the core: ids parse to real Uuids up front (a malformed
         // id fails here, not as a server 400), and the result is a wire::Message.
@@ -890,14 +916,17 @@ retry {attempt}/{} in {delay:?}…",
             if let Some(reason) = DraftRefused::from_rpc(&err) {
                 return Err(anyhow::Error::new(reason));
             }
-            // Never left this machine → a retry cannot duplicate anything.
-            if matches!(err, mafold_core::RpcError::Connect(_)) && connect_tries < 2 {
+            // Never left this machine → a retry cannot duplicate anything, so
+            // wait for the link instead of giving the trigger up.
+            if matches!(err, mafold_core::RpcError::Connect(_)) && std::time::SystemTime::now() < deadline {
                 connect_tries += 1;
-                eprintln!(
-                    "botCreateDraft connect failed (attempt {connect_tries}/3: {err}) — retrying in {delay:?}…"
-                );
+                if connect_tries <= 3 || connect_tries % 20 == 0 {
+                    eprintln!(
+                        "botCreateDraft connect failed (attempt {connect_tries}: {err}) — waiting for the link, retrying in {delay:?}…"
+                    );
+                }
                 tokio::time::sleep(delay).await;
-                delay *= 2;
+                delay = (delay * 2).min(LINK_RETRY_MAX);
                 continue;
             }
             // The far end fell over rather than said no. This is NOT provably
@@ -937,17 +966,35 @@ retry {attempt}/{} in {delay:?}…",
     /// Best-effort by design: one plain send, no retry. If the API is down hard
     /// this fails too, and the caller's log line is the last word.
     pub async fn announce_lost_turn(&self, dest: Dest<'_>, why: &str) -> Result<()> {
+        self.announce_lost_turn_until(dest, why, std::time::SystemTime::now() + NOTICE_WAIT).await
+    }
+
+    /// The notice travels the same link the draft could not, so it waits it out
+    /// the same way; past `deadline` the caller keeps the trigger journaled
+    /// (`crate::pending`) and the next connection sends it.
+    pub(crate) async fn announce_lost_turn_until(
+        &self,
+        dest: Dest<'_>,
+        why: &str,
+        deadline: std::time::SystemTime,
+    ) -> Result<()> {
         // Trimmed: the point of the bubble is "send it again", not a stack trace.
         let why: String = why.chars().take(200).collect();
-        self.send_to(
-            dest,
-            &format!(
-                "⚠️ I couldn't open a reply draft for your last message, so it was never processed \
-                 — and it won't be retried automatically. Please send it again.\n\n`{why}`"
-            ),
-        )
-        .await?;
-        Ok(())
+        let text = format!(
+            "⚠️ I couldn't open a reply draft for your last message, so it was never processed \
+             — and it won't be retried automatically. Please send it again.\n\n`{why}`"
+        );
+        let mut delay = std::time::Duration::from_millis(500);
+        loop {
+            match self.send_to(dest, &text).await {
+                Ok(_) => return Ok(()),
+                Err(e) if Self::is_connect_error(&e) && std::time::SystemTime::now() < deadline => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(LINK_RETRY_MAX);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {
@@ -2043,7 +2090,29 @@ mod lost_turn_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        serve(listener, status, reply, seen.clone());
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The same stub, except that for the first `down` nothing listens on its
+    /// port — every connection is refused, which is what a laptop that just
+    /// came out of sleep (or one whose network is still coming up) sees.
+    async fn stub_after(
+        down: std::time::Duration,
+        status: u16,
+        reply: &'static str,
+    ) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(down).await;
+            serve(TcpListener::bind(addr).await.unwrap(), status, reply, log);
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn serve(listener: TcpListener, status: u16, reply: &'static str, log: Arc<Mutex<Vec<(String, String)>>>) {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let log = log.clone();
@@ -2087,7 +2156,54 @@ mod lost_turn_tests {
                 });
             }
         });
-        (format!("http://{addr}"), seen)
+    }
+
+    /// 2026-10-01: the 08:00 routine reached the daemon in a 28-second dark
+    /// wake, before the network was back. Three connect attempts in 1.5s, then
+    /// the turn was dropped for good. A refused connection never reached the
+    /// server, so waiting for the link costs nothing and duplicates nothing.
+    #[tokio::test]
+    async fn a_create_draft_waits_out_a_link_that_is_down() {
+        let (base, seen) = stub_after(
+            std::time::Duration::from_millis(2500),
+            200,
+            r#"{"ok":true,"result":{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","conversation_id":"11111111-2222-3333-4444-555555555555","sender":{"username":"ops","display_name":"Ops","kind":"human"},"content":"","created_at":"2026-10-01T00:00:00Z","reactions":[]}}"#,
+        )
+        .await;
+        let c = Client::new(base, "t".into());
+        let id = c
+            .create_draft("11111111-2222-3333-4444-555555555555", None, None, None)
+            .await
+            .expect("a link that comes back must get the draft opened");
+        assert_eq!(id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert_eq!(seen.lock().unwrap().len(), 1, "refused attempts never reach the server");
+    }
+
+    /// …but not forever: past its deadline a link that never came back is an
+    /// outage the user has to hear about, not a wait that hides it.
+    #[tokio::test]
+    async fn a_create_draft_stops_waiting_at_its_deadline() {
+        let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let c = Client::new(format!("http://{addr}"), "t".into());
+        let deadline = std::time::SystemTime::now() + std::time::Duration::from_millis(1200);
+        let err = c
+            .create_draft_until("11111111-2222-3333-4444-555555555555", None, None, None, deadline)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("botCreateDraft failed"), "{err:#}");
+    }
+
+    /// …and the notice that a turn WAS lost goes over the same link, so it has
+    /// to wait it out the same way — otherwise it fails in the same breath as
+    /// the draft and the chat shows nothing at all.
+    #[tokio::test]
+    async fn a_lost_turn_notice_waits_out_the_link_too() {
+        let (base, seen) = stub_after(std::time::Duration::from_millis(2500), 200, r#"{"ok":true,"result":{}}"#).await;
+        let c = Client::new(base, "t".into());
+        c.announce_lost_turn(Dest::chat("conv-1"), "botCreateDraft failed: connect failed")
+            .await
+            .expect("the notice must get through once the link is back");
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]

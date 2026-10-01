@@ -30,6 +30,7 @@ mod install;
 mod langpack;
 mod mcp_link;
 mod pair;
+mod pending;
 mod permission_mcp;
 mod platform;
 mod room;

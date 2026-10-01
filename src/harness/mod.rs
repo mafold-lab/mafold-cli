@@ -59,6 +59,55 @@ impl Drop for ChildGuard {
     }
 }
 
+/// The process running a turn RIGHT NOW, so the daemon can tell a turn that is
+/// busy from one whose producer is gone.
+///
+/// The generating card judges the producer by one thing: whether `beat` keeps
+/// moving. `beat` moves on harness EVENTS, and a tool call that is still running
+/// emits none — so a ten-minute `copy-verify` read «No signal» two minutes in, on
+/// a bot that was working the whole time (2026-10-01). What separates "busy"
+/// from "gone" is whether the process doing the work is still there, and only
+/// the harness knows which process that is: a pooled `claude` outlives the turns
+/// it serves, and a seat failover swaps it out mid-turn. So each harness
+/// [`serve`](Self::serve)s from here while it runs the turn, and the render loop
+/// asks [`running`](Self::running) (see `Heartbeat` in `crate::agent`).
+///
+/// One per turn, shared by every attempt at it — the render loop outlives a
+/// failover, and so must this.
+#[derive(Clone, Default)]
+pub struct TurnProc(Arc<Mutex<Option<u32>>>);
+
+impl TurnProc {
+    /// This turn is running in `pid` until the returned guard drops. Every
+    /// harness holds one for exactly as long as its process is working on the
+    /// turn, so no exit path can leave a finished turn looking alive.
+    pub fn serve(&self, pid: Option<u32>) -> Serving {
+        *self.0.lock().unwrap() = pid;
+        Serving(self.clone(), pid)
+    }
+
+    /// Is the process serving this turn still running? False before any process
+    /// serves it (still spawning), between failover attempts, and once it has
+    /// exited — even exited-but-not-yet-reaped (`platform::child_running`).
+    pub fn running(&self) -> bool {
+        let pid = *self.0.lock().unwrap();
+        pid.is_some_and(crate::platform::child_running)
+    }
+}
+
+/// See [`TurnProc::serve`].
+pub struct Serving(TurnProc, Option<u32>);
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        let mut cur = (self.0).0.lock().unwrap();
+        // Only our own entry: a later attempt may already serve the turn.
+        if *cur == self.1 {
+            *cur = None;
+        }
+    }
+}
+
 /// The normalized event a harness turn speaks. Defined in `mafold-transcript`
 /// and re-exported here, because the vocabulary is not the daemon's: the api's
 /// own brains emit the same events and get the same cards. Harness-specific
@@ -156,6 +205,10 @@ pub struct Turn {
     pub env: Vec<(String, String)>,
     /// See [`Mount`].
     pub mount: Mount,
+    /// Where the harness says which process is running this turn — see
+    /// [`TurnProc`]. Every harness must serve from it, or its long tool calls
+    /// read as «No signal».
+    pub proc: TurnProc,
 }
 
 /// The seat behind a turn said no: its usage window is full.

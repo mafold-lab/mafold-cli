@@ -1403,6 +1403,8 @@ async fn look(
             env: with_seat(&ctx.env, seat.as_ref()),
             // The inbox speaks as a PERSON; people have no bot drive to mount.
             mount: Default::default(),
+            // …and no generating card whose heartbeat it would keep.
+            proc: Default::default(),
         };
         let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let run = ctx.harness.run(turn, sink);

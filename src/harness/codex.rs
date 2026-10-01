@@ -77,6 +77,7 @@ impl Harness for Codex {
             // Codex takes an outside skills folder is measured before it is
             // wired (`.docs/bot-drive-v1.md` §5.5).
             mount: _,
+            proc,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
@@ -100,6 +101,7 @@ impl Harness for Codex {
             draft: &draft,
             cancel: &cancel,
             sink: &sink,
+            proc: &proc,
         };
         match run_once(&p, session.as_deref()).await {
             // The stored thread id can be stale or foreign — Codex expires
@@ -152,6 +154,7 @@ struct RunParams<'a> {
     draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
+    proc: &'a super::TurnProc,
 }
 
 /// A resume failure that means "this thread id is unusable" (expired rollout, or
@@ -218,7 +221,7 @@ fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -
 /// One `codex exec` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { program, full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
+    let RunParams { program, full_prompt, workdir, model, effort, conv, draft, cancel, sink, proc } = *p;
     let stats_started_ms = mafold_transcript::stats::now_ms();
     let mut item_stats = super::codex_stats::ItemStats::default();
     let _ = sink.send(AgentEvent::Stats(RunStats {
@@ -254,6 +257,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         // exactly THIS process (see harness::live_children) — same contract as
         // the Claude harness; RAII deregisters on every exit path.
         let _child_guard = crate::harness::ChildGuard::new(child.id());
+        // …and as the process running this turn, for the heartbeat
+        // (`TurnProc`): a silent tool call in here is work, not a dead turn.
+        let _serving = proc.serve(child.id());
 
         // Feed the prompt in its OWN task (same shape as the Claude harness): a
         // prompt past the pipe buffer (~64KB — and this one holds the conversation)
@@ -808,6 +814,7 @@ mod tests {
                 draft: "draft",
                 cancel: &cancel,
                 sink: &sink,
+                proc: &crate::harness::TurnProc::default(),
             },
             None,
         )
