@@ -162,7 +162,13 @@ pub enum ConnectionCmd {
         no_rotate: bool,
     },
     /// Fetch this machine's wrapped master key once another device approves it.
-    Unlock,
+    Unlock {
+        /// One JSON line for a program (the desktop app):
+        /// `{"state":"unlocked",…}`, `{"state":"waiting"}` (no device has handed
+        /// this one the key yet — retry later), or `{"state":"error",…}`.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stay online and answer connection calls addressed to your devices.
     ///
     /// While this runs, bots you've granted a connection to get their calls
@@ -477,14 +483,27 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
         // this message only appears when none of them has been online since
         // this machine registered, so the only accurate instruction is to open
         // Mafold somewhere and come back.
-        Err(_) => bail!(
+        Err(_) => Err(anyhow::Error::new(KeyNotHandedOver)),
+    }
+}
+
+/// `unlock` found no key wrapped for this machine yet: a state to wait out,
+/// not a failure — typed, so `connection unlock --json` can say "waiting".
+#[derive(Debug)]
+pub(crate) struct KeyNotHandedOver;
+
+impl std::fmt::Display for KeyNotHandedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
             "this machine doesn't have your vault key yet.\n\n  \
              open Mafold on a device that already has it (web, mac or iOS) and it \
              will hand the key over — then run this again.\n  \
-             no other device? recover with your passphrase:  mafold connection recover"
-        ),
+             no other device? recover with your passphrase:  mafold connection recover",
+        )
     }
 }
+
+impl std::error::Error for KeyNotHandedOver {}
 
 /// Open a connection's payload.
 ///
@@ -572,7 +591,7 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
             revoke(&client, &sess, &device_id, no_rotate).await
         }
         ConnectionCmd::Listen => listen(base, &client, &sess).await,
-        ConnectionCmd::Unlock => {
+        ConnectionCmd::Unlock { json: false } => {
             let (_, key_id, dev) = unlock(&client, &sess).await?;
             println!(
                 "✓ unlocked on {} — key {} · fingerprint {}",
@@ -580,6 +599,18 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
                 key_id,
                 vault::fingerprint(&dev.public)
             );
+            Ok(())
+        }
+        ConnectionCmd::Unlock { json: true } => {
+            let out = match unlock(&client, &sess).await {
+                Ok((_, key_id, dev)) => json!({ "state": "unlocked", "key_id": key_id, "fingerprint": vault::fingerprint(&dev.public) }),
+                Err(e) if e.downcast_ref::<KeyNotHandedOver>().is_some() => json!({ "state": "waiting" }),
+                Err(e) => json!({ "state": "error", "message": format!("{e:#}") }),
+            };
+            println!("{out}");
+            if out["state"] == "error" {
+                anyhow::bail!("unlock failed");
+            }
             Ok(())
         }
         ConnectionCmd::SetRecovery => set_recovery(&client, &sess).await,

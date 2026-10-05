@@ -1122,7 +1122,8 @@ pub(crate) fn oauth_token(env: &[(String, String)]) -> Option<String> {
 pub(crate) enum StoredLogin {
     /// An unexpired access token.
     Fresh(String),
-    /// The access token has lapsed but the refresh token is there. This is
+    /// The access token has lapsed but the refresh token is there and hasn't
+    /// reached its own end ([`login_expiry_from`]). This is
     /// NOT a logged-out seat: the access token lives 8 hours (measured
     /// 2026-09-27 — Keychain write time to `expiresAt`, 8.00h on two seats)
     /// and Claude Code renews it on its next run. Any login nobody has run
@@ -1132,7 +1133,8 @@ pub(crate) enum StoredLogin {
     /// it was skipped (a Muse turn on 2026-09-27 hit a full window with a
     /// second login sitting at 0%).
     Stale,
-    /// No credential, an unreadable one, or no way to renew it.
+    /// No credential, an unreadable one, or no way to renew it — which
+    /// includes a refresh token past its end.
     Missing,
 }
 
@@ -1185,13 +1187,38 @@ pub(crate) fn stored_login_from(raw: &str, now_ms: i64) -> StoredLogin {
         return StoredLogin::Missing;
     };
     let o = &v["claudeAiOauth"];
-    let renewable = o["refreshToken"].as_str().is_some_and(|s| !s.is_empty());
+    let renewable = o["refreshToken"].as_str().is_some_and(|s| !s.is_empty())
+        && refresh_token_end(o).is_none_or(|end| end > now_ms);
     match (o["accessToken"].as_str(), o["expiresAt"].as_i64()) {
         (Some(t), Some(exp)) if exp > now_ms => StoredLogin::Fresh(t.to_string()),
         (Some(t), None) => StoredLogin::Fresh(t.to_string()),
         _ if renewable => StoredLogin::Stale,
         _ => StoredLogin::Missing,
     }
+}
+
+/// When the seat's sign-in itself ends, epoch ms: Claude Code's
+/// `refreshTokenExpiresAt`. The refresh token can't be renewed past it, so
+/// the next run after it is refused and Claude Code wipes the login (seen
+/// 2026-10-05 on `work` and `personal`, about four weeks after each signed
+/// in). Renewing the access token does not move it — `default` renewed that
+/// morning and kept its date — so this is the seat's real deadline, and only
+/// `/login` resets it. The field survives the wipe, which is what lets a
+/// listing say when a signed-out seat ran out. None when the login has no
+/// such end (`claude setup-token`) or the blob doesn't say.
+pub(crate) fn login_expiry_from(raw: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    refresh_token_end(&v["claudeAiOauth"])
+}
+
+/// [`login_expiry_from`] for the seat `env` selects.
+pub(crate) fn login_expiry(env: &[(String, String)]) -> Option<i64> {
+    login_expiry_from(&read_credential(env)?)
+}
+
+fn refresh_token_end(oauth: &serde_json::Value) -> Option<i64> {
+    let end = &oauth["refreshTokenExpiresAt"];
+    end.as_i64().or_else(|| end.as_f64().map(|f| f as i64)).filter(|ms| *ms > 0)
 }
 
 /// `GET /api/oauth/usage` — the exact request Claude Code makes to refresh its
@@ -2756,6 +2783,29 @@ mod stored_login_tests {
     fn a_lapsed_token_nothing_can_renew_is_missing() {
         assert_eq!(stored_login_from(&cred(Some("a"), None, Some(NOW - 1)), NOW), StoredLogin::Missing);
         assert_eq!(stored_login_from(&cred(Some("a"), Some(""), Some(NOW - 1)), NOW), StoredLogin::Missing);
+    }
+
+    /// 2026-10-05, `work` and `personal`: the refresh token has a hard end of
+    /// its own (`refreshTokenExpiresAt`, about four weeks after sign-in).
+    /// Past it nothing can renew the seat — Claude Code's next run is refused
+    /// and wipes the login — so it is signed out, not idle.
+    #[test]
+    fn a_lapsed_token_whose_refresh_token_has_expired_is_missing() {
+        let mut v: serde_json::Value = serde_json::from_str(&cred(Some("a"), Some("r"), Some(NOW - 9 * 3_600_000))).unwrap();
+        v["claudeAiOauth"]["refreshTokenExpiresAt"] = (NOW - 3_600_000).into();
+        assert_eq!(stored_login_from(&v.to_string(), NOW), StoredLogin::Missing);
+        // Still ahead: an idle seat like any other.
+        v["claudeAiOauth"]["refreshTokenExpiresAt"] = (NOW + 86_400_000).into();
+        assert_eq!(stored_login_from(&v.to_string(), NOW), StoredLogin::Stale);
+    }
+
+    /// The access token outlives the refresh token by up to 8 hours, and
+    /// until it lapses it still works — the seat runs on it.
+    #[test]
+    fn an_unexpired_token_is_fresh_even_past_its_refresh_tokens_end() {
+        let mut v: serde_json::Value = serde_json::from_str(&cred(Some("a"), Some("r"), Some(NOW + 60_000))).unwrap();
+        v["claudeAiOauth"]["refreshTokenExpiresAt"] = (NOW - 1).into();
+        assert_eq!(stored_login_from(&v.to_string(), NOW), StoredLogin::Fresh("a".into()));
     }
 
     /// A long-lived token (`claude setup-token`) carries no expiry: unchanged.

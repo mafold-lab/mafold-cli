@@ -111,7 +111,13 @@ enum Cmd {
     /// Stop a background agent started with `agent --detach`.
     Stop,
     /// Show whether a background agent is running.
-    Status,
+    Status {
+        /// One JSON object for a program to read (the desktop app): version,
+        /// this binary, the supervisor and the binary its service is
+        /// registered against, accounts, daemons, harnesses, vault.
+        #[arg(long)]
+        json: bool,
+    },
     /// Update mafold to the latest release.
     Update {
         /// Switch this machine's release channel, then update into it.
@@ -318,6 +324,16 @@ enum Cmd {
         username: Option<String>,
         #[arg(long)]
         password: Option<String>,
+        /// Device flow for a program driving this (the desktop app): open no
+        /// browser, and print each step as one JSON line on stdout —
+        /// `{"event":"code",…}`, then `{"event":"approved",…}` or
+        /// `{"event":"expired"}`. Other lines are notes for a person.
+        #[arg(long)]
+        device_json: bool,
+        /// Log in only — leave the supervisor as it is (the caller decides
+        /// whether this machine's service is its to start).
+        #[arg(long)]
+        no_up: bool,
     },
     /// The human accounts logged in on this machine: list them, switch which
     /// one commands act as, or forget one. No argument lists them.
@@ -460,7 +476,11 @@ async fn main() -> Result<()> {
     if matches!(cli.cmd, Cmd::Stop) {
         return daemon::stop();
     }
-    if matches!(cli.cmd, Cmd::Status) {
+    if let Cmd::Status { json } = cli.cmd {
+        if json {
+            println!("{}", supervisor::status_json().await);
+            return Ok(());
+        }
         let _ = daemon::status(); // legacy single `agent --detach`
         supervisor::status(); // multi-daemon config
         return Ok(());
@@ -544,10 +564,10 @@ async fn main() -> Result<()> {
     }
     // Human control plane: `login` mints the s_ session; `report` uses it. No bot token.
     if matches!(cli.cmd, Cmd::Login { .. }) {
-        let Cmd::Login { username, password } = cli.cmd else {
+        let Cmd::Login { username, password, device_json, no_up } = cli.cmd else {
             unreachable!()
         };
-        return login(&cli.base, username, password, cli.no_auto_update).await;
+        return login(&cli.base, username, password, cli.no_auto_update, device_json, no_up).await;
     }
     if matches!(cli.cmd, Cmd::Report) {
         return report_harnesses(&cli.base).await;
@@ -699,7 +719,7 @@ async fn main() -> Result<()> {
         Cmd::D1 { cmd } => d1::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Sites { cmd } => sites::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
-        Cmd::Stop | Cmd::Status | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
+        Cmd::Stop | Cmd::Status { .. } | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }
         | Cmd::Account { .. } | Cmd::Report
@@ -733,11 +753,18 @@ pub(crate) fn prompt_password(label: &str) -> String {
 }
 
 /// `mafold login` — mint a human `s_` session + report this machine's harnesses.
-async fn login(base: &str, username: Option<String>, password: Option<String>, no_auto_update: bool) -> Result<()> {
+async fn login(
+    base: &str,
+    username: Option<String>,
+    password: Option<String>,
+    no_auto_update: bool,
+    device_json: bool,
+    no_up: bool,
+) -> Result<()> {
     // Default (no args) → browser device flow, à la `gh auth login`. Passing
     // --username/--password keeps the direct password login (CI / scripted).
     if username.is_none() && password.is_none() {
-        return login_device(base, no_auto_update).await;
+        return login_device(base, no_auto_update, device_json, no_up).await;
     }
     let username = username.unwrap_or_else(|| prompt("Mafold username: "));
     let password = password.unwrap_or_else(|| prompt_password("Password: "));
@@ -778,7 +805,13 @@ async fn login(base: &str, username: Option<String>, password: Option<String>, n
 /// gh-style device login: get a short code, the user approves it in the Mafold
 /// web app, and we poll until the session token comes back. Works on headless /
 /// remote machines (no browser needed on THIS box — approve from your phone).
-async fn login_device(base: &str, no_auto_update: bool) -> Result<()> {
+///
+/// `machine`: a program is driving this (the desktop app, which approves the
+/// code itself in the page where its person is already signed in). No browser
+/// is opened and each step is one JSON line on stdout; `no_up` leaves the
+/// supervisor alone, because whether this machine's service is the caller's to
+/// start is the caller's decision (mafold-desktop checks who registered it).
+async fn login_device(base: &str, no_auto_update: bool, machine: bool, no_up: bool) -> Result<()> {
     let http = reqwest::Client::new();
     let start: serde_json::Value = http
         .post(format!("{base}/api/auth/device/start"))
@@ -796,18 +829,30 @@ async fn login_device(base: &str, no_auto_update: bool) -> Result<()> {
         .unwrap_or("https://mafold.com/login/device");
     let interval = r["interval"].as_u64().unwrap_or(3).max(1);
 
-    // The url carries the code (server-side), so the page can approve in one
-    // tap — but print both anyway: the person may be reading this over ssh and
-    // opening the page on another device, where they'll type the code by hand.
-    let opened = platform::open_browser(verify_url);
-    if opened {
-        println!("\n  Opened your browser to approve this device.");
-        println!("  (URL: {verify_url} — code {user_code})\n");
+    if machine {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "code",
+                "user_code": user_code,
+                "verify_url": verify_url,
+                "expires_in": r["expires_in"].as_u64().unwrap_or(600),
+            })
+        );
     } else {
-        println!("\n  Open this URL in your browser:  {verify_url}");
-        println!("  and enter the code:             {user_code}\n");
+        // The url carries the code (server-side), so the page can approve in one
+        // tap — but print both anyway: the person may be reading this over ssh and
+        // opening the page on another device, where they'll type the code by hand.
+        let opened = platform::open_browser(verify_url);
+        if opened {
+            println!("\n  Opened your browser to approve this device.");
+            println!("  (URL: {verify_url} — code {user_code})\n");
+        } else {
+            println!("\n  Open this URL in your browser:  {verify_url}");
+            println!("  and enter the code:             {user_code}\n");
+        }
+        println!("  Waiting for you to approve…  (Ctrl-C to cancel)");
     }
-    println!("  Waiting for you to approve…  (Ctrl-C to cancel)");
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
@@ -830,9 +875,18 @@ async fn login_device(base: &str, no_auto_update: bool) -> Result<()> {
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                return finish_login(base, token, uname, true, no_auto_update).await;
+                finish_login(base, token, uname.clone(), !no_up, no_auto_update).await?;
+                if machine {
+                    println!("{}", serde_json::json!({ "event": "approved", "username": uname }));
+                }
+                return Ok(());
             }
-            "expired" => anyhow::bail!("that code expired — run `mafold login` again"),
+            "expired" => {
+                if machine {
+                    println!("{}", serde_json::json!({ "event": "expired" }));
+                }
+                anyhow::bail!("that code expired — run `mafold login` again")
+            }
             _ => {} // pending — keep polling
         }
     }

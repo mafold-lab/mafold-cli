@@ -361,6 +361,12 @@ pub struct Conversation {
     /// how many. Same walk as `unread_count`, so it obeys the same read marker.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread_mention: bool,
+    /// How many messages the requester can see in the main timeline (#all —
+    /// a channel's and a thread's messages aren't in it). Per requester like
+    /// `unread_count`. Clients show it where there's nobody to be online:
+    /// Saved Messages' header. Server-set at list time.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub message_count: u32,
     /// Group avatar (None for direct chats — clients use the peer's avatar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<FileRef>,

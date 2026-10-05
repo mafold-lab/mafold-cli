@@ -403,6 +403,43 @@ pub fn reset_hint(until: i64, now: i64) -> String {
     }
 }
 
+/// How far ahead a listing starts warning that a seat's sign-in is about to
+/// end ([`crate::commands::login_expiry_from`]).
+pub const EXPIRY_WARN_SECS: i64 = 3 * 86400;
+
+/// The command that signs `name` in (again): the default login has no name.
+pub fn login_command(name: &str) -> String {
+    if name == DEFAULT { "/login".into() } else { format!("/login {name}") }
+}
+
+/// What a listing says about a seat's sign-in deadline, `end` in epoch
+/// seconds: the time left, a ⚠️ once it is inside [`EXPIRY_WARN_SECS`], and
+/// when it ran out once it has. None when the login has no deadline on file.
+pub fn login_expiry_note(name: &str, end: Option<i64>, now: i64) -> Option<String> {
+    let end = end?;
+    let fix = login_command(name);
+    Some(if end <= now {
+        format!("⚠️ sign-in expired {} ago — {fix} signs it in again", crate::commands::fmt_dur(now - end))
+    } else if end - now <= EXPIRY_WARN_SECS {
+        format!("⚠️ sign-in expires in {} — {fix} renews it", crate::commands::fmt_dur(end - now))
+    } else {
+        format!("sign-in good for {}", crate::commands::fmt_dur(end - now))
+    })
+}
+
+/// Why a seat with no usable credential is passed over — and, when its
+/// sign-in simply ran out, that it did and when.
+fn signed_out_reason(acct: &Account, now: i64) -> String {
+    let fix = login_command(&acct.name);
+    match crate::commands::login_expiry(&acct.env()).map(|ms| ms / 1000) {
+        Some(end) if end <= now => format!(
+            "isn't logged in — its sign-in expired {} ago; `{fix}` fixes that",
+            crate::commands::fmt_dur(now - end)
+        ),
+        _ => format!("isn't logged in — `{fix}` fixes that"),
+    }
+}
+
 /// A run's error text says Anthropic refused the seat's SIGN-IN — the shape a
 /// revoked refresh token takes once the turn is already running on it.
 /// Phrasings taken from the Claude Code 2.1.282 binary:
@@ -742,7 +779,7 @@ async fn first_usable(
         let snap = check_seat(acct).await;
         match &snap.state {
             SeatState::NoCredential => {
-                skipped.push((acct.name.clone(), "isn't logged in — `/login <name>` fixes that".into()));
+                skipped.push((acct.name.clone(), signed_out_reason(acct, now)));
                 continue;
             }
             SeatState::Rejected(s) => {
@@ -796,7 +833,10 @@ async fn first_usable(
                     if reg.refused(&acct.name, fp.as_deref()) {
                         skipped.push((
                             acct.name.clone(),
-                            "isn't logged in — Anthropic refused its sign-in; `/login <name>` fixes that".into(),
+                            format!(
+                                "isn't logged in — Anthropic refused its sign-in; `{}` fixes that",
+                                login_command(&acct.name)
+                            ),
                         ));
                         continue;
                     }
@@ -830,7 +870,10 @@ pub async fn choose(preferred: Option<&str>, model: Option<&str>) -> Choice {
     let preferred_name = preferred.map(str::to_string).unwrap_or_else(|| DEFAULT.into());
     let mut skipped: Vec<(String, String)> = Vec::new();
     if preferred.is_some() && reg.get(&preferred_name).is_none() {
-        skipped.push((preferred_name.clone(), "isn't on this machine — `/login <name>` adds it".into()));
+        skipped.push((
+            preferred_name.clone(),
+            format!("isn't on this machine — `{}` adds it", login_command(&preferred_name)),
+        ));
     }
     let order = reg.ordered(preferred);
     // One login and nowhere else to go: nothing to choose, so nothing to
@@ -1354,6 +1397,63 @@ mod tests {
         let (pick, _) = first_usable(&mut reg, &order, now, Some("opus"), &mut skipped).await;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(pick.map(|a| a.name).as_deref(), Some("idle-backup"), "passed over as: {skipped:?}");
+    }
+
+    /// 2026-10-05: `work` and `personal` passed their `refreshTokenExpiresAt`
+    /// (10-05 00:35 and 10-04 00:51, UTC+8) with the refresh tokens still on
+    /// file. Read as idle seats they stayed choosable; at 02:12 a run on them
+    /// was refused ("OAuth session expired and could not be refreshed") and
+    /// Claude Code wiped both logins. A seat nothing can renew is signed out
+    /// — the turn goes to the next login, and the skip says why.
+    ///
+    /// Probed for real, through the credential file.
+    #[tokio::test]
+    async fn a_seat_whose_refresh_token_has_expired_is_not_chosen() {
+        let _turn = cache_turn().await;
+        let now = now();
+        let dir = std::env::temp_dir().join(format!("mafold-expired-seat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred = serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-lapsed", "refreshToken": "sk-ant-ort01-past-its-end",
+            "expiresAt": (now - 9 * 3600) * 1000, "refreshTokenExpiresAt": (now - 3600) * 1000,
+            "scopes": ["user:inference", "user:profile"] } });
+        std::fs::write(dir.join(".credentials.json"), cred.to_string()).unwrap();
+
+        let mut reg = seeded(&[("default", healthy())]);
+        let expired = Account { name: "expired".into(), dir: Some(dir.to_string_lossy().into_owned()), email: None, added_at: 0 };
+        forget_seat(&expired.name);
+        reg.accounts.push(expired);
+        let order = reg.ordered(Some("expired"));
+        let mut skipped = vec![];
+        let (pick, _) = first_usable(&mut reg, &order, now, None, &mut skipped).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        forget_seat("expired");
+        assert_eq!(pick.map(|a| a.name).as_deref(), Some("default"), "{skipped:?}");
+        assert!(
+            skipped.iter().any(|(n, w)| n == "expired"
+                && w.contains("isn't logged in")
+                && w.contains("sign-in expired 1h")
+                && w.contains("`/login expired`")),
+            "{skipped:?}"
+        );
+    }
+
+    /// What `/account` says about each seat's deadline: the time left, a
+    /// warning inside three days, and when a signed-out seat ran out.
+    #[test]
+    fn a_listing_counts_down_to_the_sign_in_deadline() {
+        let now = 1_790_450_000;
+        assert_eq!(login_expiry_note("work", None, now), None);
+        assert_eq!(
+            login_expiry_note("work", Some(now + 27 * 86400 + 3 * 3600), now).as_deref(),
+            Some("sign-in good for 27d 3h")
+        );
+        let soon = login_expiry_note("work", Some(now + 2 * 86400), now).unwrap();
+        assert!(soon.starts_with("⚠️ sign-in expires in 2d 0h") && soon.contains("/login work renews it"), "{soon}");
+        let gone = login_expiry_note("work", Some(now - 5 * 3600), now).unwrap();
+        assert!(gone.starts_with("⚠️ sign-in expired 5h 0m ago") && gone.contains("/login work"), "{gone}");
+        // The default login is signed in again by a bare `/login`.
+        assert!(login_expiry_note(DEFAULT, Some(now + 3600), now).unwrap().ends_with("— /login renews it"));
     }
 
     /// Idle is not a free pass: a wall the registry remembers for that seat

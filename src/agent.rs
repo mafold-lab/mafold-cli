@@ -6118,6 +6118,14 @@ async fn account_list(bot_setting: Option<&str>, pin: Option<&str>) -> String {
                 v.push_str(&format!(" · held ({}) — {}", x.kind, crate::accounts::reset_hint(x.until, now)));
             }
         }
+        // The seat's sign-in deadline: a login has a hard end (about four
+        // weeks out on the ones seen so far) that only `/login` resets, so
+        // the list says how long each has left — and warns before one runs
+        // out under a turn.
+        let end = crate::commands::login_expiry(&a.env()).map(|ms| ms / 1000);
+        if let Some(note) = crate::accounts::login_expiry_note(&a.name, end, now) {
+            v.push_str(&format!(" · {note}"));
+        }
         if let Some(e) = &a.email {
             v.push_str(&format!(" · {e}"));
         }

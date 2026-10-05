@@ -299,7 +299,7 @@ fn service_path() -> String {
     if base.is_empty() { extra } else { format!("{extra}:{base}") }
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -499,7 +499,7 @@ fn task_command() -> String {
     format!(r"{root}\System32\conhost.exe")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn task_arguments(exe: &str, base: &str, no_auto_update: bool) -> String {
     // The exe is quoted because conhost re-parses this as a command line and
     // profile paths ("C:\Users\John Smith\…") contain spaces.
@@ -1137,6 +1137,120 @@ pub fn status() {
     }
 }
 
+// ---------------- machine-readable status (`mafold status --json`) ----------------
+
+/// What the boot-persistent service is actually registered to run — read back
+/// from the plist / unit / scheduled task, not assumed.
+///
+/// A program that manages this machine (the desktop app) compares this with
+/// the binary it would run BEFORE calling `up`: `up` re-registers the service
+/// against the CALLER's binary whenever the registered flags differ
+/// (`autostart_current`, which on macOS and Linux never looks at the binary
+/// itself), so an `up` from a different install would quietly take the service
+/// over — and with it every bot on the machine.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Registration {
+    pub exe: Option<String>,
+    pub no_auto_update: bool,
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+/// The first `<string>` of `ProgramArguments` in a launchd plist.
+pub(crate) fn parse_plist_registration(xml: &str) -> Registration {
+    let exe = xml
+        .split("<key>ProgramArguments</key>")
+        .nth(1)
+        .and_then(|rest| rest.split("<string>").nth(1))
+        .and_then(|s| s.split("</string>").next())
+        .map(xml_unescape);
+    Registration { exe, no_auto_update: xml.contains("--no-auto-update") }
+}
+
+/// The program of `ExecStart=` in a systemd unit — everything before
+/// ` --base `, since `ensure_autostart` writes the path unquoted.
+pub(crate) fn parse_unit_registration(unit: &str) -> Registration {
+    let exec = unit.lines().find_map(|l| l.strip_prefix("ExecStart="));
+    let exe = exec.map(|e| e.split(" --base ").next().unwrap_or(e).trim().to_string());
+    Registration { exe, no_auto_update: exec.is_some_and(|e| e.contains("--no-auto-update")) }
+}
+
+/// The quoted binary inside the scheduled task's `<Arguments>` (`task_arguments`
+/// writes `--headless "<exe>" --base …`).
+pub(crate) fn parse_task_registration(xml: &str) -> Registration {
+    let args = xml
+        .split("<Arguments>")
+        .nth(1)
+        .and_then(|s| s.split("</Arguments>").next())
+        .map(xml_unescape)
+        .unwrap_or_default();
+    let exe = args.split('"').nth(1).map(str::to_string).filter(|s| !s.is_empty());
+    Registration { exe, no_auto_update: args.contains("--no-auto-update") }
+}
+
+#[cfg(target_os = "macos")]
+fn registration() -> Option<Registration> {
+    fs::read_to_string(launchagent_path()).ok().map(|x| parse_plist_registration(&x))
+}
+#[cfg(target_os = "linux")]
+fn registration() -> Option<Registration> {
+    fs::read_to_string(systemd_unit_path()).ok().map(|x| parse_unit_registration(&x))
+}
+#[cfg(windows)]
+fn registration() -> Option<Registration> {
+    query_task_xml().map(|x| parse_task_registration(&x))
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn registration() -> Option<Registration> {
+    None
+}
+
+/// A path as the filesystem resolves it (symlinks followed), else as given —
+/// so `/opt/homebrew/bin/mafold` and `~/.mafold/mafold` compare equal.
+fn canonical(p: &str) -> String {
+    fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string())
+}
+
+/// Everything a managing program needs to decide what it may do here, as one
+/// JSON object. Paths are given both as registered and canonicalised.
+pub async fn status_json() -> serde_json::Value {
+    let me = std::env::current_exe().ok().map(|p| p.display().to_string());
+    let reg = registration();
+    let pid = sup_running();
+    let c = load();
+    let daemons: Vec<serde_json::Value> = c
+        .daemons
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.name,
+                "harness": d.harness.as_deref().unwrap_or("claude-code"),
+                "running": matches!(read_pid(&d.name), Some(p) if alive(p)),
+                "busy": busy_count(&d.name) > 0,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "exe": me,
+        "exe_canonical": me.as_deref().map(canonical),
+        "supervisor": {
+            "running": pid.is_some(),
+            "pid": pid,
+            "autostart": autostart_loaded(),
+            "registered_exe": reg.as_ref().and_then(|r| r.exe.clone()),
+            "registered_exe_canonical": reg.as_ref().and_then(|r| r.exe.as_deref()).map(canonical),
+            "no_auto_update": reg.as_ref().map(|r| r.no_auto_update),
+        },
+        "accounts": crate::session::all().into_iter().map(|s| s.username).collect::<Vec<_>>(),
+        "daemons": daemons,
+        "harnesses": crate::harness::report_rows().await,
+        "vault": crate::vault::local_state(),
+    })
+}
+
 /// `mafold logs <name>` — last ~40 lines of a daemon's log.
 pub fn logs(name: &str) -> Result<()> {
     let p = log_path(name);
@@ -1147,6 +1261,43 @@ pub fn logs(name: &str) -> Result<()> {
         println!("{l}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    // Each parser is fed exactly what this file's own `ensure_autostart` /
+    // `task_arguments` write, so a change to one side breaks a test here.
+
+    #[test]
+    fn reads_the_binary_back_out_of_a_launchd_plist() {
+        let xml = "<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.mafold.supervisor</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>/Users/a b/.mafold/mafold</string>\n    <string>--base</string><string>https://api.mafold.com</string>\n    <string>supervise</string>\n    <string>--no-auto-update</string>\n  </array>\n</dict></plist>";
+        assert_eq!(
+            parse_plist_registration(xml),
+            Registration { exe: Some("/Users/a b/.mafold/mafold".into()), no_auto_update: true }
+        );
+        assert_eq!(parse_plist_registration("<plist/>"), Registration { exe: None, no_auto_update: false });
+    }
+
+    #[test]
+    fn reads_the_binary_back_out_of_a_systemd_unit() {
+        let unit = "[Service]\nEnvironment=PATH=/usr/bin\nExecStart=/home/a/.mafold/mafold --base https://api.mafold.com supervise\nRestart=always\n";
+        assert_eq!(
+            parse_unit_registration(unit),
+            Registration { exe: Some("/home/a/.mafold/mafold".into()), no_auto_update: false }
+        );
+    }
+
+    #[test]
+    fn reads_the_binary_back_out_of_the_scheduled_task() {
+        let args = task_arguments(r"C:\Users\John Smith\.mafold\mafold.exe", "https://api.mafold.com", true);
+        let xml = format!("<Task><Actions><Exec><Command>conhost.exe</Command><Arguments>{}</Arguments></Exec></Actions></Task>", xml_escape(&args));
+        assert_eq!(
+            parse_task_registration(&xml),
+            Registration { exe: Some(r"C:\Users\John Smith\.mafold\mafold.exe".into()), no_auto_update: true }
+        );
+    }
 }
 
 #[cfg(test)]

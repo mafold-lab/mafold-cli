@@ -45,6 +45,8 @@ pub static KNOWN_METHODS: &[&str] = &[
     "approveMachinePairing",
     "approveVaultDevice",
     "auth/challenge",
+    "auth/desktop/redeem",
+    "auth/desktop/start",
     "auth/device/approve",
     "auth/device/poll",
     "auth/device/start",

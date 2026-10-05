@@ -111,6 +111,20 @@ pub fn forget_cached_umk() {
     let _ = std::fs::remove_file(umk_cache_path());
 }
 
+/// What this machine holds of the vault, judged from disk alone (no server
+/// call, so a status read stays instant): `"cached"` — a device key and a
+/// master key that opens with it; `"device"` — a device key but no usable
+/// master key yet (waiting for a hand-over, or never unlocked); `"none"`.
+pub fn local_state() -> &'static str {
+    if !device_key_path().exists() {
+        return "none";
+    }
+    match device_key() {
+        Ok(dev) if cached_umk(&dev).is_some() => "cached",
+        _ => "device",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
