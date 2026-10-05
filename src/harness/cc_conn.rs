@@ -218,6 +218,9 @@ pub struct Conn {
     /// deregisters the pid from `live_children`.
     child: Option<tokio::process::Child>,
     _guard: super::ChildGuard,
+    /// Ends [`recv`](Self::recv) when the process is gone but its stdout is
+    /// not — see [`super::ExitWatch`].
+    exit: super::ExitWatch,
     pub last_used: Instant,
     pub turns: u32,
     /// True once the hooks were registered over the control channel, so the
@@ -317,6 +320,7 @@ impl Conn {
             pid,
             child: Some(child),
             _guard: guard,
+            exit: super::ExitWatch::new(pid),
             last_used: Instant::now(),
             turns: 0,
             control_hooks: false,
@@ -513,8 +517,26 @@ impl Conn {
     }
 
     /// The next frame of the running turn, or None when the process ended.
+    ///
+    /// "Ended" means the PROCESS, not just its pipe: killed while a process it
+    /// started still holds stdout, claude never delivers EOF, and the turn sat
+    /// open until the 15-minute stall watchdog. Frames already in the pipe are
+    /// still delivered first (`biased`); the caller then takes the same road as
+    /// any other death, and a connection that ended this way is never pooled.
     pub async fn recv(&mut self) -> Option<Value> {
-        self.rx.recv().await
+        tokio::select! {
+            biased;
+            v = self.rx.recv() => v,
+            _ = self.exit.gone() => {
+                self.shared.alive.store(false, Ordering::SeqCst);
+                eprintln!(
+                    "[cc-pool] pid {} exited mid-turn but its stdout is still held open \
+                     (by something it started) — ending the turn",
+                    self.pid.unwrap_or(0)
+                );
+                None
+            }
+        }
     }
 
     /// Stop forwarding; the connection stays up.
@@ -1284,6 +1306,40 @@ mod tests {
 
     const REPLY: &str =
         r#"{"type":"control_response","response":{"subtype":"%S","request_id":"mf-init-t1"}}"#;
+
+    /// claude killed mid-turn while a process it started still holds its
+    /// stdout (the K case of `scripts/beat-alive-e2e.sh`): no EOF ever comes,
+    /// and the turn used to sit there until the 15-minute stall watchdog. The
+    /// process being gone has to end the stream — after what was already in the
+    /// pipe has been read — and the connection must never be pooled again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn harness_exit_ends_the_turn_even_if_a_child_holds_the_pipe() {
+        let mut c = stub(
+            r#"read -r _; echo '{"type":"assistant","message":{"content":[]},"session_id":"s-orphan"}'; sleep 30 & sleep 30"#,
+        )
+        .await;
+        c.begin_turn("hi", Default::default()).await.expect("the turn starts");
+        let first = tokio::time::timeout(Duration::from_secs(10), c.recv())
+            .await
+            .expect("the first frame arrives")
+            .expect("a frame, not the end");
+        assert_eq!(first["session_id"], "s-orphan");
+
+        crate::platform::terminate(c.pid().expect("a pid"));
+        let killed = Instant::now();
+        let end = tokio::time::timeout(Duration::from_secs(20), c.recv())
+            .await
+            .expect("the turn was still waiting 20s after its process died — a child of it holds the pipe");
+        assert!(end.is_none(), "once the process is gone the stream ends, got {end:?}");
+        assert!(
+            killed.elapsed() < super::super::EXIT_DRAIN + Duration::from_secs(2),
+            "ended {:?} after the kill — one {:?} drain, not more",
+            killed.elapsed(),
+            super::super::EXIT_DRAIN
+        );
+        assert!(!c.alive(), "a dead process must never go back in the pool");
+    }
 
     /// A process spawned to fork a held session forks ONCE — its first turn.
     /// Parked after that it is the only writer of the new session, and a turn

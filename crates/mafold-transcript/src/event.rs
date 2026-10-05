@@ -91,9 +91,15 @@ pub enum AgentEvent {
     /// The producer compacted its OWN context part-way through the turn (Claude
     /// Code's auto-compact). It takes minutes and produces no stream output
     /// while it runs, so relaying it is what keeps a long reply from reading as
-    /// a hang. `pre_tokens` is the context size that was compacted, when the
-    /// producer reports it.
-    Compacted { pre_tokens: Option<u64> },
+    /// a hang. `pre_tokens` / `post_tokens` are the context size before and
+    /// after, when the producer reports them.
+    ///
+    /// `summary` is what the model will now read INSTEAD of the conversation —
+    /// its own words, handed back in the user's voice — and `flagged` the lines
+    /// of it an independent check found giving instructions or approvals no
+    /// person gave. Both are shown to the owner, who otherwise never learns what
+    /// the agent now believes it was told.
+    Compacted { pre_tokens: Option<u64>, post_tokens: Option<u64>, summary: Option<String>, flagged: Vec<String> },
     /// The producer reported a usage limit that is NOT in the healthy state.
     /// Producers emit this ONLY for the non-healthy states; a limit that's
     /// fine is not news and must not be relayed into every reply.

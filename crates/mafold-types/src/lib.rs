@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod connections;
+/// D1 databases: names, wire shapes (`d1.rs`, `.docs/d1-v1.md`).
+pub mod d1;
 pub mod drive;
+/// A mafold.app site's own Worker (`sites.rs`, `.docs/site-workers-v1.md`).
+pub mod sites;
 /// Mid-turn words: which running turn takes them, and how they are framed —
 /// one rule for the daemon and the hosted brains (`steer.rs`).
 pub mod steer;

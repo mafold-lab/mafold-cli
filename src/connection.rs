@@ -108,7 +108,20 @@ pub enum ConnectionCmd {
         reveal: bool,
     },
     /// Print `export VAR=…` lines for a connection, to feed a local tool.
+    /// Refused in a bot's turn — there, what is printed is posted to the chat.
     Env { name: String },
+    /// Run a command with connections' secrets in its environment and their
+    /// values masked out of everything it prints:
+    /// `mafold connection run notion -- sh -c 'curl -H "Authorization: Bearer $NOTION_TOKEN" …'`.
+    Run {
+        /// Connections to inject (each as its provider's variable, e.g. `NOTION_TOKEN`).
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// The command, after `--`. Quote it for `sh -c` when the command line
+        /// itself needs the value — your own shell would expand `$VAR` first.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// What a connection can do — its methods, straight from the provider.
     Methods {
         name: String,
@@ -264,6 +277,49 @@ async fn require_connection_use(
         bail!(msg);
     }
     Ok(())
+}
+
+/// Whether this process is a bot's turn (the daemon sets `MAFOLD_BOT_TOKEN`
+/// for every turn it runs) — the same test [`require_connection_use`] makes.
+fn bot_turn() -> bool {
+    std::env::var("MAFOLD_BOT_TOKEN").is_ok_and(|t| !t.trim().is_empty())
+}
+
+/// `env` and `show --reveal` print a connection's raw secret. At a person's
+/// own terminal that is the point; in a bot's turn everything printed becomes
+/// the trace card, posted to the conversation for everyone in it — which is
+/// how `export NOTION_TOKEN=…` ended up in a group of two dozen (2026-10-05).
+/// The grant check doesn't help: a bot that IS allowed to use the connection
+/// still must not publish it. Refused before the vault is touched; `run` is
+/// the way to hand the value to a command.
+fn plaintext_refused(bot_turn: bool, command: &str, name: &str) -> Option<String> {
+    bot_turn.then(|| {
+        format!(
+            "`mafold connection {command}` would print `{name}`'s secret, and in a bot's turn \
+             everything printed is posted to the conversation. Use \
+             `mafold connection run {name} -- <command>` instead: the secret goes into that \
+             command's environment, and anything it prints comes back with the secret masked."
+        )
+    })
+}
+
+/// The `(VAR, value)` a connection is fed to a local tool as.
+fn env_pair(spec: &ProviderInfo, fields: &serde_json::Map<String, Value>, name: &str) -> Result<(String, String)> {
+    // A provider that names no variable but holds exactly one value — a secret
+    // someone typed into a card — is fed as the CONNECTION's name: the bot
+    // asked for `db_password`, it gets `$DB_PASSWORD`. Read off the row's
+    // shape, not the provider's id (`.docs/secure-input-v1.md` §8).
+    let var = match (&spec.env_var, spec.fields.len()) {
+        (Some(v), _) => v.clone(),
+        (None, 1) => name.to_uppercase().replace('-', "_"),
+        (None, _) => bail!("{} is an OAuth bag, not a single env var — use `mafold connection call {name} …`", spec.id),
+    };
+    let primary = spec.fields.first().map(|f| f.key.as_str()).unwrap_or("api_key");
+    let val = fields
+        .get(primary)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("connection has no `{primary}`"))?;
+    Ok((var, val.to_string()))
 }
 
 /// Mask everything but the last 4 — the same shape the api uses for bot
@@ -437,6 +493,26 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
 /// AEAD would surface "wrong key or corrupt data", which reads like the
 /// credential was damaged rather than that the caller needs to re-unlock.
 fn open_payload(umk: &Key, key_id: &str, conn: &Value) -> Result<serde_json::Map<String, Value>> {
+    // Secure input (`.docs/secure-input-v1.md` §7): sealed by someone holding
+    // no master key, to each of the owner's devices. Only this device's own
+    // wrap opens with its secret, so trying them all needs no device id.
+    if s(conn, "wrapped_dek").is_empty() {
+        let wraps = conn.get("device_wraps").and_then(|w| w.as_object());
+        let dev = vault::device_key()?;
+        let plain = wraps
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, w)| w.as_str())
+            .find_map(|w| mafold_core::vault::open_for_device(&dev.secret, &s(conn, "blob"), w).ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "`{}` was handed over to this account's devices before this one joined the vault — \
+                     ask for it again (it's a card in the chat), this machine can't open the copy that exists",
+                    s(conn, "name")
+                )
+            })?;
+        return serde_json::from_str(&plain).context("connection payload is not JSON");
+    }
     let want = s(conn, "key_id");
     if !want.is_empty() && !key_id.is_empty() && want != key_id {
         bail!(
@@ -480,6 +556,9 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
         }
         ConnectionCmd::Show { name, reveal } => show(base, &client, &sess, &name, reveal).await,
         ConnectionCmd::Env { name } => env(base, &client, &sess, &name).await,
+        ConnectionCmd::Run { names, command } => {
+            run_with(base, &client, &sess, &names, &command).await
+        }
         ConnectionCmd::Methods { name, schema } => {
             methods(base, &client, &sess, &name, schema).await
         }
@@ -563,12 +642,31 @@ async fn list(client: &Client) -> Result<()> {
         if expired {
             dead.push((s(c, "name"), s(c, "relink_reason")));
         }
+        // A value someone handed over through a card says who and until when —
+        // and how a bot spends it, since its variable is the row's own name.
+        let handed = s(c, "provided_by");
+        let note = if handed.is_empty() {
+            String::new()
+        } else {
+            let until = c
+                .get("expires_at")
+                .and_then(Value::as_i64)
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|t| format!(" until {}", t.format("%Y-%m-%d %H:%M UTC")))
+                .unwrap_or_default();
+            let name = s(c, "name");
+            format!(
+                "  from @{handed}{until} · use: mafold connection run {name} -- <cmd> (as ${})",
+                name.to_uppercase().replace('-', "_")
+            )
+        };
         println!(
-            "{:<16} {:<20} {:<10} {}",
+            "{:<16} {:<20} {:<10} {}{}",
             s(c, "name"),
             s(c, "provider"),
             if expired { "expired" } else { "linked" },
-            s(c, "label")
+            s(c, "label"),
+            note
         );
     }
     for (name, why) in dead {
@@ -1289,6 +1387,9 @@ async fn show(base: &str, client: &Client, sess: &session::Session, name: &str, 
         return Ok(());
     }
     // `--reveal` decrypts the raw secret on this machine — same gate as `env`.
+    if let Some(msg) = plaintext_refused(bot_turn(), "show --reveal", name) {
+        bail!(msg);
+    }
     require_connection_use(base, client, &sess.username, name).await?;
     let spec = descriptor(client, &s(&conn, "provider")).await?;
     refuse_if_spend_only(name, &spec)?;
@@ -1325,8 +1426,9 @@ fn refuse_if_spend_only(name: &str, spec: &ProviderInfo) -> Result<()> {
 /// bespoke integration. Deliberately not written to any file: piping into
 /// `eval` keeps the plaintext in a process, not on disk.
 async fn env(base: &str, client: &Client, sess: &session::Session, name: &str) -> Result<()> {
-    // Printing the raw secret is the same exposure as `call`, so it takes the
-    // same grant when a bot turn asks for it.
+    if let Some(msg) = plaintext_refused(bot_turn(), "env", name) {
+        bail!(msg);
+    }
     require_connection_use(base, client, &sess.username, name).await?;
     let conn = fetch(client, name).await?;
     let provider = s(&conn, "provider");
@@ -1334,16 +1436,42 @@ async fn env(base: &str, client: &Client, sess: &session::Session, name: &str) -
     refuse_if_spend_only(name, &spec)?;
     let (umk, key_id, _) = unlock(client, sess).await?;
     let fields = open_payload(&umk, &key_id, &conn)?;
-    let var = spec
-        .env_var
-        .ok_or_else(|| anyhow!("{} is an OAuth bag, not a single env var — use `show --reveal`", spec.id))?;
-    let primary = spec.fields.first().map(|f| f.key.as_str()).unwrap_or("api_key");
-    let val = fields
-        .get(primary)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("connection has no `{primary}`"))?;
+    let (var, val) = env_pair(&spec, &fields, name)?;
     println!("export {var}={val}");
     Ok(())
+}
+
+/// `mafold connection run <name>… -- <command>`: the secrets go into the
+/// command's environment, never into this process's output — see
+/// [`crate::conceal`]. Same grant as `call` in a bot's turn; exits with the
+/// command's own status so `&&` chains behave.
+async fn run_with(
+    base: &str,
+    client: &Client,
+    sess: &session::Session,
+    names: &[String],
+    command: &[String],
+) -> Result<()> {
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut opened: Option<(Key, String)> = None;
+    for name in names {
+        require_connection_use(base, client, &sess.username, name).await?;
+        let conn = fetch(client, name).await?;
+        let spec = descriptor(client, &s(&conn, "provider")).await?;
+        refuse_if_spend_only(name, &spec)?;
+        if opened.is_none() {
+            let (umk, key_id, _) = unlock(client, sess).await?;
+            opened = Some((umk, key_id));
+        }
+        let (umk, key_id) = opened.as_ref().expect("unlocked above");
+        let fields = open_payload(umk, key_id, &conn)?;
+        vars.push(env_pair(&spec, &fields, name)?);
+    }
+    let command = command.to_vec();
+    let code = tokio::task::spawn_blocking(move || crate::conceal::run(&command, &vars))
+        .await
+        .context("the command's runner panicked")??;
+    std::process::exit(code);
 }
 
 /// A device-side runtime, unlocked.
@@ -2115,6 +2243,18 @@ async fn rotate(client: &Client, sess: &session::Session) -> Result<()> {
     // leave devices holding a key that opens nothing.
     for c in &conns {
         let name = s(c, "name");
+        // A value handed over through a card is wrapped per device, and the
+        // device being revoked may hold one of those wraps. Re-sealing can't
+        // take a wrap back, and these rows live for days — so they go, and
+        // whoever needs one asks again.
+        if s(c, "wrapped_dek").is_empty() {
+            client
+                .call("deleteConnection", json!({ "name": name }))
+                .await
+                .with_context(|| format!("drop handed-over `{name}`"))?;
+            eprintln!("  dropped `{name}` (handed over through a card; ask for it again)");
+            continue;
+        }
         let fields = open_payload(&old_umk, &old_key_id, c)
             .with_context(|| format!("re-key {name}: could not open it with the current key"))?;
         let (blob, wrapped_dek) = seal_payload(&new_umk, &fields)?;
@@ -2240,6 +2380,80 @@ async fn recover(client: &Client, sess: &session::Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-05: `mafold connection env notion` in a bot's turn put
+    /// `export NOTION_TOKEN=…` into the trace card of a 24-person group. In a
+    /// bot turn the two commands that print a raw secret refuse — even for a
+    /// bot that holds the grant — and name the way that doesn't print it.
+    #[test]
+    fn a_bot_turn_never_prints_a_connections_secret() {
+        for cmd in ["env", "show --reveal"] {
+            let msg = plaintext_refused(true, cmd, "notion").expect("refused in a bot turn");
+            assert!(msg.contains("posted to the conversation"), "{msg}");
+            assert!(msg.contains("mafold connection run notion -- "), "points at run: {msg}");
+            assert_eq!(plaintext_refused(false, cmd, "notion"), None, "a person's own terminal");
+        }
+    }
+
+    #[test]
+    fn run_takes_names_then_a_command_after_the_double_dash() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: ConnectionCmd,
+        }
+        let cli = Cli::try_parse_from([
+            "x", "run", "notion", "figma", "--", "sh", "-c", "curl -H \"Authorization: Bearer $NOTION_TOKEN\"",
+        ])
+        .unwrap();
+        match cli.cmd {
+            ConnectionCmd::Run { names, command } => {
+                assert_eq!(names, ["notion", "figma"]);
+                assert_eq!(command[..2], ["sh", "-c"]);
+            }
+            _ => panic!("not run"),
+        }
+        assert!(Cli::try_parse_from(["x", "run", "notion"]).is_err(), "a command is required");
+    }
+
+    #[test]
+    fn env_pair_names_the_providers_variable() {
+        let spec = provider_infos()
+            .into_iter()
+            .find(|p| p.env_var.is_some() && !p.fields.is_empty())
+            .expect("a single-variable provider");
+        let mut fields = serde_json::Map::new();
+        fields.insert(spec.fields[0].key.clone(), json!("v4lue-1234"));
+        let (var, val) = env_pair(&spec, &fields, "x").unwrap();
+        assert_eq!(Some(var), spec.env_var);
+        assert_eq!(val, "v4lue-1234");
+
+        // One value and no variable of its own: the connection's name is the
+        // variable — what a bot asked for in a secure-input card.
+        let mut secret = spec.clone();
+        secret.env_var = None;
+        secret.fields.truncate(1);
+        let (var, _) = env_pair(&secret, &fields, "db-password").unwrap();
+        assert_eq!(var, "DB_PASSWORD");
+    }
+
+    /// A row a card handed over is sealed to the owner's DEVICES, not the
+    /// master key; this machine opens its own wrap and no other.
+    #[test]
+    fn a_handed_over_row_opens_with_this_devices_own_wrap() {
+        let me = mafold_core::vault::generate_device();
+        let other = mafold_core::vault::generate_device();
+        let (blob, wraps) = mafold_core::vault::seal_for_devices(
+            &[("other".into(), other.public.clone()), ("me".into(), me.public.clone())],
+            r#"{"value":"hunter2-42"}"#,
+        )
+        .unwrap();
+        let mine = wraps.values().find_map(|w| mafold_core::vault::open_for_device(&me.secret, &blob, w).ok());
+        assert_eq!(mine.as_deref(), Some(r#"{"value":"hunter2-42"}"#));
+        let stranger = mafold_core::vault::generate_device();
+        assert!(wraps.values().all(|w| mafold_core::vault::open_for_device(&stranger.secret, &blob, w).is_err()));
+    }
 
     /// A link that goes silent ends, so the listener reconnects — instead of
     /// waiting forever on a socket nobody is at the other end of (@fei_pota's

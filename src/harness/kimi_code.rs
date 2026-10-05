@@ -88,7 +88,9 @@ impl Harness for KimiCode {
             _ => prompt,
         };
 
+        let program = super::program("kimi");
         let p = RunParams {
+            program: &program,
             full_prompt: &full_prompt,
             workdir: &workdir,
             model: model.as_deref(),
@@ -145,6 +147,10 @@ impl Harness for KimiCode {
 /// fresh-session retry.
 #[derive(Clone, Copy)]
 struct RunParams<'a> {
+    /// The `kimi` binary to spawn — resolved once by [`Harness::run`], a
+    /// parameter so the tests below can drive the event loop against a script
+    /// (same as the Codex harness).
+    program: &'a std::ffi::OsStr,
     full_prompt: &'a str,
     workdir: &'a str,
     model: Option<&'a str>,
@@ -159,9 +165,9 @@ struct RunParams<'a> {
 /// One `kimi --print` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { full_prompt, workdir, model, thinking, conv, draft, cancel, sink, proc } = *p;
+    let RunParams { program, full_prompt, workdir, model, thinking, conv, draft, cancel, sink, proc } = *p;
 
-    let mut cmd = tokio::process::Command::new(super::program("kimi"));
+    let mut cmd = tokio::process::Command::new(program);
     // `--print` runs one turn non-interactively (and implies `--yolo`, so tools
     // run without approval prompts, which would hang a headless run).
     cmd.arg("--print").arg("--output-format").arg("stream-json");
@@ -226,22 +232,30 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     let stdout = child.stdout.take().context("no stdout")?;
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::new();
+    let mut exit = super::ExitWatch::new(child.id());
+    // Set when `exit` ended the turn: the drain has already been spent.
+    let mut drained = false;
 
     // Drain stderr CONCURRENTLY (same deadlock guard as the other harnesses) — and
     // Kimi prints its resumable session id there (`kimi -r <id>`), so we parse it
     // from the drained buffer once the run ends.
+    //
+    // Into a SHARED buffer, not a task result: a process Kimi started can hold
+    // stderr open after Kimi is gone, and then waiting for the task to finish is
+    // waiting forever. The reap below bounds that wait and keeps what was said.
+    let stderr_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let stderr_task = child.stderr.take().map(|se| {
+        let acc = stderr_bytes.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
-            // Read bytes + decode lossily (same reason as the stdout reader): Kimi
-            // is Python-on-Windows and its stderr — where the resumable session id
-            // is printed — can carry non-UTF-8 in the locale codepage. A strict
-            // decode would fail and drop the session id with it, so every turn
-            // would restart context-less. Lossy keeps the (ASCII) resume hint.
-            let mut bytes = Vec::new();
             let mut se = se;
-            let _ = se.read_to_end(&mut bytes).await;
-            String::from_utf8_lossy(&bytes).into_owned()
+            let mut chunk = [0u8; 4096];
+            loop {
+                match se.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => acc.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
         })
     });
 
@@ -272,6 +286,10 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                 let _ = child.start_kill();
                 break;
             }
+            // Kimi is gone but its stdout isn't (something it started holds
+            // it): end the turn now, not at the watchdog. Completes only then,
+            // so it never cuts a `read_until` short while Kimi still runs.
+            _ = exit.gone() => { error = Some(super::EXITED_MID_TURN.to_string()); drained = true; break; }
         };
         if n == 0 {
             break; // EOF
@@ -300,10 +318,21 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         let _ = child.start_kill(); // idempotent
     }
     let status = child.wait().await; // reap
-    let stderr_buf = match stderr_task {
-        Some(t) => t.await.unwrap_or_default(),
-        None => String::new(),
-    };
+    // Kimi is gone; stderr gets the same drain the stdout pipe does — ONE drain:
+    // if the turn already spent it waiting on stdout, stderr was being read the
+    // whole time too — and then whatever it said is what it said.
+    if let Some(mut t) = stderr_task {
+        let grace = if drained { std::time::Duration::ZERO } else { super::EXIT_DRAIN };
+        if tokio::time::timeout(grace, &mut t).await.is_err() {
+            t.abort();
+        }
+    }
+    // Decoded lossily (same reason as the stdout reader): Kimi is
+    // Python-on-Windows and its stderr — where the resumable session id is
+    // printed — can carry non-UTF-8 in the locale codepage. A strict decode
+    // would fail and drop the session id with it, so every turn would restart
+    // context-less. Lossy keeps the (ASCII) resume hint.
+    let stderr_buf = String::from_utf8_lossy(&stderr_bytes.lock().unwrap()).into_owned();
     if session_id.is_none() {
         session_id = parse_session_id(&stderr_buf);
     }
@@ -644,6 +673,58 @@ async fn kimi_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kimi killed mid-turn while a process it started still holds its stdout:
+    /// no EOF ever comes, and the turn used to sit there until the 15-minute
+    /// stall watchdog. The process being gone has to end it, with what was in
+    /// the pipe read first.
+    #[tokio::test]
+    async fn harness_exit_ends_the_turn_even_if_a_child_holds_the_pipe() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("mafold-kimi-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program =
+            crate::harness::orphan_fixture::script(&dir, r#"{"role":"assistant","content":"working on it"}"#);
+        let workdir = dir.to_string_lossy().to_string();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let proc = crate::harness::TurnProc::default();
+        let p = RunParams {
+            program: program.as_os_str(),
+            full_prompt: "hi",
+            workdir: &workdir,
+            model: None,
+            thinking: None,
+            conv: "conv",
+            draft: "draft",
+            cancel: &cancel,
+            sink: &sink,
+            proc: &proc,
+        };
+        let (out, after) =
+            crate::harness::orphan_fixture::kill_mid_turn(run_once(&p, None), &proc, Duration::from_secs(20)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let out = out
+            .expect("the turn was still open 20s after its process died — a child of it holds the pipe")
+            .expect("an outcome, not an Err");
+        // ONE drain: stdout's and stderr's are the same window (this caught
+        // them being served back to back — ten seconds).
+        assert!(
+            after < crate::harness::EXIT_DRAIN + Duration::from_secs(2),
+            "ended {after:?} after the kill — one {:?} drain, not more",
+            crate::harness::EXIT_DRAIN
+        );
+        assert!(out.error.is_some(), "a turn whose agent died must say so");
+        let mut said = String::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::Text(t) = ev {
+                said.push_str(&t);
+            }
+        }
+        assert_eq!(said, "working on it", "what the process wrote before it died was still read");
+    }
 
     // Collect every AgentEvent a handler run emits (drain a sync channel).
     fn drain(f: impl FnOnce(&UnboundedSender<AgentEvent>, &mut bool)) -> (Vec<AgentEvent>, bool) {

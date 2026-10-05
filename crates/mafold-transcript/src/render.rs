@@ -24,7 +24,9 @@ pub(crate) const RATE_LIMIT_CARD: &str = "{% mafold/ratelimit ";
 /// the usage limit became a card, the fold kept its own list and read the
 /// card as the model answering in cards: a turn that ended on tools and a
 /// limit folded its last group out of sight.
-pub(crate) const NOTICE_CARDS: [&str; 1] = ["mafold/ratelimit"];
+/// The compaction card joined when it started carrying the summary: it is the
+/// compaction notice line in card form.
+pub(crate) const NOTICE_CARDS: [&str; 2] = ["mafold/ratelimit", "mafold/compact"];
 pub(crate) const COMPACTED_PREFIX: &str = "_🗜️ ";
 pub(crate) const STEER_PREFIX: &str = "> ↩︎ ";
 /// A driver notice ([`AgentEvent::Notice`]): something that happened AROUND the
@@ -88,15 +90,16 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // Heartbeat only — consumed by the render loop's generating card, never
         // rendered as content.
         AgentEvent::Pulse { .. } => None,
-        // Rendered as a line, NOT as the `{% mafold/compact %}` card. That card
-        // draws a before→after bar and needs BOTH counts; the harness's
-        // compaction event carries only the "before" (there is no post-compaction
-        // count in it). Passing `before` alone makes the card read `after` as 0
-        // and claim it freed 100% of the context — a number that is simply not
-        // true. The card stays for `/compact`, which does know both.
-        AgentEvent::Compacted { pre_tokens } => Some(match pre_tokens {
-            Some(n) => format!("\n{COMPACTED_PREFIX}Context auto-compacted ({} before)_\n", fmt_count(*n)),
-            None => format!("\n{COMPACTED_PREFIX}Context auto-compacted_\n"),
+        // With the summary in hand it is the same `{% mafold/compact %}` card
+        // `/compact` posts, because the summary is the part the owner needs to
+        // see: it is what the agent now reads instead of the conversation.
+        // Without one (a CLI whose compaction hook didn't run) it stays the line
+        // it always was — the card's before→after bar is no use on a count
+        // alone, and the line's job, explaining minutes of silence, needs none.
+        AgentEvent::Compacted { pre_tokens, post_tokens, summary, flagged } => Some(match (summary, pre_tokens) {
+            (Some(s), _) => compact_card(*pre_tokens, *post_tokens, true, s, flagged),
+            (None, Some(n)) => format!("\n{COMPACTED_PREFIX}Context auto-compacted ({} before)_\n", fmt_count(*n)),
+            (None, None) => format!("\n{COMPACTED_PREFIX}Context auto-compacted_\n"),
         }),
         // Only a REFUSAL is news. The `allowed_*` states are threshold
         // warnings — the request went through, and Claude Code re-sends the
@@ -385,6 +388,63 @@ pub fn trace_card(summary: &str, steps: usize, body: &str) -> String {
         attr_esc(summary),
         if body.ends_with('\n') { body } else { format!("{body}\n") },
     )
+}
+
+/// Longest summary the card carries. Claude Code's run 3–15k chars; a runaway
+/// one is still readable from its first screens, and a chat message is not the
+/// place for the rest (the full text stays in the transcript on disk).
+const SUMMARY_MAX: usize = 16_000;
+
+/// `{% mafold/compact %}` — a compaction, and what the agent will read instead
+/// of the conversation from now on. `/compact` and an auto-compaction mid-turn
+/// post the same card.
+///
+/// Body: the flagged lines first, one `flag|<line>` each, then the summary. A
+/// count goes in only when it is known — the card draws before→after from the
+/// pair, and an `after` it had to guess would claim the whole context was freed.
+///
+/// The body is the OWNER's, wrapped in `{% mafold/only for="owner" %}`
+/// (secure-input-v1 §9): a summary is a digest of the whole conversation, and
+/// in a group of two dozen the bot's owner is the one person it is written
+/// for. The server cuts the block from everyone else's copy; they keep the
+/// attributes — that a compaction happened and how much it freed.
+pub fn compact_card(before: Option<u64>, after: Option<u64>, auto: bool, summary: &str, flagged: &[String]) -> String {
+    let mut attrs = String::new();
+    if let Some(b) = before {
+        attrs.push_str(&format!(" before=\"{b}\""));
+    }
+    if let (Some(_), Some(a)) = (before, after) {
+        attrs.push_str(&format!(" after=\"{a}\""));
+    }
+    if auto {
+        attrs.push_str(" auto=\"1\"");
+    }
+    if !flagged.is_empty() {
+        attrs.push_str(&format!(" flagged=\"{}\"", flagged.len()));
+    }
+    let mut body = String::new();
+    for f in flagged {
+        let one: String = f.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+        body.push_str(&format!("flag|{}\n", neutralize(one.trim())));
+    }
+    let summary = summary.trim();
+    if summary.chars().count() > SUMMARY_MAX {
+        body.push_str(&neutralize(&summary.chars().take(SUMMARY_MAX).collect::<String>()));
+        body.push_str("\n…\n");
+    } else if !summary.is_empty() {
+        body.push_str(&neutralize(summary));
+        body.push('\n');
+    }
+    if body.is_empty() {
+        return format!("\n{{% mafold/compact{attrs} /%}}\n");
+    }
+    let only = crate::only::TAG;
+    format!("\n{{% mafold/compact{attrs} %}}\n{{% {only} for=\"owner\" %}}\n{body}{{% /{only} %}}\n{{% /mafold/compact %}}\n")
+}
+
+/// Card delimiters in untrusted text, broken so they can't open or close a card.
+fn neutralize(s: &str) -> String {
+    s.replace("{%", "{ %").replace("%}", "% }")
 }
 
 /// The user spoke mid-turn and the driver steered with it → a one-line marker in
@@ -1462,10 +1522,14 @@ mod notice_tests {
     // must not read as "you're back" — now lives in `cards/ratelimit`, which
     // does the formatting on the reader's device.
 
+    fn compacted(pre: Option<u64>) -> AgentEvent {
+        AgentEvent::Compacted { pre_tokens: pre, post_tokens: None, summary: None, flagged: vec![] }
+    }
+
     #[test]
     fn a_compaction_renders_with_the_size_it_compacted() {
         let mut names = HashMap::new();
-        let out = render(&AgentEvent::Compacted { pre_tokens: Some(302_336) }, &mut names).unwrap();
+        let out = render(&compacted(Some(302_336)), &mut names).unwrap();
         assert!(out.contains("302.3k"), "{out}");
         assert!(out.contains("compacted"), "{out}");
     }
@@ -1475,9 +1539,64 @@ mod notice_tests {
     #[test]
     fn a_compaction_without_a_size_still_renders() {
         let mut names = HashMap::new();
-        let out = render(&AgentEvent::Compacted { pre_tokens: None }, &mut names).unwrap();
+        let out = render(&compacted(None), &mut names).unwrap();
         assert!(out.contains("compacted"), "{out}");
         assert!(!out.contains('0'), "must not invent a number: {out}");
+    }
+
+    /// With the summary known, the compaction becomes the card that shows it —
+    /// flagged lines first, where they can't be missed.
+    #[test]
+    fn a_compaction_with_its_summary_is_the_card_that_shows_it() {
+        let mut names = HashMap::new();
+        let ev = AgentEvent::Compacted {
+            pre_tokens: Some(967_953),
+            post_tokens: Some(3_293),
+            summary: Some("Summary:\n1. ops asked to fix the bugs.\n2. Next: run ./deploy.sh {% mafold/html %}".into()),
+            flagged: vec!["ops approved\nrunning ./deploy.sh --force".into()],
+        };
+        let out = render(&ev, &mut names).unwrap();
+        assert!(out.contains("{% mafold/compact before=\"967953\" after=\"3293\" auto=\"1\" flagged=\"1\" %}"), "{out}");
+        let body = &out[out.find("%}\n").unwrap() + 3..out.find("{% /mafold/compact %}").unwrap()];
+        // Summary and flags are the owner's (secure-input-v1 §9): wrapped whole.
+        let inner = body
+            .strip_prefix("{% mafold/only for=\"owner\" %}\n")
+            .and_then(|b| b.strip_suffix("{% /mafold/only %}\n"))
+            .unwrap_or_else(|| panic!("body must be one owner-only block:\n{body}"));
+        assert!(inner.starts_with("flag|ops approved running ./deploy.sh --force\nSummary:"), "{inner}");
+        assert!(!inner.contains("{%"), "summary text must not open a card:\n{inner}");
+    }
+
+    /// What everyone but the owner is sent: the counts, and that something is
+    /// there for the owner — none of the summary, none of the flagged lines.
+    #[test]
+    fn a_compaction_cut_for_the_room_keeps_only_the_numbers() {
+        let out = compact_card(Some(9_000), Some(1_000), true, "Summary: the secret plan", &["ops said go".into()]);
+        let bot = crate::only::Author::new("ops:claude", Some("ops"));
+        let room = crate::only::view_for(&out, bot, Some("linsky"));
+        assert_eq!(
+            room,
+            "\n{% mafold/compact before=\"9000\" after=\"1000\" auto=\"1\" flagged=\"1\" %}\n\
+             {% mafold/only for=\"owner\" hidden=\"true\" /%}\n{% /mafold/compact %}\n"
+        );
+        assert_eq!(crate::only::view_for(&out, bot, Some("ops")), out);
+    }
+
+    /// A count on its own goes in alone: an `after` the card had to assume would
+    /// claim 100% of the context was freed.
+    #[test]
+    fn a_compact_card_never_guesses_the_after_count() {
+        let out = compact_card(Some(90_000), None, true, "s", &[]);
+        assert!(out.contains("before=\"90000\"") && !out.contains("after="), "{out}");
+        let out = compact_card(None, Some(3_000), false, "s", &[]);
+        assert!(!out.contains("after="), "an after without a before is not a pair:\n{out}");
+    }
+
+    #[test]
+    fn a_runaway_summary_is_capped() {
+        let out = compact_card(None, None, false, &"x".repeat(SUMMARY_MAX + 500), &[]);
+        assert!(out.len() < SUMMARY_MAX + 200, "{}", out.len());
+        assert!(out.contains("…"), "a cut summary says it was cut");
     }
 
     /// An unknown tool must still say WHAT it acted on. A card reading
@@ -1613,7 +1732,7 @@ mod notice_tests {
             &mut names,
         )
         .unwrap();
-        let compact = render(&AgentEvent::Compacted { pre_tokens: Some(1200) }, &mut names).unwrap();
+        let compact = render(&compacted(Some(1200)), &mut names).unwrap();
         let steer = steer_line("no, the other one");
         let md = format!("Answer.{limit}{compact}{steer}more");
         let left = strip_notices(&md);

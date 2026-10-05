@@ -74,9 +74,21 @@ fn has_own_card(md: &str) -> bool {
             continue; // a close tag names a card already counted at its open
         }
         let name = inner.split_whitespace().next().unwrap_or("");
-        if !name.is_empty() && !DRIVER_CARDS.contains(&name) && !render::NOTICE_CARDS.contains(&name) {
-            return true;
+        if name.is_empty() {
+            continue;
         }
+        if DRIVER_CARDS.contains(&name) || render::NOTICE_CARDS.contains(&name) {
+            // What a stamp or a notice HOLDS is the stamp's too: the compaction
+            // card wraps its summary in `{% mafold/only %}`, and that inner tag
+            // is not the model answering in cards.
+            if !inner.ends_with('/') {
+                if let Some(end) = rest.find(&format!("{{% /{name} %}}")) {
+                    rest = &rest[end..];
+                }
+            }
+            continue;
+        }
+        return true;
     }
     false
 }
@@ -1223,7 +1235,7 @@ mod fold_tests {
         let mut t = Transcript::new();
         t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
         t.push(&result("a", "x"));
-        t.push(&AgentEvent::Compacted { pre_tokens: Some(90_000) });
+        t.push(&AgentEvent::Compacted { pre_tokens: Some(90_000), post_tokens: None, summary: None, flagged: vec![] });
         t.push(&call("b", "Read", json!({"file_path": "b.rs"})));
         t.push(&result("b", "y"));
         t.push(&AgentEvent::Text("Done.".into()));
@@ -1257,6 +1269,46 @@ mod fold_tests {
         assert!(last > close, "last group must stay visible:\n{md}");
         assert!(md.find("{% mafold/ratelimit").expect("notice") > last, "{md}");
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
+    }
+
+    /// The compaction CARD (a compaction whose summary is known) keeps the
+    /// notice line's contract: bookkeeping, never the answer. Mid-turn it goes
+    /// under the lid with the rest of the trail; last, it doesn't pull the whole
+    /// trail under a lid with nothing left outside it.
+    #[test]
+    fn a_compaction_card_is_trail_not_answer() {
+        let card = || AgentEvent::Compacted {
+            pre_tokens: Some(900_000),
+            post_tokens: Some(3_000),
+            summary: Some("ops asked to fix the bugs".into()),
+            flagged: vec![],
+        };
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Fixing it.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&card());
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        t.push(&AgentEvent::Text("All green.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        assert!(md.find("{% mafold/compact").expect("card") < close, "mid-turn card is trail:\n{md}");
+        assert!(md.find("All green.").unwrap() > close, "{md}");
+
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Fixing it.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("Now the edit.".into()));
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        t.push(&card());
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        assert!(md.find("cargo test").unwrap() > close, "last group must stay visible:\n{md}");
     }
 
     /// The SAME contract for a driver [`AgentEvent::Notice`] — the newest member

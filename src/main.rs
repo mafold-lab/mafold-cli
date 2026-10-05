@@ -18,8 +18,11 @@ mod channels;
 mod chat;
 mod client;
 mod commands;
+mod compact_hook;
 mod computer;
+mod conceal;
 mod connection;
+mod d1;
 mod daemon;
 mod discover;
 mod drafts;
@@ -35,6 +38,7 @@ mod permission_mcp;
 mod platform;
 mod room;
 mod session;
+mod sites;
 mod steer_hook;
 mod supervisor;
 mod turnenv;
@@ -217,6 +221,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: channels::ChannelsCmd,
     },
+    /// Your D1 databases (list/create/info/rename/execute/bookmark/restore/
+    /// delete/undelete) — shaped like `wrangler d1`. A bot works in its
+    /// owner's account.
+    D1 {
+        #[command(subcommand)]
+        cmd: d1::D1Cmd,
+    },
+    /// Your mafold.app sites: deploy a folder, list, remove — and a site's own
+    /// Worker (its backend, your D1 databases bound in).
+    Sites {
+        #[command(subcommand)]
+        cmd: sites::SitesCmd,
+    },
     /// Your credentials at third parties (Claude Code, Anthropic, OpenAI,
     /// Codex, Notion, Figma) — encrypted so only your own devices can read
     /// them. `mafold connection list` to see them.
@@ -340,6 +357,17 @@ enum Cmd {
     /// into the bot's memory on a turn its owner didn't trigger. Not for humans.
     #[command(hide = true)]
     DriveHook,
+    /// (internal) Claude Code's PreCompact / PostCompact / SessionStart(compact)
+    /// hook — treats the summary a compaction writes as untrusted input: shapes
+    /// how it is written, checks it against what people actually said, and
+    /// tells the model where it came from. Not for humans.
+    #[command(hide = true)]
+    CompactHook {
+        /// Print the `--settings` blob that wires this binary in, and exit —
+        /// so nothing outside the daemon has to hand-copy (and drift from) it.
+        #[arg(long)]
+        print_settings: bool,
+    },
     /// (internal) The stdio MCP server claude asks when a permission RULE says a
     /// human has to approve a tool call — puts the question in the chat as an
     /// ask card and blocks on the tap. Not for humans.
@@ -391,6 +419,9 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::DriveHook) {
         return drive::run_hook();
+    }
+    if let Cmd::CompactHook { print_settings } = cli.cmd {
+        return compact_hook::run(print_settings);
     }
     if matches!(cli.cmd, Cmd::PermissionMcp) {
         return permission_mcp::run();
@@ -665,6 +696,8 @@ async fn main() -> Result<()> {
             attach(&Client::new(cli.base, token?), &files, message.as_deref(), how).await?
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::D1 { cmd } => d1::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Sites { cmd } => sites::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
@@ -672,7 +705,7 @@ async fn main() -> Result<()> {
         | Cmd::Account { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
-        | Cmd::SteerHook | Cmd::DriveHook | Cmd::PermissionMcp => unreachable!(),
+        | Cmd::SteerHook | Cmd::DriveHook | Cmd::CompactHook { .. } | Cmd::PermissionMcp => unreachable!(),
     }
     Ok(())
 }

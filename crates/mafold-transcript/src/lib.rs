@@ -21,6 +21,7 @@
 
 pub mod event;
 pub mod lint;
+pub mod only;
 pub mod prose;
 pub mod preview;
 pub mod render;

@@ -278,6 +278,41 @@ pub fn open_with_dek(dek: &Key, blob: &str) -> Result<String> {
 /// it — every device of the user's opens it through the UMK, and nothing about
 /// the stored shape changes. `sealed_dek` is the extra copy: the same DEK,
 /// wrapped to one recipient's public key.
+/// Seal a payload straight to a set of devices' public keys — no master key.
+///
+/// What secure input needs (`.docs/secure-input-v1.md` §6): the person filling
+/// the card is often NOT the account that will use the value (linsky gives a
+/// password to opsdu's bot), and even when they are, they may be on a phone
+/// that never joined the vault. So the sealing side holds no UMK at all: a
+/// fresh DEK seals the payload, and the DEK is wrapped once per recipient
+/// device. Any of those devices opens it with its own private key; a device
+/// enrolled LATER cannot (accepted: these rows live for days, not years).
+///
+/// Returns `(blob, {device_id → wrapped_dek})`. Fails on the first malformed
+/// public key rather than sealing to some and silently skipping others — a
+/// partial set would look delivered and then not open on the machine that ran.
+pub fn seal_for_devices(
+    recipients: &[(String, String)],
+    payload_json: &str,
+) -> Result<(String, std::collections::BTreeMap<String, String>)> {
+    if recipients.is_empty() {
+        return Err(anyhow_lite::Error("no recipient devices to seal for".into()));
+    }
+    let dek = Key::random();
+    let mut wraps = std::collections::BTreeMap::new();
+    for (device_id, public_b64) in recipients {
+        wraps.insert(device_id.clone(), wrap_key_for(public_b64, &dek)?);
+    }
+    Ok((seal(&dek, payload_json.as_bytes()), wraps))
+}
+
+/// The other half: open a row sealed by [`seal_for_devices`] with this
+/// device's own secret.
+pub fn open_for_device(device_secret_b64: &str, blob: &str, wrapped_dek: &str) -> Result<String> {
+    let dek = unwrap_key(device_secret_b64, wrapped_dek)?;
+    open_with_dek(&dek, blob)
+}
+
 pub struct SharedPayload {
     pub blob: String,
     pub wrapped_dek: String,
@@ -365,6 +400,31 @@ pub fn new_key_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Secure input: sealed to two of the owner's devices by someone holding
+    /// no master key; each device opens it with its own secret, and a third
+    /// device — or the sealer's own — cannot.
+    #[test]
+    fn sealed_for_devices_opens_on_each_recipient_and_nowhere_else() {
+        let laptop = generate_device();
+        let desktop = generate_device();
+        let stranger = generate_device();
+        let recipients = vec![
+            ("laptop".to_string(), laptop.public.clone()),
+            ("desktop".to_string(), desktop.public.clone()),
+        ];
+        let (blob, wraps) = seal_for_devices(&recipients, r#"{"value":"hunter2"}"#).unwrap();
+        assert_eq!(wraps.len(), 2);
+        for (dev, id) in [(&laptop, "laptop"), (&desktop, "desktop")] {
+            assert_eq!(open_for_device(&dev.secret, &blob, &wraps[id]).unwrap(), r#"{"value":"hunter2"}"#);
+        }
+        assert!(open_for_device(&stranger.secret, &blob, &wraps["laptop"]).is_err());
+        assert!(seal_for_devices(&[], "{}").is_err(), "sealing to nobody is refused");
+        assert!(
+            seal_for_devices(&[("x".into(), "not-a-key".into())], "{}").is_err(),
+            "a malformed key fails the whole seal, not just that device"
+        );
+    }
 
     #[test]
     fn seal_open_roundtrip() {

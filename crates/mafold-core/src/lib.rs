@@ -340,6 +340,31 @@ pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Secure input (`.docs/secure-input-v1.md` §6): seal a payload to a set of
+/// devices' public keys, no master key needed. JSON in / JSON out so the wasm
+/// and UniFFI bindings are the same one-line shim over the same Rust:
+/// `recipients_json` = `[{"device_id","public_key"}]` →
+/// `{"blob","device_wraps":{device_id: wrapped}}`.
+pub fn seal_for_devices_json(recipients_json: &str, payload_json: &str) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Recipient {
+        device_id: String,
+        public_key: String,
+    }
+    let list: Vec<Recipient> =
+        serde_json::from_str(recipients_json).map_err(|e| format!("recipients: {e}"))?;
+    let pairs: Vec<(String, String)> = list.into_iter().map(|r| (r.device_id, r.public_key)).collect();
+    let (blob, wraps) = vault::seal_for_devices(&pairs, payload_json).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "blob": blob, "device_wraps": wraps }).to_string())
+}
+
+/// The native face of [`seal_for_devices_json`] — what the phone calls.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn vault_seal_for_devices(recipients_json: String, payload_json: String) -> Result<String, CoreError> {
+    seal_for_devices_json(&recipients_json, &payload_json).map_err(CoreError::Db)
+}
+
 /// Sync engine stage 1 (native): the core makes the API call itself — async over
 /// UniFFI (Swift `await`), POST {base}/{method} with a Bearer token. The web has
 /// the same via the wasm `rpc` export. Since the typed-methods layer landed this
@@ -717,6 +742,13 @@ mod web {
     #[wasm_bindgen(js_name = vaultFingerprint)]
     pub fn vault_fingerprint(public_key: String) -> String {
         crate::vault::fingerprint(&public_key)
+    }
+
+    /// Secure input: seal to devices' public keys — no unlocked vault needed,
+    /// so a browser that never joined the vault can still hand a value over.
+    #[wasm_bindgen(js_name = vaultSealForDevices)]
+    pub fn vault_seal_for_devices(recipients_json: String, payload_json: String) -> Result<String, JsValue> {
+        crate::seal_for_devices_json(&recipients_json, &payload_json).map_err(|e| JsValue::from_str(&e))
     }
 
     /// An unlocked vault. Dropping it (`free()`) drops the master key.

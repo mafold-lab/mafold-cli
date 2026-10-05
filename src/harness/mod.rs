@@ -93,7 +93,80 @@ impl TurnProc {
         let pid = *self.0.lock().unwrap();
         pid.is_some_and(crate::platform::child_running)
     }
+
+    /// The pid serving the turn — tests reach the harness process through it.
+    #[cfg(test)]
+    pub fn pid(&self) -> Option<u32> {
+        *self.0.lock().unwrap()
+    }
 }
+
+/// How long a turn keeps reading after the process running it has exited.
+/// What it wrote before it died is still in the pipe and is read as usual; past
+/// this, a pipe that is still open is held by something the process STARTED
+/// (a tool's child that inherited its stdout), not by the agent, and waiting on
+/// it is waiting for nothing.
+pub const EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Notices that the process running a turn is gone, for a read loop that would
+/// otherwise wait on its pipe forever.
+///
+/// The pipe is not the process. A harness killed mid-turn while a process it
+/// started still holds its stdout never delivers EOF, and the turn used to stay
+/// open until a stall watchdog fired (15 minutes; codex has none at all — the
+/// turn waited for someone to type /stop). [`gone`](Self::gone) asks the process
+/// itself (`platform::child_running`) and gives the pipe [`EXIT_DRAIN`] to
+/// finish before the loop gives up on it.
+///
+/// Each read loop selects on `gone()` beside its read. The state lives here,
+/// not in the future, so recreating the future every iteration loses nothing —
+/// and it only ever completes once the turn is over, so it never interrupts a
+/// read that is still worth waiting for.
+pub struct ExitWatch {
+    pid: Option<u32>,
+    drain_until: Option<tokio::time::Instant>,
+}
+
+impl ExitWatch {
+    /// How often a silent pipe has its process checked.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    pub fn new(pid: Option<u32>) -> Self {
+        Self { pid, drain_until: None }
+    }
+
+    /// Resolves when the process has exited AND [`EXIT_DRAIN`] has passed with
+    /// it still gone. Never resolves without a pid to watch.
+    pub async fn gone(&mut self) {
+        let Some(pid) = self.pid else {
+            return std::future::pending().await;
+        };
+        loop {
+            match self.drain_until {
+                None => {
+                    tokio::time::sleep(Self::POLL).await;
+                    if !crate::platform::child_running(pid) {
+                        self.drain_until = Some(tokio::time::Instant::now() + EXIT_DRAIN);
+                    }
+                }
+                Some(until) => {
+                    tokio::time::sleep_until(until).await;
+                    // Re-checked, not assumed: one misread probe must never
+                    // end a turn that is still running.
+                    if crate::platform::child_running(pid) {
+                        self.drain_until = None;
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What a turn ended by [`ExitWatch`] tells the person waiting on it.
+pub const EXITED_MID_TURN: &str = "the agent's process exited mid-turn, and something it started is still \
+holding its output open — so the turn was ended here instead of waiting on it. Your context is kept; just resend to retry.";
 
 /// See [`TurnProc::serve`].
 pub struct Serving(TurnProc, Option<u32>);
@@ -926,6 +999,112 @@ fn spawn_cause(e: &std::io::Error) -> Option<&'static str> {
             Some(7) => Some("the argument list is too long for exec"),
             _ => None,
         }
+    }
+}
+
+/// The dying-harness fixture: a turn whose process is killed while a process it
+/// started still holds its stdout — so the stream never reaches EOF, and the
+/// only sign the turn is over is that the process is gone (the K case of
+/// `scripts/beat-alive-e2e.sh`). Shared by every harness's test so none of them
+/// can drift from the case they claim to cover.
+#[cfg(test)]
+pub(crate) mod orphan_fixture {
+    use super::TurnProc;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// A stand-in harness: prints `line`, starts a child that inherits its
+    /// stdout (and outlives it), then idles until it is killed.
+    pub fn script(dir: &Path, line: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            // `start /b` shares this console AND its handles — the pipe included.
+            let path = dir.join("harness.cmd");
+            let s = format!(
+                "@echo off\r\necho {line}\r\nstart /b ping -n 30 127.0.0.1\r\nping -n 30 127.0.0.1 >nul\r\n"
+            );
+            std::fs::write(&path, s).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("harness.sh");
+            let s = format!("#!/bin/sh\ncat <<'MAFOLD_JSON'\n{line}\nMAFOLD_JSON\nsleep 30 &\nsleep 30\n");
+            std::fs::write(&path, s).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    /// Drive `run` until `proc` names the process serving it, let the script
+    /// print and fork, kill that process — and give the turn `limit` to end.
+    /// Returns its outcome (None: still open at `limit`) and how long after the
+    /// kill it ended.
+    pub async fn kill_mid_turn<F: std::future::Future>(
+        run: F,
+        proc: &TurnProc,
+        limit: Duration,
+    ) -> (Option<F::Output>, Duration) {
+        tokio::pin!(run);
+        let started = Instant::now();
+        let pid = loop {
+            tokio::select! {
+                _ = &mut run => panic!("the turn ended before its process was killed"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            if let Some(pid) = proc.pid() {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "no process ever served the turn");
+        };
+        let settle = Instant::now();
+        while settle.elapsed() < Duration::from_secs(2) {
+            tokio::select! {
+                _ = &mut run => panic!("the turn ended before its process was killed"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        crate::platform::terminate(pid);
+        let killed = Instant::now();
+        let out = tokio::time::timeout(limit, &mut run).await.ok();
+        (out, killed.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod exit_watch_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The other half, and the one that would hurt: a process that is ALIVE
+    /// and silent — a long tool call, the very thing #651 stopped calling «No
+    /// signal» — must never be taken for gone, however long the silence. Then,
+    /// killed, it is gone within one drain.
+    #[tokio::test]
+    async fn exit_watch_never_ends_a_turn_whose_process_is_alive() {
+        let mut child = crate::platform::idle_child();
+        let mut watch = ExitWatch::new(Some(child.id()));
+        let silent = EXIT_DRAIN + Duration::from_secs(2);
+        assert!(
+            tokio::time::timeout(silent, watch.gone()).await.is_err(),
+            "ended a turn whose process was alive, after {silent:?} of silence"
+        );
+
+        child.kill().expect("kill it");
+        let killed = Instant::now();
+        tokio::time::timeout(EXIT_DRAIN + Duration::from_secs(2), watch.gone())
+            .await
+            .expect("still not gone a drain after the kill");
+        assert!(killed.elapsed() >= EXIT_DRAIN, "the drain is for the pipe — it must not be skipped");
+        let _ = child.wait();
+    }
+
+    /// No pid, nothing to watch: never resolves on its own.
+    #[tokio::test]
+    async fn exit_watch_without_a_pid_waits_forever() {
+        let mut watch = ExitWatch::new(None);
+        assert!(tokio::time::timeout(Duration::from_millis(600), watch.gone()).await.is_err());
     }
 }
 

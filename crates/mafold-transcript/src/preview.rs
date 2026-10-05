@@ -2,9 +2,15 @@
 
 pub const PREVIEW_CHARS: usize = 240;
 
-/// Mirrors the generic attribute reader in cards/split.ts. Only the requested
-/// version matters here; instance props such as name/summary are not metadata.
+/// Only the requested version matters here; instance props such as
+/// name/summary are not metadata.
 fn version(attrs: &str) -> Option<&str> {
+    attr(attrs, "version")
+}
+
+/// One attribute of a tag's raw attribute run. Mirrors the generic attribute
+/// reader in cards/split.ts, so a value means here what it means to the card.
+pub(crate) fn attr<'a>(attrs: &'a str, want: &str) -> Option<&'a str> {
     let mut rest = attrs;
     let mut found = None;
     while !rest.is_empty() {
@@ -34,7 +40,7 @@ fn version(attrs: &str) -> Option<&str> {
             value = &rest[..end];
             rest = &rest[end..];
         }
-        if key == "version" {
+        if key == want {
             found = Some(value);
         }
     }

@@ -154,13 +154,13 @@ fn push_code_cuts(cuts: &mut Vec<(usize, usize)>, ranges: &[(usize, usize)], fro
     }
 }
 
-struct Tag<'a> {
-    name: &'a str,
-    attrs: &'a str,
-    is_close: bool,
-    self_close: bool,
+pub(crate) struct Tag<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) attrs: &'a str,
+    pub(crate) is_close: bool,
+    pub(crate) self_close: bool,
     /// Byte offset just past the tag's `%}`.
-    end: usize,
+    pub(crate) end: usize,
 }
 
 /// A byte that can sit inside a tag name: `[\w:-]`.
@@ -180,7 +180,7 @@ fn skip_ws(text: &str, mut p: usize) -> usize {
 
 /// The tag opening at `at` (which must be a `{%`), or `None` where the client's
 /// `TAG_RE` would not match either: no name, or no `%}` anywhere after.
-fn parse_tag(text: &str, at: usize) -> Option<Tag<'_>> {
+pub(crate) fn parse_tag(text: &str, at: usize) -> Option<Tag<'_>> {
     let b = text.as_bytes();
     let mut p = skip_ws(text, at + 2);
     let is_close = b.get(p) == Some(&b'/');

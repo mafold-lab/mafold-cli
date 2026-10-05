@@ -57,6 +57,15 @@ pub struct AuthStyle {
 }
 
 /// RFC 6750 — the default, and what every OAuth provider expects.
+/// Inert, like [`BEARER`] on rows nothing calls — but naming the field a
+/// secure-input row actually holds, so the "auth reads a real field" invariant
+/// stays true without inventing an `access_token` key.
+pub const BEARER_VALUE: AuthStyle = AuthStyle {
+    header: "Authorization",
+    prefix: "Bearer ",
+    field: "value",
+};
+
 pub const BEARER: AuthStyle = AuthStyle {
     header: "Authorization",
     prefix: "Bearer ",
@@ -642,6 +651,16 @@ const API_KEY: &[SecretField] = &[SecretField {
     issued: false,
 }];
 
+/// The one value a secure-input card collects. Named `value`, not `api_key`:
+/// it is as often a site password as a key, and a bot reads it by the
+/// CONNECTION's name (`$DB_PASSWORD`), never by this field's.
+const SECRET_VALUE: &[SecretField] = &[SecretField {
+    key: "value",
+    label: "Value",
+    required: true,
+    issued: false,
+}];
+
 /// Providers whose credential is a bearer token, however it was obtained: an
 /// OAuth grant returns `access_token`, and a hand-pasted integration token is
 /// sent in exactly the same header. One field name for both paths — naming it
@@ -802,6 +821,30 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: BEARER_API_KEY,
         oauth_capable: false,
         help_url: Some("https://platform.openai.com/api-keys"),
+        mcp_url: None,
+        native_api: None,
+        device_bound: false,
+        oauth_client: None,
+    },
+    // Secure input (`.docs/secure-input-v1.md`): a value only the person knows
+    // — a site password, their own project's env var — handed to a bot through
+    // a `mafold/connection-create provider="secret"` card. NOT a paste door for
+    // anything in this table with a link flow of its own: the api refuses a
+    // request whose variable is one of those providers' `env_var`s and the card
+    // sends the person to that provider's own connect instead (§3.6).
+    ProviderSpec {
+        id: "secret",
+        display: "Secret",
+        blurb: "A password or key only you know, handed to one bot",
+        badge: "",
+        kind: ProviderKind::ApiKey,
+        fields: SECRET_VALUE,
+        import_path: None,
+        // None on purpose: the variable is the connection's own name.
+        env_var: None,
+        auth: BEARER_VALUE,
+        oauth_capable: false,
+        help_url: None,
         mcp_url: None,
         native_api: None,
         device_bound: false,
@@ -1138,6 +1181,22 @@ impl ProviderSpec {
     /// rule is spelled out there.
     pub fn delegates_endpoint(&self) -> bool {
         self.mcp_url.is_none() && self.fields.iter().any(|f| f.key == "endpoint")
+    }
+
+    /// A value the PERSON names and already holds — a site password, their own
+    /// project's env var — rather than a credential some vendor mints: one
+    /// field, no variable of its own (the connection's name is the variable,
+    /// the same rule the cli reads off the row), nothing to call, nothing to
+    /// import. Vendor-less the way `device_bound` and `delegates_endpoint` rows
+    /// are: there is no mark to wear and no console to send anyone to.
+    pub fn names_its_own_value(&self) -> bool {
+        self.env_var.is_none()
+            && self.fields.len() == 1
+            && self.import_path.is_none()
+            && self.mcp_url.is_none()
+            && self.native_api.is_none()
+            && !self.oauth_capable
+            && !self.device_bound
     }
 }
 
@@ -1584,6 +1643,7 @@ mod tests {
                 "claude-code-oauth",
                 "anthropic-api",
                 "openai-api",
+                "secret",
                 "dashscope",
                 "codex-oauth",
                 "notion",
@@ -1735,7 +1795,7 @@ mod tests {
             // described row is vendor-less the same way: it stands for every
             // server the table does not name.
             assert!(
-                !p.badge.is_empty() || p.device_bound || p.delegates_endpoint(),
+                !p.badge.is_empty() || p.device_bound || p.delegates_endpoint() || p.names_its_own_value(),
                 "{}: no badge slug",
                 p.id
             );
@@ -1997,9 +2057,12 @@ mod tests {
             // "Pasted" means a form really draws an input. A row whose every
             // field is `issued` draws none — the machine writes them — so there
             // is nothing for a help link to help with.
+            // A value the person names themselves (a secure-input secret) is
+            // already in their head — there is no console to send them to.
             let pasted = p.import_path.is_none()
                 && !p.oauth_capable
-                && p.fields.iter().any(|f| !f.issued);
+                && p.fields.iter().any(|f| !f.issued)
+                && !p.names_its_own_value();
             if pasted {
                 assert!(
                     p.help_url.is_some(),

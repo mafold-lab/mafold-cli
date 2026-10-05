@@ -295,6 +295,10 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         let mut session_id: Option<String> = None;
         let mut error: Option<String> = None;
         let mut images: Option<ImageSweep> = None;
+        // Codex has no stall watchdog, so before this a codex killed while a
+        // process it started held its stdout left the turn open until someone
+        // typed /stop. Its exit is the one sign that is always there.
+        let mut exit = super::ExitWatch::new(child.id());
 
         // Emit whatever `image_gen` has written since the last check. Called
         // after every completed item (so a picture reaches the bubble while the
@@ -315,6 +319,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
             let line = tokio::select! {
                 line = lines.next_line() => match line? { Some(l) => l, None => break },
                 _ = cancel.notified() => { stopped = true; let _ = child.start_kill(); break; }
+                _ = exit.gone() => { error = Some(super::EXITED_MID_TURN.to_string()); break; }
             };
             let line = line.trim();
             if line.is_empty() {
@@ -824,6 +829,53 @@ mod tests {
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() { events.push(ev); }
         (out, events)
+    }
+
+    /// Codex killed mid-turn while a process it started still holds its stdout:
+    /// no EOF ever comes, and before this the turn simply never ended — codex
+    /// has no stall watchdog, so it sat there until someone typed /stop. The
+    /// process being gone has to end it, with what was in the pipe read first.
+    #[tokio::test]
+    async fn harness_exit_ends_the_turn_even_if_a_child_holds_the_pipe() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("mafold-codex-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = crate::harness::orphan_fixture::script(&dir, r#"{"type":"thread.started","thread_id":"t-orphan"}"#);
+        let workdir = dir.to_string_lossy().to_string();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let proc = crate::harness::TurnProc::default();
+        let p = RunParams {
+            program: program.as_os_str(),
+            full_prompt: "hi",
+            workdir: &workdir,
+            model: None,
+            effort: None,
+            conv: "conv",
+            draft: "draft",
+            cancel: &cancel,
+            sink: &sink,
+            proc: &proc,
+        };
+        let (out, after) =
+            crate::harness::orphan_fixture::kill_mid_turn(run_once(&p, None), &proc, Duration::from_secs(20)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let out = out
+            .expect("the turn was still open 20s after its process died — a child of it holds the pipe")
+            .expect("an outcome, not an Err");
+        assert!(
+            after < crate::harness::EXIT_DRAIN + Duration::from_secs(2),
+            "ended {after:?} after the kill — one {:?} drain, not more",
+            crate::harness::EXIT_DRAIN
+        );
+        assert!(out.error.is_some(), "a turn whose agent died must say so");
+        let mut saw_session = false;
+        while let Ok(ev) = rx.try_recv() {
+            saw_session |= matches!(ev, AgentEvent::Session(ref s) if s == "t-orphan");
+        }
+        assert!(saw_session, "what the process wrote before it died was still read");
     }
 
     #[tokio::test]

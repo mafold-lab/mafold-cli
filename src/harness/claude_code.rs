@@ -67,7 +67,7 @@ impl Harness for ClaudeCode {
             // Built the way the turn it is for will need it: a turn that finds
             // its session already running (`cc_conn::lease`) only takes a
             // process that forks.
-            let Built { mut cmd, hook_settings, bash_only, forks } =
+            let Built { mut cmd, hook_settings, always, forks } =
                 build_cmd(&shape, &exe, cc_conn::is_leased(&sid));
             let id = cc_conn::oneshot_id();
             cmd.env("MAFOLD_TURN", crate::turnenv::path_for(&id));
@@ -76,7 +76,7 @@ impl Harness for ClaudeCode {
                 f.arg("--settings").arg(s);
                 f
             });
-            cmd.arg("--settings").arg(&bash_only);
+            cmd.arg("--settings").arg(&always);
             let Ok(mut c) = cc_conn::Conn::spawn(key, id.clone(), String::new(), cmd, &shape.workdir).await
             else { return };
             if !c.register_hooks(true, true).await {
@@ -150,7 +150,7 @@ impl Harness for ClaudeCode {
                 session.as_deref().unwrap_or("")
             );
         }
-        let Built { mut cmd, hook_settings, bash_only, forks } = build_cmd(&shape, &exe, must_fork);
+        let Built { mut cmd, hook_settings, always, forks } = build_cmd(&shape, &exe, must_fork);
         // The reply being streamed right now — `mafold attach <file>` hangs
         // media on it. Kept in the env for an OLDER `mafold` on the agent's
         // $PATH; ours reads the turn file, which is current on every turn.
@@ -186,9 +186,9 @@ impl Harness for ClaudeCode {
                     f.arg("--settings").arg(s);
                     f
                 });
-                // The Bash hook goes in either way; ask and steer are registered
-                // over the control channel just below.
-                cmd.arg("--settings").arg(&bash_only);
+                // The Bash hook and the compaction guard go in either way; ask
+                // and steer are registered over the control channel just below.
+                cmd.arg("--settings").arg(&always);
                 let mut c =
                     cc_conn::Conn::spawn(key.clone(), id.clone(), draft.clone(), cmd, &workdir).await?;
                 if !c.register_hooks(ask_file.is_some(), steer_file.is_some()).await {
@@ -323,7 +323,9 @@ impl Harness for ClaudeCode {
                 }));
             }
             if v["type"] == "system" && v["subtype"] == "compact_boundary" {
-                let _ = sink.send(AgentEvent::Compacted { pre_tokens: compaction_pre_tokens(&v) });
+                let sid = v["session_id"].as_str().or(session_id.as_deref());
+                let verdict = sid.and_then(|s| crate::compact_hook::load_fresh(s, crate::compact_hook::FRESH));
+                let _ = sink.send(compacted(&v, verdict));
                 continue;
             }
             // Another local claude session tried to say something to this one
@@ -1037,6 +1039,28 @@ fn compaction_pre_tokens(v: &Value) -> Option<u64> {
     v["compactMetadata"]["preTokens"].as_u64()
 }
 
+/// A `compact_boundary` event, plus what the PostCompact hook saved about the
+/// summary it produced. The hook runs before claude writes the boundary, so a
+/// verdict for this compaction is already on disk when the event arrives; no
+/// verdict (an older CLI, a hook that failed) still reports the compaction.
+fn compacted(v: &Value, verdict: Option<crate::compact_hook::Verdict>) -> AgentEvent {
+    let (summary, flagged) = match verdict {
+        Some(x) => {
+            let shown = x.shown_flags();
+            (Some(x.summary), shown)
+        }
+        None => (None, Vec::new()),
+    };
+    AgentEvent::Compacted {
+        pre_tokens: compaction_pre_tokens(v),
+        // Newer CLIs report it (2.1.282 does); older ones don't, and a missing
+        // count must stay missing rather than read as "compacted to nothing".
+        post_tokens: v["compactMetadata"]["postTokens"].as_u64(),
+        summary,
+        flagged,
+    }
+}
+
 /// The usage-limit state worth relaying from a `rate_limit_event`'s
 /// `rate_limit_info` — `(kind, resets_at, status)` — or None when the limit
 /// is healthy. Claude emits one of these on ordinary turns too, so the
@@ -1133,8 +1157,9 @@ struct Built {
     /// The full COMMAND-hook settings, attached only when the control-channel
     /// handshake fails.
     hook_settings: Option<String>,
-    /// The Bash hook alone — always attached (see `cc_conn`'s callback ids).
-    bash_only: String,
+    /// The command hooks attached whatever the handshake says: the Bash hook
+    /// (see `cc_conn`'s callback ids) and the compaction guard.
+    always: String,
     /// It resumes with `--fork-session` (see `cc_conn::Conn::forks`).
     forks: bool,
 }
@@ -1248,7 +1273,15 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
             "matcher": "Bash",
             "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
         });
-        let bash_only = serde_json::json!({ "hooks": { "PreToolUse": [bash_hook.clone()] } }).to_string();
+        // The compaction guard rides in the same always-attached blob: it has no
+        // control-channel form, it fires once per compaction, and a turn that
+        // compacts without it hands the model its own summary in the user's
+        // voice. See `compact_hook`.
+        let always = {
+            let mut hooks = crate::compact_hook::settings(exe);
+            hooks.insert("PreToolUse".into(), serde_json::json!([bash_hook.clone()]));
+            serde_json::json!({ "hooks": hooks }).to_string()
+        };
         pre.push(bash_hook);
         {
             pre.push(serde_json::json!({
@@ -1277,7 +1310,9 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
             }));
         }
         if !pre.is_empty() || !post.is_empty() {
-            let mut hooks = serde_json::Map::new();
+            // The fallback replaces `always` rather than joining it, so it has
+            // to carry the compaction guard too.
+            let mut hooks = crate::compact_hook::settings(exe);
             if !pre.is_empty() {
                 hooks.insert("PreToolUse".into(), serde_json::Value::Array(pre));
             }
@@ -1318,7 +1353,7 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
                 forks = true;
             }
         }
-        Built { cmd, hook_settings, bash_only, forks }
+        Built { cmd, hook_settings, always, forks }
 }
 
 /// The first non-empty line of `t`, bounded — a subagent's report can be pages
@@ -1603,7 +1638,7 @@ mod tests {
             let a = args(&b);
             let dirs: Vec<&str> = a.windows(2).filter(|w| w[0] == "--plugin-dir").map(|w| w[1].as_str()).collect();
             assert_eq!(dirs, ["/h/.mafold/plugins/mafold", "/h/.mafold/drives/0123456789ab"], "{label}");
-            for blob in [Some(b.bash_only.clone()), b.hook_settings.clone()].into_iter().flatten() {
+            for blob in [Some(b.always.clone()), b.hook_settings.clone()].into_iter().flatten() {
                 let v: Value = serde_json::from_str(&blob).unwrap();
                 assert!(v.get("autoMemoryDirectory").is_none(), "{label}: {blob}");
                 assert!(v["hooks"]["PreToolUse"].is_array(), "the hooks are still there: {blob}");

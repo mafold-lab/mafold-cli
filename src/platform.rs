@@ -36,18 +36,25 @@ mod imp {
     /// by an unrelated process — answers `ECHILD`, so pid reuse can't fool this
     /// either.
     pub fn child_running(pid: u32) -> bool {
-        // SAFETY: `info` is a plain C struct the call fills in; zeroed first so
-        // "no state change" (the WNOHANG case) reads as si_pid == 0.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        r == 0 && siginfo_pid(&info) == 0
+        loop {
+            // SAFETY: `info` is a plain C struct the call fills in; zeroed first
+            // so "no state change" (the WNOHANG case) reads as si_pid == 0.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            // A signal landing mid-call says nothing about the child — and a
+            // "not running" answer can end its turn (`harness::ExitWatch`).
+            if r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return r == 0 && siginfo_pid(&info) == 0;
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
