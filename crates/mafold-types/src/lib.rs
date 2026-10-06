@@ -683,6 +683,12 @@ pub struct Message {
     /// `None` on non-replies and on messages stored before this field shipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_sender: Option<String>,
+    /// Set by the SERVER, never by a client: this message is the server's
+    /// receipt of the sender's action on card `receipt_of` — the server wrote
+    /// its words, not the sender. Cleared when the sender edits it (then the
+    /// words are theirs). See [`answers_own_request`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_of: Option<Uuid>,
     /// Slack-style thread root. `None` = top-level message (lives in the main
     /// channel timeline). `Some(root)` = a thread reply: HIDDEN from the main
     /// timeline, shown only in the thread pane for `root`, and it does NOT bump
@@ -744,6 +750,51 @@ pub struct Message {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+/// Is this message `bot`'s OWN request coming back — the server's receipt of
+/// someone's action on a card `bot` posted? ONE rule for both access gates:
+/// the daemon's allow-list (`mafold-cli` `agent.rs`, who may drive a turn on
+/// the owner's machine) and the server's draft-time billing
+/// (`mafold-api` `metering::authorize_draft`, who pays for it).
+///
+/// Both gates exist to stop a stranger's WORDS from driving the bot. A receipt
+/// carries none: the server wrote it (`receipt_of` is server-only, and an edit
+/// clears it). What it reports is that something `bot` asked for has arrived —
+/// a secret its `{% mafold/connection-create %}` card requested from a named
+/// person, who may well be someone the bot otherwise doesn't take orders from.
+/// The turn it starts is the bot following up on its own request, so it passes
+/// the allow-list and nobody is billed for it. A blacklist still wins: each
+/// gate checks that first.
+///
+/// `I` is the id type: uuids in the api, strings in the daemon.
+pub fn answers_own_request<I: PartialEq + ?Sized>(
+    receipt_of: Option<&I>,
+    reply_to_id: Option<&I>,
+    reply_to_sender: Option<&str>,
+    bot: &str,
+) -> bool {
+    receipt_of.is_some()
+        && receipt_of == reply_to_id
+        && reply_to_sender.is_some_and(|s| s.eq_ignore_ascii_case(bot))
+}
+
+#[cfg(test)]
+mod answers_own_request_tests {
+    use super::answers_own_request;
+
+    #[test]
+    fn only_a_receipt_replying_to_the_bots_own_card() {
+        let card = "card-1";
+        assert!(answers_own_request(Some(card), Some(card), Some("Ops:Claude"), "ops:claude"));
+        // A typed reply to the same card: no receipt, no pass.
+        assert!(!answers_own_request(None, Some(card), Some("ops:claude"), "ops:claude"));
+        // Someone else's card.
+        assert!(!answers_own_request(Some(card), Some(card), Some("eve:bot"), "ops:claude"));
+        // A receipt that doesn't answer the message it replies to.
+        assert!(!answers_own_request(Some(card), Some("other"), Some("ops:claude"), "ops:claude"));
+        assert!(!answers_own_request(Some(card), None, None, "ops:claude"));
+    }
 }
 
 /// A service-message payload — a ready-to-render centered pill (see

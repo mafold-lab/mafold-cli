@@ -1155,7 +1155,7 @@ fn read_credential(env: &[(String, String)]) -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let out = std::process::Command::new("security")
+    let out = crate::platform::std_command("security")
         .args(["find-generic-password", "-s", &acct.keychain_service(), "-w"])
         .output()
         .ok()?;
@@ -1619,13 +1619,12 @@ fn parse_usage_text(text: &str) -> String {
 /// Pipe `input` into a headless `claude -p` (on the seat `env` selects) and
 /// return its (ANSI-stripped) output, or "" on any failure/timeout.
 async fn run_claude_stdin(input: &str, secs: u64, env: &[(String, String)]) -> String {
-    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
+    let mut cmd = crate::platform::command(crate::harness::program("claude"));
     cmd.arg("-p")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::platform::no_window(&mut cmd);
     let fut = async {
         let mut child = cmd.spawn()?;
         if let Some(mut si) = child.stdin.take() {
@@ -2247,11 +2246,10 @@ fn mock_reply(name: &str) -> String {
 /// Run `claude <args>` on the seat `env` selects (see `crate::accounts`) and
 /// return its output; `&[]` = the daemon's own login.
 async fn run_claude(args: &[&str], secs: u64, env: &[(String, String)]) -> String {
-    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
+    let mut cmd = crate::platform::command(crate::harness::program("claude"));
     cmd.args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     let fut = cmd.output();
     match tokio::time::timeout(Duration::from_secs(secs), fut).await {
         Ok(Ok(o)) => {

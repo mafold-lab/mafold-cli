@@ -183,7 +183,7 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
     println!("  watching {} (Ctrl-C to stop)\n", manifest.entry);
 
     // esbuild runs the watch + static server itself; this blocks until Ctrl-C.
-    let mut c = tokio::process::Command::new(&esbuild);
+    let mut c = crate::platform::console_command(&esbuild);
     c.current_dir(dir)
         .arg(&manifest.entry)
         .args(bundle_args(&out))
@@ -220,7 +220,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let out = out_dir.join(format!("{}.js", manifest.slug()));
 
     println!("→ bundling {} …", manifest.entry);
-    let status = tokio::process::Command::new(&esbuild)
+    let status = crate::platform::console_command(&esbuild)
         .current_dir(dir)
         .arg(&manifest.entry)
         .args(bundle_args(&format!("dist/{}.js", manifest.slug())))
@@ -432,7 +432,7 @@ pub(crate) async fn ensure_esbuild() -> Result<PathBuf> {
         let tgz = stage.join("esbuild.tgz");
         std::fs::write(&tgz, &bytes)?;
         // The npm tarball stores the binary at package/bin/esbuild.
-        let status = std::process::Command::new("tar")
+        let status = crate::platform::console_std_command("tar")
             .arg("-xzf")
             .arg(&tgz)
             .arg("-C")

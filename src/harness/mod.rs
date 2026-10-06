@@ -94,8 +94,9 @@ impl TurnProc {
         pid.is_some_and(crate::platform::child_running)
     }
 
-    /// The pid serving the turn — tests reach the harness process through it.
-    #[cfg(test)]
+    /// The pid serving the turn — what the turn's journal records, so a
+    /// restart can tell whether that process outlived its daemon
+    /// (`drafts::Journal::child`); tests reach the harness process through it.
     pub fn pid(&self) -> Option<u32> {
         *self.0.lock().unwrap()
     }
@@ -224,6 +225,39 @@ impl Mount {
     /// Stable text for the pool key.
     pub fn signature(&self) -> String {
         self.plugin_dirs.join(",")
+    }
+}
+
+/// Where a turn's agent process is told it is: the conversation, and the forum
+/// channel the turn was asked in. Every harness exports exactly these — one
+/// door, so a fourth harness can't forget one.
+///
+/// `MAFOLD_FORUM_CHANNEL` is what lets `mafold send` / `mafold read` default to
+/// THIS channel (`chat::turn_channel`). Before it existed only Claude Code knew
+/// its channel at all (inside `MAFOLD_SURFACE`), and every agent's `mafold send
+/// <this chat>` landed in `#all`: 2026-10-05 a reply working in
+/// #mafold内容生产线 posted the GitHub device code it was waiting on to `#all`,
+/// and the chat list showed that line as if the channel's reply had finished.
+/// Exported EMPTY on `#all`, so a value inherited from the daemon's own
+/// environment can never stand in for a channel the turn isn't in.
+pub fn turn_env(conv: &str, surface: &str) -> [(&'static str, String); 2] {
+    [
+        ("MAFOLD_CONV", conv.to_string()),
+        ("MAFOLD_FORUM_CHANNEL", forum_channel_of(surface).unwrap_or_default()),
+    ]
+}
+
+/// The forum channel inside a surface tag (`{conv}__{channel}__{bot}`, built by
+/// `agent::surface_tag`; the channel part is empty on `#all`). Ids are uuids,
+/// which the tag keeps verbatim. Anything that isn't a three-part tag has no
+/// channel to offer.
+pub fn forum_channel_of(surface: &str) -> Option<String> {
+    let parts: Vec<&str> = surface.split("__").collect();
+    match parts[..] {
+        [conv, channel, bot] if !conv.is_empty() && !bot.is_empty() && !channel.is_empty() => {
+            Some(channel.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -529,6 +563,19 @@ pub trait Harness: Send + Sync {
     /// decides is WHEN it arrives — at the next tool-result boundary, or as the
     /// follow-up turn — which is the one thing the user is told, so nobody is
     /// promised a correction that is really a queue.
+    /// Does a turn of this harness name its session ([`AgentEvent::Session`])
+    /// BEFORE anything of its own reaches the reply?
+    ///
+    /// What a restart in the middle of a turn turns on (`drafts::Journal`).
+    /// When it does, everything in the bubble ahead of that name is the
+    /// daemon's own narration, so a turn killed there has done nothing yet and
+    /// can simply run again. When it names its session only once the turn ends,
+    /// whatever is in the bubble may be the agent's work, held in a session
+    /// nobody can name — and running the turn again would do that work twice.
+    fn names_session_first(&self) -> bool {
+        false
+    }
+
     fn can_steer(&self) -> bool {
         false
     }
@@ -838,7 +885,7 @@ fn cache_caps(harness: &str, seat: &str, caps: &HarnessCaps) {
 /// `<bin> --version` → a short version string ("2.1.198"): first token that
 /// starts with a digit, else the trimmed first line. None on any failure.
 fn bin_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(program(bin))
+    let out = crate::platform::std_command(program(bin))
         .arg("--version")
         .output()
         .ok()?;
@@ -1007,6 +1054,44 @@ fn spawn_cause(e: &std::io::Error) -> Option<&'static str> {
 /// only sign the turn is over is that the process is gone (the K case of
 /// `scripts/beat-alive-e2e.sh`). Shared by every harness's test so none of them
 /// can drift from the case they claim to cover.
+/// A stand-in harness binary that records where its turn told it it is
+/// (`turn_env`) and exits — so each harness's real spawn path can be checked
+/// for the env it hands its agent.
+#[cfg(all(test, unix))]
+pub(crate) mod env_probe {
+    use std::path::{Path, PathBuf};
+
+    /// `(program, record)`: running `program` writes `MAFOLD_CONV|MAFOLD_FORUM_CHANNEL`
+    /// to `record`.
+    pub fn script(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let record = dir.join("env.txt");
+        let path = dir.join("harness.sh");
+        let s = format!(
+            "#!/bin/sh\nprintf '%s|%s' \"$MAFOLD_CONV\" \"$MAFOLD_FORUM_CHANNEL\" > '{}'\n",
+            record.display()
+        );
+        std::fs::write(&path, s).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (path, record)
+    }
+}
+
+#[cfg(test)]
+mod turn_env_tests {
+    use super::*;
+
+    #[test]
+    fn the_channel_comes_out_of_a_channel_surface_and_nowhere_else() {
+        assert_eq!(forum_channel_of("c1__ch-1__bot").as_deref(), Some("ch-1"));
+        assert_eq!(forum_channel_of("c1____bot"), None, "#all");
+        // A legacy key (before the bot joined it) or anything else names no channel.
+        for other in ["", "c1", "c1__ch-1", "c1__ch-1__bot__x", "__ch-1__bot", "c1__ch-1__"] {
+            assert_eq!(forum_channel_of(other), None, "{other}");
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod orphan_fixture {
     use super::TurnProc;

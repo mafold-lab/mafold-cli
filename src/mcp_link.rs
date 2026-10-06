@@ -517,6 +517,7 @@ pub(crate) async fn serve_link(
     link_id: &str,
     name: Option<String>,
     label: Option<String>,
+    reconnect: bool,
 ) {
     let answer = |result: Value, error: Option<String>| {
         let mut body = json!({ "call_id": link_id, "result": result });
@@ -558,8 +559,8 @@ pub(crate) async fn serve_link(
         // Done on the spot, the way a machine binding is: no consent screen,
         // so the answer carries the connection rather than a URL.
         Ok(Probe::Open) => {
-            let name = free_name_from(client, &wanted).await;
-            let outcome = store(client, umk, key_id, spec, &name, &endpoint, Map::new(), &label, true).await;
+            let name = if reconnect { wanted.clone() } else { free_name_from(client, &wanted).await };
+            let outcome = store(client, umk, key_id, spec, &name, &endpoint, Map::new(), &label, !reconnect).await;
             match &outcome {
                 Ok(()) => {
                     let _ = answer(
@@ -606,8 +607,8 @@ pub(crate) async fn serve_link(
             tokio::spawn(async move {
                 let outcome: Result<String> = async {
                     let (bag, _) = oauth_exchange(&oc, leg).await?;
-                    let name = free_name_from(&client, &wanted).await;
-                    store(&client, &umk, &key_id, &spec, &name, &endpoint, bag, &label, true).await?;
+                    let name = if reconnect { wanted.clone() } else { free_name_from(&client, &wanted).await };
+                    store(&client, &umk, &key_id, &spec, &name, &endpoint, bag, &label, !reconnect).await?;
                     Ok(name)
                 }
                 .await;

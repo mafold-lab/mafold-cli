@@ -46,6 +46,11 @@ impl Harness for Codex {
         super::on_path("codex")
     }
 
+    /// Yes: `thread.started` is the first thing `codex exec --json` says.
+    fn names_session_first(&self) -> bool {
+        true
+    }
+
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
         // `thinking` and `ask_file` don't apply to Codex (no extended-thinking
         // budget; no AskUserQuestion tool / PreToolUse hook) — accepted and
@@ -71,7 +76,7 @@ impl Harness for Codex {
             // thing today (`crate::accounts`).
             env: _,
             conv,
-            surface: _,
+            surface,
             draft,
             // The drive mount is Claude Code's today (`--plugin-dir`); how
             // Codex takes an outside skills folder is measured before it is
@@ -98,6 +103,7 @@ impl Harness for Codex {
             model: model.as_deref(),
             effort: effort.as_deref(),
             conv: &conv,
+            surface: &surface,
             draft: &draft,
             cancel: &cancel,
             sink: &sink,
@@ -151,6 +157,8 @@ struct RunParams<'a> {
     model: Option<&'a str>,
     effort: Option<&'a str>,
     conv: &'a str,
+    /// The turn's surface tag — where its forum channel comes from (`turn_env`).
+    surface: &'a str,
     draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
@@ -221,7 +229,7 @@ fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -
 /// One `codex exec` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { program, full_prompt, workdir, model, effort, conv, draft, cancel, sink, proc } = *p;
+    let RunParams { program, full_prompt, workdir, model, effort, conv, surface, draft, cancel, sink, proc } = *p;
     let stats_started_ms = mafold_transcript::stats::now_ms();
     let mut item_stats = super::codex_stats::ItemStats::default();
     let _ = sink.send(AgentEvent::Stats(RunStats {
@@ -230,18 +238,18 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         ..Default::default()
     }));
 
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = crate::platform::command(program);
         cmd.args(exec_args(session, model, effort));
-        // Export the current conversation so `mafold room …` targets THIS room
-        // (harmless for Codex, which has no room skill today — kept for parity).
-        cmd.env("MAFOLD_CONV", conv);
+        // Export the current conversation and forum channel, so `mafold room`,
+        // `send` and `read` default to THIS room and channel (`turn_env`).
+        for (k, v) in super::turn_env(conv, surface) {
+            cmd.env(k, v);
+        }
         // The reply being streamed right now — `mafold attach <file>` hangs
         // media on it. Codex's own generated images are swept up automatically
         // (see ImageSweep); this is the door for everything else it draws.
         cmd.env("MAFOLD_DRAFT", draft);
         cmd.kill_on_drop(true);
-        // Don't let the console child flash a window (the agent runs detached).
-        crate::platform::no_window(&mut cmd);
 
         let mut child = cmd
             .current_dir(workdir)
@@ -726,9 +734,8 @@ async fn auth_status_line() -> String {
 /// `codex --version` → "0.5.0" (first numeric-ish token; "" if the CLI is missing).
 async fn codex_version() -> String {
     use std::time::Duration;
-    let mut cmd = tokio::process::Command::new(super::program("codex"));
+    let mut cmd = crate::platform::command(super::program("codex"));
     cmd.arg("--version").stdin(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     match tokio::time::timeout(Duration::from_secs(8), cmd.output()).await {
         Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout)
             .split_whitespace()
@@ -800,6 +807,39 @@ mod tests {
         run_scripted_events(tag, stream).await.0
     }
 
+    /// The agent process is told its conversation AND its forum channel, through
+    /// the real spawn path — `mafold send` / `read` default to the channel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_agent_process_is_told_its_conversation_and_channel() {
+        let dir = std::env::temp_dir().join(format!("mafold-codex-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (program, record) = crate::harness::env_probe::script(&dir);
+        let workdir = dir.to_string_lossy().to_string();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (sink, _rx) = tokio::sync::mpsc::unbounded_channel();
+        for (surface, want) in [("c1__ch-0001__opsdu_codex", "c1|ch-0001"), ("c1____opsdu_codex", "c1|")] {
+            let _ = std::fs::remove_file(&record);
+            let p = RunParams {
+                program: program.as_os_str(),
+                full_prompt: "hi",
+                workdir: &workdir,
+                model: None,
+                effort: None,
+                conv: "c1",
+                surface,
+                draft: "draft",
+                cancel: &cancel,
+                sink: &sink,
+                proc: &crate::harness::TurnProc::default(),
+            };
+            let _ = run_once(&p, None).await; // the probe says nothing; only what it was given counts
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), want, "{surface}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     async fn run_scripted_events(tag: &str, stream: &[&str]) -> (TurnOutcome, Vec<AgentEvent>) {
         let dir = std::env::temp_dir().join(format!("mafold-codex-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -816,6 +856,7 @@ mod tests {
                 model: None,
                 effort: None,
                 conv: "conv",
+                surface: "",
                 draft: "draft",
                 cancel: &cancel,
                 sink: &sink,
@@ -853,6 +894,7 @@ mod tests {
             model: None,
             effort: None,
             conv: "conv",
+            surface: "",
             draft: "draft",
             cancel: &cancel,
             sink: &sink,
@@ -990,7 +1032,7 @@ mod tests {
         // to `-c model_reasoning_effort="high"` on the way through.
         std::fs::write(&bat, "@echo off\r\necho %*\r\n").unwrap();
 
-        let out = std::process::Command::new(&bat)
+        let out = crate::platform::std_command(&bat)
             .args(exec_args(None, None, Some("high")))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

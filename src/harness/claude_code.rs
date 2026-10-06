@@ -36,6 +36,12 @@ impl Harness for ClaudeCode {
         true
     }
 
+    /// Yes: every stream-json line carries the `session_id`, and [`Self::run`]
+    /// reports it on the first one.
+    fn names_session_first(&self) -> bool {
+        true
+    }
+
     /// Open the connection this turn will want, while the caller is still
     /// assembling its prompt. Everything it needs is in the SHAPE; the per-turn
     /// half reaches the child through `turnenv` at `begin_turn`.
@@ -162,8 +168,6 @@ impl Harness for ClaudeCode {
         let _perm_watch: Option<PermWatch> = ask_file
             .as_ref()
             .map(|af| permission_watcher(format!("{af}.perm"), sink.clone()));
-        // Don't let the console child flash a window (the agent runs detached).
-        crate::platform::no_window(&mut cmd);
         cmd.env_remove("CLAUDECODE").env_remove("ANTHROPIC_API_KEY");
 
         // A WARM connection for this exact configuration, or a new process.
@@ -303,7 +307,14 @@ impl Harness for ClaudeCode {
                 }
             };
             if session_id.is_none() {
-                if let Some(sid) = v["session_id"].as_str() { session_id = Some(sid.to_string()); }
+                if let Some(sid) = v["session_id"].as_str() {
+                    session_id = Some(sid.to_string());
+                    // Said NOW, not only in the outcome: a daemon killed in the
+                    // middle of this turn never gets to the outcome, and the
+                    // next one can only continue the work from the session it
+                    // is being written into (`drafts::Journal::session`).
+                    let _ = sink.send(AgentEvent::Session(sid.to_string()));
+                }
             }
             // Claude Code compacting its OWN context, mid-turn. It runs for
             // minutes (135s / 162s / 308s in this machine's transcripts) and
@@ -802,13 +813,12 @@ const HIDDEN_EFFORTS: &[&str] = &["ultracode"];
 /// `None` when the CLI couldn't be run at all — distinct from an empty stderr,
 /// which is the binary saying it has no objection.
 async fn effort_probe(env: &[(String, String)], value: &str) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(super::program("claude"));
+    let mut cmd = crate::platform::command(super::program("claude"));
     cmd.arg("--effort")
         .arg(value)
         .arg("--version")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
         .await
         .ok()?
@@ -890,7 +900,7 @@ fn account_of(resp: &Value) -> Option<String> {
 /// support" that doesn't spend the thing being asked about.
 async fn handshake(env: &[(String, String)]) -> Option<Value> {
     use tokio::io::AsyncWriteExt;
-    let mut cmd = tokio::process::Command::new(super::program("claude"));
+    let mut cmd = crate::platform::command(super::program("claude"));
     cmd.arg("-p")
         .arg("--input-format").arg("stream-json")
         .arg("--output-format").arg("stream-json")
@@ -906,7 +916,6 @@ async fn handshake(env: &[(String, String)]) -> Option<Value> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     let mut child = cmd.spawn().ok()?;
     let _guard = super::ChildGuard::new(child.id());
     let req = serde_json::json!({
@@ -1173,7 +1182,10 @@ struct Built {
 /// `must_fork`: another turn of ours is running on the session this resumes
 /// (`cc_conn::lease`).
 fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
-        let mut cmd = tokio::process::Command::new(super::program("claude"));
+        // Windowless from the constructor on. `run` used to add that after
+        // calling here, and `prewarm` (the process that actually serves a
+        // turn) never did — every message to a Windows agent opened a window.
+        let mut cmd = crate::platform::command(super::program("claude"));
         // `-p` with NO prompt argument: the prompt goes in on stdin instead (see
         // the write below). It is the one input here that grows without bound —
         // it carries the conversation — and Windows hard-caps a command line at
@@ -1214,10 +1226,27 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         if let Some(e) = &shape.effort {
             cmd.arg("--effort").arg(e);
         }
-        // Export the current conversation so `mafold room …` (run by the agent
-        // via the room skill) defaults to THIS room. Per-turn (not a global env)
-        // because concurrent turns run different conversations.
-        cmd.env("MAFOLD_CONV", &shape.conv);
+        // Export the current conversation and forum channel so `mafold room …`,
+        // `send` and `read` default to THIS room and channel (`turn_env`).
+        // Per-process: a warm process serves one surface, and the surface
+        // carries the channel.
+        for (k, v) in super::turn_env(&shape.conv, &shape.surface) {
+            cmd.env(k, v);
+        }
+        // `mafold …` in the agent's shell is THIS daemon's binary: the commands
+        // a skill names (`mafold video`, `mafold pin`) exist in the version that
+        // installed the skill — not in whatever `mafold` happens to be first on
+        // PATH, or none at all (a daemon started from a GUI or a service often
+        // has no install dir on PATH, and then every `mafold` call in the turn
+        // fails with "command not found").
+        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+            let joined = std::env::join_paths(
+                std::iter::once(dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+            );
+            if let Ok(p) = joined {
+                cmd.env("PATH", p);
+            }
+        }
         // The surface (conv + forum channel) the reply lands on — the bash-hook
         // registers detached background tasks under it, so their wrap-up turn
         // comes back to THIS channel instead of leaking into another one.
@@ -1616,6 +1645,23 @@ mod tests {
         b.cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
+    /// The agent process is told its conversation AND its forum channel —
+    /// `mafold send` / `read` default to the channel (`turn_env`). Exported
+    /// empty on #all so a daemon-level value can't leak in.
+    #[test]
+    fn the_agent_process_is_told_its_conversation_and_channel() {
+        let env_of = |surface: &str| {
+            let shape = super::super::TurnShape { surface: surface.into(), ..resuming("turn-env-test") };
+            let b = build_cmd(&shape, "mafold", false);
+            let get = |k: &str| {
+                b.cmd.as_std().get_envs().find(|(n, _)| *n == k).and_then(|(_, v)| v).map(|v| v.to_string_lossy().into_owned())
+            };
+            (get("MAFOLD_CONV"), get("MAFOLD_FORUM_CHANNEL"))
+        };
+        assert_eq!(env_of("c1__ch-0001__opsdu_claude-code"), (Some("c1".into()), Some("ch-0001".into())));
+        assert_eq!(env_of("c1____opsdu_claude-code"), (Some("c1".into()), Some(String::new())));
+    }
+
     /// The drive mount is per PROCESS and `--resume` doesn't carry it (measured,
     /// CC 2.1.282: no `--plugin-dir` on a resume = no skills), so every way a
     /// process starts — fresh, resumed, forked — must carry both plugin folders.
@@ -1975,5 +2021,107 @@ mod tests {
             "at least one model must report its tiers, or the effort menu has nothing to be built from"
         );
         assert!(probe.efforts.is_empty(), "a handshake attributes every tier to a model");
+    }
+
+    // ── no console window (Windows) ──────────────────────────────────────
+    // What linsky saw: every message to a Windows agent opened a black window
+    // titled «claude», and it stayed open. The daemon has no console, so a
+    // console program it starts without CREATE_NO_WINDOW is given a console and
+    // a window of its own. The warm process `prewarm` starts, which then serves
+    // the turn, never had the flag. These two tests stand in for the daemon.
+    // The first starts the second the way the supervisor starts a daemon; the
+    // second starts `claude` every way a message does and asks each process
+    // whether it has a window.
+
+    /// A message to a Windows agent opens no console window.
+    #[cfg(windows)]
+    #[test]
+    fn win_console_a_message_opens_no_window() {
+        let dir = std::env::temp_dir().join(format!("mafold-nowindow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `claude` for the length of the test: a console program that stays up
+        // long enough to be asked, started through `cmd.exe` like npm's
+        // `claude.cmd`. Short-lived on purpose: whatever it leaves running
+        // holds this test's output pipes until it exits.
+        std::fs::write(dir.join("claude.cmd"), "@ping -n 12 127.0.0.1 >nul\r\n").unwrap();
+        let path = format!("{};{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+        let mut cmd = crate::platform::std_command(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "harness::claude_code::tests::win_console_daemon_side"])
+            .args(["--include-ignored", "--test-threads=1", "--nocapture"])
+            .env("MAFOLD_CONSOLE_PROBE_DIR", &dir)
+            .env("PATH", path)
+            .env_remove("MAFOLD_CC_POOL")
+            .stdin(Stdio::null());
+        crate::platform::configure_detached(&mut cmd);
+        let out = cmd.output().expect("start the console-less half");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "the console-less half has to actually run:\n{text}");
+    }
+
+    /// The daemon's half, which runs with no console of its own.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "half of win_console_a_message_opens_no_window, which runs it console-less"]
+    async fn win_console_daemon_side() {
+        use crate::platform::{console_window_of, has_console, unhidden_command};
+        let Ok(dir) = std::env::var("MAFOLD_CONSOLE_PROBE_DIR") else { return };
+        assert!(!has_console(), "started the way a daemon is: no console");
+        let claude = std::path::PathBuf::from(super::super::program("claude"));
+        assert!(claude.starts_with(&dir), "PATH finds the stand-in first: {}", claude.display());
+
+        // Positive control: started with no flags (the way the warm process
+        // was), the stand-in DOES get a window here. Without it, "no window"
+        // below could just mean this machine never shows one.
+        let mut bare = unhidden_command(&claude)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let seen = console_window_of(bare.id());
+        let _ = bare.kill();
+        assert_eq!(seen, Some(true), "control: an unflagged child of a console-less process gets a window");
+
+        // A turn's process, spawned exactly as `build_cmd` returns it.
+        let shape = super::super::TurnShape {
+            conv: "c1".into(),
+            surface: "s1".into(),
+            workdir: dir.clone(),
+            session: Some("00000000-0000-4000-8000-000000000001".into()),
+            model: None,
+            effort: None,
+            thinking: None,
+            system: None,
+            env: vec![],
+            mount: Default::default(),
+        };
+        let Built { mut cmd, .. } = build_cmd(&shape, "mafold", false);
+        let mut turn = cmd
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let seen = console_window_of(turn.id().unwrap());
+        let _ = turn.kill().await;
+        assert_eq!(seen, Some(false), "a turn's claude has no window");
+
+        // The warm process a message starts before its turn: the one that had
+        // no flag. It registers itself as a live harness child as it starts.
+        let before: std::collections::HashSet<u32> = super::super::live_children().lock().unwrap().clone();
+        ClaudeCode.prewarm(shape);
+        let began = std::time::Instant::now();
+        let warm = loop {
+            let now = super::super::live_children().lock().unwrap().clone();
+            if let Some(p) = now.difference(&before).next() {
+                break *p;
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(10), "prewarm started nothing");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(console_window_of(warm), Some(false), "the warm claude a message starts has no window");
     }
 }

@@ -234,7 +234,7 @@ pub fn remove(username: &str) -> Result<bool> {
 
 /// `hostname`, best-effort.
 pub fn device_name() -> String {
-    std::process::Command::new("hostname")
+    crate::platform::std_command("hostname")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())

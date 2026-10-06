@@ -171,13 +171,24 @@ mod imp {
     }
 
     /// Configure `cmd` to spawn detached from the console so it survives the
-    /// launching shell closing.
+    /// launching shell closing. Replaces the creation flags the constructor set:
+    /// a process with NO console has no window to hide.
     pub fn configure_detached(cmd: &mut Command) {
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
     /// No zombies on Windows — nothing to reap.
     pub fn reap_children() {}
+
+    /// Is this process attached to a console at all — visible, windowless or
+    /// headless alike? `GetConsoleWindow` can't say: it is NULL both for "no
+    /// console" and for a console that simply has no window. The process list
+    /// can: it has at least us on it, and the call fails without a console.
+    pub fn has_console() -> bool {
+        use windows_sys::Win32::System::Console::GetConsoleProcessList;
+        let mut pids = [0u32; 1];
+        unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 1) != 0 }
+    }
 }
 
 pub use imp::*;
@@ -202,39 +213,71 @@ pub fn hide_console() {
     }
 }
 
-/// Stop a spawned console child (e.g. `claude`) from popping up its own console
-/// window on Windows. The agent runs detached (no console), so a console child
-/// would otherwise be handed a fresh visible window until it produces output.
-/// No-op on Unix.
-pub fn no_window(cmd: &mut tokio::process::Command) {
+// ──────────────────────── starting a program ────────────────────────
+// A console program started by a process with NO console of its own is handed
+// a brand-new console by Windows — and on Windows 11, a Windows Terminal window
+// to show it in. Every daemon runs that way (`configure_detached`), so anything
+// a daemon starts without CREATE_NO_WINDOW opens a black window on the screen
+// of whoever owns the machine. That flag used to be something each spawn site
+// had to remember. The warm `claude` (#457) forgot, and from then on every
+// message to a Windows agent opened a window titled «claude» that stayed open
+// as long as the process did. So nothing outside this module builds a
+// `Command`: `tests::every_spawn_goes_through_platform` fails the build when
+// anything does, and every constructor here keeps the window away.
+
+/// THE way mafold starts a program. Never a console window: on Windows the
+/// child gets a console of its own that has none (CREATE_NO_WINDOW). Its output
+/// is read over pipes or files, so nothing else changes. Plain on Unix.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = tokio::process::Command::new(program);
     #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = cmd;
-    }
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
 }
 
-/// Same, for `std::process::Command` — helper subprocesses (schtasks, the
-/// update smoke test's `--version` run) would each flash a visible console
-/// window when the parent runs console-less (a detached supervisor/agent).
-/// Their output is read over pipes, so hiding the window changes nothing else.
-/// No-op on Unix.
-pub fn no_window_std(cmd: &mut Command) {
+/// [`command`], blocking.
+pub fn std_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    #[cfg(not(windows))]
-    {
-        let _ = cmd;
-    }
+    cmd
 }
+
+/// For a program that talks to the person at this terminal: it reads what they
+/// type or prints straight to it (`connection run`'s stdin, the installer,
+/// `stty`, esbuild's watch). It shares OUR console, which is the point. When
+/// we have none (a daemon), it gets a console with no window instead of a new
+/// window.
+pub fn console_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    if !has_console() {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// [`console_command`], blocking.
+pub fn console_std_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    if !has_console() {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Process-creation flag (winbase.h): the child's console has no window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Best-effort "open this URL in the default browser" (`mafold login`'s device
 /// flow, à la `gh auth login`). Headless boxes and weird shells just fail the
@@ -242,13 +285,13 @@ pub fn no_window_std(cmd: &mut Command) {
 pub fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut c = Command::new("open");
+        let mut c = std_command("open");
         c.arg(url);
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = {
-        let mut c = Command::new("xdg-open");
+        let mut c = std_command("xdg-open");
         c.arg(url);
         c
     };
@@ -256,9 +299,8 @@ pub fn open_browser(url: &str) -> bool {
     let mut cmd = {
         // `start` is a cmd.exe builtin; the empty "" is its window-title slot,
         // which otherwise eats a quoted URL.
-        let mut c = Command::new("cmd");
+        let mut c = std_command("cmd");
         c.args(["/C", "start", "", url]);
-        no_window_std(&mut c);
         c
     };
     cmd.stdout(std::process::Stdio::null())
@@ -314,9 +356,17 @@ pub fn reexec() -> std::io::Error {
         use std::os::unix::process::CommandExt;
         Command::new(exe).args(std::env::args_os().skip(1)).exec()
     }
+    // The successor takes over our console as it is: it shares the one we
+    // have, and a daemon with none (`configure_detached`) stays without one —
+    // given nothing, Windows would open the new copy a window of its own.
     #[cfg(windows)]
     {
-        match Command::new(exe).args(std::env::args_os().skip(1)).spawn() {
+        let mut cmd = Command::new(exe);
+        cmd.args(std::env::args_os().skip(1));
+        if !has_console() {
+            configure_detached(&mut cmd);
+        }
+        match cmd.spawn() {
             Ok(_) => std::process::exit(0),
             Err(e) => e,
         }
@@ -332,7 +382,7 @@ pub fn idle_child() -> std::process::Child {
     use std::process::Stdio;
     #[cfg(unix)]
     let mut cmd = {
-        let mut c = Command::new("sleep");
+        let mut c = std_command("sleep");
         c.arg("600");
         c
     };
@@ -340,7 +390,7 @@ pub fn idle_child() -> std::process::Child {
     // `ping` is on every install and waits a second between echoes.
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = Command::new("ping");
+        let mut c = std_command("ping");
         c.args(["-n", "601", "127.0.0.1"]);
         c
     };
@@ -351,9 +401,90 @@ pub fn idle_child() -> std::process::Child {
         .expect("spawn an idle child")
 }
 
+/// A program started the way every spawn site started one before this module
+/// owned spawning: no flags at all. The console-window tests' positive
+/// control — what a child of a console-less process looks like when nothing
+/// keeps its window away.
+#[cfg(all(test, windows))]
+pub fn unhidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::new(program)
+}
+
+/// Does `pid` have a console window? `None` when it can't be asked: gone, no
+/// console at all, or WE have one (a process can only be attached to one).
+/// So it must run console-less, like a daemon: it borrows `pid`'s console to
+/// ask, then lets go. Retries for a few seconds, because a child that was just
+/// started connects to its console a moment after `spawn` returns.
+#[cfg(all(test, windows))]
+pub fn console_window_of(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, GetConsoleWindow};
+    let began = std::time::Instant::now();
+    loop {
+        // SAFETY: plain Win32 calls; FreeConsole lets go of what AttachConsole took.
+        unsafe {
+            if AttachConsole(pid) != 0 {
+                let window = !GetConsoleWindow().is_null();
+                let seen = has_console();
+                FreeConsole();
+                assert!(seen, "attached to {pid}'s console, yet has_console() says there is none");
+                return Some(window);
+            }
+        }
+        if began.elapsed() > std::time::Duration::from_secs(5) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every program mafold starts goes through [`command`] / [`std_command`]
+    /// or [`console_command`] / [`console_std_command`], and only this module
+    /// sets creation flags. A bare `Command::new` somewhere else is how the
+    /// console window came back each time it was fixed: the fix lived at the
+    /// spawn sites, and the next new spawn site didn't have it. This holds on
+    /// every OS, so the Linux CI catches a Windows-only bug before any Windows
+    /// machine runs it.
+    #[test]
+    fn every_spawn_goes_through_platform() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() > 20, "found the sources: {}", src.display());
+        let mut bare = Vec::new();
+        for f in files.iter().filter(|f| !f.ends_with("platform.rs")) {
+            let text = std::fs::read_to_string(f).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if ["Command::new(", "Command::from(", "creation_flags("].iter().any(|n| line.contains(n)) {
+                    let rel = f.strip_prefix(&src).unwrap_or(f).display().to_string();
+                    bare.push(format!("  src/{}:{}  {}", rel.replace('\\', "/"), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "start programs with crate::platform::{{command, std_command, console_command, \
+             console_std_command}}. A bare Command started by a daemon opens a console window on \
+             Windows:\n{}",
+            bare.join("\n")
+        );
+    }
 
     /// The daemon's heartbeat asks this about the process running a turn, and
     /// the hard case is the one in between: exited, but not yet let go of. On

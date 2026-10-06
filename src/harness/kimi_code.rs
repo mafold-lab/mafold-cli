@@ -49,9 +49,10 @@ impl Harness for KimiCode {
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
         // `effort` (Kimi has no reasoning tiers) and `ask_file` (no AskUserQuestion
-        // PreToolUse hook) don't apply — accepted and ignored. `surface` likewise:
-        // the bash-hook that detaches background tasks is only wired for Claude
-        // Code, so nothing here registers any. `steer_file` too: with no hook to
+        // PreToolUse hook) don't apply — accepted and ignored. `surface` only
+        // names the forum channel (`turn_env`): the bash-hook that detaches
+        // background tasks under it is wired for Claude Code alone, so nothing
+        // here registers any. `steer_file` too: with no hook to
         // drain it mid-turn, `can_steer()` stays false and the daemon delivers a
         // mid-turn message as the FOLLOW-UP turn instead — never dropped, just
         // later, and the user is told which of the two they got.
@@ -70,7 +71,7 @@ impl Harness for KimiCode {
             // Code thing today (`crate::accounts`).
             env: _,
             conv,
-            surface: _,
+            surface,
             draft,
             // Claude Code's today; Kimi's `extra_skill_dirs` is wired after it
             // is measured (`.docs/bot-drive-v1.md` §5.5).
@@ -96,6 +97,7 @@ impl Harness for KimiCode {
             model: model.as_deref(),
             thinking,
             conv: &conv,
+            surface: &surface,
             draft: &draft,
             cancel: &cancel,
             sink: &sink,
@@ -156,6 +158,8 @@ struct RunParams<'a> {
     model: Option<&'a str>,
     thinking: Option<u32>,
     conv: &'a str,
+    /// The turn's surface tag — where its forum channel comes from (`turn_env`).
+    surface: &'a str,
     draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
@@ -165,9 +169,9 @@ struct RunParams<'a> {
 /// One `kimi --print` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { program, full_prompt, workdir, model, thinking, conv, draft, cancel, sink, proc } = *p;
+    let RunParams { program, full_prompt, workdir, model, thinking, conv, surface, draft, cancel, sink, proc } = *p;
 
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = crate::platform::command(program);
     // `--print` runs one turn non-interactively (and implies `--yolo`, so tools
     // run without approval prompts, which would hang a headless run).
     cmd.arg("--print").arg("--output-format").arg("stream-json");
@@ -193,9 +197,11 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     if let Some(sid) = session {
         cmd.arg("--session").arg(sid);
     }
-    // Export the current conversation for parity with the other harnesses (Kimi
-    // has no room skill today — harmless).
-    cmd.env("MAFOLD_CONV", conv);
+    // Export the current conversation and forum channel, so `mafold room`,
+    // `send` and `read` default to THIS room and channel (`turn_env`).
+    for (k, v) in super::turn_env(conv, surface) {
+        cmd.env(k, v);
+    }
     // The reply being streamed right now — `mafold attach <file>` hangs media on
     // it, so an image the agent makes lands in the same bubble as its text.
     cmd.env("MAFOLD_DRAFT", draft);
@@ -210,8 +216,6 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     // still taken literally (a bare `-p <value>` could mis-parse).
     cmd.arg(format!("--prompt={full_prompt}"));
     cmd.kill_on_drop(true);
-    // Don't let the console child flash a window (the agent runs detached).
-    crate::platform::no_window(&mut cmd);
 
     let mut child = cmd
         .current_dir(workdir)
@@ -657,9 +661,8 @@ fn auth_status_line() -> String {
 /// `kimi --version` → "1.49.0" (first numeric-ish token; "" if the CLI is missing).
 async fn kimi_version() -> String {
     use std::time::Duration;
-    let mut cmd = tokio::process::Command::new(super::program("kimi"));
+    let mut cmd = crate::platform::command(super::program("kimi"));
     cmd.arg("--version").stdin(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     match tokio::time::timeout(Duration::from_secs(8), cmd.output()).await {
         Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout)
             .split_whitespace()
@@ -673,6 +676,39 @@ async fn kimi_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agent process is told its conversation AND its forum channel, through
+    /// the real spawn path — `mafold send` / `read` default to the channel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_agent_process_is_told_its_conversation_and_channel() {
+        let dir = std::env::temp_dir().join(format!("mafold-kimi-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (program, record) = crate::harness::env_probe::script(&dir);
+        let workdir = dir.to_string_lossy().to_string();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (sink, _rx) = tokio::sync::mpsc::unbounded_channel();
+        for (surface, want) in [("c1__ch-0001__opsdu_kimi-code", "c1|ch-0001"), ("c1____opsdu_kimi-code", "c1|")] {
+            let _ = std::fs::remove_file(&record);
+            let p = RunParams {
+                program: program.as_os_str(),
+                full_prompt: "hi",
+                workdir: &workdir,
+                model: None,
+                thinking: None,
+                conv: "c1",
+                surface,
+                draft: "draft",
+                cancel: &cancel,
+                sink: &sink,
+                proc: &crate::harness::TurnProc::default(),
+            };
+            let _ = run_once(&p, None).await; // the probe says nothing; only what it was given counts
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), want, "{surface}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Kimi killed mid-turn while a process it started still holds its stdout:
     /// no EOF ever comes, and the turn used to sit there until the 15-minute
@@ -697,6 +733,7 @@ mod tests {
             model: None,
             thinking: None,
             conv: "conv",
+            surface: "",
             draft: "draft",
             cancel: &cancel,
             sink: &sink,

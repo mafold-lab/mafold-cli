@@ -141,8 +141,9 @@ fn record_in(
     Guard { path, kept: false }
 }
 
-/// The draft exists — from here a restart is the drafts outbox's to recover,
-/// and replaying the trigger would start a second turn.
+/// The turn's own journal holds its prompt — from here a restart is the drafts
+/// outbox's to recover (it picks the turn back up, `drafts::Journal`), and
+/// replaying the trigger as well would start a second turn.
 pub fn clear(bot: &str, trigger_id: &str) {
     let _ = std::fs::remove_file(entry_path(&dir(bot), trigger_id));
 }

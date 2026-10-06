@@ -170,7 +170,11 @@ impl Client {
     /// passed through as raw JSON — no typed round-trip, so fields the wire
     /// model hasn't caught up with can't silently vanish. The original
     /// `RpcError` rides along in the anyhow chain (see `is_connect_error`).
-    async fn post(&self, method: &str, body: Value) -> Result<Value> {
+    async fn post(&self, method: &str, mut body: Value) -> Result<Value> {
+        // Nothing this machine holds leaves it in something people read: every
+        // harness's draft, every `mafold send`, every alert passes here
+        // (conceal.rs `scrub_outgoing`, by value, before the server's own net).
+        crate::conceal::scrub_outgoing(method, &mut body, &self.token);
         match self.api().call_raw(method, &body.to_string()).await {
             Ok(result) => {
                 serde_json::from_str(&result).with_context(|| format!("{method} returned non-JSON"))
@@ -1045,6 +1049,20 @@ retry {attempt}/{} in {delay:?}…",
     /// picks by content, not by hope. Sending everything as `photo` (what this
     /// did before) meant a `.html` the agent wrote arrived as a broken image
     /// bubble, which is also why agents stopped believing they could send files.
+    /// Upload a local file into the registry WITHOUT attaching it anywhere —
+    /// for a tool that needs the bytes server-side (a video ref) rather than in
+    /// a bubble. Same kind sniffing as `attach_media`. Answers the FileRef.
+    pub async fn upload_path(&self, path: &std::path::Path) -> Result<Value> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let (kind, mime) = classify(&name, &bytes);
+        let upload_name = match kind {
+            "file" => name.clone(),
+            _ => retype(&name, mime),
+        };
+        self.upload_media(bytes, &upload_name, mime).await
+    }
+
     pub async fn attach_media(&self, message_id: &str, path: &std::path::Path) -> Result<Value> {
         self.attach_media_as(message_id, path, AttachAs::Detected).await
     }
@@ -1110,6 +1128,25 @@ retry {attempt}/{} in {delay:?}…",
                 eprintln!("sticker sent, but not kept in the library: {e:#}");
             }
         }
+        Ok(att)
+    }
+
+    /// Hang a PUBLIC URL's bytes on a message: the server fetches + registers
+    /// them (`ingestUrl`), so a vendor's 24 h clip link never has to cross
+    /// this machine's uplink. Kind follows the registered mime.
+    pub async fn attach_url(&self, message_id: &str, url: &str) -> Result<Value> {
+        let up = self.call("ingestUrl", json!({ "url": url })).await?;
+        let file_id = up["id"].as_str().context("ingestUrl returned no id")?;
+        let mime = up["mime"].as_str().unwrap_or("");
+        let kind = if mime.starts_with("image/") {
+            "photo"
+        } else if mime.starts_with("video/") {
+            "video"
+        } else {
+            "file"
+        };
+        let att = json!({ "kind": kind, "id": file_id, "file": file_id });
+        self.attach(message_id, json!([att.clone()])).await?;
         Ok(att)
     }
 
@@ -2086,7 +2123,7 @@ mod lost_turn_tests {
     /// A single-file HTTP stub: answers every request with `status`/`reply` and
     /// records each (path, body) it saw. Enough server for the real transport —
     /// retries and all — to be exercised without a network or a mock crate.
-    async fn stub(status: u16, reply: &'static str) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+    pub(super) async fn stub(status: u16, reply: &'static str) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2492,5 +2529,47 @@ mod draft_order_tests {
             assert!(bodies[2]["writer_seq"].as_u64().unwrap() > bodies[1]["writer_seq"].as_u64().unwrap());
             assert_eq!(bodies[2]["content"], "second");
         }).await.unwrap();
+    }
+}
+
+/// Credentials on the way out (conceal.rs `scrub_outgoing`), through the real
+/// transport: what matters is what the server RECEIVES.
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    const OK: &str = r#"{"ok":true,"result":{}}"#;
+
+    /// 2026-10-05/06: a turn ran `env | grep MAFOLD | sed …`, the filter
+    /// guessed the token's shape wrong, and the daemon pushed the bot's own
+    /// token into a group's trace card — three times in one night.
+    #[tokio::test]
+    async fn a_draft_push_never_carries_a_credential_this_machine_holds() {
+        // One held only in the environment — a turn's MAFOLD_BOT_TOKEN is
+        // exactly that — and the one the client itself calls with.
+        let planted = "zq81mlr0pp2xv7ct-redaction-probe";
+        std::env::set_var("MAFOLD_REDACTION_PROBE_TOKEN", planted);
+        crate::conceal::forget_sweep();
+        let own = "mb_0badc0de0badc0de0badc0de0badc0d";
+        let (base, seen) = super::lost_turn_tests::stub(200, OK).await;
+        let c = Client::new(base, own.into());
+
+        c.edit_draft("m1", &format!("$ env\nMAFOLD_REDACTION_PROBE_TOKEN={planted}\nMAFOLD_BOT_TOKEN={own}\nok"))
+            .await
+            .unwrap();
+        // The control: a call that carries a value on purpose goes out as built.
+        c.call("putConnection", json!({ "blob": planted })).await.unwrap();
+        std::env::remove_var("MAFOLD_REDACTION_PROBE_TOKEN");
+
+        let seen = seen.lock().unwrap().clone();
+        let (path, draft) = &seen[0];
+        assert!(path.ends_with("/botEditDraft"), "{path}");
+        assert!(!draft.contains(planted) && !draft.contains(own), "a credential reached the server: {draft}");
+        let body: Value = serde_json::from_str(draft).unwrap();
+        assert_eq!(
+            body["content"],
+            format!("$ env\nMAFOLD_REDACTION_PROBE_TOKEN={m}\nMAFOLD_BOT_TOKEN={m}\nok", m = crate::conceal::MASK)
+        );
+        assert!(seen[1].0.ends_with("/putConnection") && seen[1].1.contains(planted), "{:?}", seen[1]);
     }
 }

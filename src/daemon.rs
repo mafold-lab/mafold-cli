@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::platform;
 
@@ -55,7 +55,7 @@ pub fn start_detached(
         .open(log_path()?)?;
     let err = out.try_clone()?;
 
-    let mut cmd = Command::new(exe);
+    let mut cmd = platform::std_command(exe);
     cmd.arg("agent");
     // The child re-parses its own CLI, so a parent-only --no-auto-update used to
     // vanish here (the flag isn't in the env set below) — the detached agent then

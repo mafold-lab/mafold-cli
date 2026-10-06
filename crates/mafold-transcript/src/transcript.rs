@@ -340,6 +340,31 @@ impl Transcript {
         self.full.push_str(md);
     }
 
+    /// Start from a reply another process was writing when it died — `prior`
+    /// is what that reply says ([`render::strip_trailing_generating`] of its
+    /// last snapshot) — so this one goes on below it instead of over it.
+    ///
+    /// Its run groups count as this turn's: the fold at the end puts the WHOLE
+    /// trail under one lid, labelled with all of it, the same as a reply no
+    /// restart ever touched. Counted from the text, since the text is all that
+    /// is left of the process that wrote it ([`render::run_groups`]).
+    pub fn continue_from(&mut self, prior: &str) {
+        let prior = prior.trim_end();
+        if prior.is_empty() {
+            return;
+        }
+        self.push_raw(prior);
+        self.full.push_str("\n\n");
+        for (counts, items) in render::run_groups(prior) {
+            for (k, n) in &counts {
+                *self.totals.entry(k).or_insert(0) += n;
+            }
+            self.groups += 1;
+            self.steps += items;
+            self.last_group = (counts, items);
+        }
+    }
+
     /// Stamp an answer into the pending `{% mafold/ask %}` card. False when
     /// there is no unanswered one.
     pub fn stamp_ask(&mut self, answer: &str) -> bool {
@@ -1009,6 +1034,73 @@ mod fold_tests {
         }
         // The end-of-turn stamp is the driver's, and it belongs after the reply.
         assert!(md.find("{% mafold/result").expect("stamp") > answer, "{md}");
+    }
+
+    /// A turn a restart cut in two finishes looking like one that ran straight
+    /// through: the process that picks it up starts from what the reply already
+    /// says (`continue_from`), and the lid covers — and counts — the work done
+    /// before the cut as well as after it. Both shapes of the second half: more
+    /// tools, and only the answer.
+    #[test]
+    fn a_turn_continued_after_a_restart_folds_like_one_that_never_stopped() {
+        let before = |t: &mut Transcript| {
+            t.push(&AgentEvent::Text("Let me look at the tests.".into()));
+            t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+            t.push(&result("a", "x\ny"));
+            t.push(&AgentEvent::Thinking("which one fails".into()));
+            t.push(&AgentEvent::Text("Now running them.".into()));
+            t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+            // Output that looks like markup is escaped into its card's body —
+            // it is not an item of the group.
+            t.push(&result("b", "{% mafold/run summary=\"x\" %}\n49 passed, 1 failed"));
+        };
+        let more_tools = |t: &mut Transcript| {
+            t.push(&AgentEvent::Text("Fixing the one that fails.".into()));
+            t.push(&call("c", "Edit", json!({"file_path": "a.rs", "old_string": "a", "new_string": "b"})));
+            t.push(&result("c", "ok"));
+            t.push(&AgentEvent::Text("All 50 pass.".into()));
+            t.push(&done());
+        };
+        let answer_only = |t: &mut Transcript| {
+            t.push(&AgentEvent::Text("All 50 pass.".into()));
+            t.push(&done());
+        };
+        let lid = |md: &str| {
+            let open = md.find("{% mafold/trace").unwrap_or_else(|| panic!("not folded:\n{md}"));
+            let tag = &md[open..open + md[open..].find("%}").unwrap()];
+            let close = md.find("{% /mafold/trace %}").unwrap();
+            let answer = md.find("All 50 pass").unwrap();
+            assert!(close < answer, "answer under the lid:\n{md}");
+            assert!(md.find("Let me look").unwrap() < close, "trail before the cut escaped the lid:\n{md}");
+            tag.to_string()
+        };
+        for second in [&more_tools as &dyn Fn(&mut Transcript), &answer_only] {
+            let mut straight = Transcript::new();
+            before(&mut straight);
+            second(&mut straight);
+
+            let mut killed = Transcript::new();
+            before(&mut killed);
+            // What the draft said when its daemon died: the live snapshot, the
+            // open group rendered as a run card like every other push.
+            let said = killed.snapshot();
+            let mut picked_up = Transcript::new();
+            picked_up.continue_from(&said);
+            second(&mut picked_up);
+
+            assert_eq!(lid(&picked_up.finish_folded()), lid(&straight.finish_folded()));
+        }
+    }
+
+    /// Nothing written yet is nothing to continue from.
+    #[test]
+    fn continuing_from_an_empty_reply_is_a_fresh_one() {
+        let mut t = Transcript::new();
+        t.continue_from("  \n");
+        t.push(&AgentEvent::Text("hi".into()));
+        let mut fresh = Transcript::new();
+        fresh.push(&AgentEvent::Text("hi".into()));
+        assert_eq!(t.finish_folded(), fresh.finish_folded());
     }
 
     /// The pill says what the WHOLE turn did, not what its last group did.

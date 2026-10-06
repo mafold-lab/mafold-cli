@@ -809,7 +809,9 @@ pub fn oneshot_id() -> String {
 /// quietly stops matching what we actually pass.
 pub fn clone_cmd(src: &Command) -> Command {
     let std = src.as_std();
-    let mut c = Command::new(std.get_program());
+    // Creation flags can't be read back from the builder, so the copy gets
+    // them from the same constructor rather than losing them.
+    let mut c = crate::platform::command(std.get_program());
     for a in std.get_args() {
         c.arg(a);
     }
@@ -822,9 +824,6 @@ pub fn clone_cmd(src: &Command) -> Command {
     if let Some(d) = std.get_current_dir() {
         c.current_dir(d);
     }
-    // Not readable back from the builder, so re-applied rather than lost (it is
-    // what keeps a console window from flashing on Windows).
-    crate::platform::no_window(&mut c);
     c
 }
 
@@ -1297,7 +1296,7 @@ mod tests {
     /// A stub standing in for claude: `script` owns stdin/stdout the same way
     /// the real CLI does, so the handshake runs its true path.
     async fn stub(script: &str) -> Conn {
-        let mut cmd = Command::new("bash");
+        let mut cmd = crate::platform::command("bash");
         cmd.arg("-c").arg(script);
         Conn::spawn(key("opus"), "t1".into(), String::new(), cmd, "/tmp")
             .await

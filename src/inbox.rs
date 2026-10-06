@@ -155,7 +155,36 @@ struct State {
     /// ask`). While it waits there is no new patrol — one open question at a time.
     #[serde(default)]
     pending_ask: Option<PendingAsk>,
+    /// Replies that were still being written when this loop's read marker
+    /// passed them. The server brings such a reply back as one more unread
+    /// once it finishes (a "resurrection") — but it sits BEFORE the marker,
+    /// where counting back from the newest line never reaches. This list is
+    /// how the loop knows which message that unread is.
+    #[serde(default)]
+    watching: Vec<Watched>,
+    /// Timeline key → `created_at` of the newest message this loop marked read
+    /// there: what tells a resurrected reply (finished behind the marker) from
+    /// one the badge counts in place.
+    #[serde(default)]
+    marked_at: HashMap<String, String>,
 }
+
+/// A reply still being written that the marker moved past (see [`State::watching`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct Watched {
+    key: String,
+    chat_id: String,
+    #[serde(default)]
+    channel_id: Option<String>,
+    id: String,
+    created_at: String,
+    /// Epoch secs it was first seen; long-dead drafts are let go.
+    since: u64,
+}
+
+/// How long a draft is watched for. One still unfinished after this is an
+/// abandoned turn, not a reply on its way.
+const WATCH_SECS: u64 = 2 * 24 * 3600;
 
 /// One piece of work a patrol found, as the agent writes it to `proposals.json`
 /// (array order = its priority order).
@@ -485,24 +514,245 @@ fn is_bot(m: &Value) -> bool {
 /// message is always finalized on send, so the second test only ever holds a
 /// bot's reply back — the 133 KB one that woke this loop every 40 seconds while
 /// it was still being written, before the tag-only test caught up.
-fn in_progress(m: &Value) -> bool {
+pub(crate) fn in_progress(m: &Value) -> bool {
     m["content"].as_str().is_some_and(|c| c.contains("{% mafold/generating"))
         || (is_bot(m) && m.get("finalized_at").is_some_and(Value::is_null))
 }
 
-/// The last messages of a timeline, oldest first, cut before the first reply
-/// that is still being written — read up to it, never past it. The loop's own
-/// log posts (`skip`) are dropped: they are bookkeeping, not conversation.
+/// What the writing agent reports about a reply in progress — the attributes
+/// of its `{% mafold/generating … /%}` tag.
+#[derive(Debug, Default, PartialEq)]
+struct Progress {
+    started_ms: Option<u64>,
+    beat_at_ms: Option<u64>,
+    shells: u64,
+    awaiting: Option<String>,
+}
+
+/// One attribute of a card tag's inside: `name=123` or `name="text"`.
+fn tag_attr<'a>(inner: &'a str, name: &str) -> Option<&'a str> {
+    let at = inner.find(&format!(" {name}="))? + name.len() + 2;
+    let rest = &inner[at..];
+    if let Some(q) = rest.strip_prefix('"') {
+        q.find('"').map(|e| &q[..e])
+    } else {
+        Some(rest.split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or(""))
+    }
+}
+
+fn progress_of(content: &str) -> Option<Progress> {
+    const OPEN: &str = "{% mafold/generating";
+    let i = content.find(OPEN)?;
+    let inner = &content[i + OPEN.len()..];
+    let inner = &inner[..inner.find("%}")?];
+    let inner = format!(" {}", inner.trim());
+    let num = |n: &str| tag_attr(&inner, n).and_then(|v| v.parse::<u64>().ok());
+    Some(Progress {
+        started_ms: num("started"),
+        beat_at_ms: num("beatAt"),
+        shells: num("shells").unwrap_or(0),
+        awaiting: tag_attr(&inner, "awaiting").map(|w| w.replace("&quot;", "\"")).filter(|w| !w.trim().is_empty()),
+    })
+}
+
+/// A reply this long without a heartbeat has stopped, as far as anyone can tell.
+const STALL_MS: u64 = 10 * 60 * 1000;
+/// How much of what a reply in progress has written so far is shown.
+const WORKING_TAIL: usize = 120;
+
+/// "3 分钟" / "1 小时 20 分钟" — how long something has been going on.
+fn span_zh(ms: u64) -> String {
+    let mins = ms / 60_000;
+    match mins {
+        0 => "不到 1 分钟".into(),
+        1..=59 => format!("{mins} 分钟"),
+        _ if mins % 60 == 0 => format!("{} 小时", mins / 60),
+        _ => format!("{} 小时 {} 分钟", mins / 60, mins % 60),
+    }
+}
+
+/// What a reply still being written ([`in_progress`]) is doing, in one line:
+/// alive and for how long, parked on a card, or gone quiet — and the last
+/// thing it has written so far. Hiding the draft made "they're on it" and
+/// "nobody answered" look identical to this loop, and it @-ed agents that
+/// were already halfway through their answer.
+pub(crate) fn working_status(m: &Value, now_ms: u64) -> String {
+    let raw = m["content"].as_str().unwrap_or("");
+    let mut s = match progress_of(raw) {
+        Some(p) => {
+            let started = p.started_ms.or_else(|| secs_of(Some(created(m))).map(|s| s as u64 * 1000));
+            let elapsed = started.map(|t| span_zh(now_ms.saturating_sub(t))).unwrap_or_else(|| "?".into());
+            let quiet = p.beat_at_ms.map(|b| now_ms.saturating_sub(b));
+            if let Some(who) = &p.awaiting {
+                format!("⏸ 在等 @{} 回答卡片(已写 {elapsed})", who.trim_start_matches('@'))
+            } else if let Some(q) = quiet.filter(|q| *q >= STALL_MS) {
+                format!("⚠️ {}没动静了(开写 {elapsed}前) —— 可能卡住了", span_zh(q))
+            } else {
+                let mut s = format!("⏳ 正在回复 · 已写 {elapsed}");
+                match quiet {
+                    Some(q) if q < 60_000 => s.push_str(" · 刚有动静"),
+                    Some(q) => s.push_str(&format!(" · 最后动静 {}前", span_zh(q))),
+                    None => {}
+                }
+                if p.shells > 0 {
+                    s.push_str(&format!(" · {} 个后台任务", p.shells));
+                }
+                s
+            }
+        }
+        None => "⏳ 草稿还没写完(没有进度信号)".into(),
+    };
+    let prose = collapse_blank(&mafold_transcript::render::strip_cards(raw));
+    let prose = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !prose.is_empty() {
+        let n = prose.chars().count();
+        let tail: String = prose.chars().skip(n.saturating_sub(WORKING_TAIL)).collect();
+        s.push_str(&format!(" · 已写到:「{}{tail}」", if n > WORKING_TAIL { "…" } else { "" }));
+    }
+    s
+}
+
+/// [`working_status`] with the same head a message line has (`#id [when] @who(AI)`).
+fn working_line(m: &Value, me_lc: &str, principal: Option<&str>, off: i32, now_ms: u64) -> String {
+    format!("{}: {}", msg_head(m, me_lc, principal, off), working_status(m, now_ms))
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// `created_at` order, robust to the server's mix of `…:12Z` and `…:12.345678Z`
+/// (plain string order puts `12.3Z` before `12Z`).
+fn later(a: &str, b: &str) -> bool {
+    let micros = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| t.timestamp_micros());
+    match (micros(a), micros(b)) {
+        (Some(x), Some(y)) => x > y,
+        _ => a > b,
+    }
+}
+
+/// The last messages of a timeline, oldest first — replies still being written
+/// included: [`arrange`] decides what each one is. The loop's own log posts
+/// (`skip`) are dropped: they are bookkeeping, not conversation.
 async fn read_timeline(client: &Client, tl: &Timeline, skip: &HashSet<String>) -> Result<Vec<Value>> {
     let n = (tl.unread + CONTEXT_LINES).clamp(1, MAX_PER_TIMELINE + CONTEXT_LINES);
     let page = client.get_chat_history(&tl.chat_id, n, tl.channel_id.as_deref()).await?;
     let mut items = page["items"].as_array().cloned().unwrap_or_default();
     items.retain(|m| m["id"].as_str().is_none_or(|id| !skip.contains(id)));
     items.sort_by(|a, b| created(a).cmp(created(b)));
-    if let Some(i) = items.iter().position(in_progress) {
-        items.truncate(i);
-    }
     Ok(items)
+}
+
+/// One timeline's page, sorted out.
+#[derive(Debug, Default)]
+struct Arranged {
+    context: Vec<Value>,
+    new: Vec<Value>,
+    /// Other people's replies still being written — shown as status lines.
+    working: Vec<Value>,
+}
+
+/// Split a timeline's page into context / new / still being written.
+///
+/// The server's badge (`unread`) counts two things beyond "finished messages
+/// after my marker": a reply still being written counts in place like any
+/// message, and a reply that FINISHED after my marker had already passed it
+/// counts once more (the server resurrects it). `finished` are the watched
+/// replies that have finished since (fetched by id); `marked_at` is the newest
+/// message this loop marked read here — a finished reply at or before it is a
+/// resurrection and is delivered as new, wherever it sits in the page.
+fn arrange(items: &[Value], unread: usize, me_lc: &str, finished: Vec<Value>, marked_at: Option<&str>) -> Arranged {
+    let working: Vec<Value> = items.iter().filter(|m| in_progress(m) && sender(m) != me_lc).cloned().collect();
+    let done: Vec<Value> = items.iter().filter(|m| !in_progress(m)).cloned().collect();
+    let resurrected: Vec<Value> =
+        finished.into_iter().filter(|m| marked_at.is_some_and(|at| !later(created(m), at))).collect();
+    let unread_drafts = working.iter().filter(|m| marked_at.is_none_or(|at| later(created(m), at))).count();
+    let positional = unread.saturating_sub(resurrected.len() + unread_drafts);
+    let (mut context, mut new) = split_new(&done, positional, me_lc);
+    for r in resurrected {
+        let id = r["id"].clone();
+        context.retain(|m| m["id"] != id);
+        new.retain(|m| m["id"] != id);
+        new.push(r);
+    }
+    new.sort_by(|a, b| created(a).cmp(created(b)));
+    Arranged { context, new, working }
+}
+
+/// The watched replies of one timeline that have finished since (`finished`),
+/// and the ids to stop watching outright (`gone`: deleted, or no longer
+/// readable). One `getMessage` per watched reply — only for timelines being
+/// read, and a loop rarely has more than a few replies in flight.
+async fn check_watched(client: &Client, watching: &[Watched], key: &str) -> (Vec<Value>, Vec<String>) {
+    let mut finished = Vec::new();
+    let mut gone = Vec::new();
+    for w in watching.iter().filter(|w| w.key == key) {
+        match client.get_message(&w.id).await {
+            Ok(m) if m.get("id").is_some() => {
+                if m["deleted"].as_bool() == Some(true) {
+                    gone.push(w.id.clone());
+                } else if !in_progress(&m) {
+                    finished.push(m);
+                }
+            }
+            Ok(_) => gone.push(w.id.clone()),
+            Err(e) => {
+                let s = format!("{e:#}");
+                if s.contains("404") || s.contains("not found") || s.contains("permission") {
+                    gone.push(w.id.clone());
+                } else {
+                    eprintln!("inbox: checking the reply {} failed: {s}", w.id);
+                }
+            }
+        }
+    }
+    (finished, gone)
+}
+
+/// What a turn learned about replies in flight, applied only once its markers
+/// actually moved: a draft is watched when the marker passes it, and a watched
+/// reply is let go when it has been delivered finished.
+#[derive(Default)]
+struct Book {
+    watch: Vec<Watched>,
+    delivered: HashSet<String>,
+}
+
+impl Book {
+    fn saw_draft(&mut self, tl: &Timeline, d: &Value) {
+        let Some(id) = d["id"].as_str() else { return };
+        if self.watch.iter().any(|w| w.id == id) {
+            return;
+        }
+        self.watch.push(Watched {
+            key: tl.key(),
+            chat_id: tl.chat_id.clone(),
+            channel_id: tl.channel_id.clone(),
+            id: id.to_string(),
+            created_at: created(d).to_string(),
+            since: now_secs(),
+        });
+    }
+
+    /// After `markers.mark`: remember how far each timeline was marked, watch
+    /// the drafts the marker passed, drop what was delivered or has expired.
+    fn settle(self, state: &mut State, markers: &Markers) {
+        for (key, at) in markers.newest() {
+            let e = state.marked_at.entry(key).or_default();
+            if e.is_empty() || later(&at, e) {
+                *e = at;
+            }
+        }
+        state.watching.retain(|w| !self.delivered.contains(&w.id));
+        for w in self.watch {
+            let passed = state.marked_at.get(&w.key).is_some_and(|at| later(at, &w.created_at));
+            if passed && !state.watching.iter().any(|x| x.id == w.id) {
+                state.watching.push(w);
+            }
+        }
+        let now = now_secs();
+        state.watching.retain(|w| now.saturating_sub(w.since) < WATCH_SECS);
+    }
 }
 
 /// Split a page into (already read, new). The badge counts other people's
@@ -537,9 +787,12 @@ fn secs_of(ts: Option<&str>) -> Option<i64> {
 /// timeline or a forum channel) whose newest message falls inside the window,
 /// newest first, with its last few lines — the chat list with previews a person
 /// scans before deciding what to open. DMs stay out: what matters there
-/// arrives as unread anyway. Read-only: no marker moves.
-async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> String {
-    let Ok(list) = ctx.client.chats().await else { return String::new() };
+/// arrives as unread anyway. Read-only: no marker moves. Also returns, per
+/// timeline shown, the newest message in it — what the agent has now seen
+/// there (the send guard's starting point).
+async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> (String, Vec<(String, String)>) {
+    let mut shown: Vec<(String, String)> = Vec::new();
+    let Ok(list) = ctx.client.chats().await else { return (String::new(), shown) };
     let off = ctx.opts.utc_offset;
     let mut spots: Vec<(i64, Timeline)> = Vec::new();
     for c in list["items"].as_array().cloned().unwrap_or_default() {
@@ -581,21 +834,35 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> String {
     spots.truncate(OVERVIEW_SPOTS);
 
     let mut out = String::new();
+    let now = now_ms();
     for (_, tl) in &spots {
         let Ok(page) = ctx.client.get_chat_history(&tl.chat_id, OVERVIEW_LINES, tl.channel_id.as_deref()).await else {
             continue;
         };
         let mut items = page["items"].as_array().cloned().unwrap_or_default();
-        items.retain(|m| !in_progress(m) && m["id"].as_str().is_none_or(|id| !skip.contains(id)));
+        items.retain(|m| m["id"].as_str().is_none_or(|id| !skip.contains(id)));
         items.sort_by(|a, b| created(a).cmp(created(b)));
         if items.is_empty() {
             continue;
         }
+        if let Some(last) = items.last() {
+            shown.push((tl.key(), created(last).to_string()));
+        }
         out.push_str(&format!("\n== {} ==\n", tl.heading()));
         for m in &items {
-            let line = render_msg(m, &ctx.me_lc, ctx.principal.as_deref(), off);
-            // An agent's line keeps its END (the conclusion), a person's its start.
-            let line = if is_bot(m) { clip_body_tail(&line, OVERVIEW_BODY + 80) } else { clip(&line, OVERVIEW_BODY + 80) };
+            // A reply still being written is a status ("on it since …"), not
+            // a half-sentence to read as the answer.
+            let line = if in_progress(m) {
+                if sender(m) == ctx.me_lc {
+                    continue;
+                }
+                // Already bounded, and its point is at the START ("⏳ …").
+                working_line(m, &ctx.me_lc, ctx.principal.as_deref(), off, now)
+            } else {
+                let line = render_msg(m, &ctx.me_lc, ctx.principal.as_deref(), off);
+                // An agent's line keeps its END (the conclusion), a person's its start.
+                if is_bot(m) { clip_body_tail(&line, OVERVIEW_BODY + 80) } else { clip(&line, OVERVIEW_BODY + 80) }
+            };
             out.push_str(&line);
             out.push('\n');
         }
@@ -603,11 +870,12 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> String {
     if dropped > 0 {
         out.push_str(&format!("\n(还有 {dropped} 处也有动静,没列出来 —— `mafold chats` / `mafold channels list <chat>` 自己看)\n"));
     }
-    out
+    (out, shown)
 }
 
 /// Would a person's phone have buzzed for this? A DM, an @, a reply to me —
-/// from a PERSON. From an AI only an explicit @ counts: the same one door the
+/// from a PERSON. From an AI only an explicit @ counts — one that opens a line
+/// (`mafold_transcript::mention`): the same one door the
 /// bot loop opens to AI senders (`agent.rs` `should_respond`), which is what
 /// keeps two agents from answering each other forever.
 fn wakes_now(m: &Value, me_lc: &str, is_dm: bool) -> bool {
@@ -623,8 +891,13 @@ fn wakes_now_as(m: &Value, me_lc: &str, aliases: &[String], is_dm: bool) -> bool
         return false;
     }
     let content = m["content"].as_str().unwrap_or("");
-    let at_me = crate::agent::mentions_me(content, me_lc) || aliases.iter().any(|a| crate::agent::mentions_me(content, a));
-    if is_bot(m) {
+    // Called, by the one rule the bot gates run (`mafold_transcript::mention`):
+    // a person's @ anywhere, an AI's only where it opens a line — an agent
+    // naming the principal mid-sentence is reporting, not calling.
+    let ai = is_bot(m);
+    let calls = |who: &str| mafold_transcript::mention::summons(content, who, ai);
+    let at_me = calls(me_lc) || aliases.iter().any(|a| calls(a));
+    if ai {
         return at_me;
     }
     let reply_to_me = m["reply_to_sender"]
@@ -700,7 +973,8 @@ fn collapse_blank(s: &str) -> String {
 
 /// One message as the agent reads it: id to reply with, time, who (and what
 /// kind of who), what it answers, then the text a person would see.
-fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> String {
+/// `#id [when] @who(tag)` — the head every line about a message starts with.
+fn msg_head(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> String {
     let who = sender(m);
     let tag = if who == me_lc {
         "(你自己)"
@@ -711,11 +985,12 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
     } else {
         ""
     };
-    let mut line = format!(
-        "#{} [{}] @{who}{tag}",
-        m["id"].as_str().unwrap_or("?"),
-        when(m, off)
-    );
+    format!("#{} [{}] @{who}{tag}", m["id"].as_str().unwrap_or("?"), when(m, off))
+}
+
+fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> String {
+    let who = sender(m);
+    let mut line = msg_head(m, me_lc, principal, off);
     if let Some(to) = m["reply_to_sender"].as_str() {
         if to.eq_ignore_ascii_case(me_lc) {
             line.push_str(" ↩回复你");
@@ -728,10 +1003,10 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
             line.push_str(&format!(" #{rid}"));
         }
     }
-    if who != me_lc && aliases().iter().any(|a| *a != who && crate::agent::mentions_me(m["content"].as_str().unwrap_or(""), a)) {
+    let raw = m["content"].as_str().unwrap_or("");
+    if who != me_lc && aliases().iter().any(|a| *a != who && mafold_transcript::mention::summons(raw, a, is_bot(m))) {
         line.push_str(" [找本人的]");
     }
-    let raw = m["content"].as_str().unwrap_or("");
     // An agent's reply is mostly its working trail (cards) with the answer at
     // the END — 80–130 KB where the conclusion is the last paragraph. Read it
     // as prose, and when it's long keep its tail: clipping from the front is
@@ -781,6 +1056,26 @@ struct Batch {
     tl: Timeline,
     context: Vec<Value>,
     new: Vec<Value>,
+    /// Status lines for other people's replies still being written ([`working_line`]).
+    working: Vec<String>,
+    /// Ids among `new` that are replies which just finished — shown with a
+    /// "(刚写完)" mark, since they may sit far back in the timeline.
+    finished: HashSet<String>,
+    /// `created_at` of the newest reply still being written here (shown as a
+    /// status): part of what the agent has seen, for the send guard.
+    newest_working: Option<String>,
+}
+
+impl Batch {
+    /// The newest thing in this timeline the agent was shown.
+    fn newest_seen(&self) -> Option<String> {
+        self.context
+            .iter()
+            .chain(self.new.iter())
+            .map(|m| created(m).to_string())
+            .chain(self.newest_working.clone())
+            .reduce(|a, b| if later(&b, &a) { b } else { a })
+    }
 }
 
 /// A patrol's brief: what it is for, and the overview it starts from.
@@ -860,7 +1155,14 @@ fn build_prompt(
             p.push('\n');
         }
         for m in &b.new {
+            if m["id"].as_str().is_some_and(|id| b.finished.contains(id)) {
+                p.push_str("(刚写完) ");
+            }
             p.push_str(&render_msg(m, me_lc, principal, off));
+            p.push('\n');
+        }
+        for w in &b.working {
+            p.push_str(w);
             p.push('\n');
         }
     }
@@ -937,6 +1239,9 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
          找你拍板、交了活等你验收(看它的结论和证据,不够就要)、答应的事到点没动静 —— 回答、验收、拍板或追,别只在日志里记一笔。\n\
          {who}\
          - 消息前的 `#…` 是消息 id,给 --reply / react 用。「(AI)」是 bot 发的,「(本人)」是指令来源,「(你自己)」是你之前发的。\n\
+         - 「⏳ 正在回复」= 对方已经在写了:别重复 @、别说他没开工 —— 写完会以「(刚写完)」作为新消息到你这儿。\
+         「⏸ 在等 @X 回答卡片」= 卡在等那个人点卡,该提醒的是那个人。只有「⚠️ … 没动静了」才去问一声。\n\
+         - `mafold send` 回你「✋ 没发出去」= 你想的这会儿,那里又有人说话(或开始回复)了:先看它列出的新消息再决定说什么;确定还要照原样发,加 `--anyway`。\n\
          - 要在某个时间回头看某件事:写进工作目录的 followups.json(数组,每项 {{\"at\": \"带时区的 RFC3339\", \"conv\": \"会话 id\", \"note\": \"要做什么\"}}),到点会叫醒你;做完就删掉那一项。\n\
          - ledger.md 记谁答应了什么、什么时候到期;memory/ 记决定和人。它们是你跨天的记忆——会话每天换一次。\n\
          - 这一轮进行中新到的消息,会在工具调用之间递给你;你说完一句之后对方回了,也会这样接上。\n\
@@ -946,15 +1251,146 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
 
 // ───────────────────────────── the turn ─────────────────────────────
 
+// ─────────────────────────── the send guard ───────────────────────────
+
+/// What the agent has actually seen this turn, per timeline — the ledger the
+/// send guard checks against (`$MAFOLD_SEND_SEEN`, rewritten every turn).
+///
+/// Why: a turn reads, then THINKS — minutes, often — and only then speaks. New
+/// messages reach it between tool calls, so the ones that arrive while it is
+/// thinking land right AFTER its `mafold send`: 68 of 87 sends we could
+/// attribute had the same timeline speak again while the message was being
+/// composed. The guard re-checks the timeline at the moment of sending.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Seen {
+    me: String,
+    #[serde(default)]
+    principal: Option<String>,
+    #[serde(default)]
+    off: i32,
+    /// When this turn started reading: the floor for a timeline it never read.
+    started: String,
+    /// The steer mailbox. A steered message counts as seen once the mailbox no
+    /// longer holds it — the hook has handed it to the agent.
+    #[serde(default)]
+    steer_file: String,
+    /// Timeline key → `created_at` of the newest message shown there.
+    #[serde(default)]
+    timelines: HashMap<String, String>,
+    /// Messages handed over mid-turn through the steer mailbox.
+    #[serde(default)]
+    queued: Vec<Queued>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct Queued {
+    key: String,
+    id: String,
+    at: String,
+}
+
+fn seen_path(dir: &Path, dry: bool) -> PathBuf {
+    dir.join(if dry { "seen-dry.json" } else { "seen.json" })
+}
+
+fn load_seen(path: &Path) -> Option<Seen> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Atomic, so the guard (a child process) never reads half a file.
+fn save_seen(path: &Path, s: &Seen) {
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(body) = serde_json::to_string(s) {
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// `created_at`-shaped stamp for an epoch second (UTC).
+fn stamp_of(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        .unwrap_or_default()
+}
+
+/// The newest message in a timeline the agent had seen when it decided to
+/// speak: what it was shown at the start of the turn (or the turn's start,
+/// for a timeline it never read), moved forward by every steered message it
+/// has actually been handed.
+fn seen_floor(seen: &Seen, key: &str, mailbox: &str) -> String {
+    let mut floor = seen.timelines.get(key).cloned().unwrap_or_else(|| seen.started.clone());
+    for q in seen.queued.iter().filter(|q| q.key == key && !mailbox.contains(&q.id)) {
+        if later(&q.at, &floor) {
+            floor = q.at.clone();
+        }
+    }
+    floor
+}
+
+/// Other people's messages in a page newer than `floor`, oldest first —
+/// finished ones, and replies that started being written since.
+fn fresh_since(items: &[Value], floor: &str, me_lc: &str) -> Vec<Value> {
+    let mut v: Vec<Value> = items.iter().filter(|m| sender(m) != me_lc && later(created(m), floor)).cloned().collect();
+    v.sort_by(|a, b| created(a).cmp(created(b)));
+    v
+}
+
+/// How far back the guard looks. More than this many new lines since the
+/// agent last looked is a conversation it should re-read anyway.
+const GUARD_LINES: usize = 20;
+
+/// `mafold send` from inside an inbox turn: has anyone spoken in this timeline
+/// since the agent last saw it — or started writing a reply? Then the message
+/// is NOT sent; this returns what is new (to print as the command's output),
+/// and those lines now count as seen, so sending again goes through unless
+/// someone speaks again. None = nothing new, not an inbox turn, or the check
+/// itself failed (a network blip must not swallow what the agent says).
+pub(crate) async fn send_guard(client: &Client, chat_id: &str, channel_id: Option<&str>, label: &str) -> Option<String> {
+    let path = PathBuf::from(std::env::var("MAFOLD_SEND_SEEN").ok().filter(|p| !p.trim().is_empty())?);
+    let mut seen = load_seen(&path)?;
+    let key = timeline_key(chat_id, channel_id);
+    let mailbox = std::fs::read_to_string(&seen.steer_file).unwrap_or_default();
+    let floor = seen_floor(&seen, &key, &mailbox);
+    let page = match client.get_chat_history(chat_id, GUARD_LINES, channel_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("(没能先看一眼 {label} 有没有新消息,照发:{e:#})");
+            return None;
+        }
+    };
+    let fresh = fresh_since(page["items"].as_array().map_or(&[][..], |v| v.as_slice()), &floor, &seen.me);
+    let last = fresh.last()?;
+    let now = now_ms();
+    let lines: Vec<String> = fresh
+        .iter()
+        .map(|m| {
+            if in_progress(m) {
+                working_line(m, &seen.me, seen.principal.as_deref(), seen.off, now)
+            } else {
+                render_msg(m, &seen.me, seen.principal.as_deref(), seen.off)
+            }
+        })
+        .collect();
+    seen.timelines.insert(key, created(last).to_string());
+    save_seen(&path, &seen);
+    Some(format!(
+        "✋ 没发出去:你开始想之后,{label} 又有了新动静 —— 先看完,再决定这句还要不要照原样发(确定照发:同一条命令加 --anyway)。\n{}",
+        lines.join("\n")
+    ))
+}
+
 /// Environment for the harness child: speak as THIS account, paced like a
-/// person, journaled so the loop knows who was spoken to, and with this very
-/// binary first on PATH so `mafold send --reply` means what the preamble says.
-fn child_env(client: &Client, me: &str, journal: &Path, dry: bool) -> Vec<(String, String)> {
+/// person, journaled so the loop knows who was spoken to, checked against what
+/// it has seen before each send, and with this very binary first on PATH so
+/// `mafold send --reply` means what the preamble says.
+fn child_env(client: &Client, me: &str, journal: &Path, seen: &Path, dry: bool) -> Vec<(String, String)> {
     let mut env = vec![
         ("MAFOLD_BASE".to_string(), client.base.clone()),
         ("MAFOLD_SEND_PACE".to_string(), if dry { "0" } else { "1" }.to_string()),
         ("MAFOLD_SEND_DRY".to_string(), if dry { "1" } else { "0" }.to_string()),
         ("MAFOLD_SEND_JOURNAL".to_string(), journal.to_string_lossy().into_owned()),
+        ("MAFOLD_SEND_SEEN".to_string(), seen.to_string_lossy().into_owned()),
     ];
     let person = crate::session::load_named(me).is_some_and(|s| s.token == client.token);
     if person {
@@ -1091,6 +1527,13 @@ impl Markers {
     fn contains(&self, id: &str) -> bool {
         self.by_key.values().any(|(_, l)| l.iter().any(|(_, i)| i == id))
     }
+    /// Timeline key → `created_at` of the newest message marked there.
+    fn newest(&self) -> Vec<(String, String)> {
+        self.by_key
+            .iter()
+            .filter_map(|(k, (_, l))| l.iter().map(|(at, _)| at.clone()).reduce(|a, b| if later(&b, &a) { b } else { a }).map(|at| (k.clone(), at)))
+            .collect()
+    }
     async fn mark(&self, client: &Client) {
         for (tl, list) in self.by_key.values() {
             let Some((_, id)) = list.iter().max() else { continue };
@@ -1121,6 +1564,8 @@ struct Ctx {
     ask_chat: Option<String>,
     env: Vec<(String, String)>,
     journal: PathBuf,
+    /// The send guard's ledger ([`Seen`]), rewritten at the start of every turn.
+    seen: PathBuf,
     /// Whether turns pick a Claude login (`crate::accounts`) at all: a Claude
     /// Code loop started on a login this machine knows. Anything else keeps
     /// the one environment it was started with, exactly as before.
@@ -1134,22 +1579,55 @@ struct Ctx {
 
 /// Messages that arrived while a turn runs, and that it should hear now: the
 /// timelines it is already looking at, plus anything a phone would buzz for.
+/// What a steer check found: the text for the mailbox, the message ids it
+/// carries, and the same messages as send-guard entries.
+struct Steer {
+    text: String,
+    ids: HashSet<String>,
+    queued: Vec<Queued>,
+}
+
 async fn steer_check(
     ctx: &Ctx,
     turn_keys: &HashSet<String>,
     markers: &mut Markers,
     state: &State,
+    book: &mut Book,
     cancel: &Notify,
-) -> Option<(String, HashSet<String>)> {
+) -> Option<Steer> {
     let tls = unread_timelines(&ctx.client, &ctx.me_lc).await.ok()?;
     let skip = state.log_set();
     let mut block = String::new();
     let mut ids = HashSet::new();
+    let mut queued = Vec::new();
+    let now = now_ms();
     for tl in tls {
         let Ok(items) = read_timeline(&ctx.client, &tl, &skip).await else { continue };
-        let (_, new) = split_new(&items, tl.unread, &ctx.me_lc);
-        let braked = state.ai_streak.get(&tl.key()).copied().unwrap_or(0) >= AI_STREAK_BRAKE;
+        let key = tl.key();
+        let (finished, _) = check_watched(&ctx.client, &state.watching, &key).await;
+        let finished_ids: HashSet<String> =
+            finished.iter().filter_map(|m| m["id"].as_str().map(str::to_string)).collect();
+        let a = arrange(&items, tl.unread, &ctx.me_lc, finished, state.marked_at.get(&key).map(String::as_str));
+        let new = a.new;
+        let braked = state.ai_streak.get(&key).copied().unwrap_or(0) >= AI_STREAK_BRAKE;
         let mut lines = Vec::new();
+        // Someone started answering in a timeline this turn is about: say so
+        // now, or the agent may @ them again before their reply lands.
+        if turn_keys.contains(&key) {
+            for d in &a.working {
+                let Some(id) = d["id"].as_str() else { continue };
+                if state.watching.iter().any(|w| w.id == id) || book.watch.iter().any(|w| w.id == id) {
+                    continue;
+                }
+                lines.push(working_line(d, &ctx.me_lc, ctx.principal.as_deref(), ctx.opts.utc_offset, now));
+                queued.push(Queued { key: key.clone(), id: id.to_string(), at: created(d).to_string() });
+            }
+        }
+        // Every draft here, shown or not: if this turn's marker ends up past
+        // one, it has to be watched to be recognized when it finishes.
+        for d in &a.working {
+            book.saw_draft(&tl, d);
+        }
         for m in new {
             let Some(id) = m["id"].as_str() else { continue };
             if markers.contains(id) || sender(&m) == ctx.me_lc {
@@ -1169,8 +1647,17 @@ async fn steer_check(
                 continue;
             }
             if turn_keys.contains(&tl.key()) || wakes_now(&m, &ctx.me_lc, tl.is_dm) {
-                lines.push(render_msg(&m, &ctx.me_lc, ctx.principal.as_deref(), ctx.opts.utc_offset));
+                let just_finished = finished_ids.contains(id);
+                lines.push(format!(
+                    "{}{}",
+                    if just_finished { "(刚写完) " } else { "" },
+                    render_msg(&m, &ctx.me_lc, ctx.principal.as_deref(), ctx.opts.utc_offset)
+                ));
+                if just_finished {
+                    book.delivered.insert(id.to_string());
+                }
                 ids.insert(id.to_string());
+                queued.push(Queued { key: key.clone(), id: id.to_string(), at: created(&m).to_string() });
                 markers.add(&tl, &m);
             }
         }
@@ -1178,7 +1665,7 @@ async fn steer_check(
             block.push_str(&format!("== {} ==\n{}\n", tl.heading(), lines.join("\n")));
         }
     }
-    (!block.is_empty()).then(|| (format!("【你看消息的这会儿,又来了新消息】\n{block}"), ids))
+    (!block.is_empty()).then(|| Steer { text: format!("【你看消息的这会儿,又来了新消息】\n{block}"), ids, queued })
 }
 
 /// The brake (§6): speaking into a timeline where only AI spoke since last time
@@ -1225,8 +1712,10 @@ async fn look(
     let mut batches = Vec::new();
     let mut braked = Vec::new();
     let mut markers = Markers::default();
+    let mut book = Book::default();
     let mut humans: HashSet<String> = HashSet::new();
     let skip = state.log_set();
+    let now_m = now_ms();
     for tl in tls {
         let items = match read_timeline(&ctx.client, &tl, &skip).await {
             Ok(i) => i,
@@ -1235,28 +1724,42 @@ async fn look(
                 continue;
             }
         };
-        let (context, new) = split_new(&items, tl.unread, &ctx.me_lc);
+        let key = tl.key();
+        let (finished, gone) = check_watched(&ctx.client, &state.watching, &key).await;
+        state.watching.retain(|w| !gone.contains(&w.id));
+        let finished_ids: HashSet<String> =
+            finished.iter().filter_map(|m| m["id"].as_str().map(str::to_string)).collect();
+        let a = arrange(&items, tl.unread, &ctx.me_lc, finished, state.marked_at.get(&key).map(String::as_str));
+        let (context, new) = (a.context, a.new);
         for m in &new {
             markers.add(&tl, m);
         }
-        // Nothing from anyone else (only my own lines, or an agent still
-        // writing): nothing to read — marked read, but no reason for a turn.
+        for d in &a.working {
+            book.saw_draft(&tl, d);
+        }
+        book.delivered.extend(new.iter().filter_map(|m| m["id"].as_str()).filter(|id| finished_ids.contains(*id)).map(str::to_string));
+        // Nothing from anyone else (only my own lines, or only replies still
+        // being written): nothing to read — marked read, but no reason for a
+        // turn. A reply in progress is a status, not something said yet.
         if new.iter().all(|m| sender(m) == ctx.me_lc) {
             continue;
         }
-        let key = tl.key();
         if has_human(&new, &ctx.me_lc) {
             humans.insert(key.clone());
         } else if state.ai_streak.get(&key).copied().unwrap_or(0) >= AI_STREAK_BRAKE {
             braked.push(format!("{}{}", tl.label, tl.channel_name.as_deref().map(|c| format!(" #{c}")).unwrap_or_default()));
             continue;
         }
-        batches.push(Batch { tl, context, new });
+        let working =
+            a.working.iter().map(|d| working_line(d, &ctx.me_lc, ctx.principal.as_deref(), off, now_m)).collect();
+        let finished = new.iter().filter_map(|m| m["id"].as_str()).filter(|id| finished_ids.contains(*id)).map(str::to_string).collect();
+        batches.push(Batch { tl, context, new, working, finished, newest_working: a.working.iter().map(|d| created(d).to_string()).max() });
     }
 
     if batches.is_empty() && due.is_empty() && !patrol {
         if !dry {
             markers.mark(&ctx.client).await;
+            book.settle(state, &markers);
         }
         return Ok(Looked::Quiet);
     }
@@ -1309,10 +1812,10 @@ async fn look(
         state.session = None;
         state.session_day = Some(today);
     }
-    let seen = if patrol {
+    let (seen, overview_seen) = if patrol {
         overview(ctx, now as i64 - (ctx.opts.patrol_window * 3600) as i64, &skip).await
     } else {
-        String::new()
+        (String::new(), Vec::new())
     };
     let past = if patrol { decisions_digest(&ctx.workdir) } else { String::new() };
     let ask_mode = ctx.opts.patrol_mode == "ask";
@@ -1356,6 +1859,24 @@ async fn look(
         .join(format!("mafold-inbox-steer-{}-{nanos}.txt", ctx.me_lc))
         .to_string_lossy()
         .into_owned();
+    // The send guard's ledger for this turn: the newest line shown in every
+    // timeline the agent was handed (batches and the patrol overview); any
+    // other timeline counts from the moment this look began.
+    let mut seen_ledger = Seen {
+        me: ctx.me_lc.clone(),
+        principal: ctx.principal.clone(),
+        off,
+        started: stamp_of(now),
+        steer_file: steer_file.clone(),
+        ..Default::default()
+    };
+    for (key, at) in batches.iter().filter_map(|b| b.newest_seen().map(|at| (b.tl.key(), at))).chain(overview_seen) {
+        let e = seen_ledger.timelines.entry(key).or_default();
+        if e.is_empty() || later(&at, e) {
+            *e = at;
+        }
+    }
+    save_seen(&ctx.seen, &seen_ledger);
     let cancel = Arc::new(Notify::new());
     let mut seat = pick_seat(ctx).await;
     for f in &due {
@@ -1420,7 +1941,7 @@ async fn look(
                     tx_log.push(&ev);
                 }
                 _ = tick.tick() => {
-                    if let Some((text, ids)) = steer_check(ctx, &turn_keys, &mut markers, state, &cancel).await {
+                    if let Some(Steer { text, ids, queued }) = steer_check(ctx, &turn_keys, &mut markers, state, &mut book, &cancel).await {
                         use std::io::Write;
                         let ok = std::fs::OpenOptions::new().create(true).append(true).open(&steer_file)
                             .and_then(|mut f| writeln!(f, "{text}")).is_ok();
@@ -1429,6 +1950,13 @@ async fn look(
                             write(event_json(&ev));
                             tx_log.push(&ev);
                             steered.push((text, ids));
+                            // The guard counts these as seen once the hook has
+                            // taken them out of the mailbox. Read back first:
+                            // the guard itself writes the ledger too.
+                            if let Some(mut s) = load_seen(&ctx.seen) {
+                                s.queued.extend(queued);
+                                save_seen(&ctx.seen, &s);
+                            }
                         } else {
                             markers.forget(&ids);
                         }
@@ -1479,6 +2007,7 @@ async fn look(
 
     if (ok || stopped) && !dry {
         markers.mark(&ctx.client).await;
+        book.settle(state, &markers);
         update_streaks(&mut state.ai_streak, &turn_keys, &humans, &spoke);
     }
     if sends > 0 && !dry {
@@ -1627,7 +2156,8 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
     // A dry run beside the live loop must not share its send journal: the live
     // one clears and reads it to know who IT spoke to.
     let journal = dir.join(if opts.dry_run { "journal-dry.jsonl" } else { "journal.jsonl" });
-    let env = child_env(&client, &me, &journal, opts.dry_run);
+    let seen = seen_path(&dir, opts.dry_run);
+    let env = child_env(&client, &me, &journal, &seen, opts.dry_run);
     // The login this process was started on (`CLAUDE_SECURESTORAGE_CONFIG_DIR`,
     // set by whatever launched it) becomes the loop's PREFERENCE rather than a
     // pin, and leaves our own environment: every turn names its login
@@ -1673,6 +2203,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         ask_chat,
         env,
         journal,
+        seen,
         seats,
         seat_pref,
     };
@@ -1860,9 +2391,13 @@ mod tests {
         let mut reply = msg("2", "linsky", "human", "", "好的");
         reply["reply_to_sender"] = json!("opsdu");
         assert!(wakes_now_as(&reply, "realopsdu", &alias, false));
-        // An agent reporting to @opsdu (e.g. asking for a release) counts too.
-        let bot = msg("3", "opsdu:claude-code", "bot", "", "只差发版,要 @opsdu 点头");
+        // An agent calling @opsdu (e.g. for a release) counts too — by the AI
+        // rule, a line that opens with the @. Naming opsdu mid-sentence is a
+        // report, read on the next heartbeat like any chatter.
+        let bot = msg("3", "opsdu:claude-code", "bot", "", "只差发版。\n@opsdu 要你点头");
         assert!(wakes_now_as(&bot, "realopsdu", &alias, false));
+        let named = msg("3b", "opsdu:claude-code", "bot", "", "只差发版,要 @opsdu 点头");
+        assert!(!wakes_now_as(&named, "realopsdu", &alias, false));
         // The principal's own messages never wake it through the alias.
         let own = msg("4", "opsdu", "human", "", "@opsdu 备忘");
         assert!(!wakes_now_as(&own, "realopsdu", &alias, false));
@@ -1929,6 +2464,11 @@ mod tests {
         assert!(!wakes_now(&bot_reply, "realopsdu", false));
         let bot_at = msg("6", "opsdu:claude-code", "bot", "", "@realopsdu 合好了");
         assert!(wakes_now(&bot_at, "realopsdu", false));
+        // …an @ that opens a line: mid-sentence an AI is only naming it.
+        let bot_named = msg("6b", "opsdu:claude-code", "bot", "", "合好了,等 @realopsdu 出发版卡");
+        assert!(!wakes_now(&bot_named, "realopsdu", false));
+        let person_named = msg("6c", "linsky", "human", "", "合好了,等 @realopsdu 出发版卡");
+        assert!(wakes_now(&person_named, "realopsdu", false), "a person's @ anywhere still buzzes");
 
         // Never myself, never a reply still being written.
         let mine = msg("7", "realopsdu", "human", "", "@realopsdu");
@@ -2183,7 +2723,13 @@ mod tests {
         let b = Batch {
             tl,
             context: vec![msg("0", "linsky", "human", "2026-09-25T02:00:00Z", "早")],
-            new: vec![msg("1", "linsky", "human", "2026-09-25T02:01:00Z", "@realopsdu 看下")],
+            new: vec![
+                msg("9", "opsdu:claude-code", "bot", "2026-09-25T01:50:00Z", "根因是重启丢了游标"),
+                msg("1", "linsky", "human", "2026-09-25T02:01:00Z", "@realopsdu 看下"),
+            ],
+            working: vec!["#w [09-25 10:01] @opsdu:codex(AI): ⏳ 正在回复 · 已写 3 分钟".into()],
+            finished: ["9".to_string()].into_iter().collect(),
+            newest_working: None,
         };
         let due = vec![Followup { at: "2026-09-25T10:00:00+08:00".into(), conv: "c1".into(), note: "追 PR".into() }];
         let p = build_prompt("2026-09-25 10:01", &["心跳"], true, &[b], &["某群".into()], &due, None, None, "realopsdu", Some("opsdu"), 8);
@@ -2194,6 +2740,8 @@ mod tests {
         assert!(p.contains("#1 [09-25 10:01] @linsky: @realopsdu 看下"));
         assert!(p.contains("只标已读") && p.contains("某群"));
         assert!(p.contains("[到期的跟进]") && p.contains("追 PR"));
+        assert!(p.contains("(刚写完) #9 "), "a reply that just finished is marked as such");
+        assert!(p.contains("⏳ 正在回复 · 已写 3 分钟"), "a reply in progress shows as a status line");
     }
 
     /// A turn names its login explicitly: a named login's directory rides the
@@ -2227,5 +2775,158 @@ mod tests {
         assert!(p.contains("mafold channels create <chat_id> <名字>"));
         assert!(p.contains("mafold channels close <chat_id> <频道>"));
         assert!(p.contains("别把不相干的事堆进私聊或主时间线"));
+    }
+
+    /// A bot reply still being written: no finalized_at, a live generating tag.
+    fn draft(id: &str, at: &str, content: &str) -> Value {
+        let mut d = msg(id, "opsdu:claude-code", "bot", at, content);
+        d["finalized_at"] = Value::Null;
+        d
+    }
+
+    const T0: u64 = 1_790_000_000_000; // a fixed "now", in ms
+
+    #[test]
+    fn the_generating_tag_is_read_back() {
+        let tag = mafold_transcript::render::generating_tag_awaiting(T0 - 600_000, 7, T0 - 30_000, 1200, 2, Some("opsdu"));
+        let p = progress_of(&format!("先看日志{tag}")).expect("the tag is found");
+        assert_eq!(p.started_ms, Some(T0 - 600_000));
+        assert_eq!(p.beat_at_ms, Some(T0 - 30_000));
+        assert_eq!(p.shells, 2);
+        assert_eq!(p.awaiting.as_deref(), Some("opsdu"));
+        assert!(progress_of("没有卡片的正文").is_none());
+    }
+
+    /// The status says who is on it and whether it is alive — the difference
+    /// between "they're working" and "nobody answered" that the hidden draft erased.
+    #[test]
+    fn a_reply_in_progress_reads_as_what_it_is() {
+        let tag = |started: u64, beat: u64, shells: u64, awaiting: Option<&str>| {
+            mafold_transcript::render::generating_tag_awaiting(started, 1, beat, 0, shells, awaiting)
+        };
+        let alive = draft("d", "2026-09-25T02:00:00Z", &format!("先查日志,再看游标{}", tag(T0 - 9 * 60_000, T0 - 60_000, 2, None)));
+        let s = working_status(&alive, T0);
+        assert!(s.starts_with("⏳ 正在回复 · 已写 9 分钟 · 最后动静 1 分钟前 · 2 个后台任务"), "{s}");
+        assert!(s.contains("已写到:「先查日志,再看游标」"), "{s}");
+
+        let quiet = draft("d", "", &tag(T0 - 40 * 60_000, T0 - 25 * 60_000, 0, None));
+        assert!(working_status(&quiet, T0).starts_with("⚠️ 25 分钟没动静了"), "{}", working_status(&quiet, T0));
+
+        let parked = draft("d", "", &tag(T0 - 5 * 60_000, T0 - 20 * 60_000, 0, Some("opsdu")));
+        assert!(working_status(&parked, T0).starts_with("⏸ 在等 @opsdu 回答卡片"), "parked beats quiet: {}", working_status(&parked, T0));
+
+        let bare = draft("d", "2026-09-25T02:00:00Z", "写了一半");
+        assert!(working_status(&bare, T0).starts_with("⏳ 草稿还没写完"));
+
+        let long = "很".repeat(300);
+        let s = working_status(&draft("d", "", &format!("{long}{}", tag(T0, T0, 0, None))), T0);
+        assert!(s.contains("已写到:「…") && s.chars().count() < 200, "only the tail of a long draft: {s}");
+    }
+
+    /// The old reader stopped at the first draft: everything after it — a
+    /// person's message included — stayed invisible until the draft finished.
+    #[test]
+    fn a_draft_no_longer_hides_what_came_after_it() {
+        let items = vec![
+            msg("a", "linsky", "human", "2026-09-25T02:00:00Z", "早"),
+            draft("d", "2026-09-25T02:01:00Z", "写着呢"),
+            msg("b", "linsky", "human", "2026-09-25T02:02:00Z", "@realopsdu 急"),
+        ];
+        // The badge counts the draft in place, plus b.
+        let a = arrange(&items, 2, "realopsdu", vec![], Some("2026-09-25T02:00:00Z"));
+        assert_eq!(a.new.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(a.context.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(a.working.len(), 1, "the draft is a status, not a message");
+    }
+
+    /// A reply that finished after the marker had passed it comes back as ONE
+    /// more unread that sits before the marker — counting back from the newest
+    /// line would hand over the wrong message and never the reply.
+    #[test]
+    fn a_reply_that_finished_behind_the_marker_comes_back_as_new() {
+        let r = msg("r", "opsdu:claude-code", "bot", "2026-09-25T02:01:00Z", "结论:修好了");
+        let items = vec![
+            msg("a", "linsky", "human", "2026-09-25T02:00:00Z", "早"),
+            r.clone(),
+            msg("z", "linsky", "human", "2026-09-25T02:05:00Z", "好"),
+        ];
+        let a = arrange(&items, 1, "realopsdu", vec![r.clone()], Some("2026-09-25T02:05:00Z"));
+        assert_eq!(a.new.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["r"]);
+        assert!(!a.context.iter().any(|m| m["id"] == "r"), "not shown twice");
+        assert!(!a.new.iter().any(|m| m["id"] == "z"), "z was already read");
+
+        // Finished AHEAD of the marker: the badge counts it in place — once.
+        let a = arrange(&items, 2, "realopsdu", vec![r], Some("2026-09-25T02:00:00Z"));
+        assert_eq!(a.new.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["r", "z"]);
+    }
+
+    #[test]
+    fn a_draft_is_watched_only_once_the_marker_passes_it() {
+        let tl = Timeline {
+            chat_id: "c1".into(),
+            channel_id: None,
+            channel_name: None,
+            label: "x".into(),
+            is_dm: false,
+            unread: 0,
+        };
+        let mut state = State::default();
+        let mut book = Book::default();
+        book.saw_draft(&tl, &draft("early", "2026-09-25T02:01:00Z", ""));
+        book.saw_draft(&tl, &draft("late", "2026-09-25T02:09:00Z", ""));
+        let mut markers = Markers::default();
+        markers.add(&tl, &msg("m", "linsky", "human", "2026-09-25T02:05:00Z", "x"));
+        book.settle(&mut state, &markers);
+        let watched: Vec<&str> = state.watching.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(watched, vec!["early"], "the draft after the marker still counts in place");
+        assert_eq!(state.marked_at.get("c1").map(String::as_str), Some("2026-09-25T02:05:00Z"));
+
+        // Delivered once finished: let go.
+        let mut book = Book::default();
+        book.delivered.insert("early".into());
+        book.settle(&mut state, &Markers::default());
+        assert!(state.watching.is_empty());
+    }
+
+    /// The guard's floor: what the agent was shown, moved forward only by what
+    /// the steer hook actually handed it — not by what still sits in the mailbox.
+    #[test]
+    fn the_guard_counts_only_what_the_agent_was_handed() {
+        let seen = Seen {
+            me: "realopsdu".into(),
+            started: "2026-09-25T02:00:00.000000Z".into(),
+            timelines: [("c1".to_string(), "2026-09-25T02:03:00Z".to_string())].into_iter().collect(),
+            queued: vec![
+                Queued { key: "c1".into(), id: "handed".into(), at: "2026-09-25T02:04:00Z".into() },
+                Queued { key: "c1".into(), id: "waiting".into(), at: "2026-09-25T02:06:00Z".into() },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(seen_floor(&seen, "c1", "== x ==\n#waiting [..] @linsky: 还没递到"), "2026-09-25T02:04:00Z");
+        assert_eq!(seen_floor(&seen, "c1", ""), "2026-09-25T02:06:00Z", "an empty mailbox: everything was handed over");
+        assert_eq!(seen_floor(&seen, "other", ""), "2026-09-25T02:00:00.000000Z", "a timeline it never read counts from the turn's start");
+
+        let items = vec![
+            msg("old", "linsky", "human", "2026-09-25T02:03:00Z", "看过的"),
+            msg("mine", "realopsdu", "human", "2026-09-25T02:07:00Z", "我说的"),
+            msg("new", "linsky", "human", "2026-09-25T02:07:30.5Z", "补充一句"),
+            draft("d", "2026-09-25T02:08:00Z", ""),
+        ];
+        let fresh = fresh_since(&items, "2026-09-25T02:04:00Z", "realopsdu");
+        let ids: Vec<&str> = fresh.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["new", "d"], "someone spoke and someone started answering; my own line is not news");
+    }
+
+    #[test]
+    fn timestamps_compare_as_times_not_strings() {
+        assert!(later("2026-09-25T02:00:12.5Z", "2026-09-25T02:00:12Z"));
+        assert!(!later("2026-09-25T02:00:12Z", "2026-09-25T02:00:12.5Z"));
+    }
+
+    #[test]
+    fn preamble_explains_the_status_lines_and_the_held_send() {
+        let p = preamble("realopsdu", Some("opsdu"));
+        assert!(p.contains("「⏳ 正在回复」") && p.contains("别重复 @"));
+        assert!(p.contains("「✋ 没发出去」") && p.contains("--anyway"));
     }
 }

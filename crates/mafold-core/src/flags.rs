@@ -60,6 +60,21 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-09",
     },
+    // ModelArk (a user's OWN Seedance key) is held back until the video line's
+    // e2e passes on devapi (@realopsdu 2026-10-06). Registered BEFORE the
+    // provider lands: the connection pack goes live within 15 minutes of the
+    // merge that adds a provider, while this gate reaches the web only with
+    // its next release — so the gate has to be out there first.
+    FlagMeta {
+        key: "provider:modelark",
+        default: false,
+        dev_default: true,
+        label: "ModelArk connection",
+        description: "Offers BytePlus ModelArk (Seedance video, on your own key) under Add \
+                      connection. Held back until the video line launches.",
+        owner: "linsky",
+        added: "2026-10",
+    },
     FlagMeta {
         key: "starterTutorial",
         default: false,
@@ -86,6 +101,18 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         description: "Reveals the bottom tab switcher (Moments / Chats / Garden) under the chat list.",
         owner: "ops",
         added: "2026-07",
+    },
+    FlagMeta {
+        key: "gardenOnePath",
+        default: false,
+        dev_default: false,
+        label: "New garden (mafold/garden)",
+        description: "The garden button opens mafold/garden and 收进园地 writes its pins, on web and phone \
+                      alike. Off = the pre-switch path (web: opsdu/garden-beta + the old garden room; \
+                      phone: the garden DM). Turn on for everyone once garden.mafold.app is switched, \
+                      then delete the old path with this flag.",
+        owner: "ops",
+        added: "2026-10",
     },
     FlagMeta {
         key: "moments",

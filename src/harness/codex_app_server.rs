@@ -150,7 +150,7 @@ impl CodexAppServer {
     /// handshake before returning. Stable APIs are used unless the caller opts
     /// in through [`CodexAppServerOptions::experimental_api`].
     pub async fn spawn(options: CodexAppServerOptions) -> Result<Self> {
-        let mut cmd = tokio::process::Command::new(&options.program);
+        let mut cmd = crate::platform::command(&options.program);
         cmd.args(&options.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -159,7 +159,6 @@ impl CodexAppServer {
         if let Some(dir) = &options.current_dir {
             cmd.current_dir(dir);
         }
-        crate::platform::no_window(&mut cmd);
 
         let mut child = cmd
             .spawn()

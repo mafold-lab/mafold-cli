@@ -203,6 +203,12 @@ async fn pair(base: &str, dev: &crate::vault::DeviceKey, name: Option<String>) -
     }
 }
 
+/// How many calls this machine runs at once. Enough that a background poll is
+/// never stuck behind a foreground job; few enough that a runaway caller can't
+/// fork-bomb a machine somebody lent you. At the cap the machine stops parking,
+/// and new calls wait on the api's board until a slot frees.
+const IN_FLIGHT: usize = 8;
+
 /// Answer calls for the one connection this machine was paired for, forever.
 ///
 /// The loop is thin on purpose: everything that decides whether to claim, what
@@ -210,33 +216,66 @@ async fn pair(base: &str, dev: &crate::vault::DeviceKey, name: Option<String>) -
 /// — the same function a signed-in daemon and the browser run. A paired machine
 /// is not a second implementation of answering a call; it is the same one
 /// holding less.
+///
+/// Each call runs on its own task and the loop goes straight back to park. It
+/// used to run the call inline, and a machine is only listening while it is
+/// parked: every call that arrived while it ran the previous one — a whole
+/// command, plus four round trips to fetch the row, claim and answer — went to
+/// nobody, and its caller waited out 30s for "no device answered". The api now
+/// keeps such calls on a board for the next park (`after` is this machine's
+/// place in it), but a call that waits behind a long job still runs late; on
+/// its own task it doesn't wait.
 async fn serve(base: &str, public_key: &str, paired: Paired, dek: Key) -> Result<()> {
-    let mut rt = Runtime::for_row(
-        &format!("{base}/api"),
-        &paired.token,
-        &paired.connection,
-        dek,
-    );
-    // The id in the row's sealed payload is this machine's PUBLIC KEY: the very
-    // thing its owner approved. `can_serve` compares the two before claiming,
-    // so a call addressed to a different machine is declined here rather than
-    // claimed and fumbled.
-    rt.attach_computer(public_key, crate::computer::executor());
+    // One runtime per call, from the same four things: a `Runtime` is used
+    // `&mut`, so calls running side by side can't share one. Building it costs
+    // nothing — no network — and the provider registry it reads is
+    // process-wide.
+    let runtime = {
+        let api = format!("{base}/api");
+        let (token, connection) = (paired.token.clone(), paired.connection.clone());
+        let (public_key, executor) = (public_key.to_string(), crate::computer::executor());
+        move || {
+            let mut rt = Runtime::for_row(&api, &token, &connection, dek.clone());
+            // The id in the row's sealed payload is this machine's PUBLIC KEY:
+            // the very thing its owner approved. `can_serve` compares the two
+            // before claiming, so a call addressed to a different machine is
+            // declined here rather than claimed and fumbled.
+            rt.attach_computer(&public_key, executor.clone());
+            rt
+        }
+    };
 
     let anon = Client::new(base.to_string(), paired.token.clone());
     println!("  Listening. Ctrl-C to stop; this machine answers nothing else.");
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT));
+    // The newest call the api has handed this machine — so it is never handed
+    // that one, or anything older, again.
+    let mut after = 0u64;
     let mut quiet_failures = 0u32;
     loop {
-        match anon.call("waitConnectionCall", json!({})).await {
+        // A free slot BEFORE parking: a call handed to a machine that can't
+        // start it yet would sit here instead of on the board, where a slot
+        // freeing up finds it just the same.
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            return Ok(());
+        };
+        match anon.call("waitConnectionCall", json!({ "after": after })).await {
             Ok(v) => {
                 quiet_failures = 0;
-                let Some(event) = v.get("event").filter(|e| !e.is_null()) else {
-                    // A quiet window. Park again immediately — the gap between
-                    // two parks is the only moment a call can miss this
-                    // machine, so it is kept as short as the round trip.
+                if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
+                    after = after.max(seq);
+                }
+                let Some(event) = v.get("event").filter(|e| !e.is_null()).cloned() else {
+                    // A quiet window. Park again.
                     continue;
                 };
-                handle_event(&mut rt, &event.to_string()).await;
+                let mut rt = runtime();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    if handle_event(&mut rt, &event.to_string()).await {
+                        println!("  · answered a call");
+                    }
+                });
             }
             Err(e) => {
                 // The api being unreachable is temporary; the token being
@@ -258,4 +297,152 @@ async fn serve(base: &str, public_key: &str, paired: Paired, dek: Key) -> Result
 
 fn s(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Enough api for `serve` to run against: one row, a claim that always
+    /// wins, and a `waitConnectionCall` that hands out `calls` in order (with
+    /// a `seq` each), then quiet windows. Records each answer as it lands,
+    /// and every `after` the machine parked with.
+    async fn stub(
+        row: Value,
+        calls: Vec<Value>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let parks = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(calls.into_iter().enumerate().collect::<Vec<_>>()));
+        let (a, p) = (answers.clone(), parks.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (answers, parks, queue, row) = (a.clone(), p.clone(), queue.clone(), row.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (path, body) = loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        let text = String::from_utf8_lossy(&buf).into_owned();
+                        let Some(end) = text.find("\r\n\r\n") else { continue };
+                        let want: usize = text[..end]
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if text.len() < end + 4 + want {
+                            continue;
+                        }
+                        let path = text.lines().next().and_then(|l| l.split(' ').nth(1)).unwrap_or("");
+                        break (path.to_string(), text[end + 4..].to_string());
+                    };
+                    let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let result = match path.as_str() {
+                        "/api/listConnections" => json!({ "items": [row] }),
+                        "/api/claimConnectionCall" => json!({ "claimed": true }),
+                        "/api/answerConnectionCall" => {
+                            answers.lock().unwrap().push(body["result"]["stdout"].as_str().unwrap_or("").trim().to_string());
+                            Value::Null
+                        }
+                        "/api/waitConnectionCall" => {
+                            parks.lock().unwrap().push(body["after"].clone());
+                            let next = {
+                                let mut q = queue.lock().unwrap();
+                                (!q.is_empty()).then(|| q.remove(0))
+                            };
+                            match next {
+                                Some((i, params)) => json!({
+                                    "event": { "method": "events.connectionCall", "params": params },
+                                    "seq": i as u64 + 1,
+                                }),
+                                None => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    json!({ "event": null })
+                                }
+                            }
+                        }
+                        _ => Value::Null,
+                    };
+                    let reply = json!({ "ok": true, "result": result }).to_string();
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), answers, parks)
+    }
+
+    /// A paired machine is listening only while it is parked. It used to run
+    /// each call before parking again, so every call that arrived meanwhile
+    /// went to nobody (2026-10-05, every second or third call on a busy
+    /// borrowed laptop). Now a slow call runs on its own while the machine
+    /// takes — and answers — the next one; and each park says where the
+    /// machine is in the api's board.
+    #[tokio::test]
+    async fn a_slow_call_does_not_stop_the_machine_taking_the_next() {
+        use mafold_core::mafold_types::connections::provider_infos;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        mafold_core::providers::install_unverified_for_tests(1, provider_infos(), now);
+
+        let machine = mafold_core::vault::generate_device();
+        let dek = Key::random();
+        let row = json!({
+            "name": "box",
+            "provider": "computer",
+            "label": "box",
+            "blob": mafold_core::vault::seal(
+                &dek,
+                json!({ "device_id": machine.public, "machine": "box" }).to_string().as_bytes(),
+            ),
+            "wrapped_dek": "",
+            "key_id": "k1",
+        });
+        let call = |id: &str, cmd: &str| {
+            json!({
+                "call_id": id,
+                "connection": "box",
+                "method": "shell.exec",
+                "params": { "cmd": cmd, "cwd": "/tmp", "timeout_ms": 10_000 },
+            })
+        };
+        let (base, answers, parks) = stub(
+            row,
+            vec![call("slow", "sleep 2 && echo slow"), call("fast", "echo fast")],
+        )
+        .await;
+
+        let paired = Paired { connection: "box".into(), token: "tok".into(), dek: dek.to_b64() };
+        let serving = tokio::spawn(async move { serve(&base, &machine.public, paired, dek).await });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while answers.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        serving.abort();
+
+        assert_eq!(
+            *answers.lock().unwrap(),
+            vec!["fast".to_string(), "slow".to_string()],
+            "the quick call must not wait behind the slow one"
+        );
+        let parks = parks.lock().unwrap().clone();
+        assert_eq!(parks[0], json!(0), "the first park starts at the board's beginning");
+        assert_eq!(parks[1], json!(1), "and each later one says what it was last handed");
+        assert_eq!(parks[2], json!(2));
+    }
 }

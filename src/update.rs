@@ -513,9 +513,8 @@ fn sha256_of_file(p: &Path) -> Option<String> {
 
 /// Quick "does it run?" check on the downloaded binary before swapping it in.
 fn smoke_test(path: &Path) -> bool {
-    let mut cmd = std::process::Command::new(path);
+    let mut cmd = crate::platform::std_command(path);
     cmd.arg("--version");
-    crate::platform::no_window_std(&mut cmd); // a hidden supervisor must not flash a console
     cmd.output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
@@ -528,9 +527,8 @@ fn smoke_test(path: &Path) -> bool {
 /// while OUR file is still older. Trusting it made apply() return Ok without
 /// doing anything, and the caller's reexec respawned the same old binary forever.
 fn binary_is(bin: &Path, version: &str) -> bool {
-    let mut cmd = std::process::Command::new(bin);
+    let mut cmd = crate::platform::std_command(bin);
     cmd.arg("--version");
-    crate::platform::no_window_std(&mut cmd); // a hidden supervisor must not flash a console
     cmd.output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(version))
         .unwrap_or(false)
@@ -543,22 +541,169 @@ fn binary_is(bin: &Path, version: &str) -> bool {
 // nudge, spamming the log and wasting bandwidth forever. Remember the version
 // that just failed and skip re-attempts for a while; a manual `mafold update`
 // is not throttled (it never consults this).
-static LAST_FAILED: std::sync::Mutex<Option<(String, std::time::Instant)>> =
-    std::sync::Mutex::new(None);
-const FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
+//
+// WALL CLOCK, NOT `Instant`. On macOS `Instant` is CLOCK_UPTIME_RAW, which
+// stops while the machine sleeps. 2026-09-27, cli@0.9.123: a download failed
+// on a TLS reset, the Mac slept on battery nine minutes later, and when it woke
+// 1h40m afterwards the "1 hour" cooldown had advanced about ten minutes — the
+// machine sat on the old build for an hour and a half with nothing in the log
+// to say why. `SystemTime` keeps counting through sleep.
+//
+// BACKOFF, NOT A FLAT HOUR. The download is already retried in place (see
+// `DOWNLOAD_RETRY_DELAYS`), so reaching here means a few tries in a row
+// failed. The first cooldown is short — most failures are a network blip that
+// is gone by the next 10-minute check — and only a version that keeps failing
+// works its way up to the old hour.
+const FAILURE_BACKOFF: [std::time::Duration; 4] = [
+    std::time::Duration::from_secs(5 * 60),
+    std::time::Duration::from_secs(15 * 60),
+    std::time::Duration::from_secs(30 * 60),
+    std::time::Duration::from_secs(60 * 60),
+];
 
-/// Record that auto-updating to `version` just failed (starts the cooldown).
-pub fn mark_failed(version: &str) {
-    *LAST_FAILED.lock().unwrap() = Some((version.to_string(), std::time::Instant::now()));
+/// The last failed auto-update, for the cooldown.
+struct Failure {
+    version: String,
+    at: std::time::SystemTime,
+    /// Failed attempts at THIS version in a row (1 = first). Picks the backoff.
+    streak: usize,
+    error: String,
 }
 
-/// Should the auto-updater skip `version` because it failed recently?
-pub fn recently_failed(version: &str) -> bool {
-    LAST_FAILED
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|(v, at)| v == version && at.elapsed() < FAILURE_COOLDOWN)
+static LAST_FAILED: std::sync::Mutex<Option<Failure>> = std::sync::Mutex::new(None);
+
+fn backoff_for(streak: usize) -> std::time::Duration {
+    FAILURE_BACKOFF[streak.clamp(1, FAILURE_BACKOFF.len()) - 1]
+}
+
+impl Failure {
+    /// How long `version` still has to wait at wall-clock `now`; `None` = it
+    /// may be tried. A clock that has gone BACKWARDS since the failure counts
+    /// as "the wait is over": the safe mistake is one extra attempt, not a
+    /// machine that refuses to update until the clock catches up.
+    fn wait_left(&self, version: &str, now: std::time::SystemTime) -> Option<std::time::Duration> {
+        if self.version != version {
+            return None;
+        }
+        let since = now.duration_since(self.at).ok()?;
+        backoff_for(self.streak).checked_sub(since).filter(|d| !d.is_zero())
+    }
+}
+
+/// Record that auto-updating to `version` just failed. Returns how long the
+/// auto-updater will now leave it alone, for the caller's log line.
+pub fn mark_failed(version: &str, error: &anyhow::Error) -> std::time::Duration {
+    let mut g = LAST_FAILED.lock().unwrap();
+    let streak = match &*g {
+        Some(f) if f.version == version => f.streak + 1,
+        _ => 1,
+    };
+    *g = Some(Failure {
+        version: version.to_string(),
+        at: std::time::SystemTime::now(),
+        streak,
+        error: format!("{error:#}"),
+    });
+    backoff_for(streak)
+}
+
+/// Should the auto-updater try `version` now? When it shouldn't, it SAYS SO:
+/// a cooldown that skips without a word is indistinguishable from an updater
+/// that has stopped working, which is exactly what this looked like on
+/// 2026-09-27 (one `checking now` line in the log, then nothing for 90 min).
+pub fn should_attempt(version: &str) -> bool {
+    let g = LAST_FAILED.lock().unwrap();
+    let Some(f) = g.as_ref() else { return true };
+    let now = std::time::SystemTime::now();
+    let Some(left) = f.wait_left(version, now) else { return true };
+    let ago = now.duration_since(f.at).unwrap_or_default();
+    eprintln!(
+        "↻ v{version} available — not retrying yet: attempt {} failed {} ago ({}); cooldown ends in {}",
+        f.streak,
+        human(ago),
+        f.error,
+        human(left),
+    );
+    false
+}
+
+/// `90s` / `7m` / `1h05m` — for log lines a person reads.
+pub fn human(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..=99 => format!("{s}s"),
+        100..=3599 => format!("{}m", (s + 30) / 60),
+        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// Wall-clock time since `t`. A clock that went backwards reads as "forever",
+/// so a periodic check keyed on this fires rather than stalling.
+pub fn wall_elapsed(t: std::time::SystemTime) -> std::time::Duration {
+    std::time::SystemTime::now().duration_since(t).unwrap_or(std::time::Duration::MAX)
+}
+
+/// Gaps between the in-place download attempts inside one [`apply`]: three
+/// tries over ~40 seconds before the failure counts at all. The failure this
+/// exists for — a TLS reset mid-download — is almost always gone by the
+/// second try; before this, a single one cost the machine the whole cooldown.
+/// Kept short because the supervisor's keep-alive loop waits on it.
+const DOWNLOAD_RETRY_DELAYS: [std::time::Duration; 2] =
+    [std::time::Duration::from_secs(10), std::time::Duration::from_secs(30)];
+
+/// Run `op` until it succeeds, sleeping `delays[i]` after failure `i`; the
+/// error from the last try comes back once the delays run out. Every failure
+/// and a late success are logged — the log has to show the retry happened, or
+/// the next person reading it after a slow update will guess at why.
+async fn retrying<T, Fut>(
+    what: &str,
+    delays: &[std::time::Duration],
+    mut op: impl FnMut() -> Fut,
+) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let tries = delays.len() + 1;
+    for attempt in 1.. {
+        match op().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    eprintln!("update: {what} succeeded on attempt {attempt}/{tries}");
+                }
+                return Ok(v);
+            }
+            Err(e) => match delays.get(attempt - 1) {
+                Some(d) => {
+                    eprintln!(
+                        "update: {what} failed (attempt {attempt}/{tries}: {e:#}) — retrying in {}",
+                        human(*d)
+                    );
+                    tokio::time::sleep(*d).await;
+                }
+                None => return Err(e.context(format!("{what}: {tries} attempts failed"))),
+            },
+        }
+    }
+    unreachable!("the loop only exits by returning")
+}
+
+/// One download of the release binary, checked against `want`. A checksum
+/// mismatch is retried like a network error: a body cut short or mangled by a
+/// proxy on the way in is a transient failure too.
+async fn download_verified(http: &reqwest::Client, url: &str, want: &str) -> Result<Vec<u8>> {
+    let bytes = http
+        .get(url)
+        .header("User-Agent", "mafold-cli")
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let got = sha256_hex(&bytes);
+    if !got.eq_ignore_ascii_case(want) {
+        anyhow::bail!("checksum mismatch (want {want}, got {got}) — refusing to update");
+    }
+    Ok(bytes.to_vec())
 }
 
 /// Is a newer release available? Returns it (no download). No-ops on platforms
@@ -615,18 +760,10 @@ pub async fn apply(
     let want = sha256.context(
         "release is missing its .sha256 checksum asset — refusing to update an unverifiable binary",
     )?;
-    let bytes = http
-        .get(url)
-        .header("User-Agent", "mafold-cli")
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    let got = sha256_hex(&bytes);
-    if !got.eq_ignore_ascii_case(want) {
-        anyhow::bail!("checksum mismatch (want {want}, got {got}) — refusing to update");
-    }
+    let bytes = retrying(&format!("downloading v{version}"), &DOWNLOAD_RETRY_DELAYS, || {
+        download_verified(http, url, want)
+    })
+    .await?;
     // Unique temp per process so concurrent updaters never clobber each other.
     // Keep the binary's extension (Windows needs `.exe` to run the smoke test).
     let tmp = match bin.extension().and_then(|e| e.to_str()) {
@@ -946,6 +1083,104 @@ mod tests {
         });
         let e = release_from_api_envelope(&env, Channel::Stable).expect_err("must surface");
         assert!(e.to_string().contains("sparc"), "{e}");
+    }
+
+    // ── failure cooldown + in-place retry ──
+
+    use super::{backoff_for, human, mark_failed, retrying, Failure};
+    use std::time::{Duration, SystemTime};
+
+    fn failure(version: &str, at: SystemTime, streak: usize) -> Failure {
+        Failure { version: version.into(), at, streak, error: "tls reset".into() }
+    }
+
+    /// THE INCIDENT (2026-09-27, cli@0.9.123): the download failed, the Mac
+    /// slept, and it woke 1h40m later. Measured on the wall clock that is long
+    /// past any cooldown — the next check must try again. (On `Instant` the
+    /// sleep didn't count and the machine waited out another hour awake.)
+    #[test]
+    fn a_cooldown_measured_across_sleep_is_over() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let f = failure("0.9.123", t0, 1);
+        assert_eq!(f.wait_left("0.9.123", t0 + Duration::from_secs(100 * 60)), None);
+    }
+
+    #[test]
+    fn a_fresh_failure_holds_that_version_and_only_that_version() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let f = failure("0.9.123", t0, 1);
+        assert_eq!(
+            f.wait_left("0.9.123", t0 + Duration::from_secs(60)),
+            Some(Duration::from_secs(4 * 60))
+        );
+        // A newer release is a different download — never held by an old failure.
+        assert_eq!(f.wait_left("0.9.124", t0 + Duration::from_secs(60)), None);
+    }
+
+    /// A clock set backwards must not freeze updates until it catches up.
+    #[test]
+    fn a_clock_that_went_backwards_ends_the_cooldown() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let f = failure("0.9.123", t0, 1);
+        assert_eq!(f.wait_left("0.9.123", t0 - Duration::from_secs(3600)), None);
+    }
+
+    /// Short first, the old hour only for a version that keeps failing.
+    #[test]
+    fn repeated_failures_back_off_to_an_hour_and_stay_there() {
+        assert_eq!(backoff_for(1), Duration::from_secs(5 * 60));
+        assert_eq!(backoff_for(2), Duration::from_secs(15 * 60));
+        assert_eq!(backoff_for(3), Duration::from_secs(30 * 60));
+        assert_eq!(backoff_for(4), Duration::from_secs(60 * 60));
+        assert_eq!(backoff_for(40), Duration::from_secs(60 * 60));
+        // The only test that touches the process-wide record.
+        let e = anyhow::anyhow!("connection reset");
+        assert_eq!(mark_failed("0.0.1-streak-test", &e), backoff_for(1));
+        assert_eq!(mark_failed("0.0.1-streak-test", &e), backoff_for(2));
+        assert_eq!(mark_failed("0.0.2-streak-test", &e), backoff_for(1), "a new version starts over");
+    }
+
+    #[test]
+    fn durations_read_like_a_person_wrote_them() {
+        assert_eq!(human(Duration::from_secs(10)), "10s");
+        assert_eq!(human(Duration::from_secs(5 * 60)), "5m");
+        assert_eq!(human(Duration::from_secs(65 * 60)), "1h05m");
+    }
+
+    /// A blip mid-download is retried in place: two failures then a success is
+    /// a SUCCESS, with no cooldown involved at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_download_that_fails_twice_then_works_is_a_success() {
+        let calls = std::cell::Cell::new(0);
+        let got = retrying("downloading v9", &super::DOWNLOAD_RETRY_DELAYS, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 3 {
+                    anyhow::bail!("tls: cannot decrypt peer's message")
+                }
+                Ok(n)
+            }
+        })
+        .await
+        .expect("third try succeeds");
+        assert_eq!(got, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_download_that_keeps_failing_gives_up_after_three_tries() {
+        let calls = std::cell::Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let e = retrying("downloading v9", &super::DOWNLOAD_RETRY_DELAYS, || {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>(anyhow::anyhow!("connection reset")) }
+        })
+        .await
+        .expect_err("all three fail");
+        assert_eq!(calls.get(), 3);
+        assert_eq!(started.elapsed(), Duration::from_secs(40), "10s + 30s between tries");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("3 attempts failed") && msg.contains("connection reset"), "{msg}");
     }
 
     /// Anything we can't read is STABLE. A typo in `~/.mafold/channel` must

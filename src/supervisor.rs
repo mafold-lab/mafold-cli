@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::platform;
 
@@ -336,8 +336,8 @@ fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
     fs::write(&plist, xml)?;
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     // Re-load cleanly: bootout if already present (ignore errors), then bootstrap.
-    let _ = Command::new("launchctl").arg("bootout").arg(format!("{domain}/{SERVICE_LABEL}")).output();
-    let out = Command::new("launchctl").arg("bootstrap").arg(&domain).arg(&plist).output()
+    let _ = platform::std_command("launchctl").arg("bootout").arg(format!("{domain}/{SERVICE_LABEL}")).output();
+    let out = platform::std_command("launchctl").arg("bootstrap").arg(&domain).arg(&plist).output()
         .context("launchctl not available")?;
     if !out.status.success() {
         anyhow::bail!("launchctl bootstrap failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -348,14 +348,14 @@ fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn remove_autostart() {
     let domain = format!("gui/{}", unsafe { libc::getuid() });
-    let _ = Command::new("launchctl").arg("bootout").arg(format!("{domain}/{SERVICE_LABEL}")).output();
+    let _ = platform::std_command("launchctl").arg("bootout").arg(format!("{domain}/{SERVICE_LABEL}")).output();
     let _ = fs::remove_file(launchagent_path());
 }
 
 #[cfg(target_os = "macos")]
 fn autostart_loaded() -> bool {
     launchagent_path().exists()
-        && Command::new("launchctl")
+        && platform::std_command("launchctl")
             .arg("print").arg(format!("gui/{}/{SERVICE_LABEL}", unsafe { libc::getuid() }))
             .output().map(|o| o.status.success()).unwrap_or(false)
 }
@@ -379,8 +379,8 @@ fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
         exe = exe.display(), base = base, path = service_path(),
     );
     fs::write(systemd_unit_path(), unit)?;
-    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
-    let out = Command::new("systemctl").args(["--user", "enable", "--now", "mafold-supervisor"]).output()
+    let _ = platform::std_command("systemctl").args(["--user", "daemon-reload"]).output();
+    let out = platform::std_command("systemctl").args(["--user", "enable", "--now", "mafold-supervisor"]).output()
         .context("systemctl not available")?;
     if !out.status.success() {
         anyhow::bail!("systemctl enable failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -390,13 +390,13 @@ fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn remove_autostart() {
-    let _ = Command::new("systemctl").args(["--user", "disable", "--now", "mafold-supervisor"]).output();
+    let _ = platform::std_command("systemctl").args(["--user", "disable", "--now", "mafold-supervisor"]).output();
     let _ = fs::remove_file(systemd_unit_path());
 }
 
 #[cfg(target_os = "linux")]
 fn autostart_loaded() -> bool {
-    Command::new("systemctl").args(["--user", "is-enabled", "mafold-supervisor"])
+    platform::std_command("systemctl").args(["--user", "is-enabled", "mafold-supervisor"])
         .output().map(|o| o.status.success()).unwrap_or(false)
 }
 
@@ -477,9 +477,8 @@ fn decode_console_bytes(bytes: &[u8]) -> String {
 /// checks so they judge the same bytes.
 #[cfg(windows)]
 fn query_task_xml() -> Option<String> {
-    let mut cmd = Command::new("schtasks");
+    let mut cmd = platform::std_command("schtasks");
     cmd.args(["/Query", "/TN", TASK_NAME, "/XML"]);
-    platform::no_window_std(&mut cmd);
     let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
@@ -587,9 +586,8 @@ fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
     let xml_path = task_xml_path();
     write_utf16le(&xml_path, &xml)?;
     // /F re-registers in place — same idempotence as launchctl bootout→bootstrap.
-    let mut create = Command::new("schtasks");
+    let mut create = platform::std_command("schtasks");
     create.args(["/Create", "/TN", TASK_NAME, "/XML"]).arg(&xml_path).arg("/F");
-    platform::no_window_std(&mut create);
     let out = create.output().context("schtasks not available")?;
     if !out.status.success() {
         anyhow::bail!(
@@ -611,18 +609,16 @@ fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
 /// the watchdog trigger and restart settings govern it). True on success.
 #[cfg(windows)]
 fn run_task() -> bool {
-    let mut cmd = Command::new("schtasks");
+    let mut cmd = platform::std_command("schtasks");
     cmd.args(["/Run", "/TN", TASK_NAME]);
-    platform::no_window_std(&mut cmd);
     cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 #[cfg(windows)]
 fn remove_autostart() {
     for args in [&["/End", "/TN", TASK_NAME][..], &["/Delete", "/TN", TASK_NAME, "/F"][..]] {
-        let mut cmd = Command::new("schtasks");
+        let mut cmd = platform::std_command("schtasks");
         cmd.args(args);
-        platform::no_window_std(&mut cmd);
         let _ = cmd.output();
     }
     let _ = fs::remove_file(task_xml_path());
@@ -754,7 +750,7 @@ fn start_supervisor(base: &str, no_auto_update: bool) -> Result<u32> {
     let exe = std::env::current_exe()?;
     let out = fs::OpenOptions::new().create(true).append(true).open(home().join(".mafold/supervisor.log"))?;
     let err = out.try_clone()?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = platform::std_command(exe);
     cmd.arg("--base").arg(base).arg("supervise");
     // Carry the caller's update setting into the detached process — this is the
     // same intent the service/task command line encodes on the managed paths.
@@ -791,6 +787,10 @@ pub async fn supervise(base: String, auto_update: bool) {
     let mut listening: std::collections::HashSet<String> = std::collections::HashSet::new();
     let http = reqwest::Client::new();
     let mut ticks: u64 = 0;
+    // Wall clock, like the failure cooldown in `update.rs`: counting 10-second
+    // ticks stalls while a Mac sleeps, so a laptop that wakes up an hour past
+    // a release still waited up to 10 more minutes before it looked.
+    let mut last_update_check = std::time::SystemTime::now();
     loop {
         reap(); // clear zombies so the liveness check below is accurate
         // A daemon whose bot was deleted server-side tombstones itself and
@@ -807,20 +807,22 @@ pub async fn supervise(base: String, auto_update: bool) {
                 }
             }
         }
-        // Update check every 10 min (60 × 10s), OR immediately when an agent child
-        // nudged us (it relayed an events.cliUpdate) — so a new release lands in
-        // seconds via the webhook path, not only on the 10-min poll. Gated by
-        // `--no-auto-update` (a locally-patched install must not be clobbered by
-        // an official release; the nudge is still consumed so the file can't pile
-        // up). A version that just failed to apply (e.g. the release download is
-        // unreachable from this network) is under cooldown — retried later, not
-        // on every tick.
+        // Update check every 10 min of wall-clock time, OR immediately when an
+        // agent child nudged us (it relayed an events.cliUpdate) — so a new
+        // release lands in seconds via the webhook path, not only on the 10-min
+        // poll. Gated by `--no-auto-update` (a locally-patched install must not
+        // be clobbered by an official release; the nudge is still consumed so
+        // the file can't pile up). A version that just failed to apply (e.g. the
+        // release download is unreachable from this network) is under cooldown —
+        // retried later, not on every tick, and the skip is logged.
         ticks += 1;
         let nudged = crate::update::take_nudge();
-        if auto_update && (nudged || ticks % 60 == 0) {
+        let due = crate::update::wall_elapsed(last_update_check) >= std::time::Duration::from_secs(600);
+        if auto_update && (nudged || due) {
+            last_update_check = std::time::SystemTime::now();
             if nudged { println!("↻ update nudge from a daemon — checking now"); }
             match crate::update::check(&http, &base, crate::update::Channel::current()).await {
-                Ok(Some(r)) if crate::update::recently_failed(&r.version) => {}
+                Ok(Some(r)) if !crate::update::should_attempt(&r.version) => {}
                 Ok(Some(r)) => {
                     println!("{} — applying + restarting daemons…", r.action_line());
                     match crate::update::apply(&http, &r.url, &r.version, r.sha256.as_deref()).await {
@@ -838,8 +840,13 @@ pub async fn supervise(base: String, auto_update: bool) {
                             crate::update::reexec_or_warn(&r.version);
                         }
                         Err(e) => {
-                            crate::update::mark_failed(&r.version);
-                            eprintln!("update to v{} failed ({e:#}) — keeping the current version, retrying in ~1h", r.version);
+                            let wait = crate::update::mark_failed(&r.version, &e);
+                            eprintln!(
+                                "update to v{} failed ({e:#}) — keeping v{}, cooling down for {}",
+                                r.version,
+                                crate::update::current_version(),
+                                crate::update::human(wait),
+                            );
                         }
                     }
                 }
@@ -1005,7 +1012,7 @@ fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {
     let out = fs::OpenOptions::new().create(true).append(true).open(log_path(&d.name))?;
     let err = out.try_clone()?;
 
-    let mut cmd = Command::new(exe);
+    let mut cmd = platform::std_command(exe);
     cmd.arg("agent")
         // The supervisor owns updates — daemons never self-update.
         .arg("--no-auto-update")

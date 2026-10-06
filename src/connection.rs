@@ -1607,6 +1607,8 @@ pub async fn handle_link_event(
     let p = env.get("params").cloned().unwrap_or(Value::Null);
     let link_id = s(&p, "link_id");
     let provider = s(&p, "provider");
+    let reconnect = p["reconnect"].as_str().map(str::to_owned);
+    let reconnect_label = reconnect.as_ref().and_then(|_| p["label"].as_str()).map(str::to_owned);
     if link_id.is_empty() {
         return false;
     }
@@ -1648,8 +1650,9 @@ pub async fn handle_link_event(
                 &sp,
                 &endpoint,
                 &link_id,
-                typed("name"),
+                reconnect.clone().or_else(|| typed("name")),
                 typed("label"),
+                reconnect.is_some(),
             )
             .await;
             return true;
@@ -1659,7 +1662,7 @@ pub async fn handle_link_event(
         // connection instead of a URL, and `startConnectionLink` reads that as
         // "already linked".
         Some(sp) if is_device_binding(&sp) => {
-            let outcome = bind_for_link(client, sess, umk, key_id, &sp).await;
+            let outcome = bind_for_link(client, sess, umk, key_id, &sp, reconnect.as_deref(), reconnect_label.as_deref()).await;
             match &outcome {
                 Ok(name) => {
                     let _ = answer(
@@ -1688,7 +1691,7 @@ pub async fn handle_link_event(
             return true;
         }
         Some(sp) if sp.import_path.is_some() && sp.oauth_fixed.is_none() => {
-            let outcome = import_for_link(client, umk, key_id, &sp).await;
+            let outcome = import_for_link(client, umk, key_id, &sp, reconnect.as_deref(), reconnect_label.as_deref()).await;
             match &outcome {
                 Ok(name) => { let _ = answer(json!({ "authorize_url": "", "device": sess.device_name, "connection": name }), None).await; }
                 Err(e) => { let _ = answer(Value::Null, Some(format!("{e:#}"))).await; }
@@ -1745,7 +1748,7 @@ pub async fn handle_link_event(
     let umk = umk.clone();
     let key_id = key_id.to_string();
     tokio::spawn(async move {
-        let outcome = finish_linking(&client, &spec, leg, &umk, &key_id).await;
+        let outcome = finish_linking(&client, &spec, leg, &umk, &key_id, reconnect.as_deref(), reconnect_label.as_deref()).await;
         let body = match &outcome {
             Ok(name) => json!({ "link_id": link_id, "connection": name }),
             Err(e) => json!({ "link_id": link_id, "error": format!("{e:#}") }),
@@ -1772,20 +1775,22 @@ async fn bind_for_link(
     umk: &Key,
     key_id: &str,
     spec: &ProviderInfo,
+    reconnect: Option<&str>,
+    reconnect_label: Option<&str>,
 ) -> Result<String> {
     let fields = machine_binding(sess);
     let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
-    let name = free_name(client, &spec.id).await;
+    let name = match reconnect { Some(name) => name.to_owned(), None => free_name(client, &spec.id).await };
     client
         .call(
             "putConnection",
             json!({
                 "name": name,
                 "provider": spec.id,
-                "label": sess.device_name,
+                "label": reconnect_label.unwrap_or(&sess.device_name),
                 "blob": blob,
                 "wrapped_dek": wrapped_dek,
-                "key_id": key_id, "create_only": true,
+                "key_id": key_id, "create_only": reconnect.is_none(),
             }),
         )
         .await
@@ -1795,14 +1800,14 @@ async fn bind_for_link(
 
 /// Import the provider's declared local login into one new sealed connection.
 /// The same collection path as `connection add --import`, callable from a card.
-async fn import_for_link(client: &Client, umk: &Key, key_id: &str, spec: &ProviderInfo) -> Result<String> {
+async fn import_for_link(client: &Client, umk: &Key, key_id: &str, spec: &ProviderInfo, reconnect: Option<&str>, reconnect_label: Option<&str>) -> Result<String> {
     let mut fields = collect(spec, true, false)?;
     enrich_oauth_payload(spec, &mut fields);
     let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
-    let name = free_name(client, &spec.id).await;
+    let name = match reconnect { Some(name) => name.to_owned(), None => free_name(client, &spec.id).await };
     client.call("putConnection", json!({
-        "name": name, "provider": spec.id, "label": spec.display,
-        "blob": blob, "wrapped_dek": wrapped_dek, "key_id": key_id, "create_only": true,
+        "name": name, "provider": spec.id, "label": reconnect_label.unwrap_or(&spec.display),
+        "blob": blob, "wrapped_dek": wrapped_dek, "key_id": key_id, "create_only": reconnect.is_none(),
     })).await.context("putConnection failed")?;
     Ok(name)
 }
@@ -1815,11 +1820,13 @@ async fn finish_linking(
     leg: OauthLeg,
     umk: &Key,
     key_id: &str,
+    reconnect: Option<&str>,
+    reconnect_label: Option<&str>,
 ) -> Result<String> {
     let (mut fields, suggested) = oauth_finish(spec, leg).await?;
     enrich_oauth_payload(&spec, &mut fields);
     let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
-    let name = free_name(client, &spec.id).await;
+    let name = match reconnect { Some(name) => name.to_owned(), None => free_name(client, &spec.id).await };
     let label = suggested.unwrap_or_else(|| {
         fields
             .get("account_id")
@@ -1833,10 +1840,10 @@ async fn finish_linking(
             json!({
                 "name": name,
                 "provider": spec.id,
-                "label": label,
+                "label": reconnect_label.unwrap_or(&label),
                 "blob": blob,
                 "wrapped_dek": wrapped_dek,
-                "key_id": key_id, "create_only": true,
+                "key_id": key_id, "create_only": reconnect.is_none(),
             }),
         )
         .await
@@ -1927,93 +1934,147 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
 /// no second command to know about.
 ///
 /// QUIET by construction: it only serves when this machine already holds a
-/// cached, still-current vault key — it never creates a vault, never prompts,
-/// never prints. Locked (or logged-out) machines just re-check on a slow tick,
-/// so running `mafold connection unlock` later brings this to life without
-/// restarting the supervisor.
+/// still-current vault key, fetching an approved wrap when the cache is empty.
+/// It never creates a vault or prompts. Waiting machines retry automatically.
+const VAULT_RECHECK: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Keep the socket alive even before a key is available. Requests are retained
+/// in this loop, so the request that wakes a locked device is also answered.
+fn key_refresh_event(envelope: &str, device_id: &str, locked: bool) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(envelope) else { return false; };
+    match v.get("method").and_then(Value::as_str) {
+        Some("events.connectionCall" | "events.connectionLink") => locked,
+        Some("events.vaultReset") => true,
+        Some("events.vaultDeviceApproved") => v["params"]["device_id"].as_str() == Some(device_id),
+        _ => false,
+    }
+}
+
+async fn listener_frame<S>(ws: &mut S, retry: &mut tokio::time::Interval)
+    -> Result<Option<tokio_tungstenite::tungstenite::Message>, ()>
+where S: futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin {
+    tokio::select! {
+        frame = next_live(ws, LISTEN_IDLE) => Ok(frame),
+        _ = retry.tick() => Err(()),
+    }
+}
+
 pub async fn supervise_listener(base: String, username: String) {
-    use futures_util::SinkExt;
-    use tokio_tungstenite::tungstenite::Message as WsMsg;
-    let mut said_locked = false;
     loop {
-        // By NAME, never "the current session": this machine can hold several
-        // logins and one listener belongs to exactly one of them. Re-read each
-        // pass so a re-login (new token) is picked up, and so the listener
-        // stands down on its own once that account is removed.
         let Some(sess) = session::load_named(&username) else {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             continue;
         };
         let client = Client::new(base.clone(), sess.token.clone());
-        let (mut rt, umk, key_id) = match quiet_runtime(&base, &client, &sess).await {
-            Some(rt) => {
-                said_locked = false;
-                rt
-            }
-            None => {
-                if !said_locked {
-                    println!("· connections: vault locked here — `mafold connection unlock` lets granted bots use your connections on this machine");
-                    said_locked = true;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                continue;
-            }
-        };
-        println!("· connections: answering granted calls as @{}", sess.username);
-        loop {
-            let mut ws = match client.ws_connect().await {
-                Ok((ws, _)) => ws,
-                Err(e) => {
-                    let _ = e;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    break; // re-check session + key, then come back
-                }
-            };
-            while let Some(frame) = next_live(&mut ws, LISTEN_IDLE).await {
-                match frame {
-                    WsMsg::Text(t) => {
-                        if mafold_core::connections::handle_event(&mut rt, &t).await {
-                            println!("· connections: answered a call");
-                        } else {
-                            // A Connect button somewhere else (the web pane, a
-                            // phone) asking this machine to run a consent
-                            // screen it can and the asker can't.
-                            handle_link_event(&client, &sess, &umk, &key_id, &t).await;
-                        }
-                    }
-                    WsMsg::Ping(p) => {
-                        let _ = ws.send(WsMsg::Pong(p)).await;
-                    }
-                    WsMsg::Close(_) => break,
-                    _ => {}
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Ok(dev) = vault::device_key() {
+            let _ = listener_session(&base, &client, &sess, &dev, true).await;
         }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
+async fn listener_session(base: &str, client: &Client, sess: &session::Session, dev: &DeviceKey, persist_cache: bool) -> Result<()> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+    let mut said_locked = false;
+        // Subscribe BEFORE enrollment, so an approval during the first fetch
+        // is queued rather than lost until the two-minute fallback.
+        let (mut ws, _) = client.ws_connect().await?;
+        let mut runtime = quiet_runtime_for_device(base, client, sess, dev, persist_cache).await;
+        let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + VAULT_RECHECK, VAULT_RECHECK);
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if runtime.is_none() && !said_locked {
+                println!("· connections: waiting for this computer's vault key — open Settings → Connections on a device that already holds it; this computer will pick it up automatically");
+                said_locked = true;
+            } else if runtime.is_some() && said_locked {
+                println!("· connections: answering granted calls as @{}", sess.username);
+                said_locked = false;
+            }
+            let frame = match listener_frame(&mut ws, &mut retry).await {
+                Err(()) => {
+                    if runtime.is_none() { runtime = quiet_runtime_for_device(base, client, sess, dev, persist_cache).await; }
+                    continue;
+                }
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+            };
+            match frame {
+                WsMsg::Text(t) => {
+                    let reset = serde_json::from_str::<Value>(&t).ok()
+                        .is_some_and(|v| v["method"] == "events.vaultReset");
+                    if reset { runtime = None; }
+                    if key_refresh_event(&t, &sess.device_id, runtime.is_none()) {
+                        // Preserve the runtime and MCP tool cache on ordinary calls.
+                        // Reconnect, reset and local approval revalidate the key.
+                        runtime = quiet_runtime_for_device(base, client, sess, dev, persist_cache).await;
+                        retry.reset();
+                    }
+                    if let Some((rt, umk, key_id)) = runtime.as_mut() {
+                        if mafold_core::connections::handle_event(rt, &t).await {
+                            println!("· connections: answered a call");
+                        } else {
+                            handle_link_event(&client, &sess, umk, key_id, &t).await;
+                        }
+                    }
+                }
+                WsMsg::Ping(p) => { let _ = ws.send(WsMsg::Pong(p)).await; }
+                WsMsg::Close(_) => break,
+                _ => {}
+            }
+        }
+    Ok(())
+}
+
 /// The unlocked runtime IF this machine can produce one silently: registered
-/// device + cached UMK that still matches the server's recorded generation.
-/// Anything less returns None — enrollment is `unlock`'s interactive job.
+/// device + a cached or newly fetched UMK in the server's recorded generation.
+/// Missing approval stays pending; this path never mints a replacement key.
 ///
 /// The key comes back alongside the runtime because answering a call and
 /// SEALING a new grant (a link this device runs for another surface) are the
 /// same permission — a machine that can do one can do the other, and handing
 /// out both from one place is what keeps that true.
-async fn quiet_runtime(
-    base: &str,
-    client: &Client,
-    sess: &session::Session,
+async fn quiet_runtime_for_device(
+    base: &str, client: &Client, sess: &session::Session, dev: &DeviceKey, persist_cache: bool,
 ) -> Option<(mafold_core::connections::Runtime, Key, String)> {
-    let dev = vault::device_key().ok()?;
-    let reg = register(client, sess, &dev).await.ok()?;
-    let (umk, key_id) = vault::cached_umk(&dev)?;
-    if key_id.is_empty() || s(&reg["device"], "key_id") != key_id {
-        return None;
+    let reg = register(client, sess, dev).await.ok()?;
+    let cached = if persist_cache { vault::cached_umk(dev) } else { None };
+    let cached_id = cached.as_ref().map(|(_, id)| id.clone());
+    let (umk, key_id) = quiet_key(client, sess, dev, &reg, cached).await?;
+    if cached_id.as_deref() != Some(key_id.as_str()) {
+        if persist_cache { vault::cache_umk(&umk, dev, &key_id).ok()?; }
+        auto_approve_pending(client, &umk, &key_id).await;
     }
     let rt = core_runtime(base, sess, umk.clone());
     Some((rt, umk, key_id))
+}
+
+/// Kept separate from the disk cache so pending → approved can be exercised
+/// without touching the host machine's real vault.
+async fn quiet_key(
+    client: &Client,
+    sess: &session::Session,
+    dev: &DeviceKey,
+    reg: &Value,
+    cached: Option<(Key, String)>,
+) -> Option<(Key, String)> {
+    let registered_id = s(&reg["device"], "key_id");
+    if reg["device"]["approved"].as_bool() != Some(true) || registered_id.is_empty() {
+        return None;
+    }
+    if let Some((key, id)) = cached {
+        if id == registered_id {
+            return Some((key, id));
+        }
+    }
+    let v = client.call("getVaultKey", json!({ "device_id": sess.device_id })).await.ok()?;
+    let key_id = s(&v, "key_id");
+    // Approval may have changed during the request. Retry on the next tick.
+    if key_id != registered_id {
+        return None;
+    }
+    let key = vault::unwrap_key(&dev.secret, &s(&v, "sealed_umk")).ok()?;
+    Some((key, key_id))
 }
 
 /// What a connection can do, asked of the provider itself.
@@ -2411,6 +2472,103 @@ async fn recover(client: &Client, sess: &session::Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real CLI event loop for browser → API → native-device E2E. No mock
+    /// transport and no host account/key files. The browser enrolls/approves
+    /// this generated device through the dev api, then clicks Connect.
+    /// Driven by `mafold-e2e`: the account is the run's own test account
+    /// (`MAFOLD_TEST_USER`, token `dev:<user>`), never a shared or seeded one.
+    #[tokio::test]
+    #[ignore = "requires the dev api (mafold-e2e) and a browser E2E driver"]
+    async fn live_resident_listener_for_browser_e2e() {
+        let base = std::env::var("MAFOLD_TEST_API_ORIGIN").expect("dev API origin");
+        assert!(base.starts_with("http://127.0.0.1:"));
+        let user = std::env::var("MAFOLD_TEST_USER").expect("the e2e run's test account");
+        let generated = mafold_core::vault::generate_device();
+        let dev = DeviceKey { secret: generated.secret, public: generated.public };
+        let sess = session::Session { token: format!("dev:{user}"), username: user, device_id: "e2e-native-device".into(), device_name: "E2E Mac CLI".into() };
+        let client = Client::new(base.clone(), sess.token.clone());
+        let run = async { loop {
+            let _ = listener_session(&base, &client, &sess, &dev, false).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }};
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(900), run).await;
+    }
+
+    #[test]
+    fn unlocked_listener_keeps_runtime_for_calls_and_links() {
+        for method in ["events.connectionCall", "events.connectionLink"] {
+            let event = json!({"method": method}).to_string();
+            assert!(!key_refresh_event(&event, "local", false));
+            assert!(key_refresh_event(&event, "local", true));
+        }
+        for method in ["events.vaultReset", "events.vaultDeviceApproved"] {
+            let event = json!({"method": method, "params": {"device_id": "local"}}).to_string();
+            assert!(key_refresh_event(&event, "local", false));
+        }
+        let other = json!({"method": "events.vaultDeviceApproved", "params": {"device_id": "other"}}).to_string();
+        assert!(!key_refresh_event(&other, "local", false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_waits_two_minutes_but_requests_and_approval_wake_immediately() {
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let start = tokio::time::Instant::now();
+        let mut retry = tokio::time::interval_at(start + VAULT_RECHECK, VAULT_RECHECK);
+        // Real sockets receive server pings every 25s. Those frames keep the
+        // idle watchdog alive without causing register/getVaultKey calls.
+        for seconds in [5, 25, 50, 75, 100, 119] {
+            tokio::time::advance(std::time::Duration::from_secs(seconds) - start.elapsed()).await;
+            let mut ping = futures_util::stream::iter([Ok(WsMsg::Ping(vec![]))]);
+            assert!(matches!(listener_frame(&mut ping, &mut retry).await, Ok(Some(WsMsg::Ping(_)))));
+            assert_eq!(start.elapsed().as_secs(), seconds);
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let mut idle = futures_util::stream::pending();
+        assert!(listener_frame(&mut idle, &mut retry).await.is_err());
+        assert_eq!(start.elapsed(), VAULT_RECHECK);
+        for method in ["events.connectionCall", "events.connectionLink", "events.vaultDeviceApproved"] {
+            let request = json!({"method":method,"params":{"device_id":"this-device","call_id":"same-request"}}).to_string();
+            let mut incoming = futures_util::stream::iter([Ok(WsMsg::Text(request.clone()))]);
+            let Ok(Some(WsMsg::Text(received))) = listener_frame(&mut incoming, &mut retry).await else { panic!("request was lost") };
+            assert_eq!(received, request, "handle the waking request, not a second click");
+            assert!(key_refresh_event(&received, "this-device", true));
+            assert_eq!(start.elapsed(), VAULT_RECHECK, "events do not wait for a timer");
+        }
+        assert!(!key_refresh_event(r#"{"method":"events.vaultDeviceApproved","params":{"device_id":"other"}}"#, "this-device", true));
+        assert!(!key_refresh_event(r#"{"method":"events.vaultDevicePending"}"#, "this-device", true));
+    }
+
+    #[tokio::test]
+    async fn quiet_key_picks_up_approval_without_unlock_or_a_local_cache() {
+        let generated = mafold_core::vault::generate_device();
+        let dev = DeviceKey { secret: generated.secret, public: generated.public };
+        let umk = Key::random();
+        let api = spawn_api(vec![("getVaultKey", json!({
+            "key_id": "generation-2",
+            "sealed_umk": vault::wrap_key_for(&dev.public, &umk).unwrap(),
+        }))]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let sess = a_session();
+        let pending = json!({"device": {"approved": false, "key_id": ""}});
+        assert!(quiet_key(&client, &sess, &dev, &pending, None).await.is_none());
+        assert!(api.calls("getVaultKey").is_empty());
+
+        let approved = json!({"device": {"approved": true, "key_id": "generation-2"}});
+        let (key, id) = quiet_key(&client, &sess, &dev, &approved, None).await.unwrap();
+        assert_eq!(id, "generation-2");
+        let sealed = vault::wrap_key_for(&dev.public, &key).unwrap();
+        assert!(vault::unwrap_key(&dev.secret, &sealed).is_ok());
+        assert_eq!(api.calls("getVaultKey")[0]["device_id"], sess.device_id);
+        assert!(quiet_key(&client, &sess, &dev, &approved, Some((key, id))).await.is_some());
+        assert_eq!(api.calls("getVaultKey").len(), 1, "current cache needs no fetch");
+        assert!(quiet_key(&client, &sess, &dev, &approved,
+            Some((Key::random(), "retired-generation".into()))).await.is_some());
+        assert_eq!(api.calls("getVaultKey").len(), 2, "stale cache fetches replacement");
+        let rotated = json!({"device": {"approved": true, "key_id": "generation-3"}});
+        assert!(quiet_key(&client, &sess, &dev, &rotated, None).await.is_none());
+        assert!(api.calls("approveVaultDevice").is_empty(), "never creates a vault");
+    }
 
     /// 2026-10-05: `mafold connection env notion` in a bot's turn put
     /// `export NOTION_TOKEN=…` into the trace card of a 24-person group. In a
@@ -2900,6 +3058,22 @@ mod tests {
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"), "{url}");
         assert!(url.contains("codex_cli_simplified_flow=true"), "{url}");
         assert_eq!(answer["result"]["device"], "ops-mbp");
+    }
+
+    #[tokio::test]
+    async fn reconnecting_a_machine_replaces_the_original_connection_name() {
+        let api = spawn_api(vec![]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let spec = provider_infos().into_iter().find(|p| p.id == "computer").unwrap();
+        let name = bind_for_link(&client, &a_session(), &Key::random(), "new-key", &spec, Some("original-computer"), Some("My office computer")).await.unwrap();
+        assert_eq!(name, "original-computer");
+        let writes = api.calls("putConnection");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["name"], "original-computer");
+        assert_eq!(writes[0]["key_id"], "new-key");
+        assert_eq!(writes[0]["label"], "My office computer");
+        assert_eq!(writes[0]["create_only"], false);
+        assert!(api.calls("listConnections").is_empty(), "reconnect must not choose a free name");
     }
 
     /// Names don't collide: a second Codex account makes a second row.

@@ -346,6 +346,7 @@ pub fn seal_payload_for(
 
 // ── recovery passphrase ────────────────────────────────────────────────────
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RecoveryBlob {
     pub salt: String,
     pub mem_kib: u32,

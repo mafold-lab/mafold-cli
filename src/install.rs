@@ -143,7 +143,7 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
     // stock Windows box) the manual route in `fallback` IS the answer. Bailing
     // with a bare "failed to run bash" left the user with no next step on the one
     // platform that had no other way in.
-    let status = match std::process::Command::new("bash")
+    let status = match crate::platform::console_std_command("bash")
         .arg("-c")
         .arg(t.install_cmd)
         .status()
@@ -178,7 +178,7 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
 }
 
 fn version_of(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(crate::harness::program(bin))
+    let out = crate::platform::std_command(crate::harness::program(bin))
         .arg("--version")
         .output()
         .ok()?;

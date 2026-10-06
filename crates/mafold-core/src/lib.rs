@@ -776,8 +776,23 @@ mod web {
         Vault { umk: crate::vault::Key::random(), key_id: crate::vault::new_key_id() }
     }
 
+    #[wasm_bindgen(js_name = vaultRecover)]
+    pub fn vault_recover(blob_json: String, passphrase: String, key_id: String) -> Result<Vault, JsValue> {
+        let blob: crate::vault::RecoveryBlob = serde_json::from_str(&blob_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let umk = crate::vault::unwrap_umk_with_passphrase(&blob, &passphrase)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(Vault { umk, key_id })
+    }
+
     #[wasm_bindgen]
     impl Vault {
+        #[wasm_bindgen(js_name = recoveryBlob)]
+        pub fn recovery_blob(&self, passphrase: String) -> Result<String, JsValue> {
+            let blob = crate::vault::wrap_umk_with_passphrase(&self.umk, &passphrase)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            serde_json::to_string(&blob).map_err(|e| JsValue::from_str(&e.to_string()))
+        }
         #[wasm_bindgen(getter, js_name = keyId)]
         pub fn key_id(&self) -> String {
             self.key_id.clone()

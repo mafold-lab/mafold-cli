@@ -194,6 +194,26 @@ pub fn generating_tag_awaiting(
     )
 }
 
+/// A running snapshot without its trailing [`generating_tag`] — what the reply
+/// actually SAYS so far, e.g. to carry it into the process that picks a
+/// killed turn back up.
+///
+/// Only a trailing card is stripped, and only when the tail is EXACTLY that one
+/// self-closing tag: an earlier `{% mafold/generating` in the body is the agent
+/// talking ABOUT the card, and cutting there would drop real content. The api
+/// carries a byte-identical twin (`store.rs`), which finalize enforces; it
+/// cannot share this crate (it deploys with no sibling path-deps).
+pub fn strip_trailing_generating(content: &str) -> &str {
+    let Some(i) = content.rfind("{% mafold/generating") else { return content };
+    let tail = content[i..].trim_end();
+    // `{% mafold/generating a=1 /%}` → nothing before the closer holds another `%}`,
+    // proving the card is the last thing in the message.
+    let is_lone_card = tail
+        .strip_suffix("/%}")
+        .is_some_and(|inner| !inner.contains("%}"));
+    if is_lone_card { content[..i].trim_end() } else { content }
+}
+
 /// Stamp the user's answer into the pending (last unanswered) `{% mafold/ask %}` card
 /// in `full` by adding `answered="…"` to its opening tag. The message content
 /// itself is the durable record — a reloaded page or another device renders the
@@ -361,6 +381,112 @@ pub fn run_summary(counts: &HashMap<&'static str, usize>) -> String {
 /// so it is NOT escaped; each primitive escapes its own body.
 pub fn run_card(summary: &str, body: &str) -> String {
     format!("\n{{% mafold/run summary=\"{}\" %}}\n{}{{% /mafold/run %}}\n", attr_esc(summary), body)
+}
+
+/// The run groups already written in `md`, read back as what [`run_card`] was
+/// given: each group's per-category counts and how many items it holds — what
+/// the fold counts (`Transcript::continue_from`).
+///
+/// The items are counted exactly: a run card's body is nothing but its item
+/// cards, and every one of them escaped its own body ([`block_esc`]), so the
+/// only tags at the top of a run body ARE its items. The counts come back from
+/// the summary ([`summary_counts`]) — exact, except what [`attr_esc`] cut off a
+/// summary longer than 80 characters.
+pub fn run_groups(md: &str) -> Vec<(HashMap<&'static str, usize>, usize)> {
+    top_level_cards(md)
+        .into_iter()
+        .filter(|c| c.name == "mafold/run")
+        .map(|c| {
+            let summary = c
+                .attrs
+                .split_once("summary=\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(s, _)| s)
+                .unwrap_or("");
+            (summary_counts(summary), top_level_cards(c.body).len())
+        })
+        .collect()
+}
+
+/// [`run_summary`] read backwards: "Read 3 files, ran 1 shell command" → `read`
+/// 3, `shell` 1. Whatever doesn't parse — "Details", a part cut off by
+/// [`attr_esc`] — counts nothing. "updated the plan" carries no number, so it
+/// counts one.
+pub fn summary_counts(summary: &str) -> HashMap<&'static str, usize> {
+    const NOUNS: &[(&str, &str, &str)] = &[
+        ("shell", "shell command", "shell commands"),
+        ("search", "search", "searches"),
+        ("web", "web search", "web searches"),
+        ("task", "subagent", "subagents"),
+        ("workflow", "workflow", "workflows"),
+        ("tool", "tool", "tools"),
+    ];
+    let mut counts = HashMap::new();
+    for part in summary.split(", ") {
+        let part = part.to_lowercase();
+        if part == "updated the plan" {
+            counts.insert("plan", 1);
+            continue;
+        }
+        let Some((verb, rest)) = part.split_once(' ') else { continue };
+        let Some((n, noun)) = rest.split_once(' ') else { continue };
+        let Ok(n) = n.parse::<usize>() else { continue };
+        let key = match (verb, noun) {
+            ("read", "file" | "files") => Some("read"),
+            ("edited", "file" | "files") => Some("edit"),
+            ("ran", noun) => NOUNS.iter().find(|(_, s, p)| noun == *s || noun == *p).map(|(k, _, _)| *k),
+            _ => None,
+        };
+        if let Some(k) = key {
+            counts.insert(k, n);
+        }
+    }
+    counts
+}
+
+/// One card at the top level of a markdoc text: its name, the rest of its open
+/// tag, and its body (empty for a self-closing tag).
+struct TopCard<'a> {
+    name: &'a str,
+    attrs: &'a str,
+    body: &'a str,
+}
+
+/// The cards at the top level of `md`, in order — nested ones are part of their
+/// container's body. Same walk as [`strip_cards_where`]: an unterminated tag is
+/// text, and a container with no closer runs to the end.
+fn top_level_cards(md: &str) -> Vec<TopCard<'_>> {
+    let mut out = Vec::new();
+    let mut rest = md;
+    while let Some(i) = rest.find("{%") {
+        let after = &rest[i..];
+        let Some(close) = after.find("%}") else { break };
+        let tag_end = close + 2;
+        let inner = after[2..close].trim();
+        rest = &after[tag_end..];
+        if inner.starts_with('/') {
+            continue;
+        }
+        let (name, attrs) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
+        if name.is_empty() {
+            continue;
+        }
+        if after[..tag_end].ends_with("/%}") {
+            out.push(TopCard { name, attrs: attrs.trim_end_matches('/').trim(), body: "" });
+            continue;
+        }
+        let closer = format!("{{% /{name} %}}");
+        let body = match rest.find(&closer) {
+            Some(j) => {
+                let body = &rest[..j];
+                rest = &rest[j + closer.len()..];
+                body
+            }
+            None => std::mem::take(&mut rest),
+        };
+        out.push(TopCard { name, attrs: attrs.trim(), body });
+    }
+    out
 }
 
 /// Wrap a finished turn's WORKING TRAIL — every interim sentence and every
@@ -1473,8 +1599,64 @@ mod strip_tests {
 }
 
 #[cfg(test)]
+mod run_groups_tests {
+    use super::{run_card, run_groups, run_summary, summary_counts};
+    use std::collections::HashMap;
+
+    /// Every phrase `run_summary` can write reads back as the count it was
+    /// written from — the two are one table, kept honest by this test.
+    #[test]
+    fn a_summary_reads_back_as_the_counts_it_was_made_from() {
+        for k in ["read", "edit", "shell", "search", "web", "task", "workflow", "tool"] {
+            for n in [1, 7] {
+                let c: HashMap<&'static str, usize> = HashMap::from([(k, n)]);
+                assert_eq!(summary_counts(&run_summary(&c)), c, "{}", run_summary(&c));
+            }
+        }
+        let plan: HashMap<&'static str, usize> = HashMap::from([("plan", 1)]);
+        assert_eq!(summary_counts(&run_summary(&plan)), plan);
+        let mixed: HashMap<&'static str, usize> = HashMap::from([("read", 2), ("shell", 1), ("web", 3)]);
+        assert_eq!(summary_counts(&run_summary(&mixed)), mixed);
+        assert!(summary_counts("Details").is_empty());
+        // Cut off by the attribute's 80-character limit: what's left still counts.
+        assert_eq!(summary_counts("Read 12 files, edited 9 files, ran 1…"), HashMap::from([("read", 12), ("edit", 9)]));
+    }
+
+    /// Only the run groups, each with the items it holds — not the cards
+    /// around them, and not markup quoted inside an item's output.
+    #[test]
+    fn groups_are_read_back_with_their_items() {
+        let md = format!(
+            "Looking.\n{}\n{{% mafold/html %}}<i>{{% mafold/run summary=\"Read 9 files\" %}}</i>{{% /mafold/html %}}\nThen{}",
+            run_card(
+                "Read 2 files",
+                "\n{% mafold/tool name=\"Read\" detail=\"a\" /%}\n\n{% mafold/tool name=\"Read\" detail=\"b\" out=\"1 line\" %}\n{ % mafold/run % }\n{% /mafold/tool %}\n"
+            ),
+            run_card("Ran 1 shell command", "\n{% mafold/thinking %}\nhm\n{% /mafold/thinking %}\n{% mafold/tool name=\"Bash\" detail=\"ls\" /%}\n"),
+        );
+        let groups = run_groups(&md);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(groups[0], (HashMap::from([("read", 2)]), 2));
+        assert_eq!(groups[1], (HashMap::from([("shell", 1)]), 2));
+    }
+}
+
+#[cfg(test)]
 mod generating_tests {
-    use super::{generating_tag, generating_tag_awaiting};
+    use super::{generating_tag, generating_tag_awaiting, strip_trailing_generating};
+
+    /// What a picked-up turn carries over is the reply minus its spinner — and
+    /// never less than the reply.
+    #[test]
+    fn stripping_takes_the_trailing_card_and_nothing_else() {
+        let body = "Read the file.\n\n{% mafold/run summary=\"Read 1 file\" %}x{% /mafold/run %}";
+        assert_eq!(strip_trailing_generating(&format!("{body}{}", generating_tag(1, 2, 3, 4, 0))), body);
+        assert_eq!(strip_trailing_generating(body), body, "no card, nothing to take");
+        // The agent quoting the card mid-reply is content.
+        let talk = "the `{% mafold/generating /%}` card, then more words"; // LINT-IGNORE
+        assert_eq!(strip_trailing_generating(talk), talk);
+        assert_eq!(strip_trailing_generating(&generating_tag(1, 2, 3, 4, 0)), "");
+    }
 
     /// A turn parked on a question is not a producer gone quiet: its beat is
     /// frozen because a PERSON has the next move. The card can only tell those

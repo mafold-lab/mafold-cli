@@ -375,7 +375,7 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
     );
     println!("  watching {} (Ctrl-C to stop)\n", manifest.entry);
 
-    let mut c = tokio::process::Command::new(&esbuild);
+    let mut c = crate::platform::console_command(&esbuild);
     c.current_dir(dir)
         .arg(&manifest.entry)
         .args(bundle_args_with(&out, APP_EXTERNALS))
@@ -437,7 +437,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let out = out_dir.join(format!("{slug}.js"));
 
     println!("→ bundling {} …", manifest.entry);
-    let status = tokio::process::Command::new(&esbuild)
+    let status = crate::platform::console_command(&esbuild)
         .current_dir(dir)
         .arg(&manifest.entry)
         .args(bundle_args_with(&format!("dist/{slug}.js"), APP_EXTERNALS))

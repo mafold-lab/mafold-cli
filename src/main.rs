@@ -32,6 +32,7 @@ mod inbox;
 mod install;
 mod langpack;
 mod mcp_link;
+mod msgops;
 mod pair;
 mod pending;
 mod permission_mcp;
@@ -44,6 +45,7 @@ mod supervisor;
 mod turnenv;
 mod update;
 mod vault;
+mod video;
 mod wallet;
 
 use anyhow::{Context, Result};
@@ -152,9 +154,13 @@ enum Cmd {
         chat: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Read a forum channel instead of the main timeline.
+        /// Read a forum channel (id or #name). Inside a channel turn, this
+        /// turn's own conversation already defaults to the turn's channel.
         #[arg(long)]
         channel: Option<String>,
+        /// Read the main timeline (#all), even inside a channel turn.
+        #[arg(long, conflicts_with = "channel")]
+        main: bool,
         /// Download the transcript's photos and files to ~/.mafold/attachments
         /// and print each one's path, so the agent can actually open them.
         /// Off by default: a long page of a photo-heavy room is a lot of bytes
@@ -180,12 +186,22 @@ enum Cmd {
     /// Send a message. <chat> is a conversation id or a @username.
     Send {
         chat: String,
-        /// Send into a forum channel (id or #name) instead of the main timeline.
+        /// Send into a forum channel (id or #name). Inside a channel turn, a
+        /// send to the turn's own conversation already goes to the turn's
+        /// channel; elsewhere the default is the main timeline.
         #[arg(long)]
         channel: Option<String>,
+        /// Send to the main timeline (#all), even inside a channel turn.
+        #[arg(long, conflicts_with = "channel")]
+        main: bool,
         /// Quote-reply to this message id (`mafold read --ids` shows them).
         #[arg(long)]
         reply: Option<String>,
+        /// Inside an inbox turn, a send is held back when someone spoke there
+        /// since the agent last looked (it prints what is new instead). Send
+        /// it as written regardless.
+        #[arg(long)]
+        anyway: bool,
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
     },
@@ -202,7 +218,9 @@ enum Cmd {
     /// MAFOLD_DRAFT), so what it just made arrives in the same bubble as the
     /// text about it. The kind is read from the bytes: an image becomes a photo,
     /// a clip becomes a player, anything else becomes a file card — unless
-    /// `--sticker` says a picture is a sticker.
+    /// `--sticker` says a picture is a sticker. A public http(s) URL is
+    /// accepted too: the SERVER fetches it, so a clip parked on a vendor CDN
+    /// never comes down this machine's uplink.
     Attach {
         /// Files on this machine.
         #[arg(required = true)]
@@ -259,6 +277,36 @@ enum Cmd {
         /// the account — that is `deleteConnection`, or the key in Settings.
         #[arg(long)]
         forget: bool,
+    },
+    /// Pin a message in the current conversation — by default the reply you are
+    /// writing right now (inside an agent turn). Prints the pinned id.
+    Pin {
+        /// Message id; omit to pin the reply in flight.
+        message: Option<String>,
+        /// Conversation (id, @username or name); default = this turn's.
+        #[arg(long)]
+        chat: Option<String>,
+        /// Remove the pin instead.
+        #[arg(long)]
+        unpin: bool,
+    },
+    /// Replace the text of a message you sent (e.g. the pinned record).
+    Edit {
+        /// The message to rewrite.
+        message: String,
+        /// The full new text, or `-` to read it from stdin.
+        text: Option<String>,
+        /// Read the full new text from a file instead.
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Video generation (agent tool surface): models / submit / status / cancel.
+    /// Prices are list prices for the estimate; the bill is the vendor's own
+    /// token count on the finished job. A finished clip is already landed
+    /// server-side (24 h vendor links never reach the chat).
+    Video {
+        #[command(subcommand)]
+        cmd: video::VideoCmd,
     },
     /// Token wallet: balances / transfer / convert / rates / history / grants.
     Wallet {
@@ -681,10 +729,10 @@ async fn main() -> Result<()> {
             supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
         Cmd::Chats => chats(&Client::new(cli.base, token?)).await?,
-        Cmd::Read { chat: c, limit, channel, media, json, unread, ids } => {
+        Cmd::Read { chat: c, limit, channel, main, media, json, unread, ids } => {
             chat::read(
                 &Client::new(cli.base, token?),
-                chat::ReadArgs { chat: c, limit, channel, json, media, unread, ids },
+                chat::ReadArgs { chat: c, limit, channel, main, json, media, unread, ids },
             )
             .await?
         }
@@ -692,15 +740,18 @@ async fn main() -> Result<()> {
         Cmd::Send {
             chat,
             channel,
+            main,
             reply,
+            anyway,
             text,
         } => {
             send(
                 &Client::new(cli.base, token?),
                 &chat,
-                channel.as_deref(),
+                Target::of(channel.as_deref(), main),
                 reply.as_deref(),
                 &text.join(" "),
+                anyway,
             )
             .await?
         }
@@ -718,6 +769,13 @@ async fn main() -> Result<()> {
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::D1 { cmd } => d1::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Sites { cmd } => sites::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Video { cmd } => video::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Pin { message, chat, unpin } => {
+            msgops::pin(&Client::new(cli.base, token?), message.as_deref(), chat.as_deref(), unpin).await?
+        }
+        Cmd::Edit { message, text, file } => {
+            msgops::edit(&Client::new(cli.base, token?), &message, text.as_deref(), file.as_deref()).await?
+        }
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Stop | Cmd::Status { .. } | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
@@ -744,10 +802,10 @@ pub(crate) fn prompt_password(label: &str) -> String {
     use std::io::Write;
     print!("{label}");
     let _ = std::io::stdout().flush();
-    let _ = std::process::Command::new("stty").arg("-echo").status();
+    let _ = platform::console_std_command("stty").arg("-echo").status();
     let mut s = String::new();
     let _ = std::io::stdin().read_line(&mut s);
-    let _ = std::process::Command::new("stty").arg("echo").status();
+    let _ = platform::console_std_command("stty").arg("echo").status();
     println!();
     s.trim().to_string()
 }
@@ -1132,6 +1190,22 @@ async fn attach(
         }
     };
     for f in files {
+        if f.starts_with("http://") || f.starts_with("https://") {
+            // A sticker is a picture this machine already holds; fetching one
+            // server-side would land it as a plain photo, the opposite of what
+            // `--sticker` asked for.
+            if matches!(how, client::AttachAs::Sticker { .. }) {
+                anyhow::bail!("--sticker takes a picture on this machine, not a URL ({f})");
+            }
+            // The server pulls the bytes itself — a generated clip parked on a
+            // vendor CDN never has to come down this machine's uplink.
+            client
+                .attach_url(&msg, f)
+                .await
+                .with_context(|| format!("attaching {f}"))?;
+            println!("✓ attached {f} (fetched server-side)");
+            continue;
+        }
         let path = std::path::Path::new(f);
         client
             .attach_media_as(&msg, path, how)
@@ -1180,8 +1254,50 @@ fn speaking_token(bot_token: Option<String>, account: Option<&str>) -> Result<St
 /// * `MAFOLD_SEND_DRY=1` — say what WOULD be sent and send nothing (the inbox
 ///   loop's `--dry-run`). Checked before anything touches the network: even
 ///   resolving an `@username` can open a DM.
-async fn send(client: &Client, chat: &str, channel: Option<&str>, reply: Option<&str>, text: &str) -> Result<()> {
+/// * `MAFOLD_SEND_SEEN=<file>` — the inbox loop's record of what its agent has
+///   seen; when the timeline moved on since, the send is held back and what
+///   is new is printed instead ([`inbox::send_guard`]; `anyway` overrides).
+/// Where `mafold send` was told to go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Target<'a> {
+    /// `--channel <id or #name>`.
+    Channel(&'a str),
+    /// `--main`: the main timeline, even inside a channel turn.
+    Main,
+    /// Nothing said: the turn's own channel when the chat is the turn's own
+    /// conversation (`chat::turn_channel`), the main timeline otherwise.
+    ///
+    /// It used to be the main timeline always, and an agent working in a
+    /// channel — the only place anyone was watching it — spoke into `#all`
+    /// whenever it used `send` instead of its reply (2026-10-05: the GitHub
+    /// device code a channel's turn was waiting on went to `#all`).
+    Default,
+}
+
+impl<'a> Target<'a> {
+    fn of(channel: Option<&'a str>, main: bool) -> Self {
+        match channel {
+            Some(c) => Target::Channel(c),
+            None if main => Target::Main,
+            None => Target::Default,
+        }
+    }
+}
+
+async fn send(
+    client: &Client,
+    chat: &str,
+    target: Target<'_>,
+    reply: Option<&str>,
+    text: &str,
+    anyway: bool,
+) -> Result<()> {
     if env_flag("MAFOLD_SEND_DRY") {
+        let channel = match target {
+            Target::Channel(c) => Some(c.to_string()),
+            Target::Main => None,
+            Target::Default => chat::turn_channel(chat),
+        };
         journal(&serde_json::json!({
             "kind": "send", "dry": true, "chat_id": chat, "channel_id": channel, "reply_to": reply, "text": text,
         }));
@@ -1190,14 +1306,32 @@ async fn send(client: &Client, chat: &str, channel: Option<&str>, reply: Option<
         println!("✓ (dry-run,没有真发) → {chat}{at}{re}: {text}");
         return Ok(());
     }
-    let (chat_id, channel_id, label) = match channel {
-        Some(ch) => {
+    // The receipt says where it landed, every time — a `#all` that went
+    // unremarked is how the wrong timeline went unnoticed.
+    let (chat_id, channel_id, label) = match target {
+        Target::Channel(ch) => {
             let (chat_id, ch) = channels::resolve(client, chat, ch).await?;
             let name = ch["name"].as_str().unwrap_or("?").to_string();
             (chat_id, ch["id"].as_str().map(str::to_string), format!("{chat} #{name}"))
         }
-        None => (client.resolve_chat(chat).await?, None, chat.to_string()),
+        Target::Main => (client.resolve_chat(chat).await?, None, format!("{chat} #all")),
+        Target::Default => {
+            let chat_id = client.resolve_chat(chat).await?;
+            match chat::turn_channel(&chat_id) {
+                Some(ch) => {
+                    let name = chat::channel_name(client, &chat_id, &ch).await;
+                    (chat_id, Some(ch), format!("{chat} #{name} (this turn's channel; --main for #all)"))
+                }
+                None => (chat_id, None, chat.to_string()),
+            }
+        }
     };
+    if !anyway {
+        if let Some(fresh) = inbox::send_guard(client, &chat_id, channel_id.as_deref(), &label).await {
+            println!("{fresh}");
+            anyhow::bail!("没发出去 —— 先看上面的新消息");
+        }
+    }
     if env_flag("MAFOLD_SEND_PACE") {
         pace_typing(client, &chat_id, channel_id.as_deref(), text).await;
     }
@@ -1264,5 +1398,34 @@ fn journal(entry: &serde_json::Value) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{entry}");
+    }
+}
+
+#[cfg(test)]
+mod send_target_tests {
+    use super::*;
+
+    fn send_target(args: &[&str]) -> Result<(Option<String>, bool), clap::Error> {
+        let argv = ["mafold", "send", "72355ef4-c43f-44ba-a0d5-b2c061026cd6"].iter().chain(args).chain(["hi"].iter());
+        match Cli::try_parse_from(argv)?.cmd {
+            Cmd::Send { channel, main, .. } => Ok((channel, main)),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Nothing said ⇒ the turn decides (its channel, or #all outside one);
+    /// `--main` is #all even inside a channel turn; a named channel wins; and
+    /// asking for both is refused rather than silently picking one.
+    #[test]
+    fn where_a_send_goes_is_said_once() {
+        let (c, m) = send_target(&[]).unwrap();
+        assert_eq!(Target::of(c.as_deref(), m), Target::Default);
+        let (c, m) = send_target(&["--main"]).unwrap();
+        assert_eq!(Target::of(c.as_deref(), m), Target::Main);
+        let (c, m) = send_target(&["--channel", "#发版"]).unwrap();
+        assert_eq!(Target::of(c.as_deref(), m), Target::Channel("#发版"));
+        assert!(send_target(&["--main", "--channel", "#发版"]).is_err());
+        assert!(Cli::try_parse_from(["mafold", "read", "--main", "--channel", "x"]).is_err());
+        assert!(Cli::try_parse_from(["mafold", "read", "--main"]).is_ok());
     }
 }

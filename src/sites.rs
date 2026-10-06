@@ -39,6 +39,37 @@ pub enum SitesCmd {
         #[command(subcommand)]
         cmd: WorkerCmd,
     },
+    /// What your sites' backends used this month, against your allowance.
+    /// Over a line, the platform pauses them (their /api/* answers 503).
+    Usage {
+        /// One site: adds its day-by-day numbers.
+        site: Option<String>,
+        /// YYYY-MM (UTC). Default: this month.
+        #[arg(long)]
+        month: Option<String>,
+        /// Operators: someone else's month.
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Operators: set one person's monthly lines (unset flags keep the default).
+    Allowance {
+        user: String,
+        #[arg(long)]
+        requests: Option<i64>,
+        #[arg(long)]
+        cpu_ms: Option<i64>,
+        #[arg(long)]
+        rows_read: Option<i64>,
+        #[arg(long)]
+        rows_written: Option<i64>,
+        #[arg(long)]
+        storage_mib: Option<i64>,
+        /// Back to the default lines.
+        #[arg(long, conflicts_with_all = ["requests", "cpu_ms", "rows_read", "rows_written", "storage_mib"])]
+        reset: bool,
+    },
     /// Call a webview app's backend as yourself: mints your launch token for
     /// the app (`getAppLaunch`) and sends it as the Bearer. How an agent writes
     /// into a site, e.g. `mafold sites call opsdu/garden-beta POST /api/inbox
@@ -95,6 +126,116 @@ pub enum WorkerCmd {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Lift a pause once its reason is gone (a burst, or storage you freed).
+    /// A used-up month comes back on the 1st by itself.
+    Resume {
+        site: String,
+        /// Operators: lift it anyway and let it run for the rest of the month.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+const MIB: i64 = 1024 * 1024;
+
+fn utc_time(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| t.to_string())
+}
+
+fn grouped(n: i64) -> String {
+    let s = n.abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+fn amount(metric: &str, n: i64) -> String {
+    match metric {
+        "cpu" => format!("{:.1} s", n as f64 / 1000.0),
+        "storage" => format!("{:.1} MiB", n as f64 / MIB as f64),
+        _ => grouped(n),
+    }
+}
+
+fn describe_pause(p: &Value) -> String {
+    let reason = p["reason"].as_str().unwrap_or("?");
+    match p["until"].as_i64() {
+        Some(t) => format!("⏸ paused ({reason}) until {}", utc_time(t)),
+        None if reason == "storage" => format!("⏸ paused ({reason}) — free some space, then `mafold sites worker resume`"),
+        None => format!("⏸ paused ({reason}) — `mafold sites worker resume` when it's fixed"),
+    }
+}
+
+fn print_usage(u: &Value) {
+    println!(
+        "{} · {} · counts start over {}",
+        u["month"].as_str().unwrap_or("?"),
+        u["person"].as_str().unwrap_or("?"),
+        u["resets_at"].as_i64().map(utc_time).unwrap_or_default()
+    );
+    let a = &u["allowance"];
+    let used = &u["used"];
+    for (label, metric, n, limit) in [
+        ("requests", "requests", used["requests"].as_i64(), a["requests"].as_i64()),
+        ("cpu", "cpu", used["cpu_ms"].as_i64(), a["cpu_ms"].as_i64()),
+        ("rows written", "rows", used["rows_written"].as_i64(), a["rows_written"].as_i64()),
+        ("rows read", "rows", used["rows_read"].as_i64(), a["rows_read"].as_i64()),
+        ("storage", "storage", u["storage_bytes"].as_i64(), a["storage_bytes"].as_i64()),
+    ] {
+        let (n, limit) = (n.unwrap_or(0), limit.unwrap_or(0));
+        let pct = if limit > 0 { n.saturating_mul(100) / limit } else { 0 };
+        println!("  {label:<13} {:>14} / {:<14} {pct:>4}%", amount(metric, n), amount(metric, limit));
+    }
+    let sites = u["sites"].as_array().cloned().unwrap_or_default();
+    if !sites.is_empty() {
+        println!("sites");
+    }
+    for s in &sites {
+        let m = &s["month"];
+        let paused = if s["paused"].is_object() { format!("  {}", describe_pause(&s["paused"])) } else { String::new() };
+        println!(
+            "  {:<24} {:>12} req · {:>9} cpu · {} errors{paused}",
+            s["site"].as_str().unwrap_or("?"),
+            grouped(m["requests"].as_i64().unwrap_or(0)),
+            amount("cpu", m["cpu_ms"].as_i64().unwrap_or(0)),
+            grouped(m["errors"].as_i64().unwrap_or(0)),
+        );
+        for d in s["days"].as_array().cloned().unwrap_or_default() {
+            println!(
+                "    {}  {:>12} req · {:>9} cpu",
+                d["date"].as_str().unwrap_or("?"),
+                grouped(d["requests"].as_i64().unwrap_or(0)),
+                amount("cpu", d["cpu_ms"].as_i64().unwrap_or(0)),
+            );
+        }
+    }
+    let dbs = u["databases"].as_array().cloned().unwrap_or_default();
+    if !dbs.is_empty() {
+        println!("databases");
+    }
+    for d in &dbs {
+        let bound = d["sites"].as_array().map(|s| s.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        println!(
+            "  {:<24} read {:>14} · written {:>12} · {}{}",
+            d["name"].as_str().unwrap_or("?"),
+            grouped(d["rows_read"].as_i64().unwrap_or(0)),
+            grouped(d["rows_written"].as_i64().unwrap_or(0)),
+            amount("storage", d["size_bytes"].as_i64().unwrap_or(0)),
+            if bound.is_empty() { String::new() } else { format!(" · bound to {bound}") },
+        );
+    }
+    match (u["measured_at"].as_i64(), u["measuring_error"].as_str()) {
+        (_, Some(why)) => println!("⚠ not measuring right now: {why}"),
+        (Some(t), None) => println!("measured {}", utc_time(t)),
+        (None, None) => println!("not measured yet"),
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -157,6 +298,9 @@ fn print_worker(w: &Value) {
         w["bytes"].as_i64().unwrap_or(0) / 1024,
         w["deployed_by"].as_str().unwrap_or("?")
     );
+    if w["paused"].is_object() {
+        println!("  {}", describe_pause(&w["paused"]));
+    }
 }
 
 pub async fn run(cmd: SitesCmd, client: &Client) -> Result<()> {
@@ -261,7 +405,47 @@ pub async fn run(cmd: SitesCmd, client: &Client) -> Result<()> {
                     println!("{site} had no Worker");
                 }
             }
+            WorkerCmd::Resume { site, force } => {
+                let out = client.call("resumeSiteWorker", json!({ "site": site, "force": force })).await?;
+                if out["resumed"].as_bool() == Some(true) {
+                    println!("✓ {site}'s backend is running again (was {})", out["was"]["reason"].as_str().unwrap_or("paused"));
+                } else {
+                    println!("{site} wasn't paused");
+                }
+            }
         },
+        SitesCmd::Usage { site, month, user, json } => {
+            let out = client.call("getSiteUsage", json!({ "site": site, "month": month, "user": user })).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print_usage(&out);
+            }
+        }
+        SitesCmd::Allowance { user, requests, cpu_ms, rows_read, rows_written, storage_mib, reset } => {
+            let allowance = if reset {
+                Value::Null
+            } else {
+                // Start from what the person has now, change only what was given.
+                let now = client.call("getSiteUsage", json!({ "user": user })).await?;
+                let mut a = now["allowance"].clone();
+                for (k, v) in [
+                    ("requests", requests),
+                    ("cpu_ms", cpu_ms),
+                    ("rows_read", rows_read),
+                    ("rows_written", rows_written),
+                    ("storage_bytes", storage_mib.map(|m| m.saturating_mul(MIB))),
+                ] {
+                    if let Some(v) = v {
+                        a[k] = json!(v);
+                    }
+                }
+                a
+            };
+            let out = client.call("setSiteAllowance", json!({ "user": user, "allowance": allowance })).await?;
+            println!("✓ {}'s site allowance{}:", out["person"].as_str().unwrap_or(&user), if reset { " is the default again" } else { "" });
+            println!("{}", serde_json::to_string_pretty(&out["allowance"])?);
+        }
         SitesCmd::Call { app, method, path, json: body } => {
             let method = reqwest::Method::from_bytes(method.trim().to_uppercase().as_bytes())
                 .context("method is GET, POST, PATCH, PUT or DELETE")?;

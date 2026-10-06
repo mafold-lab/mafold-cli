@@ -213,14 +213,14 @@ fn script_body(command: &str, timeout_secs: Option<u64>) -> String {
 #[cfg(unix)]
 fn spawn_detached(script: &Path, log: &Path, cwd: &str) -> Option<u32> {
     use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log)
         .ok()?;
     let err = out.try_clone().ok()?;
-    let mut cmd = Command::new("bash");
+    let mut cmd = crate::platform::std_command("bash");
     cmd.arg(script)
         .current_dir(cwd)
         .stdin(Stdio::null())

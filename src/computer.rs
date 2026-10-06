@@ -99,7 +99,7 @@ fn workdir(cwd: Option<&str>) -> Result<PathBuf> {
 async fn exec(cmd: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Value> {
     let dir = workdir(cwd)?;
     let (sh, args) = shell();
-    let mut command = tokio::process::Command::new(&sh);
+    let mut command = crate::platform::console_command(&sh);
     command
         .args(&args)
         .arg(cmd)
@@ -123,50 +123,96 @@ async fn exec(cmd: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Value> {
         .spawn()
         .map_err(|e| format!("could not start `{sh}`: {e}"))?;
     let pid = child.id();
-    let out = child.stdout.take().map(read_capped);
-    let err = child.stderr.take().map(read_capped);
-    let (out, err) = (
-        tokio::spawn(async move {
-            match out {
-                Some(f) => f.await,
-                None => (String::new(), false),
-            }
-        }),
-        tokio::spawn(async move {
-            match err {
-                Some(f) => f.await,
-                None => (String::new(), false),
-            }
-        }),
-    );
+    // Into the job at once, before the shell has started anything — see `Tree`.
+    #[cfg(windows)]
+    let tree = Tree::of(&child);
+    let (mut out, mut err) = (Captured::from(child.stdout.take()), Captured::from(child.stderr.take()));
 
     let deadline = std::time::Duration::from_millis(timeout_ms);
     let (code, timed_out) = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => (status.code(), false),
         Ok(Err(e)) => return Err(format!("{cmd}: {e}")),
         Err(_) => {
-            // Kill the GROUP: the shell may have exited already, leaving the
-            // thing we actually care about running under it.
+            // Kill the whole TREE: the shell may have exited already, leaving
+            // the thing we actually care about running under it.
             if let Some(pid) = pid {
                 kill_group(pid as i32);
             }
-            let _ = child.wait().await;
+            #[cfg(windows)]
+            if let Some(tree) = &tree {
+                tree.kill();
+            }
+            // A shell that traps the signal gets a moment to clean up; one
+            // that ignores it is killed outright — this wait has to end.
+            if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
             (None, true)
         }
     };
-    // The readers finish when the pipes close, which the kill above guarantees.
-    let (stdout, out_trunc) = out.await.unwrap_or_default();
-    let (stderr, err_trunc) = err.await.unwrap_or_default();
+    // The readers end when the pipes close — normally the instant the command
+    // exits. Not when it left something running that inherited them (`cmd &`,
+    // PowerShell's `Start-Process`): that holds them open for as long as IT
+    // runs, and waiting on it held this call open with it — on a paired
+    // machine, every call queued behind it too. So the drain gets a moment, and
+    // then what has arrived is the answer. The readers keep draining on their
+    // own, so the job left behind never blocks on a full pipe.
+    let (out_done, err_done) = tokio::join!(out.settle(DRAIN_GRACE), err.settle(DRAIN_GRACE));
+    let (stdout, out_trunc) = out.take();
+    let (stderr, err_trunc) = err.take();
 
     Ok(json!({
         "exit_code": code,
         "stdout": stdout,
         "stderr": stderr,
-        "truncated": out_trunc || err_trunc,
+        // A stream something is still writing to is, by definition, cut short.
+        "truncated": out_trunc || err_trunc || !out_done || !err_done,
         "timed_out": timed_out,
         "duration_ms": started.elapsed().as_millis() as u64,
         "cwd": dir.to_string_lossy(),
     }))
+}
+
+/// How long `shell.exec` waits for its output pipes to close once the command
+/// itself has ended. Output already written is drained in milliseconds; this
+/// only ever runs out when a background process is holding a pipe.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// How long a timed-out command's shell has between the polite signal and the
+/// kill. With [`DRAIN_GRACE`] on top of the core's 25s cap this still answers
+/// inside the api's 30s park — which is what the cap was sized against.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One output stream of a running command: what has been read so far, shared
+/// with the task reading it — so an answer can be cut from it while the
+/// reading goes on.
+struct Captured {
+    got: Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Captured {
+    fn from<R: tokio::io::AsyncRead + Unpin + Send + 'static>(stream: Option<R>) -> Self {
+        let got = Arc::new(std::sync::Mutex::new((Vec::new(), false)));
+        let reader = stream.map(|r| tokio::spawn(read_capped(r, got.clone())));
+        Self { got, reader }
+    }
+
+    /// Wait up to `grace` for the stream to close; false = something still
+    /// holds it open.
+    async fn settle(&mut self, grace: std::time::Duration) -> bool {
+        match self.reader.as_mut() {
+            Some(reader) => tokio::time::timeout(grace, reader).await.is_ok(),
+            None => true,
+        }
+    }
+
+    /// What has been read, and whether any of it was dropped at the cap.
+    fn take(&self) -> (String, bool) {
+        let got = self.got.lock().unwrap_or_else(|e| e.into_inner());
+        (String::from_utf8_lossy(&got.0).into_owned(), got.1)
+    }
 }
 
 /// Read a stream, keeping at most [`MAX_OUTPUT`] bytes but DRAINING the rest.
@@ -175,27 +221,76 @@ async fn exec(cmd: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Value> {
 /// pipe full, which blocks the child on its next write — so a chatty command
 /// would hang forever instead of being truncated, and the caller would see a
 /// timeout with no output at all.
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> (String, bool) {
-    let mut kept: Vec<u8> = Vec::new();
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    into: Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
+) {
     let mut buf = [0u8; 8192];
-    let mut truncated = false;
     loop {
         match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let room = MAX_OUTPUT.saturating_sub(kept.len());
-                if room == 0 {
-                    truncated = true;
-                    continue;
-                }
-                let take = room.min(n);
-                kept.extend_from_slice(&buf[..take]);
-                truncated |= take < n;
+                let mut got = into.lock().unwrap_or_else(|e| e.into_inner());
+                let take = MAX_OUTPUT.saturating_sub(got.0.len()).min(n);
+                got.0.extend_from_slice(&buf[..take]);
+                got.1 |= take < n;
             }
         }
     }
-    (String::from_utf8_lossy(&kept).into_owned(), truncated)
 }
+
+/// The process TREE a command started, so a timeout can end all of it.
+///
+/// Unix gets that from `setsid` + `killpg`. Windows has no process group to
+/// signal, and `kill_group` was a no-op there — so the timeout killed nothing,
+/// the wait under it waited for the command to finish on its own, and a
+/// `shell.exec` on Windows ran as long as it liked: the caller gave up at 30s
+/// with "no device answered", and the machine stayed busy with it for minutes.
+/// A job object is Windows' process group: everything the shell starts joins
+/// it, and `TerminateJobObject` ends the lot. No `KILL_ON_JOB_CLOSE` — a
+/// command that FINISHES leaves whatever it started running, as on Unix.
+#[cfg(windows)]
+struct Tree(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Tree {
+    fn of(child: &tokio::process::Child) -> Option<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        let process = child.raw_handle()?;
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            if AssignProcessToJobObject(job, process as _) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+
+    fn kill(&self) {
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Tree {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+// The handle is only ever used to terminate the job, from whichever task owns
+// the exec future.
+#[cfg(windows)]
+unsafe impl Send for Tree {}
 
 #[cfg(unix)]
 fn kill_group(pid: i32) {
@@ -276,7 +371,7 @@ async fn spawn(cmd: &str, cwd: Option<&str>) -> Result<Value> {
         .open(&log)
         .map_err(|e| format!("{}: {e}", log.display()))?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
-    let mut command = tokio::process::Command::new("/bin/sh");
+    let mut command = crate::platform::command("/bin/sh");
     command
         .arg(&script)
         .current_dir(&dir)
@@ -473,6 +568,54 @@ mod tests {
             out["stdout"].as_str().unwrap().contains("before"),
             "partial output must survive the kill: {out}"
         );
+    }
+
+    /// A command that leaves a job running in the background ends when the
+    /// SHELL ends — not when the job does. The job inherits the output pipes,
+    /// and waiting for them to close held the call open for the job's whole
+    /// life (on a paired machine, every call queued behind it too).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_job_cannot_hold_the_answer() {
+        let t0 = std::time::Instant::now();
+        let out = exec("echo started; sleep 30 &", Some("/tmp"), 10_000).await.unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "held for {:?}", t0.elapsed());
+        assert_eq!(out["timed_out"], json!(false));
+        assert_eq!(out["exit_code"], json!(0));
+        assert!(out["stdout"].as_str().unwrap().contains("started"), "{out}");
+    }
+
+    /// Windows' `shell.exec` timeout used to kill nothing (`kill_group` was a
+    /// no-op there), so the call ran until the command finished on its own —
+    /// here, 30 seconds of a grandchild the shell started. It must end at the
+    /// timeout, grandchild and all. (`ping -n` is the sleep every Windows has,
+    /// and it needs no quoting to survive `cmd /C`.)
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_a_timeout_ends_the_whole_tree() {
+        let dir = std::env::temp_dir();
+        let t0 = std::time::Instant::now();
+        let out = exec("echo before & ping -n 30 127.0.0.1 > nul", dir.to_str(), 1_500)
+            .await
+            .unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "ran {:?}", t0.elapsed());
+        assert_eq!(out["timed_out"], json!(true), "{out}");
+        assert!(out["stdout"].as_str().unwrap().contains("before"), "{out}");
+    }
+
+    /// `start /b` is Windows' `&`: the job shares the shell's output handles
+    /// and outlives it. The answer comes when the shell is done.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_a_background_job_cannot_hold_the_answer() {
+        let dir = std::env::temp_dir();
+        let t0 = std::time::Instant::now();
+        let out = exec("start /b ping -n 30 127.0.0.1 & echo started", dir.to_str(), 10_000)
+            .await
+            .unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(8), "held for {:?}", t0.elapsed());
+        assert_eq!(out["timed_out"], json!(false), "{out}");
+        assert!(out["stdout"].as_str().unwrap().contains("started"), "{out}");
     }
 
     /// The cap exists so a relayed answer stays a message rather than a dump —

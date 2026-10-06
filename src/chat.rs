@@ -98,6 +98,8 @@ pub struct ReadArgs {
     pub chat: Option<String>,
     pub limit: usize,
     pub channel: Option<String>,
+    /// The main timeline (`#all`) even inside a channel turn.
+    pub main: bool,
     pub json: bool,
     pub media: bool,
     /// Only the unread (the chat's badge, capped by `limit`), then mark read.
@@ -146,9 +148,13 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
         )?,
     };
     let chat = resolve_room(client, &raw).await?;
+    // Inside a channel turn, this room means THIS channel unless told
+    // otherwise — the same default `send` has, so an agent reads where it is
+    // about to write. `--main` asks for `#all`.
+    let from_turn = if a.channel.is_none() && !a.main { turn_channel(&chat.id) } else { None };
     let channel = match &a.channel {
         Some(c) => Some(resolve_channel(client, &chat.id, c).await?),
-        None => None,
+        None => from_turn.clone(),
     };
 
     // `--unread`: only as many as the badge says, and none at all is an answer.
@@ -192,6 +198,11 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
     // Bytes first, so the transcript can print real paths beside the rows they
     // belong to rather than a trailing list the reader has to match up.
     let files = if a.media { fetch_media(client, &page).await } else { Default::default() };
+    if let Some(ch) = &from_turn {
+        // Say which timeline this is: the reader didn't name it.
+        let name = channel_name(client, &chat.id, ch).await;
+        println!("# #{name} —— 本回合所在的频道(读 #all 加 --main)");
+    }
     print_transcript_ex(&chat, lender.as_deref(), &page, &files, a.ids);
     // Reading the unread is what opening the chat does: move MY marker to the
     // newest message shown (never past it — anything that arrived since stays
@@ -442,11 +453,19 @@ fn print_transcript_ex(
         return;
     }
     let mut unfetched = 0usize;
+    let now = crate::inbox::now_ms();
     for m in &items {
         let who = m["sender"]["username"].as_str().unwrap_or("?");
         let ts = m["created_at"].as_str().unwrap_or("");
         let when = ts.get(5..16).unwrap_or(ts).replace('T', " ");
-        let body = readable_body(m["content"].as_str().unwrap_or(""));
+        // A reply still being written reads as what it is — someone on it
+        // since …, gone quiet, or waiting on a card — not as a half-finished
+        // answer with a stray "[卡片:mafold/generating]" in it.
+        let body = if crate::inbox::in_progress(m) {
+            crate::inbox::working_status(m, now)
+        } else {
+            readable_body(m["content"].as_str().unwrap_or(""))
+        };
         let id = match (ids, m["id"].as_str()) {
             (true, Some(id)) => format!("#{id} "),
             _ => String::new(),
@@ -933,6 +952,41 @@ fn pending_for(grants: &Value, conv: &str) -> Option<Value> {
         .cloned()
 }
 
+/// The forum channel this turn was asked in, when `chat_id` IS the turn's own
+/// conversation — where `send` and `read` go when no `--channel`/`--main` is
+/// given. The daemon exports both halves (`harness::turn_env`). None outside a
+/// turn, on `#all`, and for any other chat: a DM or another room is never
+/// steered into a channel of this one.
+pub fn turn_channel(chat_id: &str) -> Option<String> {
+    turn_channel_from(
+        chat_id,
+        std::env::var("MAFOLD_CONV").ok().as_deref(),
+        std::env::var("MAFOLD_FORUM_CHANNEL").ok().as_deref(),
+    )
+}
+
+fn turn_channel_from(chat_id: &str, conv: Option<&str>, channel: Option<&str>) -> Option<String> {
+    let conv = conv.map(str::trim).filter(|c| !c.is_empty())?;
+    let channel = channel.map(str::trim).filter(|c| !c.is_empty())?;
+    conv.eq_ignore_ascii_case(chat_id.trim()).then(|| channel.to_string())
+}
+
+/// A channel's name for a receipt or a heading; the id when it can't be found.
+pub async fn channel_name(client: &Client, chat: &str, channel_id: &str) -> String {
+    client
+        .list_channels(chat)
+        .await
+        .ok()
+        .and_then(|v| {
+            let list = v.get("items").cloned().unwrap_or(v);
+            list.as_array()?
+                .iter()
+                .find(|c| c["id"].as_str() == Some(channel_id))
+                .and_then(|c| c["name"].as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| channel_id.to_string())
+}
+
 async fn resolve_channel(client: &Client, chat: &str, name: &str) -> Result<String> {
     let n = name.trim_start_matches('#');
     if is_uuid(n) {
@@ -951,6 +1005,20 @@ async fn resolve_channel(client: &Client, chat: &str, name: &str) -> Result<Stri
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `send`/`read` default to the turn's channel — for the turn's OWN
+    /// conversation only, and only when there is one.
+    #[test]
+    fn the_turn_channel_is_the_default_only_for_this_turns_own_chat() {
+        let conv = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
+        let ch = "6037c16d-af20-4df5-82c5-175acd50c7c1";
+        assert_eq!(turn_channel_from(conv, Some(conv), Some(ch)).as_deref(), Some(ch));
+        assert_eq!(turn_channel_from(&conv.to_uppercase(), Some(conv), Some(ch)).as_deref(), Some(ch), "uuid case");
+        assert_eq!(turn_channel_from("df093413-8311-4ed4-a5e9-f243158d3a6b", Some(conv), Some(ch)), None, "another chat");
+        assert_eq!(turn_channel_from(conv, Some(conv), Some("")), None, "#all turn");
+        assert_eq!(turn_channel_from(conv, Some(conv), None), None, "an older daemon that exports no channel");
+        assert_eq!(turn_channel_from(conv, None, Some(ch)), None, "not in a turn");
+    }
 
     fn conv(kind: &str, title: Option<&str>, people: &[(&str, &str)]) -> Value {
         json!({

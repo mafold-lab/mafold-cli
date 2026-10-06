@@ -8,8 +8,8 @@
 //! gets a tappable mention label.
 //!
 //! Every scanner that asks "does this text @-mention X" — the api's unread badge
-//! (`mentions_user`), the api's bot trigger (`extract_mentions`), the daemon's
-//! reply gate (`mentions_me`) — has to ask it of THIS text, or it answers about
+//! (`mentions_user`), the bot trigger on both sides (`crate::mention`, which
+//! holds the grammar) — has to ask it of THIS text, or it answers about
 //! text the reader never sees as a mention. Measured in the Mafold DEV forum on
 //! 2026-09-06: of 49 `@linsky` hits that lit a channel's `@` badge, 41 sat in a
 //! card body (an agent's HTML mock-up showing a profile row "@linsky", tool
@@ -40,11 +40,33 @@ use std::borrow::Cow;
 /// there is nothing to cut — the common case, a human line — so the unread walk
 /// that runs this over every message of every conversation allocates nothing.
 pub fn visible_prose(text: &str) -> Cow<'_, str> {
+    project(text, '\n')
+}
+
+/// [`visible_prose`] with its LINES kept the reader's: a card or a code block
+/// is a block in the bubble, so it still becomes a newline, but an inline code
+/// span sits inside its line, so it becomes [`INLINE_CUT`] instead. For asking
+/// what OPENS a line (`crate::mention`): in `改的是 `fire_bots` @a 那条路`, `@a`
+/// is mid-sentence, and a newline in place of the span would make it open one.
+pub fn visible_lines(text: &str) -> Cow<'_, str> {
+    project(text, INLINE_CUT)
+}
+
+/// What stands in for an inline code span in [`visible_lines`]: not a handle
+/// byte, so a mention still ends (or may begin) at it, and not whitespace, so
+/// the text after it does not open a line.
+pub const INLINE_CUT: char = '\u{FFFC}';
+
+/// The cut itself. A card or a fenced block — a block in the bubble — becomes
+/// a newline; an inline code span becomes `inline`.
+fn project(text: &str, inline: char) -> Cow<'_, str> {
     if !text.contains("{%") && !text.contains('`') && !text.contains("~~~") {
         return Cow::Borrowed(text);
     }
-    let mut ranges = code_ranges(text);
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut spans = code_spans(text);
+    let mut ranges = plain(&spans);
+    // `(start, end, block)`: a card or a fence is a block, a backtick span not.
+    let mut cuts: Vec<(usize, usize, bool)> = Vec::new();
     let mut settled = 0usize; // prose before this offset already had its code cut
     let mut i = 0usize;
     while let Some(rel) = text[i..].find("{%") {
@@ -65,34 +87,35 @@ pub fn visible_prose(text: &str) -> Cow<'_, str> {
                 .or_else(|| orphan_close(text, tag.end, &ranges, tag.name).map(|(_, end)| end))
                 .unwrap_or(text.len())
         };
-        push_code_cuts(&mut cuts, &ranges, settled, start);
-        cuts.push((start, end));
+        push_code_cuts(&mut cuts, &spans, settled, start);
+        cuts.push((start, end, true));
         // A fence inside this card must not put the rest of the message "in
         // code" — recompute for the suffix (only needed if the span could have
         // opened one at all).
         if text[start..end].contains(['`', '~']) {
-            ranges = if end < text.len() {
-                code_ranges(&text[end..]).into_iter().map(|(a, b)| (a + end, b + end)).collect()
+            spans = if end < text.len() {
+                code_spans(&text[end..]).into_iter().map(|(a, b, f)| (a + end, b + end, f)).collect()
             } else {
                 Vec::new()
             };
+            ranges = plain(&spans);
         }
         settled = end;
         i = end;
     }
-    push_code_cuts(&mut cuts, &ranges, settled, text.len());
+    push_code_cuts(&mut cuts, &spans, settled, text.len());
     if cuts.is_empty() {
         return Cow::Borrowed(text);
     }
     cuts.sort_unstable();
     let mut out = String::with_capacity(text.len());
     let mut pos = 0usize;
-    for (a, b) in cuts {
+    for (a, b, block) in cuts {
         if a < pos {
             continue; // can't happen (cuts never overlap), belt and braces
         }
         out.push_str(&text[pos..a]);
-        out.push('\n');
+        out.push(if block { '\n' } else { inline });
         pos = b;
     }
     out.push_str(&text[pos..]);
@@ -145,13 +168,19 @@ pub fn map_card_text(
     out
 }
 
-/// The code ranges that fall inside the prose run `from..to`, clipped to it.
-fn push_code_cuts(cuts: &mut Vec<(usize, usize)>, ranges: &[(usize, usize)], from: usize, to: usize) {
-    for &(a, b) in ranges {
+/// The code spans that fall inside the prose run `from..to`, clipped to it,
+/// each keeping whether it is a block (a fence).
+fn push_code_cuts(cuts: &mut Vec<(usize, usize, bool)>, spans: &[(usize, usize, bool)], from: usize, to: usize) {
+    for &(a, b, fence) in spans {
         if b > from && a < to {
-            cuts.push((a.max(from), b.min(to)));
+            cuts.push((a.max(from), b.min(to), fence));
         }
     }
+}
+
+/// [`code_spans`] without the tag — what `in_code` and the tag search take.
+fn plain(spans: &[(usize, usize, bool)]) -> Vec<(usize, usize)> {
+    spans.iter().map(|&(a, b, _)| (a, b)).collect()
 }
 
 pub(crate) struct Tag<'a> {
@@ -285,6 +314,14 @@ fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)], name: &str) 
 /// backtick spans. The client splitter's rule (`codeRanges` in `cards/split.ts`),
 /// so every Rust scanner agrees with the renderer on which `{% … %}` are live.
 pub fn code_ranges(s: &str) -> Vec<(usize, usize)> {
+    plain(&code_spans(s))
+}
+
+/// [`code_ranges`], each tagged `true` for a fenced block and `false` for an
+/// inline backtick span — inline even when it runs over a line break (as
+/// CommonMark lets it): in the bubble it sits inside its paragraph, so it must
+/// not end a line in [`visible_lines`].
+fn code_spans(s: &str) -> Vec<(usize, usize, bool)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     // Fenced blocks: a line whose start (≤3 blanks in) is ``` or ~~~ opens; the
     // next fence line of the same char and at least as long closes it.
@@ -336,7 +373,8 @@ pub fn code_ranges(s: &str) -> Vec<(usize, usize)> {
             _ => {}
         }
     }
-    ranges
+    let fences = fenced.len();
+    ranges.into_iter().enumerate().map(|(k, (a, b))| (a, b, k < fences)).collect()
 }
 
 /// `(fence byte, run length)` when the line opens or closes a fence.
@@ -417,6 +455,27 @@ mod tests {
         assert_eq!(prose("`a `` @ops` x"), "\n x");
         // An unclosed fence is code to the end.
         assert_eq!(prose("```\n@ops"), "\n");
+    }
+
+    #[test]
+    fn visible_lines_keeps_inline_code_inside_its_line() {
+        let lines = |s: &str| visible_lines(s).into_owned();
+        // An inline span stays in its line; blocks still break it.
+        assert_eq!(lines("改的是 `fire_bots` @a 那条路"), "改的是 \u{FFFC} @a 那条路");
+        assert_eq!(lines("`x` @a"), "\u{FFFC} @a");
+        assert_eq!(lines("看\n```\n@a\n```\n@b 你来"), "看\n\n\n@b 你来");
+        assert_eq!(lines("see {% mafold/kline symbol=\"BTC\" /%} @a"), "see \n @a");
+        // A backtick span may run over a line break (CommonMark) and is still
+        // inline: it must not end up opening the line after it.
+        assert_eq!(lines("用 ` 分隔。\n下一行 ` @a 也走"), "用 \u{FFFC} @a 也走");
+        assert_eq!(prose("用 ` 分隔。\n下一行 ` @a 也走"), "用 \n @a 也走", "visible_prose unchanged");
+        // An indented fence and a `~~~` fence are blocks.
+        assert_eq!(lines("x\n   ```\n@a\n   ```\n@b"), "x\n\n\n@b");
+        assert_eq!(lines("~~~\n@a\n~~~\n@b"), "\n\n@b");
+        // Same cuts as visible_prose, only the inline stand-in differs.
+        let s = "`@ops` and\n```\n@ops\n```\nbut {% x /%}@ops";
+        assert_eq!(lines(s).replace(INLINE_CUT, "\n"), prose(s));
+        assert!(matches!(visible_lines("plain @a"), Cow::Borrowed(_)));
     }
 
     #[test]
