@@ -21,7 +21,6 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::io::Read;
-#[cfg(unix)]
 use std::path::Path;
 
 pub fn run() -> Result<()> {
@@ -42,6 +41,14 @@ fn rewrite(input: &str) -> Option<String> {
     if ti["run_in_background"].as_bool() != Some(true) {
         return None;
     }
+    // Off = the call goes through untouched, exactly as before detaching
+    // existed — never a half-on state where the task survives but the agent
+    // was told nothing does. The hook is claude's child and holds no flags, so
+    // on Windows it asks the daemon that told the agent (`background_windows`).
+    #[cfg(windows)]
+    if !crate::background_windows::daemon_says_on() {
+        return None;
+    }
     detach(&v, ti)
 }
 
@@ -50,19 +57,19 @@ fn rewrite(input: &str) -> Option<String> {
 /// `agent.rs` states it to the model in the system prompt, and only emits the
 /// `{% mafold/bgtasks %}` card ("结果会出现在下一条回复里") for tasks this returned true
 /// for. When it is false the agent must not claim a follow-up is coming.
-pub const fn bg_detach_supported() -> bool {
-    cfg!(unix)
+///
+/// Windows: only where the `windowsBackground` flag is on for this bot and its
+/// broker is up — read live in the daemon, so the server switches it per
+/// person (`background_windows::enabled`).
+pub fn bg_detach_supported() -> bool {
+    #[cfg(unix)]
+    return true;
+    #[cfg(windows)]
+    return crate::background_windows::enabled();
+    #[cfg(not(any(unix, windows)))]
+    return false;
 }
 
-// No detach story on Windows yet — background tasks keep claude's own
-// (turn-scoped) semantics there, and `bg_detach_supported()` tells the agent to
-// stop promising otherwise.
-#[cfg(not(unix))]
-fn detach(_v: &Value, _ti: &Value) -> Option<String> {
-    None
-}
-
-#[cfg(unix)]
 fn detach(v: &Value, ti: &Value) -> Option<String> {
     let command = ti["command"].as_str()?;
     let home = std::env::var("HOME").ok()?;
@@ -105,6 +112,7 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
     // extension and collide every task of the conversation onto one filename.
     let script = dir.join(format!("{tag}.{ts}.sh"));
     let log = dir.join(format!("{tag}.{ts}.log"));
+    #[cfg(unix)]
     let pidf = dir.join(format!("{tag}.{ts}.pid"));
     let meta = dir.join(format!("{tag}.{ts}.meta"));
     // The Bash tool's own `timeout` (ms), which detaching used to throw away —
@@ -137,7 +145,19 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
         .to_string(),
     )
     .ok()?;
+    #[cfg(unix)]
     let pid = spawn_detached(&script, &log, &cwd)?;
+    #[cfg(windows)]
+    let pid = match crate::background_windows::request(crate::background_windows::Task {
+        script: script.clone(), log: log.clone(), cwd: cwd.into(), bash: true, timeout_secs,
+    }) {
+        Ok(pid) => pid,
+        Err(e) => return Some(serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": format!("Mafold could not confirm background startup: {e}. Do not retry or start an unmanaged copy; inspect {} first.", log.display())
+        }}).to_string()),
+    };
+    #[cfg(unix)]
     std::fs::write(&pidf, pid.to_string()).ok()?;
 
     let cap = match timeout_secs {
@@ -145,7 +165,7 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
         None => String::new(),
     };
     let msg = format!(
-        "[mafold] Background task detached (pid {pid}) — it runs in its own session and \
+        "[mafold] Background task detached (pid {pid}) — it runs independently and \
          SURVIVES this turn and daemon restarts.{cap} Its output streams to {} — do NOT wait \
          for it or poll it this turn: THIS task finishes on its own schedule and the daemon \
          opens a NEW turn for you to read that log and report the results. (If the user asks \
@@ -207,6 +227,13 @@ fn script_body(command: &str, timeout_secs: Option<u64>) -> String {
     )
 }
 
+// Timeout and exit accounting live in the Windows worker, outside the shell:
+// `exit`, syntax errors and commands that leave descendants all get a receipt.
+#[cfg(windows)]
+fn script_body(command: &str, _timeout_secs: Option<u64>) -> String {
+    format!("{command}\n")
+}
+
 /// Spawn `bash <script>` in a NEW SESSION with stdout/stderr appended to `log`.
 /// The child leaves claude's process group entirely, so claude's exit-time
 /// killpg can't reach it; when this hook exits, init adopts it.
@@ -237,14 +264,12 @@ fn spawn_detached(script: &Path, log: &Path, cwd: &str) -> Option<u32> {
 }
 
 /// POSIX single-quote `s` for safe embedding in a shell command.
-#[cfg(unix)]
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Best-effort GC: registry artifacts older than 7 days (logs/scripts of
 /// long-reported tasks) — keeps ~/.mafold/bgtasks from growing forever.
-#[cfg(unix)]
 fn sweep_old(dir: &Path) {
     const WEEK: u64 = 7 * 24 * 3600;
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -301,5 +326,30 @@ mod tests {
         let ti = serde_json::json!({ "timeout": 400 });
         let secs = ti["timeout"].as_u64().map(|ms| (ms / 1000).max(1));
         assert_eq!(secs, Some(1));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_switch_tests {
+    /// Flag off (every bot today), a background Bash goes through untouched —
+    /// nothing detached, nothing written to the registry, nothing promised —
+    /// even with the daemon's broker up and answering. The control: the same
+    /// broker says on once the server turns the flag on.
+    #[test]
+    fn win_flag_off_leaves_background_bash_alone() {
+        use crate::background_windows::{daemon_says_on, enabled, start_broker, FLAG};
+        start_broker().unwrap();
+        crate::flags::ingest(&serde_json::json!({ "values": { FLAG: false }, "version": 0 }));
+        assert!(!enabled() && !super::bg_detach_supported(), "the prompt says nothing survives");
+        assert!(!daemon_says_on(), "and so does the broker, to the hook");
+        let call = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "echo hi", "run_in_background": true },
+        });
+        assert_eq!(super::rewrite(&call.to_string()), None);
+
+        crate::flags::ingest(&serde_json::json!({ "values": { FLAG: true }, "version": 0 }));
+        assert!(super::bg_detach_supported() && daemon_says_on(), "control: on is on, both ways");
+        crate::flags::ingest(&serde_json::json!({ "values": { FLAG: false }, "version": 0 }));
     }
 }

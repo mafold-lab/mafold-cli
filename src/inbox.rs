@@ -509,13 +509,20 @@ fn is_bot(m: &Value) -> bool {
     m["sender"]["kind"].as_str().is_some_and(|k| k.eq_ignore_ascii_case("bot"))
 }
 
-/// A reply still streaming: its `generating` tag is still on (the last push
-/// removes it), or it is an agent's draft that was never finalized. A person's
-/// message is always finalized on send, so the second test only ever holds a
-/// bot's reply back — the 133 KB one that woke this loop every 40 seconds while
-/// it was still being written, before the tag-only test caught up.
+/// A reply still streaming: it still ends on its live `generating` card (the
+/// last push removes it), or it is an agent's draft that was never finalized. A
+/// person's message is always finalized on send, so the second test only ever
+/// holds a bot's reply back — the 133 KB one that woke this loop every 40
+/// seconds while it was still being written, before the tag-only test caught up.
+///
+/// Only the card on the END counts ([`trailing_generating`]). A finished reply
+/// that quoted the tag mid-sentence once passed for a draft: the badge counted
+/// it, this loop skipped it and handed over the line before it on every look
+/// for twelve days, and the marker never got past it.
+///
+/// [`trailing_generating`]: mafold_transcript::render::trailing_generating
 pub(crate) fn in_progress(m: &Value) -> bool {
-    m["content"].as_str().is_some_and(|c| c.contains("{% mafold/generating"))
+    m["content"].as_str().is_some_and(|c| mafold_transcript::render::trailing_generating(c).is_some())
         || (is_bot(m) && m.get("finalized_at").is_some_and(Value::is_null))
 }
 
@@ -542,8 +549,9 @@ fn tag_attr<'a>(inner: &'a str, name: &str) -> Option<&'a str> {
 
 fn progress_of(content: &str) -> Option<Progress> {
     const OPEN: &str = "{% mafold/generating";
-    let i = content.find(OPEN)?;
-    let inner = &content[i + OPEN.len()..];
+    // The live card on the end — an earlier mention of the tag is prose.
+    let card = mafold_transcript::render::trailing_generating(content)?;
+    let inner = card.strip_prefix(OPEN)?;
     let inner = &inner[..inner.find("%}")?];
     let inner = format!(" {}", inner.trim());
     let num = |n: &str| tag_attr(&inner, n).and_then(|v| v.parse::<u64>().ok());
@@ -1233,6 +1241,9 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
          - 你这一轮写下的任何文字都**不会被任何人看到**——只进日志。想让别人看到,只有调工具:\n\
          \u{20} · 发消息:`mafold send <chat_id> [--channel <channel_id>] [--reply <消息id>] <正文>`。一次一条;要连发就调多次。像人一样说话:短、口语、一条一个意思;不要 markdown 标题、表格、卡片。\n\
          \u{20} · 表情:`mafold react <消息id> <emoji>`——很多时候回个表情就够了。\n\
+         \u{20} · 点卡片上的按钮(跟人手点一样):`mafold tap <消息id> <action> [内容]` —— 回答问题卡 `ask:answer <答案>`、\
+         权限卡 `perm:answer Allow`;叫停一个正在写的回复:`mafold tap <「⏳」那行的 #id> stop`,它会告诉你停没停下。\
+         只停你自己叫起来、却重复了或跑偏了的回复,或者本人让你停的;别人的(尤其 linsky 和他的 bot)不碰。\n\
          \u{20} · 要更多上下文:`mafold read <chat_id> [--channel <channel_id>] --ids --limit 30`;所有会话:`mafold chats`。\n\
          \u{20} · 分派工作 = 一件事一个频道:群是论坛(有频道)时,先 `mafold channels list <chat_id>` 找对应这件事的频道;没有就 `mafold channels create <chat_id> <名字>` 开一个(名字就写这件事,短),再用 `--channel` 在里面说、@ 人。别把不相干的事堆进私聊或主时间线。开不了(只有管理员能开)就用最接近的现有频道,并说明一句。事情结了,`mafold channels close <chat_id> <频道>` 关掉你自己开的那个。\n\
          - 闲聊、别人之间的事,看完不说话完全正常。但**有人在等你**的时候必须接:问了你(或「找本人的」)的问题、\
@@ -2823,6 +2834,67 @@ mod tests {
         assert!(s.contains("已写到:「…") && s.chars().count() < 200, "only the tail of a long draft: {s}");
     }
 
+    /// What @opsdu:claude-code said in #还没有消息？ on 09-25 — finished, and
+    /// quoting the generating tag mid-sentence, in backticks.
+    const QUOTES_THE_CARD: &str = "这个洞 main 上确实还在。现在 agent 一开始思考,daemon 和托管 bot 都会马上把 `{% mafold/generating %}` 卡推进草稿,草稿内容就不是空的了。\n\n你是想自己改,还是我照这个方案改好、CI 绿了合进去?";
+
+    /// Only the live card on the END says "still being written"; prose that
+    /// talks about the card is just prose.
+    #[test]
+    fn a_finished_reply_that_quotes_the_card_is_not_a_draft() {
+        let mut said = msg("18a2", "opsdu:claude-code", "bot", "2026-09-25T14:08:35.755720855Z", QUOTES_THE_CARD);
+        said["finalized_at"] = json!("2026-09-25T14:08:35.755717995Z");
+        assert!(!in_progress(&said), "finished, whatever its prose talks about");
+
+        // A quote early and the live card on the end: still being written, and
+        // the status is read off the live card — not the quote.
+        let tag = mafold_transcript::render::generating_tag(T0 - 60_000, 3, T0 - 5_000, 0, 1);
+        let live = msg("l", "opsdu:claude-code", "bot", "2026-09-25T14:08:35Z", &format!("{QUOTES_THE_CARD}{tag}"));
+        assert!(in_progress(&live), "the card arm alone (no finalized_at field) sees the live card");
+        let p = progress_of(live["content"].as_str().unwrap()).expect("the live card is read");
+        assert_eq!((p.started_ms, p.shells), (Some(T0 - 60_000), 1));
+    }
+
+    /// The page the clone's loop got for DEV #还没有消息？ (2026-10-07), ids
+    /// cut short. The badge said 1: the finished reply after the marker. The
+    /// loop took that reply for a draft and handed over 86890897 — the line
+    /// BEFORE it — on every look, marking read where the marker already was.
+    #[test]
+    fn the_reply_that_quotes_the_card_is_the_one_handed_over() {
+        let mut fixed = msg("86890897", "linsky:opus48", "bot", "2026-09-18T19:08:02.728523592Z", "修好了 —— 但要更正我上一条的一处说法。");
+        fixed["finalized_at"] = json!("2026-09-18T19:19:13.880496978Z");
+        let mut said = msg("18a2a2be", "opsdu:claude-code", "bot", "2026-09-25T14:08:35.755720855Z", QUOTES_THE_CARD);
+        said["finalized_at"] = json!("2026-09-25T14:08:35.755717995Z");
+        let items = vec![
+            msg("703e7a1c", "linsky", "human", "2026-09-18T19:07:56.479653772Z", "继续"),
+            fixed,
+            said,
+            msg("ac4b9a52", "realopsdu", "human", "2026-09-26T11:20:16.903324898Z", "@linsky 你的 #508 claude-code 看了"),
+            msg("7bf2ce96", "realopsdu", "human", "2026-09-27T15:11:34.486084025Z", "@linsky #508 空草稿预览晾一个多礼拜了"),
+        ];
+        let ids = |v: &[Value]| v.iter().map(|m| m["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // Marked here before (the live loop) or never (a fresh state file).
+        for marked_at in [Some("2026-09-18T19:08:02.728523592Z"), None] {
+            let a = arrange(&items, 1, "realopsdu", vec![], marked_at);
+            assert_eq!(ids(&a.new), ["18a2a2be", "ac4b9a52", "7bf2ce96"], "marked_at={marked_at:?}");
+            assert!(a.working.is_empty(), "nothing here is still being written");
+            // …so the marker goes past the reply, and the badge clears.
+            let tl = Timeline {
+                chat_id: "c".into(),
+                channel_id: Some("ch".into()),
+                channel_name: None,
+                label: "x".into(),
+                is_dm: false,
+                unread: 1,
+            };
+            let mut markers = Markers::default();
+            for m in &a.new {
+                markers.add(&tl, m);
+            }
+            assert_eq!(markers.newest(), [("c/ch".to_string(), "2026-09-27T15:11:34.486084025Z".to_string())]);
+        }
+    }
+
     /// The old reader stopped at the first draft: everything after it — a
     /// person's message included — stayed invisible until the draft finished.
     #[test]
@@ -2928,5 +3000,15 @@ mod tests {
         let p = preamble("realopsdu", Some("opsdu"));
         assert!(p.contains("「⏳ 正在回复」") && p.contains("别重复 @"));
         assert!(p.contains("「✋ 没发出去」") && p.contains("--anyway"));
+    }
+
+    /// A tap is how the loop presses what a person would press — and the
+    /// rule for a stop travels with it.
+    #[test]
+    fn preamble_teaches_the_tap_and_when_to_stop() {
+        let p = preamble("realopsdu", Some("opsdu"));
+        assert!(p.contains("mafold tap <消息id> <action>"));
+        assert!(p.contains("ask:answer") && p.contains("perm:answer"));
+        assert!(p.contains("stop") && p.contains("只停你自己叫起来"));
     }
 }

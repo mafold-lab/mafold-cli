@@ -123,18 +123,10 @@ mod imp {
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
-    /// Is `pid` a live process? If we can open a handle to it, it exists; once a
-    /// process exits and its handles close, `OpenProcess` fails (Windows has no
-    /// zombies, so "openable" ≈ "alive" for our own daemons).
+    /// An exited process can remain openable while another process holds its
+    /// handle. Query its exit state so background completion is not suppressed.
     pub fn pid_alive(pid: u32) -> bool {
-        unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if h.is_null() {
-                return false;
-            }
-            CloseHandle(h);
-            true
-        }
+        child_running(pid)
     }
 
     /// Is `pid` — a CHILD of this process — still running?
@@ -310,6 +302,33 @@ pub fn open_browser(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A worker-owned kill-on-close job. Keeping its handle in the worker (rather
+/// than the daemon) makes daemon restarts harmless and worker termination end
+/// the complete task tree. The handle is never inherited by children.
+#[cfg(windows)]
+pub struct BackgroundJob(windows_sys::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+impl Drop for BackgroundJob {
+    fn drop(&mut self) { unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0); } }
+}
+#[cfg(windows)]
+pub fn background_job() -> std::io::Result<BackgroundJob> {
+    use windows_sys::Win32::System::{JobObjects::*, Threading::GetCurrentProcess};
+    unsafe {
+        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if handle.is_null() { return Err(std::io::Error::last_os_error()); }
+        let job = BackgroundJob(handle);
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(handle, JobObjectExtendedLimitInformation,
+            &info as *const _ as _, std::mem::size_of_val(&info) as u32) == 0
+            || AssignProcessToJobObject(handle, GetCurrentProcess()) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+}
+
 // ────────────────────── cross-process file lock ──────────────────────
 // `update.rs` holds an exclusive lock on `~/.mafold/update.lock` while it swaps
 // the binary. Unix does this inline with `flock`; Windows needs `LockFileEx`.
@@ -410,14 +429,40 @@ pub fn unhidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     Command::new(program)
 }
 
-/// Does `pid` have a console window? `None` when it can't be asked: gone, no
-/// console at all, or WE have one (a process can only be attached to one).
-/// So it must run console-less, like a daemon: it borrows `pid`'s console to
-/// ask, then lets go. Retries for a few seconds, because a child that was just
-/// started connects to its console a moment after `spawn` returns.
+/// Does `pid` have a console window? `None` when it can't be asked: gone, or
+/// no console at all. It borrows `pid`'s console to ask, then lets go — and a
+/// process can only be attached to one console, so a caller that has its own
+/// (a test run from a terminal or CI step) asks through a console-less copy of
+/// this test binary, started the way a daemon is. Retries for a few seconds,
+/// because a child that was just started connects to its console a moment
+/// after `spawn` returns.
 #[cfg(all(test, windows))]
 pub fn console_window_of(pid: u32) -> Option<bool> {
     use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, GetConsoleWindow};
+    if has_console() {
+        let mut cmd = std_command(std::env::current_exe().ok()?);
+        cmd.args(["--exact", "platform::tests::console_window_probe"])
+            .args(["--include-ignored", "--test-threads=1", "--nocapture"])
+            .env("MAFOLD_CONSOLE_PROBE_PID", pid.to_string())
+            .stdin(std::process::Stdio::null());
+        configure_detached(&mut cmd);
+        let out = cmd.output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // libtest prints `test … ... ` and then the test's own output on the
+        // same line, so the answer is found anywhere, not at a line's start.
+        let answer = text.split("CONSOLE_WINDOW=").nth(1).and_then(|r| r.split_whitespace().next());
+        return match answer {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => {
+                eprintln!(
+                    "console_window_of({pid}): the console-less probe answered nothing usable:\n{text}\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                None
+            }
+        };
+    }
     let began = std::time::Instant::now();
     loop {
         // SAFETY: plain Win32 calls; FreeConsole lets go of what AttachConsole took.
@@ -440,6 +485,24 @@ pub fn console_window_of(pid: u32) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `console_window_of`'s console-less half: asks about
+    /// `MAFOLD_CONSOLE_PROBE_PID` and prints the answer for the caller.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run by console_window_of from a process that has a console"]
+    fn console_window_probe() {
+        let Some(pid) = std::env::var("MAFOLD_CONSOLE_PROBE_PID").ok().and_then(|p| p.parse().ok()) else {
+            return;
+        };
+        assert!(!has_console(), "started detached, so no console of its own");
+        let answer = match console_window_of(pid) {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "none",
+        };
+        println!("\nCONSOLE_WINDOW={answer}");
+    }
 
     /// Every program mafold starts goes through [`command`] / [`std_command`]
     /// or [`console_command`] / [`console_std_command`], and only this module
@@ -490,8 +553,8 @@ mod tests {
     /// the hard case is the one in between: exited, but not yet let go of. On
     /// unix that is a zombie, which still answers `kill(pid, 0)`; on Windows it
     /// is a process object our `Child` still holds a handle to, which still
-    /// answers `OpenProcess`. `pid_alive` says yes to both; this must say no —
-    /// and must not reap, or the harness that owns the child loses its exit
+    /// answers `OpenProcess`. Both Windows liveness probes must say no, without
+    /// reaping, or the harness that owns the child loses its exit
     /// status.
     #[test]
     fn child_running_sees_through_a_dead_unreleased_child() {
@@ -505,7 +568,17 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(!child_running(pid), "dead, not yet reaped: not running");
-        assert!(pid_alive(pid), "positive control: the naive probe still calls it alive");
+        #[cfg(unix)]
+        assert!(pid_alive(pid), "positive control: the Unix pid probe sees an unreaped zombie");
+        #[cfg(windows)]
+        {
+            // The old probe confused an openable object with a running task.
+            use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::OpenProcess};
+            let handle = unsafe { OpenProcess(0x1000, 0, pid) };
+            assert!(!handle.is_null(), "positive control: exited process is still openable");
+            unsafe { CloseHandle(handle); }
+            assert!(!pid_alive(pid), "background completion must see through a held handle too");
+        }
 
         let status = child.wait().expect("the owner still reaps it");
         #[cfg(unix)]

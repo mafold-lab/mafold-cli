@@ -302,8 +302,11 @@ fn kill_group(pid: i32) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_group(_pid: i32) {}
+#[cfg(windows)]
+fn kill_group(pid: i32) {
+    // The worker owns a kill-on-close job covering all descendants.
+    crate::platform::terminate(pid as u32);
+}
 
 // ── shell.spawn / status / kill ───────────────────────────────────────────
 
@@ -413,9 +416,25 @@ async fn spawn(cmd: &str, cwd: Option<&str>) -> Result<Value> {
     }))
 }
 
-#[cfg(not(unix))]
-async fn spawn(_cmd: &str, _cwd: Option<&str>) -> Result<Value> {
-    Err("shell.spawn needs a POSIX machine — this one can only run shell.exec".into())
+#[cfg(windows)]
+async fn spawn(cmd: &str, cwd: Option<&str>) -> Result<Value> {
+    let dir = workdir(cwd)?;
+    let root = tasks_dir()?;
+    sweep_old(&root);
+    let id = new_task_id();
+    let script = root.join(format!("{id}.cmd"));
+    let log = root.join(format!("{id}.log"));
+    std::fs::write(&script, format!("@echo off\r\n{cmd}\r\n")).map_err(|e| e.to_string())?;
+    let task = crate::background_windows::Task {
+        script, log: log.clone(), cwd: dir.clone(), bash: false, timeout_secs: None,
+    };
+    // Already runs in the computer executor, outside any harness process job.
+    let pid = tokio::task::spawn_blocking(move || crate::background_windows::start(&task, None))
+        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    std::fs::write(root.join(format!("{id}.meta")),
+        json!({"cmd": cmd, "cwd": dir.to_string_lossy(), "started_at": now_ms()}).to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"task_id": id, "pid": pid, "log": log.to_string_lossy(), "cwd": dir.to_string_lossy()}))
 }
 
 fn status(task_id: &str, tail: usize) -> Result<Value> {
@@ -479,9 +498,9 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-#[cfg(not(unix))]
-fn alive(_pid: i32) -> bool {
-    false
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    crate::platform::child_running(pid as u32)
 }
 
 /// Last `n` lines of a log, and whether anything was left out.
@@ -540,6 +559,45 @@ fn sweep_old(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_spawn_status_exit_and_tree_kill() {
+        let dir = std::env::temp_dir().join(format!("mf spawn & spaces {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let task = spawn("echo spawned-output & exit /b 7", dir.to_str()).await.unwrap();
+        let id = task["task_id"].as_str().unwrap();
+        let began = std::time::Instant::now();
+        let done = loop {
+            let value = status(id, 30).unwrap();
+            if value["running"] == false { break value; }
+            assert!(began.elapsed() < std::time::Duration::from_secs(10));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(done["exit_code"], 7, "{done}");
+        assert!(done["output"].as_str().unwrap().contains("spawned-output"));
+
+        let task = spawn("powershell.exe -NoProfile -Command \"$PID; Start-Sleep -Seconds 60\"", dir.to_str()).await.unwrap();
+        let id = task["task_id"].as_str().unwrap();
+        let began = std::time::Instant::now();
+        let child_pid = loop {
+            let value = status(id, 30).unwrap();
+            if let Some(pid) = value["output"].as_str().unwrap().lines().find_map(|l| l.trim().parse::<u32>().ok()) { break pid; }
+            assert!(began.elapsed() < std::time::Duration::from_secs(10), "{value}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(crate::platform::console_window_of(child_pid), Some(false));
+        assert_eq!(kill(id).unwrap()["killed"], true);
+        let began = std::time::Instant::now();
+        while crate::platform::child_running(child_pid) {
+            assert!(began.elapsed() < std::time::Duration::from_secs(5), "grandchild survived shell.kill");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let done = status(id, 30).unwrap();
+        assert_eq!(done["running"], false);
+        assert_eq!(done["killed"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn exec_returns_output_and_an_exit_code() {

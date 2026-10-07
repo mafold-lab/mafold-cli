@@ -114,6 +114,36 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-10",
     },
+    // Owner 10-06, after seeing it live: "样式还行但不能这样直接上,要隐藏".
+    // Off until he turns it on. A phone binary built before this entry doesn't
+    // know the key and resolves it off too; turning it ON for phones therefore
+    // needs the next app@ binary.
+    FlagMeta {
+        key: "premiumRing",
+        default: false,
+        dev_default: false,
+        label: "Premium avatar ring",
+        description: "The blue → pink ring around a Premium member's avatar (heartbeat ripples while \
+                      they are online, still while offline, opened where the online dot sits), on web \
+                      and phone alike. Off = no ring; the crown by the name is unaffected.",
+        owner: "ops",
+        added: "2026-10",
+    },
+    // Read by the daemon (`mafold-cli`), not a UI: a bot evaluates as its own
+    // handle, and an allowlist entry naming a person covers their bots too —
+    // so it is switched on per person, from the server, with nothing to set on
+    // the Windows machine itself.
+    FlagMeta {
+        key: "windowsBackground",
+        default: false,
+        dev_default: false,
+        label: "Windows background tasks",
+        description: "On Windows, an agent's background Bash is started by the daemon with no \
+                      console window, outlives the turn and is reported back in a new turn — \
+                      as on macOS/Linux. Off = background Bash stays turn-scoped, as before.",
+        owner: "ops",
+        added: "2026-10",
+    },
     FlagMeta {
         key: "moments",
         default: false,
@@ -127,6 +157,12 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
 
 fn meta(key: &str) -> Option<&'static FlagMeta> {
     KNOWN_FLAGS.iter().find(|m| m.key == key)
+}
+
+/// A flag's production default — for a client that holds the server's values
+/// itself instead of in a [`Store`] (the daemon). Unknown key → false.
+pub fn prod_default(key: &str) -> bool {
+    meta(key).is_some_and(|m| m.default)
 }
 
 const TBL: &str = "flags";

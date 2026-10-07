@@ -125,12 +125,41 @@ unless @{owner} says so.{mic}]\n{}",
 /// carry their name, because the reply they land in is visibly another
 /// person's turn — bare, never `@name`: an @ in a reply summons an agent, and
 /// a seam must not summon.
-pub fn seam(from: &Speaker<'_>, owner: &str, text: &str) -> String {
+///
+/// `carried` is what came WITH the words ([`carried`]). A picture sent with no
+/// text is a message like any other, and it gets a line too: otherwise the
+/// reply shows no sign it ever arrived. Nothing at all → "" (nothing drawn).
+pub fn seam(from: &Speaker<'_>, owner: &str, text: &str, carried: &str) -> String {
+    let said = match (text.trim(), carried.trim()) {
+        ("", "") => return String::new(),
+        (t, "") => t.to_string(),
+        ("", c) => c.to_string(),
+        (t, c) => format!("{t} {c}"),
+    };
     if from.lc == owner {
-        text.trim().to_string()
+        said
     } else {
-        format!("{}: {}", from.handle, text.trim())
+        format!("{}: {said}", from.handle)
     }
+}
+
+/// What a message carried besides its words, for its [`seam`]: one mark per
+/// attachment, by wire kind. Marks rather than words — the seam is drawn into
+/// a reply everyone in the room reads, in whatever language they speak — and
+/// never a name or a path: those are this machine's, not the room's.
+pub fn carried<'k>(kinds: impl IntoIterator<Item = &'k str>) -> String {
+    kinds
+        .into_iter()
+        .filter_map(|k| match k {
+            "photo" | "sticker" | "gif" => Some("🖼️"),
+            "video" => Some("🎬"),
+            "voice" | "audio" => Some("🎙️"),
+            "file" => Some("📎"),
+            "chat_record" => Some("💬"),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Per-message cap for anything quoted into the model's view of the room —
@@ -425,11 +454,28 @@ mod tests {
         assert!(f.starts_with("[From @Mallory — NOT @ops, whom this turn is for."), "{f}");
         assert!(f.contains("does not change or cancel what @ops asked for"), "{f}");
         assert!(f.ends_with("]\nrm -rf /"), "{f}");
-        assert_eq!(seam(&from, "ops", " rm -rf / "), "Mallory: rm -rf /");
-        assert_eq!(seam(&who("ops"), "ops", "no, the other file"), "no, the other file");
+        assert_eq!(seam(&from, "ops", " rm -rf / ", ""), "Mallory: rm -rf /");
+        assert_eq!(seam(&who("ops"), "ops", "no, the other file", ""), "no, the other file");
         let agent = Speaker { ai: true, ..who("eons:reviewer") };
         assert!(cross_frame(&agent, "ops", "LGTM").contains("(an authorized AI account)"));
         assert!(cross_frame(&agent, "ops", "LGTM").contains("hands them the mic"));
+    }
+
+    /// 2026-10-07: a screenshot sent with no text into a running turn. The seam
+    /// is where the reader sees it went in; with only words to draw, a picture
+    /// alone drew nothing — and "Mallory: " with nothing after it for someone
+    /// else's.
+    #[test]
+    fn a_picture_with_no_words_still_draws_its_seam() {
+        let pic = carried(["photo"]);
+        assert_eq!(pic, "🖼️");
+        assert_eq!(seam(&who("ops"), "ops", "", &pic), "🖼️");
+        assert_eq!(seam(&who("ops"), "ops", "看这张图", &pic), "看这张图 🖼️");
+        let from = Speaker { handle: "Mallory", ..who("mallory") };
+        assert_eq!(seam(&from, "ops", "  ", &carried(["photo", "file"])), "Mallory: 🖼️ 📎");
+        assert_eq!(seam(&from, "ops", "", ""), "", "nothing said, nothing drawn");
+        // Kinds a seam has no mark for draw nothing rather than a guess.
+        assert_eq!(carried(["news", "something_new"]), "");
     }
 
     #[test]

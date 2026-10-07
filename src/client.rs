@@ -670,6 +670,26 @@ impl Client {
         .await
     }
 
+    /// A tap on a card's button — the one pipe every host forwards taps
+    /// through verbatim (`MessageBubble` on the web, the RN bubble): `stop` on
+    /// a reply being written, `ask:answer` on a question, `perm:answer` on a
+    /// permission prompt, … `fields` is whatever that button carries (most
+    /// carry a string: the answer, the verdict). Who may do what is decided on
+    /// the other side, by who tapped.
+    pub async fn send_component_action(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        action: &str,
+        fields: Option<Value>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "message_id": message_id, "action": action });
+        if let Some(f) = fields {
+            body["fields"] = f;
+        }
+        self.post("sendComponentAction", body).await
+    }
+
     /// Publish this bot's slash commands (the chat command panel).
     pub async fn set_commands(&self, commands: Value) -> Result<()> {
         self.post("setBotCommands", json!({ "commands": commands }))

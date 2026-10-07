@@ -30,9 +30,10 @@
 //! `{% x /%}@ops` mentions in the bubble (the `@` opens a fresh text run) and it
 //! mentions here.
 //!
-//! Not the same question as [`crate::render::strip_cards`]: that one feeds a
-//! model the prose of its own last turn, where a code block IS the answer and
-//! stays. This one asks what a person sees as a mention label.
+//! Not the same question as [`crate::render::strip_cards`], though the same
+//! grammar (it walks with these helpers): that one feeds a model the prose of
+//! a turn, where a code block IS the answer and stays. This one asks what a
+//! person sees as a mention label.
 
 use std::borrow::Cow;
 
@@ -240,7 +241,7 @@ pub(crate) fn parse_tag(text: &str, at: usize) -> Option<Tag<'_>> {
 
 /// End offset of the first `{% /NAME %}` at or after `from` — the same fixed-tag
 /// search `splitCards` runs, code or not.
-fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
+pub(crate) fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
     let b = text.as_bytes();
     let mut i = from;
     while let Some(rel) = text[i..].find("{%") {
@@ -265,7 +266,7 @@ fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
 /// `(start, end)` of the first close tag after `from` that nothing inside the
 /// body opened — the close the author meant for the unclosed container but
 /// misspelled. Depth-tracked so a nested container's own close isn't taken.
-fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)], name: &str) -> Option<(usize, usize)> {
+pub(crate) fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)], name: &str) -> Option<(usize, usize)> {
     // Match the client's recovery: an unmatched tag-shaped mention inside a
     // body is not another container, and a same-name re-open can be a typo.
     let mut last_close = std::collections::HashMap::new();

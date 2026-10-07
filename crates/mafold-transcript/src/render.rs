@@ -214,6 +214,19 @@ pub fn strip_trailing_generating(content: &str) -> &str {
     if is_lone_card { content[..i].trim_end() } else { content }
 }
 
+/// The live [`generating_tag`] a snapshot ends with — the reply is still being
+/// written — or None for a reply that says what it says and is done.
+///
+/// One question with [`strip_trailing_generating`], so one rule: the lone card
+/// on the end. Reading "still writing" off any `{% mafold/generating` in the
+/// body turned a finished reply that QUOTED the tag into a draft that never
+/// ends — the inbox loop then skipped it, handed over the line before it on
+/// every look, and the reader's badge never cleared.
+pub fn trailing_generating(content: &str) -> Option<&str> {
+    let said = strip_trailing_generating(content);
+    (said.len() < content.len()).then(|| content[said.len()..].trim())
+}
+
 /// Stamp the user's answer into the pending (last unanswered) `{% mafold/ask %}` card
 /// in `full` by adding `answered="…"` to its opening tag. The message content
 /// itself is the durable record — a reloaded page or another device renders the
@@ -1077,40 +1090,60 @@ pub fn strip_notices(md: &str) -> String {
 /// through verbatim — open tag, body and close tag — and the walk continues
 /// after its open tag, so a content card nesting a transcript card still has
 /// the inner one cut.
+///
+/// What is a card at all is the renderer's grammar ([`crate::prose`], the twin
+/// of `cards/split.ts`): a tag inside a fence or a backtick span is code, shown
+/// as written, so it stays; a container runs to its close, else to the close
+/// its author misspelled, else to the end. Scanning for `{%` alone took a
+/// QUOTED tag (`` `{% mafold/generating %}` ``) for an open container with no
+/// close — and every word after the quote went with it.
 fn strip_cards_where(md: &str, cut: impl Fn(&str) -> bool) -> String {
+    use crate::prose::{code_ranges, find_close, in_code, orphan_close, parse_tag};
+    // `md[from..to]`'s code ranges, as offsets into `md`.
+    let ranges_in = |from: usize, to: usize| -> Vec<(usize, usize)> {
+        code_ranges(&md[from..to]).into_iter().map(|(a, b)| (a + from, b + from)).collect()
+    };
+    let mut ranges = code_ranges(md);
     let mut out = String::with_capacity(md.len());
-    let mut rest = md;
-    while let Some(i) = rest.find("{%") {
-        out.push_str(&rest[..i]);
-        let after = &rest[i..];
-        let Some(close) = after.find("%}") else {
-            // An unterminated tag is not a card — keep it verbatim.
-            out.push_str(after);
-            return out;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while let Some(rel) = md[i..].find("{%") {
+        let start = i + rel;
+        let Some(tag) = parse_tag(md, start) else {
+            i = start + 2;
+            continue;
         };
-        let tag_end = close + 2;
-        let inner = after[2..close].trim();
-        let self_closing = after[..tag_end].ends_with("/%}");
-        let name = inner.trim_start_matches('/').split_whitespace().next().unwrap_or("");
-        let keep = !name.is_empty() && !cut(name);
-        if keep {
-            out.push_str(&after[..tag_end]);
-            rest = &after[tag_end..];
+        i = tag.end;
+        if in_code(start, &ranges) {
             continue;
         }
-        if self_closing || inner.starts_with('/') || name.is_empty() {
-            rest = &after[tag_end..];
+        let end = if tag.is_close || tag.self_close {
+            tag.end
+        } else {
+            find_close(md, tag.end, tag.name)
+                .or_else(|| orphan_close(md, tag.end, &ranges, tag.name).map(|(_, end)| end))
+                .unwrap_or(md.len())
+        };
+        // As the client does once it has taken a card: a backtick or a fence
+        // inside the card's span says nothing about code after it.
+        let recount = md[start..end].contains(['`', '~']);
+        if !cut(tag.name) {
+            // It stays, and the walk goes on inside it — its body counts its
+            // own code, and what follows the card counts afresh.
+            if recount {
+                ranges = ranges_in(tag.end, end);
+                ranges.extend(ranges_in(end, md.len()));
+            }
             continue;
         }
-        // A container: drop through its matching close, or — when the message
-        // was truncated mid-card — through the rest of the text.
-        let closer = format!("{{% /{name} %}}");
-        rest = match after[tag_end..].find(&closer) {
-            Some(j) => &after[tag_end + j + closer.len()..],
-            None => "",
-        };
+        out.push_str(&md[copied..start]);
+        if recount {
+            ranges = ranges_in(end, md.len());
+        }
+        copied = end;
+        i = end;
     }
-    out.push_str(rest);
+    out.push_str(&md[copied..]);
     out
 }
 
@@ -1596,6 +1629,48 @@ mod strip_tests {
         let md = "{% mafold/run summary=\"x\" %}{% mafold/tool name=\"Read\" /%}{% /mafold/run %}tail"; // LINT-IGNORE
         assert_eq!(strip_cards(md), "tail");
     }
+
+    /// What @opsdu:claude-code said in DEV #还没有消息？ on 09-25, byte for
+    /// byte. There is no card in it, only a QUOTE of one in backticks, so what
+    /// goes in comes out. It used to come out cut at that backtick: the quote
+    /// read as an open container with no close, which took the rest of the
+    /// message — the question it ends on — from every model that read it.
+    const QUOTES_A_TAG: &str = "@linsky 你的 PR #508(空草稿不再是频道预览)我帮 ops 过了一遍,合之前先问你一句。\n\n这个洞 main 上确实还在(store.rs 里 list_channels 直接拿第一条可见消息当预览),PR 也能干净合进 main。但它的判定是「有 finalized 或内容非空或有附件」。现在 agent 一开始思考,daemon 和托管 bot 都会马上把 `{% mafold/generating %}` 卡推进草稿,草稿内容就不是空的了。所以按这条判定,生成中的草稿照样会被当成预览;客户端的 spokenText 会把它剥掉,最后还是显示「还没有消息」。PR 里的测试用的是空内容的草稿,所以是绿的。\n\n建议改两处:\n① 判定改成 `finalized || 有附件 || !strip_trailing_generating(content).trim().is_empty()`,用 store.rs:314 现成的函数。最好提成一个共享函数,rpc/methods.rs 的 conversations_list 里也有同样的漏洞,一起用它。\n② 测试里加一步:把草稿内容设成 generating 卡,断言预览仍然是上一条真消息。现在的代码跑这一步应该会红。\n\n你是想自己改,还是我照这个方案改好、CI 绿了合进去?";
+
+    #[test]
+    fn a_quoted_tag_is_prose_and_the_message_comes_out_whole() {
+        assert_eq!(strip_cards(QUOTES_A_TAG), QUOTES_A_TAG);
+        assert_eq!(super::strip_transcript_cards(QUOTES_A_TAG), QUOTES_A_TAG);
+    }
+
+    /// The renderer's grammar (`cards/split.ts`): a tag in a fence or a
+    /// backtick span is code, shown as written — and a real card after the
+    /// code is still a card.
+    #[test]
+    fn code_keeps_its_tags_and_real_cards_still_go() {
+        let code = "看这段:\n```\n{% mafold/run summary=\"x\" %}\n```\n双反引号 ``{% mafold/tool name=\"a\" /%}`` 也是代码。\n";
+        let md = format!("{code}{{% mafold/run summary=\"Ran 1 shell command\" %}}{{% mafold/bash cmd=\"ls\" /%}}{{% /mafold/run %}}\n完了。");
+        assert_eq!(strip_cards(&md), format!("{code}\n完了。"));
+    }
+
+    /// A card that stays (an html mock-up) can hold a backtick of its own — a
+    /// JS template literal. It pairs inside that body, never with prose after
+    /// it, so the run group that follows is still cut. (The client consumes
+    /// the card and recomputes code for the rest; so does this.)
+    #[test]
+    fn a_backtick_inside_a_kept_card_does_not_shield_what_follows() {
+        let html = "{% mafold/html %}<script>let t = `x</script>{% /mafold/html %}\n";
+        let md = format!("{html}{{% mafold/run summary=\"x\" %}}{{% mafold/tool name=\"Read\" /%}}{{% /mafold/run %}}\n后面 `y` 结束");
+        assert_eq!(super::strip_transcript_cards(&md), format!("{html}\n后面 `y` 结束"));
+    }
+
+    /// …nor does a fence inside a card that goes: tool output with a lone
+    /// ``` line must not turn the rest of the message into code.
+    #[test]
+    fn a_fence_inside_a_cut_card_does_not_shield_what_follows() {
+        let md = "{% mafold/run summary=\"x\" %}\n```\nlog\n{% /mafold/run %}\n中间\n{% mafold/result duration=\"1s\" /%}\n尾";
+        assert_eq!(strip_cards(md), "\n中间\n\n尾");
+    }
 }
 
 #[cfg(test)]
@@ -1643,7 +1718,25 @@ mod run_groups_tests {
 
 #[cfg(test)]
 mod generating_tests {
-    use super::{generating_tag, generating_tag_awaiting, strip_trailing_generating};
+    use super::{generating_tag, generating_tag_awaiting, strip_trailing_generating, trailing_generating};
+
+    /// "Still being written?" is the same question as "what would stripping
+    /// take?": the lone card on the end. A finished reply that QUOTES the tag
+    /// in its prose read as a draft that never ends (2026-10-07: the inbox
+    /// loop handed the clone the message before it on every look for twelve
+    /// days, and its badge never cleared).
+    #[test]
+    fn the_live_card_is_the_trailing_one_only() {
+        let live = generating_tag(1, 2, 3, 4, 0);
+        assert_eq!(trailing_generating(&format!("在查日志{live}")), Some(live.trim()));
+        assert_eq!(trailing_generating(&live), Some(live.trim()));
+        let talk = "daemon 会马上把 `{% mafold/generating %}` 卡推进草稿。\n\n你是想自己改,还是我照这个方案改好?";
+        assert_eq!(trailing_generating(talk), None, "a finished reply talking ABOUT the card");
+        // Quoted early AND live on the end: the live one, never the quote.
+        assert_eq!(trailing_generating(&format!("{talk}{live}")), Some(live.trim()));
+        assert_eq!(trailing_generating("没有卡片的正文"), None);
+        assert_eq!(trailing_generating(""), None);
+    }
 
     /// What a picked-up turn carries over is the reply minus its spinner — and
     /// never less than the reply.

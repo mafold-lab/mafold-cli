@@ -2057,6 +2057,16 @@ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new
 
 pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String, auto_update: bool) -> Result<()> {
     let _ = START.set(std::time::Instant::now());
+    // The flags this bot runs under (`windowsBackground` among them) — before
+    // the first prompt is built, since the prompt states what they allow.
+    crate::flags::refresh(&client).await;
+    // Up whatever the flag says, so the server can switch it on live. One that
+    // can't start keeps this daemon turn-scoped (`background_windows::enabled`),
+    // so the prompt, the hook and the card still tell one story.
+    #[cfg(windows)]
+    if let Err(e) = crate::background_windows::start_broker() {
+        eprintln!("⚠️  background tasks stay turn-scoped: the broker could not start ({e:#})");
+    }
     // Self-update on startup (before connecting) so a (re)started agent is
     // always current; if it updates, re-exec into the new binary. A failure is
     // printed and remembered (cooldown), never silently swallowed — on networks
@@ -3694,6 +3704,9 @@ async fn connect_and_run(
         // restarted and its in-memory event log reset; re-anchor (that
         // window is unrecoverable server-side).
         if method == "events.hello" {
+            // A `flagsChanged` pushed while we were away is not replayed; ask.
+            let c = client.clone();
+            tokio::spawn(async move { crate::flags::refresh(&c).await });
             let head = env.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
             if last_seq == 0 || last_seq > head {
                 if last_seq > head {
@@ -4008,6 +4021,12 @@ async fn connect_and_run(
         // Tell the caller to deprovision instead of reconnect-looping forever.
         // The bot's drive moved (the owner installed a skill, edited a memory
         // in the web app, another machine running this bot pushed): catch up.
+        // A flag was switched on the server (`setFlag`): the new values,
+        // evaluated for this bot. The next turn's prompt reads them.
+        if method == "events.flagsChanged" {
+            crate::flags::ingest(&env["params"]);
+            continue;
+        }
         if method == "events.driveChanged" {
             if let Some(m) = crate::drive::current() {
                 tokio::spawn(async move { crate::drive::refresh(&m).await });
@@ -4683,8 +4702,9 @@ async fn connect_and_run(
             // keeps its meaning while a turn runs. Everything below is a thing
             // the user wants said to the agent — and if that agent is already
             // working, saying it to a SECOND copy of itself in the same working
-            // directory is the wrong answer. Steer the one that's running.
-            if !content.trim().is_empty() {
+            // directory is the wrong answer. Steer the one that's running —
+            // and that includes a picture sent with no words.
+            if has_something_to_say(&content, &attachments) {
                 // In order: a message of theirs that came in just before this
                 // one and is still opening its draft is the running turn this
                 // one belongs to — it just isn't in `turns` yet.
@@ -4696,9 +4716,10 @@ async fn connect_and_run(
                     ai: sender_is_bot,
                     pays: sender_pays,
                 };
+                let carried = steering::carried(attachments.iter().map(|a| a.kind.as_str()));
                 let steered = steer_in_order(
                     &chat_states, &arrived, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
-                    from, reply_to_id.as_deref(), &content,
+                    from, reply_to_id.as_deref(), &content, &carried,
                     // Borrows only — the normal-turn path below still owns both,
                     // and re-downloads nothing: whatever this fetched is already
                     // in `~/.mafold/attachments` under the same content name.
@@ -5144,8 +5165,10 @@ impl steering::Running for TurnHandle {
 /// differs, and drawing the wrong one puts words in someone's mouth.
 enum Seam {
     /// A person interrupted. Show what they said: without it the turn reads as
-    /// if the model changed its mind unprompted.
-    User,
+    /// if the model changed its mind unprompted. Carries the marks for what
+    /// came with their words (`steering::carried`) — a picture sent with no
+    /// text has nothing else to draw.
+    User(String),
     /// Something happened AROUND the turn — a background task it started came
     /// back. Not the user speaking and not model output, which is exactly what
     /// `AgentEvent::Notice` is for. Carries its own one-line wording: the model
@@ -5203,7 +5226,8 @@ async fn drop_turn(chat_states: &ChatStates, chat_id: &str, cancel: &Arc<Notify>
 /// `attach_context` once a target is confirmed, so "看这张图" typed mid-turn
 /// arrives with a path the agent can Read. It used to arrive as three words
 /// about a picture that, as far as the model could tell, did not exist — and the
-/// agent's only recourse was to guess at the newest file on disk.
+/// agent's only recourse was to guess at the newest file on disk. `carried` is
+/// what the seam draws for those attachments (`steering::carried`).
 #[allow(clippy::too_many_arguments)]
 async fn steer_turn<Fut: std::future::Future<Output = String>>(
     chat_states: &ChatStates,
@@ -5213,12 +5237,29 @@ async fn steer_turn<Fut: std::future::Future<Output = String>>(
     from: Speaker<'_>,
     reply_to: Option<&str>,
     text: &str,
+    carried: &str,
     body: impl FnOnce(String) -> Fut,
 ) -> Option<Steered> {
     inject_into_live_turn(
-        chat_states, chat_id, channel, thread, from, reply_to, text, Seam::User, body,
+        chat_states, chat_id, channel, thread, from, reply_to, text,
+        Seam::User(carried.to_string()), body,
     )
     .await
+}
+
+/// Does this message have anything to hand a running turn — words, or
+/// something sent with them?
+///
+/// Words alone was the rule, and a picture sent with no text failed it: it
+/// skipped the running turn entirely and started a SECOND one beside it — on
+/// Claude Code a fork of the very session already at work, on Codex and Kimi a
+/// second process in the same directory. The running turn never heard of the
+/// picture; a copy of the agent did, and redid the running turn's task beside
+/// it (2026-10-07 08:09, a screenshot into a turn in #桌面端). A message whose
+/// attachments turn into nothing at all still starts its own turn: the
+/// injection gives it back when the body it builds is empty.
+fn has_something_to_say(content: &str, attachments: &[InAttachment]) -> bool {
+    !content.trim().is_empty() || !attachments.is_empty()
 }
 
 /// The running turn a message belongs in (`steering::pick` — the rule the
@@ -5281,6 +5322,7 @@ async fn steer_in_order<Fut: std::future::Future<Output = String>>(
     from: Speaker<'_>,
     reply_to: Option<&str>,
     text: &str,
+    carried: &str,
     body: impl FnOnce(String) -> Fut,
 ) -> Option<Steered> {
     // Polled, not signalled: an arrival resolves in one of two places (its turn
@@ -5307,7 +5349,7 @@ async fn steer_in_order<Fut: std::future::Future<Output = String>>(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    steer_turn(chat_states, chat_id, channel, thread, from, reply_to, text, body).await
+    steer_turn(chat_states, chat_id, channel, thread, from, reply_to, text, carried, body).await
 }
 
 /// The body of the above, with the SEAM left open.
@@ -5375,10 +5417,20 @@ async fn inject_into_live_turn<Fut: std::future::Future<Output = String>>(
     // message with no turn to steer — very nearly all of them — an image pull
     // before its own turn is allowed to begin.
     let body = body(text.trim().to_string()).await;
+    // Nothing came of it — no words, and attachments that turn into nothing
+    // the agent can open. A mailbox entry that says nothing is dropped by the
+    // reader, and the 👀 below would promise a turn that never hears it: give
+    // the message back, and the caller starts the turn it always would have.
+    if body.trim().is_empty() {
+        return None;
+    }
+    // A picture with no text arrives as its attachment block alone, after the
+    // blank lines that would have separated it from the words.
+    let body = body.trim().to_string();
     // Someone else's words say so — to the model. A background wrap-up is not
     // anyone's words; its prompt already says what it is.
     let body = match seam {
-        Seam::User if cross => steering::cross_frame(&from, &owner, &body),
+        Seam::User(_) if cross => steering::cross_frame(&from, &owner, &body),
         _ => body,
     };
     let body = steering::mailbox::said(&body);
@@ -5424,9 +5476,10 @@ async fn inject_into_live_turn<Fut: std::future::Future<Output = String>>(
         // Their TEXT, never `body`: this line is drawn into the VISIBLE reply
         // (`mafold-transcript` `steer_line`), and `body` carries absolute paths
         // on this machine — C:\Users\…\.mafold\attachments\… pasted into a group.
-        // Someone else's words carry their name (`steering::seam`).
+        // Someone else's words carry their name (`steering::seam`), and a
+        // picture is drawn as a mark, never as the path the model was given.
         let _ = events.send(match seam {
-            Seam::User => AgentEvent::Steered(steering::seam(&from, &owner, text)),
+            Seam::User(carried) => AgentEvent::Steered(steering::seam(&from, &owner, text, &carried)),
             Seam::Notice(line) => AgentEvent::Notice(line),
         });
         Some(Steered::Now { mailbox: steer_file, owner })
@@ -8833,6 +8886,7 @@ fn bgtasks_cleanup(pid_paths: &[PathBuf]) {
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(p.with_extension("log"));
         let _ = std::fs::remove_file(p.with_extension("sh"));
+        let _ = std::fs::remove_file(p.with_extension("exit"));
         // `.meta` too — it was missing here, so every reported task left one
         // behind and the registry silted up with orphans that only the 7-day
         // sweep ever collected.
@@ -10185,7 +10239,10 @@ mod heartbeat_tests {
         // Positive control: this IS the dead-but-held case (a zombie on unix, a
         // still-open process handle on Windows). A probe that trusted
         // `pid_alive` would keep this dead turn «working» forever.
-        assert!(crate::platform::pid_alive(pid), "expected a dead-but-unreleased process here");
+        #[cfg(unix)]
+        assert!(crate::platform::pid_alive(pid), "expected an unreaped zombie here");
+        #[cfg(windows)]
+        assert!(!crate::platform::pid_alive(pid), "Windows pid liveness must reject an exited but held process");
 
         let killed_at = T0 + 60_000;
         let no_signal = silence(&mut hb, &proc, killed_at, 3 * 60_000);
@@ -12573,7 +12630,7 @@ mod steer_tests {
         reply_to: Option<&str>,
         text: &str,
     ) -> Option<Steered> {
-        steer_turn(states, chat, channel, thread, from, reply_to, text, |t| async move { t }).await
+        steer_turn(states, chat, channel, thread, from, reply_to, text, "", |t| async move { t }).await
     }
 
     async fn states(turns: Vec<(&str, TurnHandle)>) -> ChatStates {
@@ -12612,7 +12669,7 @@ mod steer_tests {
     }
 
     async fn steer_after(s: &ChatStates, a: &Arrived, who: &str, channel: Option<&str>, text: &str) -> Option<Steered> {
-        steer_in_order(s, a, "c1", channel, None, Speaker::person(who), None, text, |t| async move { t }).await
+        steer_in_order(s, a, "c1", channel, None, Speaker::person(who), None, text, "", |t| async move { t }).await
     }
 
     /// 2026-09-27 #失败不可见, the whole incident in one test. Two @s from the
@@ -12698,7 +12755,7 @@ mod steer_tests {
         assert!(steer_after(&s, &a, "ops", None, "first").await.is_none());
         assert!(steer_after(&s, &elsewhere, "ops", Some("ch2"), "another channel").await.is_none());
         assert!(
-            steer_in_order(&s, &threaded, "c1", None, Some("root-9"), Speaker::person("eons"), None, "in a thread", |t| async move { t })
+            steer_in_order(&s, &threaded, "c1", None, Some("root-9"), Speaker::person("eons"), None, "in a thread", "", |t| async move { t })
                 .await
                 .is_none()
         );
@@ -13123,7 +13180,7 @@ mod steer_tests {
         let client = offline_client();
         let atts = vec![photo(&id)];
         assert!(matches!(
-            steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", |x| attach_context(
+            steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", "🖼️", |x| attach_context(
                 &client, x, &atts, &[]
             ))
             .await,
@@ -13147,7 +13204,7 @@ mod steer_tests {
         let s = states(vec![("d1", t)]).await;
         let client = offline_client();
         let atts = vec![photo(&format!("steertest-missing-{}", std::process::id()))];
-        steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", |x| attach_context(
+        steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", "🖼️", |x| attach_context(
             &client, x, &atts, &[]
         ))
         .await;
@@ -13166,13 +13223,87 @@ mod steer_tests {
         let s = states(vec![("d1", t)]).await;
         let client = offline_client();
         let nothing: Vec<InAttachment> = vec![];
-        steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "  no, the other file  ", |x| {
+        steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "  no, the other file  ", "", |x| {
             attach_context(&client, x, &nothing, &[])
         })
         .await;
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "no, the other file
 ");
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// 2026-10-07 08:09, the report this exists for: a screenshot with NO text,
+    /// sent into a turn that was running. Dispatch only handed WORDS to a
+    /// running turn, so the picture skipped it and started a second turn beside
+    /// it — on Claude Code a fork of the very session at work. Words, or
+    /// anything sent with them, is something to say.
+    #[test]
+    fn a_picture_with_no_words_is_still_something_to_say() {
+        assert!(has_something_to_say("", &[photo("p1")]));
+        assert!(has_something_to_say("  \n", &[photo("p1")]));
+        assert!(has_something_to_say("看这个", &[]));
+        assert!(!has_something_to_say("  ", &[]));
+    }
+
+    /// …and once it is, it reaches the running turn the way a correction with
+    /// words does: the picture as a path the agent can Read, at the next tool
+    /// boundary (Claude Code — what the PostToolUse hook hands the model) or as
+    /// the follow-up queued behind the turn (Codex, Kimi — what their next
+    /// round is given). One mailbox, both doors. The seam draws a mark: there
+    /// are no words to draw, and the path is this machine's, not the room's.
+    #[tokio::test]
+    async fn a_picture_alone_reaches_the_running_turn_through_both_doors() {
+        let id = format!("steertest-alone-{}.png", std::process::id());
+        let dir = attachments_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cached = dir.join(sanitize_attachment_name(&id));
+        std::fs::write(&cached, b"pretend png").unwrap();
+        let path = cached.to_string_lossy().into_owned();
+        let client = offline_client();
+        let atts = vec![photo(&id)];
+        let carried = steering::carried(atts.iter().map(|a| a.kind.as_str()));
+        for can_steer in [true, false] {
+            let (t, f, mut rx) = watched_turn("ops", None, can_steer);
+            let s = states(vec![("d1", t)]).await;
+            let out = steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "", &carried, |x| {
+                attach_context(&client, x, &atts, &[])
+            })
+            .await;
+            let raw = std::fs::read_to_string(&f).unwrap();
+            if can_steer {
+                assert!(matches!(out, Some(Steered::Now { .. })), "not taken by the running turn");
+                let ctx = steering::Part::for_model(&steering::mailbox::parse(&raw)).unwrap();
+                assert!(ctx.contains(&path) && ctx.contains("Use your Read tool"), "{ctx}");
+                let Ok(AgentEvent::Steered(seam)) = rx.try_recv() else {
+                    panic!("the picture drew no seam");
+                };
+                assert_eq!(seam, "🖼️");
+            } else {
+                assert!(matches!(out, Some(Steered::Queued { .. })), "not queued behind the running turn");
+                let next = steering::mailbox::followup(&raw).expect("the follow-up round was dropped");
+                assert!(next.contains(&path), "{next}");
+            }
+            let _ = std::fs::remove_file(&f);
+        }
+        let _ = std::fs::remove_file(&cached);
+    }
+
+    /// Sent with no words and turning into nothing the agent could open (a link
+    /// card): handed BACK, and the caller starts its own turn as it always did.
+    /// Taken in, it would be a mailbox entry the reader drops as empty and a 👀
+    /// promising a turn that never hears it.
+    #[tokio::test]
+    async fn an_attachment_that_becomes_nothing_is_given_back() {
+        let (t, f) = turn("ops", None, true);
+        let s = states(vec![("d1", t)]).await;
+        let client = offline_client();
+        let card = vec![InAttachment { kind: "news".into(), file: None, emoji: None, title: None, entries: vec![] }];
+        let out = steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "", "", |x| {
+            attach_context(&client, x, &card, &[])
+        })
+        .await;
+        assert!(out.is_none(), "taken in with nothing to say");
+        assert!(std::fs::read_to_string(&f).is_err(), "left an empty entry in the mailbox");
     }
 
     /// The download is seconds long (five tries with backoff) and the turn can
@@ -13191,7 +13322,7 @@ mod steer_tests {
         let bg = {
             let s = s.clone();
             tokio::spawn(async move {
-                steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", |x| async move {
+                steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", "🖼️", |x| async move {
                     let _ = reached_tx.send(());
                     let _ = release_rx.await;
                     format!("{x}
@@ -13216,7 +13347,7 @@ mod steer_tests {
     async fn the_seam_shown_in_chat_is_their_text_not_a_local_path() {
         let (t, f, mut rx) = watched_turn("ops", None, true);
         let s = states(vec![("d1", t)]).await;
-        steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", |x| async move {
+        steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "看这张图", "🖼️", |x| async move {
             format!("{x}
 
 [The user attached 1 image(s). Use your Read tool to view them:
@@ -13226,7 +13357,7 @@ mod steer_tests {
         let Ok(AgentEvent::Steered(seam)) = rx.try_recv() else {
             panic!("the steer drew no seam");
         };
-        assert_eq!(seam, "看这张图");
+        assert_eq!(seam, "看这张图 🖼️");
         assert!(!seam.contains(".mafold"), "{seam}");
         let _ = std::fs::remove_file(&f);
     }
@@ -13245,7 +13376,7 @@ mod steer_tests {
         let slow = {
             let s = s.clone();
             tokio::spawn(async move {
-                steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "改成这样", |x| async move {
+                steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "改成这样", "🖼️", |x| async move {
                     let _ = reached_tx.send(());
                     let _ = release_rx.await; // the download nobody can hurry
                     format!("{x} [图]")
@@ -13259,7 +13390,7 @@ mod steer_tests {
             // …and this one, carrying nothing, would be written and gone before
             // the first one's bytes ever arrive.
             tokio::spawn(async move {
-                steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "算了别改", |x| async move { x }).await
+                steer_turn(&s, "c1", None, None, Speaker::person("ops"), None, "算了别改", "", |x| async move { x }).await
             })
         };
         // Let the second message run as far as it can get. Its body has no
@@ -13515,6 +13646,127 @@ mod account_scope_tests {
         seed_pins(&mut again, load_pins_from(&path));
         let _ = std::fs::remove_file(&path);
         assert!(again.get("conv-rei").and_then(|s| s.account.clone()).is_none(), "a reset survives too");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_background_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn win_background_real_claude_survives_and_reports() {
+        // Explicit CI-only test: install real Claude, build the actual hook
+        // binary, and drive it against the local deterministic Messages API.
+        let Some(hook) = std::env::var_os("MAFOLD_WINDOWS_TEST_BINARY") else {
+            panic!("set MAFOLD_WINDOWS_TEST_BINARY to the built mafold.exe");
+        };
+        crate::background_windows::start_broker().unwrap();
+        // The server switching it on for this bot, as `events.flagsChanged`
+        // delivers it — the real hook below asks this broker, which reads it.
+        let flag = crate::background_windows::FLAG;
+        crate::flags::ingest(&serde_json::json!({ "values": { flag: true }, "version": 0 }));
+        assert!(crate::background_windows::daemon_says_on(), "this broker answers on");
+
+        // The real hook against this broker with no Claude in between: a
+        // background Bash in, «detached» out, a registered task that exits 0.
+        let direct = std::env::temp_dir().join(format!("mf-direct-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&direct).unwrap();
+        let call = serde_json::json!({
+            "tool_name": "Bash", "cwd": direct.to_string_lossy(),
+            "tool_input": { "command": "echo direct-ok", "run_in_background": true },
+        });
+        let mut hook_run = crate::platform::std_command(&hook)
+            .arg("bash-hook")
+            .env("HOME", &direct)
+            .env("MAFOLD_SURFACE", "ci__windows__direct")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            hook_run.stdin.take().unwrap().write_all(call.to_string().as_bytes()).unwrap();
+        }
+        let out = hook_run.wait_with_output().unwrap();
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(said.contains("Background task detached"), "the hook alone: {said}");
+        let registry_dir = direct.join(".mafold").join("bgtasks");
+        let began = std::time::Instant::now();
+        let exit = loop {
+            let found = std::fs::read_dir(&registry_dir).unwrap().flatten().map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|x| x == "exit"));
+            if let Some(p) = found { break p; }
+            assert!(began.elapsed() < Duration::from_secs(20), "no exit receipt in {}", registry_dir.display());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let code = std::fs::read_to_string(&exit).unwrap();
+        let log = std::fs::read_to_string(exit.with_extension("log")).unwrap_or_default();
+        if code != "0" || !log.contains("direct-ok") {
+            // Everything the registry holds, so one failing run says why.
+            let mut dump = String::new();
+            for e in std::fs::read_dir(&registry_dir).unwrap().flatten() {
+                let body = std::fs::read_to_string(e.path()).unwrap_or_else(|e| format!("<{e}>"));
+                dump.push_str(&format!("--- {} ({} bytes)\n{body}\n", e.file_name().to_string_lossy(), body.len()));
+            }
+            panic!("exit {code}; registry:\n{dump}");
+        }
+        let _ = std::fs::remove_dir_all(&direct);
+        println!("PASS: the real hook, alone, detached through this broker and the task reported exit 0");
+
+        let registry = std::env::temp_dir().join(format!("mf-registry-{}", uuid::Uuid::new_v4()));
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/windows-claude-detach-probe.py");
+        let output = crate::platform::std_command("python")
+            .arg(script).env("MAFOLD_VERIFY_BACKGROUND", hook)
+            .env("MAFOLD_VERIFY_REGISTRY", &registry).output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        let home = std::fs::read_to_string(&registry).unwrap();
+        let old = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let tag = "ci__windows__test";
+        let (live, done) = super::bgtasks_scan(tag);
+        assert_eq!(live, 0);
+        assert_eq!(done.len(), 1, "the daemon must discover completion for its report turn");
+        let tasks = super::bgtasks_snapshot(tag);
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].running);
+        assert!(tasks[0].tail.join("\n").contains("reported after turn"));
+        // A failed delivery/restart must retain the same report; only the
+        // existing successful-delivery acknowledgement removes its artifacts.
+        assert_eq!(super::bgtasks_scan(tag).1.len(), 1);
+        // Exercise the actual daemon monitor through dispatch and receipt,
+        // not merely a second test-side implementation of its file scan.
+        let mailbox = std::path::Path::new(&home).join("report-mailbox").to_string_lossy().into_owned();
+        let (events, mut notices) = tokio::sync::mpsc::unbounded_channel();
+        let states: ChatStates = Default::default();
+        states.lock().await.entry("ci".into()).or_default().turns.insert("report-turn".into(), TurnHandle {
+            cancel: Arc::new(Notify::new()), ask_file: None, owner: "owner".into(),
+            channel: Some("windows".into()), thread: None, events, steer_file: mailbox.clone(),
+            can_steer: true, pays: false,
+        });
+        arm_bg_wakeup(
+            Client::new("http://127.0.0.1:1".into(), "local-test".into()), home.clone(), false,
+            "test".into(), "ci".into(), None, Some("windows".into()),
+            Default::default(), ExecCoord::new(None), states,
+            Arc::new(crate::harness::claude_code::ClaudeCode),
+            None, None, None, None, None, "owner".into(), 1, None,
+        );
+        let notice = tokio::time::timeout(Duration::from_secs(20), notices.recv()).await.unwrap().unwrap();
+        assert!(matches!(notice, AgentEvent::Notice(_)), "completion must dispatch a report notice");
+        assert_eq!(super::bgtasks_scan(tag).1.len(), 1, "unclaimed report retained for restart");
+        let prompt = crate::steer_hook::take(&mailbox).expect("monitor delivered the report prompt");
+        assert!(prompt.contains("have finished"));
+        assert!(prompt.contains(&done[0].1), "report points to the real output log");
+        let began = std::time::Instant::now();
+        while !super::bgtasks_scan(tag).1.is_empty() {
+            assert!(began.elapsed() < Duration::from_secs(20), "claimed report not cleaned up");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if let Some(old) = old { std::env::set_var("HOME", old); } else { std::env::remove_var("HOME"); }
+        let _ = std::fs::remove_file(registry);
+        let _ = std::fs::remove_dir_all(home);
+        println!("PASS: actual daemon monitor dispatched report, retained until claim, then cleaned up");
     }
 }
 

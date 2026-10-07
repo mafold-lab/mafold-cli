@@ -11,6 +11,8 @@ mod agent;
 mod apps;
 mod ask_hook;
 mod bash_hook;
+#[cfg(windows)]
+mod background_windows;
 mod bot_token;
 mod cards;
 mod cardtags;
@@ -27,6 +29,7 @@ mod daemon;
 mod discover;
 mod drafts;
 mod drive;
+mod flags;
 mod harness;
 mod inbox;
 mod install;
@@ -212,6 +215,23 @@ enum Cmd {
         emoji: String,
         #[arg(long)]
         remove: bool,
+    },
+    /// Tap a button on a card, exactly as a person's tap does — stop a reply
+    /// that is being written (`stop`), answer a question card (`ask:answer
+    /// <answer>`), a permission prompt (`perm:answer Allow`), … Whether you may
+    /// is decided where it always is, by who tapped. Afterwards the message is
+    /// read back and shown as it is now: a refusal only ever shows up as a
+    /// pop-up on a screen, so the message itself is the proof.
+    Tap {
+        /// The message the card is in (`mafold read --ids` shows ids).
+        message: String,
+        /// The button's action, as the card sends it: `stop`, `ask:answer`, `perm:answer`, …
+        action: String,
+        /// What the button carries — the answer for `ask:answer`, the verdict for `perm:answer`.
+        value: Option<String>,
+        /// A structured payload instead of `value`, as JSON.
+        #[arg(long, conflicts_with = "value")]
+        fields: Option<String>,
     },
     /// Attach local files to the reply you are streaming right now — images,
     /// clips, documents. Run by an AGENT mid-turn (the daemon presets
@@ -412,6 +432,9 @@ enum Cmd {
     /// (claude kills its background shells at exit). Not for humans.
     #[command(hide = true)]
     BashHook,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    BackgroundWorker { config: std::path::PathBuf },
     /// (internal) PostToolUse hook claude runs after every tool — delivers what
     /// the user said mid-turn, so a long run can be corrected instead of killed.
     /// Not for humans.
@@ -469,6 +492,10 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Cmd::BackgroundWorker { ref config } = cli.cmd {
+        return background_windows::worker(config);
+    }
 
     // The AskUserQuestion hook is invoked by claude (a child of the daemon) and
     // needs no auth — it just bridges stdin/the answer file. Handle it first.
@@ -758,6 +785,9 @@ async fn main() -> Result<()> {
         Cmd::React { message, emoji, remove } => {
             react(&Client::new(cli.base, token?), &message, &emoji, remove).await?
         }
+        Cmd::Tap { message, action, value, fields } => {
+            tap(&Client::new(cli.base, token?), &message, &action, value.as_deref(), fields.as_deref()).await?
+        }
         Cmd::Attach { files, message, sticker, emoji } => {
             let how = if sticker {
                 client::AttachAs::Sticker { emoji: emoji.as_deref() }
@@ -784,6 +814,8 @@ async fn main() -> Result<()> {
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
         | Cmd::SteerHook | Cmd::DriveHook | Cmd::CompactHook { .. } | Cmd::PermissionMcp => unreachable!(),
+        #[cfg(windows)]
+        Cmd::BackgroundWorker { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -1366,6 +1398,80 @@ async fn react(client: &Client, message: &str, emoji: &str, remove: bool) -> Res
     Ok(())
 }
 
+/// What a tap carries: `value` as the string most buttons send (an answer, a
+/// verdict), or `fields` as a JSON payload; neither = a bare tap (`stop`).
+fn tap_payload(value: Option<&str>, fields: Option<&str>) -> Result<Option<serde_json::Value>> {
+    match (value, fields) {
+        (Some(v), _) => Ok(Some(serde_json::Value::String(v.to_string()))),
+        (None, Some(f)) => serde_json::from_str(f).map(Some).context("--fields is not valid JSON"),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The answer stamped into a question card once it was answered
+/// (`{% mafold/ask answered="…" %}`).
+fn answered_of(content: &str) -> Option<String> {
+    let at = content.find("answered=\"")? + "answered=\"".len();
+    let rest = &content[at..];
+    Some(rest[..rest.find('"')?].replace("&quot;", "\""))
+}
+
+/// The message as it is after a tap, in one line.
+fn after_tap(before: &serde_json::Value, after: &serde_json::Value, now_ms: u64) -> String {
+    if inbox::in_progress(after) {
+        return format!("仍在进行 —— {}", inbox::working_status(after, now_ms));
+    }
+    let content = after["content"].as_str().unwrap_or("");
+    if inbox::in_progress(before) {
+        return "已停下(不再生成)".to_string();
+    }
+    if let Some(a) = answered_of(content) {
+        return format!("卡片已回答:「{a}」");
+    }
+    let body = chat::readable_body(content);
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = body.chars().count();
+    if n > 200 { format!("{}…", body.chars().take(200).collect::<String>()) } else { body }
+}
+
+/// `mafold tap` — a card button pressed through the same pipe a finger uses.
+/// The server tells us only that the tap was DELIVERED; whether it took is
+/// decided on the other side (a bot's daemon refuses a stop from someone it
+/// doesn't allow with a pop-up nobody here can see). So the message is read
+/// back until it changes (or ~10s pass) and shown as it is.
+async fn tap(client: &Client, message: &str, action: &str, value: Option<&str>, fields: Option<&str>) -> Result<()> {
+    let payload = tap_payload(value, fields)?;
+    if env_flag("MAFOLD_SEND_DRY") {
+        journal(&serde_json::json!({ "kind": "tap", "dry": true, "message_id": message, "action": action }));
+        println!("✓ (dry-run,没有真点) {action} → #{message}");
+        return Ok(());
+    }
+    let before = client.get_message(message).await.context("reading the message the card is in")?;
+    let chat_id = before["conversation_id"].as_str().context("that message has no conversation")?.to_string();
+    let r = client.send_component_action(&chat_id, message, action, payload).await?;
+    journal(&serde_json::json!({ "kind": "tap", "chat_id": chat_id, "message_id": message, "action": action }));
+    if let Some(m) = r["message"].as_str().filter(|m| !m.trim().is_empty()) {
+        println!("{m}");
+    }
+    let mut after = before.clone();
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Ok(m) = client.get_message(message).await {
+            after = m;
+        }
+        if after["content"] != before["content"] || after["finalized_at"] != before["finalized_at"] {
+            break;
+        }
+    }
+    let now = inbox::now_ms();
+    let state = after_tap(&before, &after, now);
+    println!("✓ 点了 {action} → #{message}\n现在:{state}");
+    if action == "stop" && inbox::in_progress(&before) && inbox::in_progress(&after) {
+        anyhow::bail!("没停下 —— 对方没有接受这次叫停(多半是没有权限),或者还没收到");
+    }
+    Ok(())
+}
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
 }
@@ -1427,5 +1533,45 @@ mod send_target_tests {
         assert!(send_target(&["--main", "--channel", "#发版"]).is_err());
         assert!(Cli::try_parse_from(["mafold", "read", "--main", "--channel", "x"]).is_err());
         assert!(Cli::try_parse_from(["mafold", "read", "--main"]).is_ok());
+    }
+
+    /// A tap carries what the card's own button carries: most send a string
+    /// (an ask answer, a permission verdict), `stop` sends nothing.
+    #[test]
+    fn a_tap_carries_what_the_button_carries() {
+        assert_eq!(tap_payload(Some("Allow"), None).unwrap(), Some(serde_json::json!("Allow")));
+        assert_eq!(tap_payload(None, Some(r#"{"name":"x"}"#)).unwrap(), Some(serde_json::json!({"name": "x"})));
+        assert_eq!(tap_payload(None, None).unwrap(), None);
+        assert!(tap_payload(None, Some("{not json")).is_err());
+        assert!(Cli::try_parse_from(["mafold", "tap", "m1", "stop"]).is_ok());
+        assert!(Cli::try_parse_from(["mafold", "tap", "m1", "ask:answer", "Cloudflare"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["mafold", "tap", "m1", "x", "v", "--fields", "{}"]).is_err(),
+            "a value and --fields at once is ambiguous"
+        );
+    }
+
+    /// After a tap the message is shown as it is now — the only place a
+    /// refused stop can be seen from here.
+    #[test]
+    fn after_a_tap_the_message_says_whether_it_took() {
+        let writing = serde_json::json!({
+            "sender": { "username": "opsdu:claude-code", "kind": "bot" },
+            "created_at": "2026-10-06T02:00:00Z",
+            "finalized_at": null,
+            "content": "查日志中\n{% mafold/generating started=1 beat=1 beatAt=1 tokens=0 shells=0 /%}\n",
+        });
+        let stopped = serde_json::json!({
+            "sender": { "username": "opsdu:claude-code", "kind": "bot" },
+            "created_at": "2026-10-06T02:00:00Z",
+            "finalized_at": "2026-10-06T02:01:00Z",
+            "content": "查日志中\n\n⏹ Stopped.",
+        });
+        assert_eq!(after_tap(&writing, &stopped, 0), "已停下(不再生成)");
+        assert!(after_tap(&writing, &writing, 0).starts_with("仍在进行 —— "), "a refused stop shows as still running");
+
+        let card = serde_json::json!({ "content": "{% mafold/ask answered=\"Cloudflare\" %}\nq|部署|0|去哪?\no|Cloudflare|x\n{% /mafold/ask %}" });
+        assert_eq!(after_tap(&card, &card, 0), "卡片已回答:「Cloudflare」");
+        assert_eq!(answered_of("{% mafold/ask %}"), None);
     }
 }
