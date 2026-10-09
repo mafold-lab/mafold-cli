@@ -810,6 +810,26 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_client: None,
     },
     ProviderSpec {
+        id: "modelark",
+        display: "BytePlus ModelArk",
+        blurb: "Your own key for Seedance video",
+        badge: "modelark",
+        kind: ProviderKind::ApiKey,
+        fields: API_KEY,
+        import_path: None,
+        env_var: Some("ARK_API_KEY"),
+        auth: BEARER_API_KEY,
+        oauth_capable: false,
+        help_url: Some("https://console.byteplus.com/ark/region:ap-southeast-1/apiKey"),
+        mcp_url: None,
+        // The device half of `mafold video …` with the user's own key: submit /
+        // status / cancel against ModelArk, the finished clip lands through the
+        // server's `ingestUrl`. The house-key path (server env) stays as is.
+        native_api: Some("ark-video"),
+        device_bound: false,
+        oauth_client: None,
+    },
+    ProviderSpec {
         id: "openai-api",
         display: "OpenAI Platform",
         blurb: "Your own key for GPT models",
@@ -1642,6 +1662,7 @@ mod tests {
             vec![
                 "claude-code-oauth",
                 "anthropic-api",
+                "modelark",
                 "openai-api",
                 "secret",
                 "dashscope",

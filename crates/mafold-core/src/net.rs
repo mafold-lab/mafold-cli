@@ -296,6 +296,42 @@ pub async fn http_post(
     Ok(HttpReply { status, headers, body })
 }
 
+/// One plain request with any method — `http_post` for the other verbs a
+/// vendor's REST API needs (a task is read with GET and cancelled with
+/// DELETE). Same reply shape, same error mapping.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn http_request(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<HttpReply, RpcError> {
+    let m = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|_| RpcError::Transport(format!("bad method {method}")))?;
+    let mut req = client().request(m, url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(b) = body {
+        req = req.body(b.to_string());
+    }
+    let resp = req.send().await.map_err(|e| {
+        if e.is_connect() {
+            RpcError::Connect(e.to_string())
+        } else {
+            RpcError::Transport(e.to_string())
+        }
+    })?;
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string())))
+        .collect();
+    let body = resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?;
+    Ok(HttpReply { status, headers, body })
+}
+
 #[cfg(target_arch = "wasm32")]
 pub async fn http_post(
     url: &str,
@@ -415,6 +451,58 @@ pub async fn http_get(url: &str, headers: &[(String, String)]) -> Result<HttpRep
 
 /// One in-flight streaming reply. `next()` yields raw body bytes as they
 /// arrive (native) or the whole body once (wasm), then `None`.
+#[cfg(target_arch = "wasm32")]
+pub async fn http_request(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<HttpReply, RpcError> {
+    use futures::future::{select, Either};
+    use gloo_net::http::{Method, RequestBuilder};
+
+    let m = match method.to_ascii_uppercase().as_str() {
+        "GET" => Method::GET,
+        "POST" => Method::POST,
+        "PUT" => Method::PUT,
+        "PATCH" => Method::PATCH,
+        "DELETE" => Method::DELETE,
+        other => return Err(RpcError::Transport(format!("bad method {other}"))),
+    };
+    let controller = web_sys::AbortController::new()
+        .map_err(|_| RpcError::Transport("AbortController unavailable".into()))?;
+    let signal = controller.signal();
+    let mut builder = RequestBuilder::new(url).method(m).abort_signal(Some(&signal));
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    let request = match body {
+        Some(b) => builder.body(b.to_string()),
+        None => builder.build(),
+    }
+    .map_err(|e| RpcError::Transport(e.to_string()))?;
+
+    let work = Box::pin(async move {
+        let resp = request.send().await.map_err(|e| RpcError::Transport(e.to_string()))?;
+        let status = resp.status();
+        let headers = resp
+            .headers()
+            .entries()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v))
+            .collect();
+        let body = resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?;
+        Ok(HttpReply { status, headers, body })
+    });
+    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(RPC_TIMEOUT_MS as u32));
+    match select(work, deadline).await {
+        Either::Left((out, _)) => out,
+        Either::Right(((), _)) => {
+            controller.abort();
+            Err(RpcError::Transport(format!("no response in {}s from {url}", RPC_TIMEOUT_MS / 1000)))
+        }
+    }
+}
+
 pub struct StreamingReply {
     pub status: u16,
     #[cfg(not(target_arch = "wasm32"))]

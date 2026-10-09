@@ -114,5 +114,64 @@
     },
     "hidden": ["mafold/result"],
     "expected": "我是 deepseek-v4-pro（V4 Pro）模型。"
+  },
+  {
+    "name": "code keeps what it quotes, only the backticks go",
+    "content": "把 whitelist 设成 `*` 即可,`a > b` 也行 **好**\n```\n# keep #\n```",
+    "names": {},
+    "expected": "把 whitelist 设成 * 即可,a > b 也行 好 # keep #"
+  },
+  {
+    "name": "an unclosed backtick is a mark, not code",
+    "content": "a `b *c* #d",
+    "names": {},
+    "expected": "a b c d"
+  },
+  {
+    "name": "a bare tag reads as the official card it predates",
+    "content": "给你一键入口: {% customize field=\"whitelist\" /%} 点开就行 {% result duration=\"48.3s\" /%} {% kline /%}",
+    "names": {
+      "mafold/customize": "Customize",
+      "customize": "NOT THE BARE NAME",
+      "result": "NOR THIS"
+    },
+    "hidden": ["mafold/result"],
+    "expected": "给你一键入口: Customize 点开就行 kline"
+  },
+  {
+    "name": "a table says its cells, not its pipes",
+    "content": "**搬完了，手机上还没删。**\n\n| | |\n|---|---|\n| 搬了什么 | **242 个 B站视频** |\n| 放在哪 | `D:\\手机备份` |\n\n**删掉之后：**",
+    "names": {},
+    "expected": "搬完了，手机上还没删。 搬了什么 242 个 B站视频 放在哪 D:\\手机备份 删掉之后："
+  },
+  {
+    "name": "a table's escaped pipe is text, its alignment row is a mark, a plain line after it is still a row",
+    "content": "a \\| b | c\n:--|--:\n`x|y` | z \\| w\nafter the table\n\nnext | paragraph",
+    "names": {},
+    "expected": "a | b c x y z | w after the table next | paragraph"
+  },
+  {
+    "name": "pipes are only marks in a table",
+    "content": "a | b\n---\n| one |\n|---|---|\n```\n| in | code |\n|----|------|\n```",
+    "names": {},
+    "expected": "a | b --- | one | |---|---| | in | code | |----|------|"
+  },
+  {
+    "name": "a stray backtick before a table doesn't hide it",
+    "content": "按 ` 键切换\n\n| 命令 | 作用 |\n|---|---|\n| `ls` | 列目录 |",
+    "names": {},
+    "expected": "按 键切换 命令 作用 ls 列目录"
+  },
+  {
+    "name": "a list item after a table ends it",
+    "content": "| a | b |\n|---|---|\n| 1 | 2 |\n- 用法: cat x | grep y",
+    "names": {},
+    "expected": "a b 1 2 - 用法: cat x | grep y"
+  },
+  {
+    "name": "an escaped backslash escapes no pipe",
+    "content": "| C:\\\\| x |\n|---|---|",
+    "names": {},
+    "expected": "C:\\\\ x"
   }
 ]

@@ -38,6 +38,12 @@ pub struct TurnEnv {
     /// per-turn `MAFOLD_SURFACE` of its own.
     #[serde(default)]
     pub surface: String,
+    /// When someone other than the bot's owner started this turn: the only
+    /// plugins it may invoke skills from (`crate::drive::skill_gate`). Absent
+    /// on the owner's turns — any skill. Read by the gate in process and as
+    /// `mafold drive-hook` alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_plugins: Option<Vec<String>>,
 }
 
 /// The stable path for one connection. Named by the connection, not the turn —
@@ -90,6 +96,13 @@ pub fn perm_file() -> Option<String> {
     resolve(|t| &t.perm, "MAFOLD_PERM_FILE")
 }
 
+/// The plugins this turn may use skills from (`crate::drive::skill_gate`).
+/// File only: a process's env names the turn that SPAWNED it, and holding one
+/// turn to another's rule is exactly the mistake this must not make.
+pub fn skill_plugins() -> Option<Vec<String>> {
+    load().and_then(|t| t.skill_plugins)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +120,7 @@ mod tests {
                 steer: "s".into(),
                 perm: "/tmp/ask.perm".into(),
                 surface: "c1".into(),
+                skill_plugins: Some(vec!["tea-bot".into(), "mafold".into()]),
             },
         );
         std::env::set_var("MAFOLD_TURN", &p);
@@ -120,8 +134,10 @@ mod tests {
         );
         assert_eq!(steer_file().as_deref(), Some("s"));
         assert_eq!(perm_file().as_deref(), Some("/tmp/ask.perm"), "the permission mailbox rides here too");
+        assert_eq!(skill_plugins(), Some(vec!["tea-bot".to_string(), "mafold".to_string()]));
         std::env::remove_var("MAFOLD_TURN");
         assert_eq!(draft().as_deref(), Some("m_old"), "no file → the env still works");
+        assert_eq!(skill_plugins(), None, "the skill gate has no env fallback");
         std::env::remove_var("MAFOLD_DRAFT");
         std::env::remove_var("MAFOLD_ASK_FILE");
         let _ = std::fs::remove_dir_all(&dir);

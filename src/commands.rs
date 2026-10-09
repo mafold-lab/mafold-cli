@@ -66,6 +66,16 @@ pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>
     }
 }
 
+/// Who may run `name` here (`crate::harness::Who`). Everything above reads or
+/// changes the owner's own Claude Code — their circle's — except `/logout`,
+/// which signs the machine's login out: the owner's alone, as `/login` is.
+pub fn who(name: &str) -> crate::harness::Who {
+    match name {
+        "logout" => crate::harness::Who::Owner,
+        _ => crate::harness::Who::Circle,
+    }
+}
+
 // ───────────────────────── auth ─────────────────────────
 
 /// `/logout` — clear the Anthropic credentials of the seat `env` selects.

@@ -27,6 +27,26 @@ use crate::net::{self, RpcError};
 pub static KNOWN_METHODS: &[&str] = &[
     "addChatMembers",
     "addGroupBot",
+    "adminAccount",
+    "adminAudit",
+    "adminAuditRecord",
+    "adminCapsGrant",
+    "adminCapsList",
+    "adminCapsRevoke",
+    "adminMailAddressAdd",
+    "adminMailCatchAll",
+    "adminMailInbound",
+    "adminMailLog",
+    "adminMailRouteDelete",
+    "adminMailRouteSet",
+    "adminMailRoutes",
+    "adminMailSuppressions",
+    "adminMailUnsuppress",
+    "adminMe",
+    "adminOverview",
+    "adminSearchAccounts",
+    "adminSetVerified",
+    "adminTeam",
     "answerCardAction",
     "answerConnectionCall",
     "answerConnectionCallChunk",
@@ -56,6 +76,9 @@ pub static KNOWN_METHODS: &[&str] = &[
     "auth/passkey/login/finish",
     "auth/passkey/register/begin",
     "auth/passkey/register/finish",
+    "auth/reauth/passkey/begin",
+    "auth/reauth/passkey/finish",
+    "auth/reauth/password",
     "auth/register",
     "blockUser",
     "bookmarkDatabase",
@@ -159,6 +182,8 @@ pub static KNOWN_METHODS: &[&str] = &[
     "getUsers",
     "getVaultKey",
     "getVaultRecovery",
+    "getViewerOutput",
+    "getViewerPreviews",
     "githubWebhook",
     "grantBotPlan",
     "grantChatAccess",
@@ -191,10 +216,12 @@ pub static KNOWN_METHODS: &[&str] = &[
     "listSkillLibrary",
     "listTokens",
     "listVaultDevices",
+    "listViewerOutputs",
     "markChannelRead",
     "markConnectionRelink",
     "markRead",
     "markThreadRead",
+    "messageOrigin",
     "moments/commentCreate",
     "moments/commentDelete",
     "moments/commentsList",
@@ -214,6 +241,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "oauth/authorize",
     "oauth/check",
     "oauth/clientinfo",
+    "oauth/revoke",
     "oauth/token",
     "oauth/userinfo",
     "pinApp",
@@ -523,8 +551,14 @@ impl ApiClient {
         thread_root_id: Option<Uuid>,
         channel_id: Option<Uuid>,
         trigger_id: Option<Uuid>,
+        // One of this bot's own earlier messages the draft continues (a steer's
+        // fresh draft): the server carries that one's origin over. Not billing.
+        carries: Option<Uuid>,
     ) -> Result<wire::Message, RpcError> {
         let mut body = serde_json::json!({ "chat_id": chat_id });
+        if let Some(c) = carries {
+            body["carries"] = serde_json::json!(c);
+        }
         if let Some(root) = thread_root_id {
             body["thread_root_id"] = serde_json::json!(root);
         }
@@ -625,7 +659,7 @@ mod tests {
         assert!(page.items.iter().any(|m| m.id == sent.id), "sent message in history");
 
         // Draft pipeline (ordinary account works — accounts are symmetric).
-        let draft = api.bot_create_draft(conv.id, None, None, None).await.expect("draft");
+        let draft = api.bot_create_draft(conv.id, None, None, None, None).await.expect("draft");
         api.bot_append_delta(draft.id, "hello ").await.expect("delta1");
         api.bot_append_delta(draft.id, "world").await.expect("delta2");
         api.bot_finalize(draft.id).await.expect("finalize");
@@ -746,7 +780,7 @@ mod tests {
         let chat = Uuid::parse_str("0a02b7d1-6a3c-49f7-97a3-1ec54cf9e2f1").unwrap();
         let ch = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
 
-        let draft = api.bot_create_draft(chat, None, Some(ch), None).await.expect("draft");
+        let draft = api.bot_create_draft(chat, None, Some(ch), None, None).await.expect("draft");
         assert_eq!(draft.id.to_string(), "6dd93a1e-46e4-4d31-a461-c8c8fbf9f0a5");
         let body: serde_json::Value = serde_json::from_str(&mock.request(0).body).unwrap();
         assert_eq!(body["channel_id"], ch.to_string());

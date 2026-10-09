@@ -244,6 +244,7 @@ pub struct Conn {
 /// as still running forever. It stays a command hook, where that contract holds.
 const CB_ASK: &str = "mf-ask";
 const CB_STEER: &str = "mf-steer";
+const CB_SKILLS: &str = "mf-skills";
 
 impl Conn {
     /// Spawn a process for `key`. `configure` receives the `Command` so the
@@ -351,6 +352,11 @@ impl Conn {
         if ask {
             pre.push(serde_json::json!({ "matcher": "AskUserQuestion", "hookCallbackIds": [CB_ASK] }));
         }
+        // The Skill tool, so a turn the bot's owner didn't start can't use the
+        // owner's own skills (`crate::drive::skill_gate`). Registered for every
+        // process: whose turn it is is decided per turn (`TurnEnv::
+        // skill_plugins`), and a pooled process serves many turns.
+        pre.push(serde_json::json!({ "matcher": "Skill", "hookCallbackIds": [CB_SKILLS] }));
         let mut hooks = serde_json::Map::new();
         if !pre.is_empty() {
             hooks.insert("PreToolUse".into(), Value::Array(pre));
@@ -682,6 +688,11 @@ async fn handle_hook(shared: Arc<Shared>, out: UnboundedSender<String>, v: Value
         CB_STEER => {
             let f = shared.turn.lock().unwrap().steer.clone();
             if f.is_empty() { None } else { crate::steer_hook::response(&f) }
+        }
+        CB_SKILLS => {
+            let plugins = shared.turn.lock().unwrap().skill_plugins.clone();
+            let input = &req["input"];
+            plugins.and_then(|p| crate::drive::skill_gate(input["tool_name"].as_str().unwrap_or("Skill"), &input["tool_input"], &p))
         }
         _ => None,
     };
@@ -1365,6 +1376,50 @@ mod tests {
         .await;
         assert!(c.register_hooks(true, true).await);
         assert!(c.control_hooks);
+    }
+
+    /// The skill gate over the control channel (`crate::drive::skill_gate`):
+    /// registered with every handshake, silent on the owner's turn, and on
+    /// anyone else's refusing a skill from outside the mounted plugins.
+    #[tokio::test]
+    async fn the_skill_callback_holds_a_non_owner_turn_to_the_mounted_plugins() {
+        let sent = std::env::temp_dir().join(format!("mafold-cc-init-{}.json", std::process::id()));
+        let mut c = stub(&format!(
+            "read -r l; printf '%s' \"$l\" > {}; echo '{}'; cat > /dev/null",
+            sent.display(),
+            REPLY.replace("%S", "success")
+        ))
+        .await;
+        assert!(c.register_hooks(false, false).await);
+        let init: Value = serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&sent);
+        assert_eq!(
+            init["request"]["hooks"]["PreToolUse"],
+            serde_json::json!([{ "matcher": "Skill", "hookCallbackIds": [CB_SKILLS] }]),
+            "registered even with nothing else to register: {init}"
+        );
+
+        let shared = test_shared();
+        let answer = |skill: &str| {
+            let shared = shared.clone();
+            let v = serde_json::json!({ "type": "control_request", "request_id": "r1", "request": {
+                "subtype": "hook_callback", "callback_id": CB_SKILLS,
+                "input": { "hook_event_name": "PreToolUse", "tool_name": "Skill", "tool_input": { "skill": skill } } } });
+            async move {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                handle_hook(shared, tx, v).await;
+                serde_json::from_str::<Value>(&rx.recv().await.unwrap()).unwrap()["response"].clone()
+            }
+        };
+        let r = answer("superpowers:brainstorming").await;
+        assert_eq!((r["subtype"].as_str(), r.get("response")), (Some("success"), None), "the owner's turn: any skill");
+        shared.turn.lock().unwrap().skill_plugins = Some(vec!["tea-bot".into(), "mafold".into()]);
+        let r = answer("superpowers:brainstorming").await;
+        assert_eq!(r["request_id"], "r1");
+        assert_eq!(r["response"]["hookSpecificOutput"]["permissionDecision"], "deny", "{r}");
+        for ok in ["tea-bot:brew", "mafold:mafold-video"] {
+            assert_eq!(answer(ok).await.get("response"), None, "{ok}");
+        }
     }
 
     /// The reply we don't recognise must fail FAST — conflating it with the

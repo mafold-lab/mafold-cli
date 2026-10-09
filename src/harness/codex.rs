@@ -30,7 +30,8 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{AgentEvent, CommandOutcome, Harness, Turn, TurnOutcome};
+use super::codex_app_server::{CodexAppServer, CodexAppServerOptions};
+use super::{AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModelCap, Turn, TurnOutcome};
 use mafold_transcript::RunStats;
 use crate::client::Client;
 
@@ -82,6 +83,8 @@ impl Harness for Codex {
             // Codex takes an outside skills folder is measured before it is
             // wired (`.docs/bot-drive-v1.md` §5.5).
             mount: _,
+            // No PreToolUse hook to hold it with (`crate::drive::skill_gate`).
+            skill_plugins: _,
             proc,
         } = turn;
         if !Path::new(&workdir).is_dir() {
@@ -142,6 +145,119 @@ impl Harness for Codex {
     async fn cli_version(&self) -> String {
         codex_version().await
     }
+
+    /// Ask THIS `codex` what it takes: App Server's `model/list` names every
+    /// model the login can pick and, per model, the reasoning tiers it accepts
+    /// (`supportedReasoningEfforts`) — the same list codex's own model picker
+    /// draws, `ultra` included where a model has it. `account/read` says which
+    /// login answered. Neither opens a thread, so neither costs a turn.
+    ///
+    /// `env` doesn't apply: codex keys its login by `CODEX_HOME`, which the
+    /// daemon's own environment already carries (see [`Harness::run`]).
+    async fn caps(&self, _env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
+        let server = CodexAppServer::spawn(CodexAppServerOptions::default()).await.ok()?;
+        let models = list_models(&server).await;
+        let account = server
+            .request("account/read", json!({}))
+            .await
+            .ok()
+            .and_then(|r| r["account"]["email"].as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+        let _ = server.shutdown().await;
+        let models = models?;
+        Some(HarnessProbe {
+            account,
+            source: CapsSource::Handshake,
+            models,
+            ..Default::default()
+        })
+    }
+
+    /// Codex keys its login by `CODEX_HOME` — the daemon's own (a supervisor
+    /// can pin one per bot), or `~/.codex` when unset — so that is the seat a
+    /// roster belongs to. Two codex bots on two logins must not read each
+    /// other's answer off the same file.
+    fn seat_key(&self, env: &[(String, String)]) -> String {
+        env.iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("CODEX_HOME").ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(|home| format!("home-{home}"))
+            .unwrap_or_else(|| "default".into())
+    }
+}
+
+/// Most `model/list` pages to follow. The roster is a dozen models on one
+/// page today; the cap only keeps a server that never stops paging from
+/// holding the probe forever.
+const MODEL_PAGES: usize = 20;
+
+/// Every visible model, across pages. `None` unless the list ENDED: a page
+/// that fails, a cursor that doesn't move, or more pages than any roster has
+/// would all leave a list missing its tail — which drops real models from the
+/// sheet and judges tiers against the wrong roster, worse than keeping what
+/// it already has.
+async fn list_models(server: &CodexAppServer) -> Option<Vec<ModelCap>> {
+    let mut models: Vec<ModelCap> = Vec::new();
+    let mut cursor = Value::Null;
+    for _ in 0..MODEL_PAGES {
+        let mut params = json!({ "includeHidden": false });
+        if !cursor.is_null() {
+            params["cursor"] = cursor.clone();
+        }
+        let page = server.request("model/list", params).await.ok()?;
+        for m in models_of(&page) {
+            if !models.iter().any(|x| x.id == m.id) {
+                models.push(m);
+            }
+        }
+        let next = match &page["nextCursor"] {
+            Value::String(s) if s.is_empty() => Value::Null,
+            v => v.clone(),
+        };
+        if next.is_null() {
+            return Some(models);
+        }
+        if next == cursor {
+            return None;
+        }
+        cursor = next;
+    }
+    None
+}
+
+/// One `model/list` page as [`ModelCap`]s, in codex's order. `model` is what
+/// `--model` takes; `id` (the preset) is the same string today and an alias
+/// when it isn't. Every field but the slug is optional-tolerant — the shape has
+/// grown between builds, and a missing key means "this build didn't say".
+fn models_of(page: &Value) -> Vec<ModelCap> {
+    let s = |v: &Value, k: &str| v[k].as_str().map(str::to_string).filter(|x| !x.is_empty());
+    page["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["hidden"].as_bool() != Some(true))
+        .filter_map(|m| {
+            let id = s(m, "model").or_else(|| s(m, "id"))?;
+            let aliases = s(m, "id").filter(|alias| *alias != id).into_iter().collect();
+            Some(ModelCap {
+                display: s(m, "displayName").unwrap_or_else(|| id.clone()),
+                resolved: None,
+                aliases,
+                description: s(m, "description"),
+                efforts: m["supportedReasoningEfforts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["reasoningEffort"].as_str().or_else(|| e.as_str()))
+                    .map(str::to_string)
+                    .collect(),
+                id,
+            })
+        })
+        .collect()
 }
 
 /// Borrowed per-turn invocation parameters shared by the resume attempt and its
@@ -213,12 +329,14 @@ fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -
         args.push("--model".into());
         args.push(m.into());
     }
-    // Reasoning effort (owner-set via Customization) → Codex's config key.
-    // Codex supports minimal/low/medium/high; the higher mafold tiers clamp to
-    // high. No mapping = Codex's own default.
-    if let Some(eff) = effort.and_then(map_effort) {
+    // Reasoning effort (owner-set via Customization) → Codex's config key, AS
+    // GIVEN. Which tiers exist is codex's to say (`model/list`, see `caps`) and
+    // the daemon's to check before the turn (`harness::effort_for_turn`); a
+    // table here clamped xhigh/max to high and dropped ultra on the floor, so
+    // the run took `~/.codex/config.toml`'s tier instead. None = codex's own.
+    if let Some(eff) = effort.map(str::trim).filter(|e| !e.is_empty()) {
         args.push("-c".into());
-        args.push(format!("model_reasoning_effort=\"{eff}\""));
+        args.push(format!("model_reasoning_effort={}", toml_string(eff)));
     }
     // `--` stops flag parsing so the `-` after it is read as the prompt argument.
     args.push("--".into());
@@ -234,7 +352,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     let mut item_stats = super::codex_stats::ItemStats::default();
     let _ = sink.send(AgentEvent::Stats(RunStats {
         model: model.map(str::to_string),
-        effort: effort.and_then(map_effort).map(str::to_string),
+        effort: effort.map(str::trim).filter(|e| !e.is_empty()).map(str::to_string),
         ..Default::default()
     }));
 
@@ -532,17 +650,9 @@ impl ImageSweep {
     }
 }
 
-/// Map a mafold effort level (`low`…`max`) to Codex's `model_reasoning_effort`
-/// (`minimal`/`low`/`medium`/`high`). `None` = use Codex's own default.
-fn map_effort(effort: &str) -> Option<&'static str> {
-    match effort.trim().to_lowercase().as_str() {
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        // Codex tops out at `high`; the higher mafold tiers clamp to it.
-        "high" | "xhigh" | "max" => Some("high"),
-        _ => None, // "default"/unknown → Codex default
-    }
+/// `s` as a TOML basic string — `-c key=value` parses its value as TOML.
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Normalize a Codex `item` event into `AgentEvent`s. `phase` is the outer
@@ -1050,16 +1160,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The tier rides to codex exactly as the turn carries it — the field bug
+    /// was `ultra` vanishing from argv (and xhigh/max arriving as `high`), so
+    /// codex ran `~/.codex/config.toml`'s medium. Which tiers are real is
+    /// checked before the turn (`harness::effort_for_turn`), not here.
     #[test]
-    fn effort_mapping() {
-        assert_eq!(map_effort("low"), Some("low"));
-        assert_eq!(map_effort("Medium"), Some("medium"));
-        assert_eq!(map_effort("high"), Some("high"));
-        assert_eq!(map_effort("xhigh"), Some("high"));
-        assert_eq!(map_effort("max"), Some("high"));
-        assert_eq!(map_effort("minimal"), Some("minimal"));
-        assert_eq!(map_effort("default"), None);
-        assert_eq!(map_effort("wat"), None);
+    fn effort_reaches_codex_verbatim() {
+        let effort_arg = |e: Option<&str>| {
+            let args = exec_args(None, Some("gpt-6.1-sol"), e);
+            args.iter()
+                .position(|a| a == "-c")
+                .map(|i| args[i + 1].clone())
+        };
+        for tier in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+            assert_eq!(effort_arg(Some(tier)), Some(format!("model_reasoning_effort=\"{tier}\"")));
+        }
+        assert_eq!(effort_arg(None), None, "unset = codex's own default");
+        assert_eq!(effort_arg(Some("  ")), None);
+        // Still one TOML string whatever it holds.
+        assert_eq!(effort_arg(Some("a\"b")), Some(r#"model_reasoning_effort="a\"b""#.to_string()));
+    }
+
+    /// `model/list` as codex 0.161.0 answers it (trimmed): per-model tiers,
+    /// `ultra` only where the model has it, hidden models left out, and the
+    /// paging cursor ignored by the parse.
+    #[test]
+    fn model_list_becomes_per_model_tiers() {
+        let tiers = |ts: &[&str]| -> Value {
+            ts.iter().map(|t| json!({ "reasoningEffort": t, "description": "…" })).collect()
+        };
+        let page = json!({
+            "data": [
+                { "id": "gpt-6.1-sol", "model": "gpt-6.1-sol", "displayName": "GPT-6.1-Sol",
+                  "description": "Latest workhorse model.", "hidden": false, "isDefault": true,
+                  "defaultReasoningEffort": "low",
+                  "supportedReasoningEfforts": tiers(&["low", "medium", "high", "xhigh", "max", "ultra"]) },
+                { "id": "gpt-6-luna", "model": "gpt-6-luna", "displayName": "GPT-6-Luna", "hidden": false,
+                  "supportedReasoningEfforts": tiers(&["low", "medium", "high", "xhigh", "max"]) },
+                { "id": "gpt-daybreak-blue-latest", "model": "gpt-daybreak-blue-latest", "hidden": true,
+                  "supportedReasoningEfforts": tiers(&["low"]) },
+                { "id": "preset-x", "model": "gpt-x", "supportedReasoningEfforts": [] }
+            ],
+            "nextCursor": null
+        });
+        let models = models_of(&page);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["gpt-6.1-sol", "gpt-6-luna", "gpt-x"], "hidden models stay out of the sheet");
+        assert_eq!(models[0].display, "GPT-6.1-Sol");
+        assert_eq!(models[0].efforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(models[1].efforts, ["low", "medium", "high", "xhigh", "max"]);
+        // The slug is what `--model` takes; a different preset id still names it.
+        assert_eq!(models[2].display, "gpt-x");
+        assert!(models[2].matches("preset-x"));
+        assert!(models[2].efforts.is_empty());
+        assert!(models_of(&json!({})).is_empty());
+    }
+
+    /// A roster belongs to the codex login it was read from — two daemons on
+    /// two `CODEX_HOME`s keep two answers, never one shared `default`.
+    #[test]
+    fn codex_rosters_are_kept_per_codex_home() {
+        let pro = Codex.seat_key(&[("CODEX_HOME".into(), "/u/.codex-pro".into())]);
+        let plus = Codex.seat_key(&[("CODEX_HOME".into(), "/u/.codex-plus".into())]);
+        assert_ne!(pro, plus);
+        assert_ne!(pro, "default");
+        assert_ne!(
+            super::super::caps_cache_path("codex", &pro),
+            super::super::caps_cache_path("codex", &plus)
+        );
+    }
+
+    /// The real binary, when there is one: the probe must come back with the
+    /// tiers per model, and spend nothing doing it (no thread is opened).
+    #[tokio::test]
+    #[ignore = "requires an installed Codex CLI with App Server support"]
+    async fn live_codex_reports_its_tiers() {
+        if !super::super::on_path("codex") {
+            return;
+        }
+        let probe = Codex.caps(&[], "").await.expect("codex answered model/list");
+        assert!(!probe.models.is_empty());
+        assert!(probe.models.iter().all(|m| !m.efforts.is_empty()), "{:?}", probe.models);
+        for m in &probe.models {
+            println!("  {} ({}) efforts={:?}", m.id, m.display, m.efforts);
+        }
     }
 
     /// A sweep must report only what THIS turn drew. A resumed thread's

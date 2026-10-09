@@ -221,6 +221,12 @@ impl Runtime {
         })
     }
 
+    /// The sealed payload, opened with whatever keyring this runtime holds —
+    /// for a native driver in another module (`ark`).
+    pub(crate) fn open_payload(&self, conn: &Value) -> Result<Map<String, Value>> {
+        self.open(conn)
+    }
+
     fn open(&self, conn: &Value) -> Result<Map<String, Value>> {
         let blob = conn.get("blob").and_then(Value::as_str).unwrap_or("");
         let plain = match &self.keys {
@@ -416,6 +422,8 @@ impl Runtime {
                     crate::computer::catalog()
                 } else if driver == crate::google::DRIVER {
                     crate::google::catalog()
+                } else if driver == crate::ark::DRIVER {
+                    crate::ark::catalog()
                 } else {
                     serde_json::json!({ "tools": [] })
                 });
@@ -453,6 +461,9 @@ impl Runtime {
             }
             Some(d) if d == crate::google::DRIVER => {
                 crate::google::run(self, name, &conn, &spec, method, params).await
+            }
+            Some(d) if d == crate::ark::DRIVER => {
+                crate::ark::run(self, name, &conn, &spec, method, params).await
             }
             // The ONE case where "update the app" is still the honest answer:
             // the pack can name a driver, but a driver is code. Everything else

@@ -114,6 +114,31 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-10",
     },
+    FlagMeta {
+        key: "gardenWorksV2",
+        default: false,
+        dev_default: false,
+        label: "Garden activity v2",
+        description: "动态 also shows other people's agents when they answer you, marked with whose they \
+                      are, and the ones writing to you right now; card type definitions are no longer works. \
+                      (Its work series were never shipped — gardenWorksV3 replaced them, linsky 10-08.) \
+                      Read by getAppViewerProfile for the viewer.",
+        owner: "linsky",
+        added: "2026-10",
+    },
+    // linsky 10-08: 「生成的东西忠实地全部放进来,不让 agent 判断」.
+    FlagMeta {
+        key: "gardenWorksV3",
+        default: false,
+        dev_default: false,
+        label: "Garden works v3 (every output)",
+        description: "The garden's 作品 are everything the person's own agents produced, judged by nobody: \
+                      every HTML card and every file on every finished message they sent, wherever the \
+                      person can still read it (getAppViewerProfile `outputs`, listViewerOutputs, \
+                      getViewerOutput). Card type definitions are no longer works.",
+        owner: "linsky",
+        added: "2026-10",
+    },
     // Owner 10-06, after seeing it live: "样式还行但不能这样直接上,要隐藏".
     // Off until he turns it on. A phone binary built before this entry doesn't
     // know the key and resolves it off too; turning it ON for phones therefore
@@ -141,6 +166,21 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         description: "On Windows, an agent's background Bash is started by the daemon with no \
                       console window, outlives the turn and is reported back in a new turn — \
                       as on macOS/Linux. Off = background Bash stays turn-scoped, as before.",
+        owner: "ops",
+        added: "2026-10",
+    },
+    // Owner 10-09: the left rail is fine as the wide-screen default, but it
+    // goes out behind this flag, off, with its own line on the release card —
+    // on only once he has clicked it there.
+    FlagMeta {
+        key: "folderRail",
+        default: false,
+        dev_default: false,
+        label: "Folder tabs on the left",
+        description: "On a wide screen the chat-list folder tabs become a rail down the column's left \
+                      edge (mafold-mac's sidebar rail; the desktop shell's window lights at its head), \
+                      and Settings > Chat Folders offers left / top. Off = the strip across the top, \
+                      no choice offered.",
         owner: "ops",
         added: "2026-10",
     },

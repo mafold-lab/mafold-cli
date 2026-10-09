@@ -19,6 +19,7 @@ pub mod flags;
 pub mod connections;
 pub mod providers;
 mod codex;
+mod ark;
 pub mod computer;
 pub mod google;
 pub mod mcp;

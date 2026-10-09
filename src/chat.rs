@@ -996,9 +996,42 @@ async fn resolve_channel(client: &Client, chat: &str, name: &str) -> Result<Stri
     chs.as_array()
         .into_iter()
         .flatten()
+        // An untitled channel's name is a placeholder it shares with every
+        // other untitled one: those go by id.
+        .filter(|c| c["untitled"].as_bool() != Some(true))
         .find(|c| c["name"].as_str().map(str::to_lowercase).as_deref() == Some(&n.to_lowercase()))
         .and_then(|c| c["id"].as_str().map(str::to_string))
         .with_context(|| format!("no channel called #{n}"))
+}
+
+/// The block a turn in an UNTITLED forum channel carries. A channel created
+/// without a name is named by the agent answering in it, the way an AI chat
+/// titles itself — this is the self-hosted half of the hosted `name_channel`
+/// tool (mafold-api `brains/platform.rs`). Both ids are spelled out, so the
+/// command reads the same from every harness with no env expansion involved.
+///
+/// `None` on `#all`, in a named channel, or when the list can't be fetched: a
+/// hint that fails is silence, never a failed turn. Not cached — a channel is
+/// untitled for one exchange, and a stale "untitled" would send the agent to
+/// rename a channel that already has a name (the server refuses that anyway).
+pub async fn untitled_channel_block(client: &Client, chat: &str, channel_id: Option<&str>) -> Option<String> {
+    let channel_id = channel_id?;
+    let list = client.list_channels(chat).await.ok()?;
+    untitled_block_from(&list, chat, channel_id)
+}
+
+fn untitled_block_from(list: &Value, chat: &str, channel_id: &str) -> Option<String> {
+    let items = list.get("items").unwrap_or(list);
+    let ch = items.as_array()?.iter().find(|c| c["id"].as_str() == Some(channel_id))?;
+    if ch["untitled"].as_bool() != Some(true) {
+        return None;
+    }
+    Some(format!(
+        "[UNTITLED CHANNEL — the channel you are answering in has no name yet. Once you have \
+replied and know what it is about, name it: `mafold channels rename {chat} {channel_id} <a few \
+words, in the conversation's language, no #>`. Name it once; if it answers that the channel \
+already has a name, leave it.]"
+    ))
 }
 
 #[cfg(test)]
@@ -1166,5 +1199,22 @@ mod tests {
         assert_eq!(held_grantor(&g, "bbb").as_deref(), Some("kim"));
         assert!(held_grantor(&g, "ccc").is_none());
         assert!(held_grantor(&json!({}), "aaa").is_none());
+    }
+
+    /// Only a turn in an untitled channel is told to name it, with both ids
+    /// in the command; a named channel and an unknown one cost nothing.
+    #[test]
+    fn only_an_untitled_channel_asks_to_be_named() {
+        let list = json!([
+            {"id": "c-new", "name": "未命名", "untitled": true},
+            {"id": "c-old", "name": "发版"},
+        ]);
+        let block = untitled_block_from(&list, "conv-1", "c-new").expect("untitled");
+        assert!(block.contains("mafold channels rename conv-1 c-new "), "{block}");
+        assert!(untitled_block_from(&list, "conv-1", "c-old").is_none());
+        assert!(untitled_block_from(&list, "conv-1", "gone").is_none());
+        // The list arrives either bare or wrapped in `items`.
+        let wrapped = json!({"items": list});
+        assert!(untitled_block_from(&wrapped, "conv-1", "c-new").is_some());
     }
 }

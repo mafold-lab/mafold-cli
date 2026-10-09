@@ -380,6 +380,13 @@ pub fn mafold_plugin_dir() -> PathBuf {
     drives_dir().parent().map(|p| p.join("plugins").join("mafold")).unwrap_or_else(|| PathBuf::from("plugins/mafold"))
 }
 
+/// The plugin name a folder goes by — its manifest's `name`, which is what
+/// the agent puts before each of its skills (`<name>:<skill>`).
+pub fn plugin_name(dir: &Path) -> Option<String> {
+    let b = std::fs::read(dir.join(".claude-plugin").join("plugin.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&b).ok()?["name"].as_str().map(str::to_string)
+}
+
 /// What a turn's agent process is pointed at: Mafold's own plugin (always,
 /// once installed) and the bot's drive (when mirrored).
 pub async fn mount(m: Option<&Mirror>) -> crate::harness::Mount {
@@ -391,18 +398,90 @@ pub async fn mount(m: Option<&Mirror>) -> crate::harness::Mount {
     if let Some(m) = m {
         plugin_dirs.push(m.root());
     }
-    crate::harness::Mount { plugin_dirs }
+    crate::harness::Mount { plugin_dirs, guest: false }
 }
 
-/// `mafold drive-hook` — was the command form of the memory guard (cli
-/// 0.9.130–0.9.133). Drives hold no memory now, so it has no opinion on
-/// anything: it reads its input and says nothing, which a PreToolUse hook
-/// reads as "go ahead". It still EXISTS because a claude started by an older
-/// daemon can have it in its settings — and an unknown subcommand exits 2,
-/// which claude reads as "block this tool call".
+/// The skill gate: what a guest's turn — one someone outside the owner's
+/// circle started — may invoke with the Skill tool.
+///
+/// The agent is the OWNER's Claude Code, and their skills are instructions
+/// they wrote for themselves; the model reaches for one by its description,
+/// for whoever is asking. A guest's process is started without them
+/// (`Mount::guest`), and this holds its Skill calls to `plugins`, the ones the
+/// daemon mounted (this bot's drive, `<label>:…`, and Mafold's own,
+/// `mafold:…`) all the same; anything else is refused, and the reason — which
+/// the model reads as the tool's result — says what it may use instead.
+/// `None` = no opinion.
+///
+/// This holds the tool, not the files: the agent runs as the owner's OS user,
+/// so a file tool can still open a skill's folder.
+pub fn skill_gate(tool_name: &str, tool_input: &serde_json::Value, plugins: &[String]) -> Option<serde_json::Value> {
+    if tool_name != "Skill" {
+        return None;
+    }
+    // `skill` today; `command` on older Claude Code (the transcript reads both).
+    let name = ["skill", "command", "name"].iter().find_map(|k| tool_input[*k].as_str()).unwrap_or_default();
+    let name = name.trim().trim_start_matches('/');
+    if may_use_skill(name, plugins) {
+        return None;
+    }
+    let open = if plugins.is_empty() {
+        "none are mounted here".to_string()
+    } else {
+        plugins.iter().map(|p| format!("`{p}:…`")).collect::<Vec<_>>().join(" and ")
+    };
+    let reason = format!(
+        "`{name}` isn't available on this turn: it is one of this agent's owner's own skills, and only the owner and people they've whitelisted may use those. Skills anyone here may use: {open}. Do what you can without it, and say that this part needs the owner."
+    );
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }))
+}
+
+/// Does `skill` (`<plugin>:<name>`) come from one of `plugins`?
+pub fn may_use_skill(skill: &str, plugins: &[String]) -> bool {
+    skill.split_once(':').is_some_and(|(p, _)| plugins.iter().any(|q| q == p.trim()))
+}
+
+/// The plugins a guest's turn may use skills from: the ones in
+/// `mount`, by manifest name — less any name one of the owner's own installed
+/// plugins also goes by (`installed`). A skill only says `<name>:<skill>`, so
+/// a bot named like one of those would let the owner's whole plugin through;
+/// the shared name is held instead, the bot's own skills with it.
+pub fn gated_plugins(mount: &crate::harness::Mount, installed: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in mount.plugin_dirs.iter().filter_map(|d| plugin_name(Path::new(d))) {
+        if installed.contains(&name) {
+            eprintln!("skills: `{name}` is also one of the owner's installed plugins — held on guests' turns");
+        } else {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// `mafold drive-hook` — the command form of [`skill_gate`], for a claude that
+/// can't take control-channel hooks. Whose turn it is comes from the turn
+/// file (`crate::turnenv::skill_plugins`), never the environment: that names
+/// the turn that spawned the process.
+///
+/// cli 0.9.130–0.9.133 registered it for file writes (the memory guard); a
+/// claude one of those started still calls it that way, and it says nothing
+/// about anything but the Skill tool — which a PreToolUse hook reads as "go
+/// ahead". An unknown subcommand would exit 2: "block this tool call".
 pub fn run_hook() -> Result<()> {
     use std::io::Read;
-    let _ = std::io::stdin().read_to_string(&mut String::new());
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let Some(plugins) = crate::turnenv::skill_plugins() else { return Ok(()) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else { return Ok(()) };
+    if let Some(out) = skill_gate(v["tool_name"].as_str().unwrap_or_default(), &v["tool_input"], &plugins) {
+        println!("{out}");
+    }
     Ok(())
 }
 

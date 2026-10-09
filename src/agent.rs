@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::client::{Client, Dest};
-use crate::harness::{AgentEvent, Harness, Turn};
+use crate::harness::{AgentEvent, Harness, Turn, Who};
 
 #[derive(Deserialize)]
 struct Sender {
@@ -637,6 +637,105 @@ fn norm_user(raw: &str) -> String {
     raw.trim().trim_start_matches('@').trim().to_lowercase()
 }
 
+/// Who may drive this bot, and who for free (`AllowList`) — the same one the
+/// access gate reads, hot reloads included. One bot per daemon process, like
+/// its drive (`crate::drive::current`).
+static ACCESS: std::sync::OnceLock<Arc<RwLock<AllowList>>> = std::sync::OnceLock::new();
+
+/// Is `sender` in the owner's own circle — the owner, someone they
+/// whitelisted by name, or a bot of either: the people who drive this bot for
+/// free (`AllowList::is_free`, owner call 2026-10-07)? Not `*` and not the paid
+/// tier: those open the door to anyone. A turn from outside the circle is a
+/// guest's (`crate::harness::Mount::guest`): it runs on none of the owner's
+/// own Claude Code, in a session of its own, held to the mounted plugins'
+/// skills (`crate::drive::skill_gate`).
+async fn trusted(sender: &str) -> bool {
+    let Some(access) = ACCESS.get() else { return false };
+    access.read().await.circle(sender)
+}
+
+/// Where someone stands with this bot — what [`Who`] asks before a command
+/// runs, whichever road it came by. The circle is `trusted`'s; nothing here
+/// draws a second one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// Let in by `*` or the paid tier: outside the owner's circle.
+    Guest,
+    /// Whitelisted by name, or a bot of the owner's or of someone whitelisted.
+    Circle,
+    /// The owner's own account. Not a bot of theirs: its message may be
+    /// carrying anyone's words.
+    Owner,
+}
+
+impl Standing {
+    fn may(self, who: Who) -> bool {
+        match who {
+            Who::Anyone => true,
+            Who::Circle => self != Standing::Guest,
+            Who::Owner => self == Standing::Owner,
+        }
+    }
+}
+
+/// `sender`'s [`Standing`], and — another bot's message relaying someone — the
+/// lower of theirs, as for [`trusted_turn`].
+async fn standing(sender: &str, relayed_for: Option<&str>) -> Standing {
+    match ACCESS.get() {
+        Some(access) => access.read().await.standing(sender, relayed_for),
+        None => Standing::Guest,
+    }
+}
+
+/// What someone hears when a command isn't theirs to run.
+fn not_yours(name: &str, who: Who) -> String {
+    match who {
+        Who::Owner => format!("`/{name}` changes the Claude sign-ins on this agent's machine, so only its owner can use it."),
+        _ => format!("`/{name}` reads this agent's machine or changes how it runs for everyone in the chat, so only its owner and people they've whitelisted can use it."),
+    }
+}
+
+/// Who another bot's message `id` is passing on (`messageOrigin`), for
+/// [`trusted_turn`]: the person its chain started from; `""` — nobody in
+/// particular, a guest — when nobody knows and the bot is open to anyone (its
+/// word can't vouch for whom); `None` when nobody knows and it isn't (its own
+/// standing decides), or the server can't say (one from before this).
+async fn relayed_for(client: &Client, id: &str) -> Option<String> {
+    let o = client.message_origin(id).await.ok()?;
+    o.person.or_else(|| o.open.then(String::new))
+}
+
+/// Is the turn `sender` starts the owner's circle's — and, when another bot's
+/// message is relaying someone (`Client::message_origin`), is that person in
+/// it too? The owner's own bot, open to everyone, passing on a stranger's
+/// request is the stranger asking. The relay's word only ever narrows: a bot
+/// naming a trigger it wasn't asked by can't widen anything.
+async fn trusted_turn(sender: &str, relayed_for: Option<&str>) -> bool {
+    standing(sender, relayed_for).await != Standing::Guest
+}
+
+/// A guest's turns keep sessions of their own: one the owner's circle has
+/// used may hold what the owner's skills, agents or CLAUDE.md put in it.
+fn guest_session(skey: String, guest: bool) -> String {
+    if guest { format!("{skey}#guest") } else { skey }
+}
+
+/// A guest's turn may not run the owner's skills as a typed command either:
+/// Claude Code expands a prompt that opens with `/name` itself, without the
+/// Skill tool — so without the skill gate. Unless it names a skill from one of
+/// `plugins`, it goes in as words, with a line saying why.
+fn unslash(prompt: String, sender: &str, plugins: Option<&[String]>) -> String {
+    let Some(plugins) = plugins else { return prompt };
+    let Some(rest) = prompt.trim_start().strip_prefix('/') else { return prompt };
+    let name = rest.split(char::is_whitespace).next().unwrap_or_default();
+    if crate::drive::may_use_skill(name, plugins) {
+        return prompt;
+    }
+    format!(
+        "(@{sender} typed this as a slash command. It was not run: for someone outside its owner's circle, this agent can only use its own skills and Mafold's.)\n{prompt}"
+    )
+}
+
 impl AllowList {
     /// Build from the bot's owner (`getMe` → `parent_username`) plus the
     /// owner-authored `whitelist` / `blacklist` config lists and the legacy
@@ -679,6 +778,26 @@ impl AllowList {
             return false;
         }
         idents.iter().any(|i| self.users.contains(i))
+    }
+
+    /// [`Self::is_free`] for a handle as it arrives: a bot's is
+    /// `<owner>:<label>`, and it stands where its owner does.
+    fn circle(&self, sender: &str) -> bool {
+        let lc = norm_user(sender);
+        let parent = lc.split_once(':').map(|(p, _)| p.to_string());
+        self.is_free(&lc, parent.as_deref())
+    }
+
+    /// [`Standing`] on this list. A bot's message passing someone on
+    /// (`relayed_for`) stands no higher than they do.
+    fn standing(&self, sender: &str, relayed_for: Option<&str>) -> Standing {
+        if !self.circle(sender) || relayed_for.is_some_and(|o| !self.circle(o)) {
+            Standing::Guest
+        } else if self.owner.as_deref() == Some(norm_user(sender).as_str()) {
+            Standing::Owner
+        } else {
+            Standing::Circle
+        }
     }
 
     /// May this sender drive the bot? An AI sender is judged as BOTH itself and
@@ -772,6 +891,9 @@ struct TurnHandle {
     /// a billed sender's words are never folded into anyone's turn, where they
     /// would ride free (see `pick_turn`).
     pays: bool,
+    /// A guest's turn (`trusted`), as decided when it started — the process it
+    /// runs in was fixed then, whatever the access list says later.
+    guest: bool,
 }
 
 /// A message on its way to becoming a turn.
@@ -2192,6 +2314,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         }
         Arc::new(RwLock::new(a))
     };
+    let _ = ACCESS.set(allow.clone());
 
     // Cloud-first harness: the bot's server-configured harness wins over the
     // local `--harness` flag (which is the fallback / first-run default).
@@ -2409,6 +2532,10 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
                 }
             }
             println!("↻ re-arming background-task wakeup for {tag} ({n} registration(s))");
+            // A guest's tasks (`guest_tag`) wake as a guest — nobody in
+            // particular, since the registry doesn't say which one — never as
+            // the owner, whose own Claude Code that would put them on.
+            let guest = surface_split(&tag).is_some_and(|(_, _, b)| b != me);
             arm_bg_wakeup(
                 client.clone(),
                 workdir.clone(),
@@ -2426,7 +2553,8 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
                 None,
                 None,
                 None,
-                stopper.clone(),
+                if guest { String::new() } else { stopper.clone() },
+                guest,
                 n,
                 // The card-carrying reply predates this process — wake-up only.
                 None,
@@ -2582,28 +2710,32 @@ struct ControlCommand {
     arg_hint: Option<&'static str>,
     menu: Menu,
     effect: Effect,
+    /// Who may run it (`Who`): asked before it runs, whoever typed it.
+    who: Who,
 }
 
 /// The daemon's own control commands — handled locally, never forwarded to the
 /// harness CLI (`handle_control`; `/login` runs its own flow). The ONE table:
-/// the menu is rendered from it and the group gate reads each row's `effect`.
+/// the menu is rendered from it, the group gate reads each row's `effect`, and
+/// every road a command arrives by reads its `who`.
 const CONTROL: &[ControlCommand] = &[
-    ControlCommand { name: "clear", description: "Start a fresh conversation (clear context)", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible },
-    ControlCommand { name: "new", description: "Alias for /clear", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible },
-    ControlCommand { name: "stop", description: "Stop the reply that's currently running", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
-    ControlCommand { name: "model", description: "Switch the model for this chat", arg_hint: Some("name | reset"), menu: Menu::All, effect: Effect::Reversible },
+    ControlCommand { name: "clear", description: "Start a fresh conversation (clear context)", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible, who: Who::Anyone },
+    ControlCommand { name: "new", description: "Alias for /clear", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible, who: Who::Anyone },
+    ControlCommand { name: "stop", description: "Stop the reply that's currently running", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone },
+    ControlCommand { name: "model", description: "Switch the model for this chat", arg_hint: Some("name | reset"), menu: Menu::All, effect: Effect::Reversible, who: Who::Circle },
     // A Claude Code budget (MAX_THINKING_TOKENS); codex's depth is the owner-set effort.
-    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except("codex"), effect: Effect::Reversible },
-    ControlCommand { name: "resume", description: "Resume an earlier session (terminal ones pick up their live state)", arg_hint: Some("id | last"), menu: Menu::Only("claude-code"), effect: Effect::Reversible },
+    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except("codex"), effect: Effect::Reversible, who: Who::Circle },
+    ControlCommand { name: "resume", description: "Resume an earlier session (terminal ones pick up their live state)", arg_hint: Some("id | last"), menu: Menu::Only("claude-code"), effect: Effect::Reversible, who: Who::Circle },
     // Irreversible by its worst form: `forget` drops a saved login from the machine.
-    ControlCommand { name: "account", description: "Which Claude account this chat runs on — list, pin, forget", arg_hint: Some("name | reset | forget <name>"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible },
+    ControlCommand { name: "account", description: "Which Claude account this chat runs on — list, pin, forget", arg_hint: Some("name | reset | forget <name>"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner },
     // A sign-in replaces the seat's stored token.
-    ControlCommand { name: "login", description: "Sign in to Anthropic — with a name, add a second Claude account", arg_hint: Some("[name]"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible },
-    ControlCommand { name: "compact", description: "Summarize this conversation's context to free tokens", arg_hint: None, menu: Menu::Hidden, effect: Effect::Irreversible },
-    ControlCommand { name: "status", description: "Agent, session, account & daemon info", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
-    ControlCommand { name: "cwd", description: "Show the working directory", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
-    ControlCommand { name: "access", description: "Who may use this bot, and who pays", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
-    ControlCommand { name: "help", description: "What this agent can do", arg_hint: None, menu: Menu::All, effect: Effect::Reversible },
+    ControlCommand { name: "login", description: "Sign in to Anthropic — with a name, add a second Claude account", arg_hint: Some("[name]"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner },
+    ControlCommand { name: "compact", description: "Summarize this conversation's context to free tokens", arg_hint: None, menu: Menu::Hidden, effect: Effect::Irreversible, who: Who::Anyone },
+    // The account line names the owner's Claude login; the workdir is a path on their disk.
+    ControlCommand { name: "status", description: "Agent, session, account & daemon info", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle },
+    ControlCommand { name: "cwd", description: "Show the working directory", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle },
+    ControlCommand { name: "access", description: "Who may use this bot, and who pays", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone },
+    ControlCommand { name: "help", description: "What this agent can do", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone },
 ];
 
 /// The row for a control command, if `name` is one.
@@ -2617,16 +2749,34 @@ fn control_runs(effect: Effect, in_group: bool, named: bool) -> bool {
     effect == Effect::Reversible || !in_group || named
 }
 
-/// The control commands this harness advertises, listed first in the menu.
-fn control_commands(harness_id: &str) -> Vec<Value> {
-    CONTROL
-        .iter()
-        .filter(|c| match c.menu {
+impl ControlCommand {
+    /// Does this harness offer it — in the menu, and in a guest's `/help`?
+    fn advertised(&self, harness_id: &str) -> bool {
+        match self.menu {
             Menu::All => true,
             Menu::Only(h) => harness_id == h,
             Menu::Except(h) => harness_id != h,
             Menu::Hidden => false,
-        })
+        }
+    }
+}
+
+/// `/help` for a guest: the commands that are theirs to run and this harness
+/// advertises, read off `CONTROL` — the full help names ones they'd only be
+/// refused.
+fn guest_help(harness_id: &str) -> String {
+    let mut text = String::from("I'm an agent running on my owner's machine — message me a task. Your conversation with me is your own.\n\nCommands you can use:");
+    for c in CONTROL.iter().filter(|c| c.who == Who::Anyone && c.advertised(harness_id)) {
+        text.push_str(&format!("\n• /{} — {}", c.name, c.description));
+    }
+    text
+}
+
+/// The control commands this harness advertises, listed first in the menu.
+fn control_commands(harness_id: &str) -> Vec<Value> {
+    CONTROL
+        .iter()
+        .filter(|c| c.advertised(harness_id))
         .map(|c| match c.arg_hint {
             Some(hint) => serde_json::json!({ "command": c.name, "description": c.description, "arg_hint": hint }),
             None => serde_json::json!({ "command": c.name, "description": c.description }),
@@ -2888,6 +3038,14 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
         // binary actually accepts; `/model <name>` still takes anything newer.
         // Reasoning effort IS its thinking depth, so it gets the effort select
         // and NO extended-thinking budget field.
+        //
+        // Both menus are a BOOTSTRAP, exactly as for Claude Code below: codex
+        // answers `model/list` ([`report_caps`]) and from then on the server
+        // builds them from what this machine's codex said, per model — `ultra`
+        // where a model has it, and no `minimal`, which no model offers any more.
+        // Until it has answered (or on a codex too old to), the effort menu is
+        // only the tiers every codex takes, old builds and new: an old one has
+        // no xhigh/max, a new one no minimal.
         "codex" => {
             let mut models = vec![serde_json::json!({
                 "label": "Agent default",
@@ -2906,7 +3064,6 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                     { "key": "effort", "label": "Reasoning effort", "label_key": "botField.effort.label", "kind": "select", "default": "",
                       "options": [
                         { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
-                        { "label": "Minimal", "label_key": "botField.effort.minimal", "value": "minimal" },
                         { "label": "Low",     "label_key": "botField.effort.low",     "value": "low" },
                         { "label": "Medium",  "label_key": "botField.effort.medium",  "value": "medium" },
                         { "label": "High",    "label_key": "botField.effort.high",    "value": "high" }
@@ -2916,7 +3073,8 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                     { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
                       "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" },
                     { "key": "whitelist", "label": "Whitelist", "label_key": "botField.whitelist.label", "kind": "string",
-                      "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder" },
+                      "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder",
+                      "hint": "This bot runs on your computer: anyone who can drive it can read and write files there with your account.", "hint_key": "botField.whitelist.hint" },
                     { "key": "blacklist", "label": "Blacklist", "label_key": "botField.blacklist.label", "kind": "string",
                       "placeholder": "Never these users — deny wins over the whitelist", "placeholder_key": "botField.blacklist.placeholder" },
                     { "key": "greeting", "label": "Introduction", "label_key": "botField.greeting.label", "kind": "string",
@@ -2947,7 +3105,8 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                 { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
                   "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" },
                 { "key": "whitelist", "label": "Whitelist", "label_key": "botField.whitelist.label", "kind": "string",
-                  "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder" },
+                  "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder",
+                      "hint": "This bot runs on your computer: anyone who can drive it can read and write files there with your account.", "hint_key": "botField.whitelist.hint" },
                 { "key": "blacklist", "label": "Blacklist", "label_key": "botField.blacklist.label", "kind": "string",
                   "placeholder": "Never these users — deny wins over the whitelist", "placeholder_key": "botField.blacklist.placeholder" },
                 { "key": "greeting", "label": "Introduction", "label_key": "botField.greeting.label", "kind": "string",
@@ -2994,7 +3153,8 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                 { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
                   "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" },
                 { "key": "whitelist", "label": "Whitelist", "label_key": "botField.whitelist.label", "kind": "string",
-                  "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder" },
+                  "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder",
+                      "hint": "This bot runs on your computer: anyone who can drive it can read and write files there with your account.", "hint_key": "botField.whitelist.hint" },
                 { "key": "blacklist", "label": "Blacklist", "label_key": "botField.blacklist.label", "kind": "string",
                   "placeholder": "Never these users — deny wins over the whitelist", "placeholder_key": "botField.blacklist.placeholder" },
                 { "key": "greeting", "label": "Introduction", "label_key": "botField.greeting.label", "kind": "string",
@@ -3161,7 +3321,7 @@ async fn intro_turn(
         client, &turn_workdir, workdir_ns, my_username, chat_id, None, None, &brief, &[],
         sessions, coord, chat_states, harness,
         model, effort, thinking, system, cc.account.clone(),
-        &norm_user(answerer), group_context, &[],
+        &norm_user(answerer), None, group_context, &[],
         // An intro answers nobody's message — it is never billed.
         None,
         false,
@@ -3864,14 +4024,17 @@ async fn connect_and_run(
         }
         // The run-card Stop button (relayed by the API as events.cancelRun, NOT a
         // `/stop` chat message). Authorization is enforced HERE by the same
-        // AllowList that gates all interaction: an allow-listed sender cancels the
-        // running turn (reusing the per-chat cancel Notify); anyone else gets a
-        // directed alert pushed back, and the run keeps going.
+        // AllowList that gates all interaction, and `/stop`'s rule (`stops`): the
+        // owner's circle cancels the running turn (reusing the per-chat cancel
+        // Notify), a guest only a turn they started; anyone else gets a directed
+        // alert pushed back, and the run keeps going.
         if method == "events.cancelRun" {
             let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
             let from = env["params"]["from"].as_str().unwrap_or("").to_string();
             // The Stop button carries the draft's message_id → cancel just THAT
-            // turn. Absent (older clients) → cancel every turn in the conversation.
+            // turn. Absent (older clients) → every turn in the conversation: the
+            // event carries no channel, so narrowing it would silently drop turns
+            // it was meant to reach.
             let msg_id = env["params"]["message_id"].as_str().map(str::to_string);
             // The API may broadcast cancelRun to EVERY bot in the conversation, so
             // a stop aimed at another bot's run can also reach us. Only react if we
@@ -3881,17 +4044,26 @@ async fn connect_and_run(
             if !has_turn(chat_states, &conv_id, msg_id.as_deref()).await {
                 continue;
             }
-            if allow.read().await.allows(&from, None) {
-                match &msg_id {
-                    Some(mid) => { cancel_turn(chat_states, &conv_id, mid).await; }
-                    None => { cancel_all(chat_states, &conv_id).await; }
+            let standing = {
+                let a = allow.read().await;
+                a.allows(&from, None).then(|| a.standing(&from, None))
+            };
+            let by = norm_user(&from);
+            let n = match standing {
+                Some(s) => {
+                    cancel_matching(chat_states, &conv_id, |id, t| {
+                        msg_id.as_deref().is_none_or(|m| m == id) && stops(t, s, &by)
+                    })
+                    .await
                 }
-            } else {
-                println!("← stop from @{from} (not authorized → alert)");
+                None => 0,
+            };
+            if standing.is_none() || (standing == Some(Standing::Guest) && n == 0) {
+                println!("← stop from @{from} (not theirs to stop → alert)");
                 let client = client.clone();
                 tokio::spawn(async move {
                     let _ = client
-                        .push_alert(&from, Some("Can't stop"), "Only the bot's owner (or an allow-listed user) can stop this run.", "error")
+                        .push_alert(&from, Some("Can't stop"), "Only whoever started this run, the bot's owner, or someone they've whitelisted can stop it.", "error")
                         .await;
                 });
             }
@@ -3963,7 +4135,10 @@ async fn connect_and_run(
             let action = env["params"]["action"].as_str().unwrap_or("").to_string();
             let (client, harness, workdir) = (client.clone(), harness.clone(), workdir.to_string());
             let sessions = sessions.clone();
-            let allowed = allow.read().await.allows(&from, None);
+            let standing = {
+                let a = allow.read().await;
+                a.allows(&from, None).then(|| a.standing(&from, None))
+            };
             // The seat this conversation speaks for (`/account` pin, else the
             // owner's setting) — read here, where the locks already are.
             let card_seat = chat_states.lock().await.get(&conv_id).and_then(|s| s.account.clone())
@@ -3972,7 +4147,7 @@ async fn connect_and_run(
             // silent buys them the full timeout and then an "unavailable" that
             // blames the daemon for being offline when it was right here saying no.
             tokio::spawn(async move {
-                let result = if !allowed {
+                let result = if standing.is_none() {
                     serde_json::json!({ "kind": "error", "message": "Only the bot's owner (or an allow-listed user) can do that." })
                 } else if let Some(command) = action.strip_prefix("refresh|") {
                     // `refresh|<command>` is a contract between the card and THIS
@@ -3981,6 +4156,14 @@ async fn connect_and_run(
                     let mut it = rest.splitn(2, char::is_whitespace);
                     let name = it.next().unwrap_or("").to_lowercase();
                     let arg = it.next().unwrap_or("").trim().to_string();
+                    // The same command typed would be asked this; a tap on its
+                    // card is no back door around it.
+                    let who = harness.command_who(&name);
+                    if !standing.is_some_and(|s| s.may(who)) {
+                        let message = not_yours(&name, who);
+                        let _ = client.answer_card_action(&action_id, serde_json::json!({ "kind": "error", "message": message })).await;
+                        return;
+                    }
                     let session = sessions.lock().await.get(&conv_id).cloned();
                     // A card refreshing itself has to speak for the same login
                     // the chat's turns do, or `/usage` reports another
@@ -4435,21 +4618,37 @@ async fn connect_and_run(
         // locally and never reach claude. `/login` runs an interactive flow.
         // Any OTHER `/name …` falls through (emulated, mocked, or to claude).
         // (All reachable only by an allow-listed sender — gated above.)
-        if let Some((name, arg)) = slash_command(trimmed, is_forward, my_username) {
+        if let Some((name, arg, cmd)) = slash_command(trimmed, is_forward, my_username)
+            .and_then(|(name, arg)| control_command(&name).map(|cmd| (name, arg, cmd)))
+        {
             // They skip the reply gate, which is what keeps a bare `/stop` a
             // brake in a group. The irreversible ones don't get that pass: in
             // a group they must name this bot — an @ in what the sender typed,
             // or a reply to one of its messages — or this daemon leaves them be.
-            if let Some(cmd) = control_command(&name) {
-                let named = directed_at_me(&m.content, is_forward, my_username, sender_is_bot) || (!is_forward && reply_to_me);
-                // The chat's kind is only asked for when it can change the answer.
-                let in_group = cmd.effect == Effect::Irreversible
-                    && !named
-                    && conv_is_group(client, &m.conversation_id, chat_states).await.unwrap_or(true);
-                if !control_runs(cmd.effect, in_group, named) {
-                    println!("  (group · /{name} is irreversible and doesn't name @{my_username} → skip)");
-                    continue;
+            let named = directed_at_me(&m.content, is_forward, my_username, sender_is_bot) || (!is_forward && reply_to_me);
+            // The chat's kind is only asked for when it can change the answer.
+            let in_group = cmd.effect == Effect::Irreversible
+                && !named
+                && conv_is_group(client, &m.conversation_id, chat_states).await.unwrap_or(true);
+            if !control_runs(cmd.effect, in_group, named) {
+                println!("  (group · /{name} is irreversible and doesn't name @{my_username} → skip)");
+                continue;
+            }
+            // Whose it is to run (`Who`), asked before anything runs — the
+            // sign-in flow included. Letting someone in to talk to the agent
+            // doesn't hand them the owner's machine.
+            let relayed_for = if sender_is_bot { relayed_for(client, &m.id).await } else { None };
+            let standing = standing(&sender_lc, relayed_for.as_deref()).await;
+            if !standing.may(cmd.who) {
+                println!("  (/{name} isn't @{}'s to run → refused)", m.sender.username);
+                // A bare one in a group reached every daemon there that lets
+                // the sender in; only a bot it names says why.
+                if named || !conv_is_group(client, &m.conversation_id, chat_states).await.unwrap_or(true) {
+                    let _ = client
+                        .send_to(Dest::chat(&m.conversation_id).channel(m.channel_id.as_deref()), &not_yours(&name, cmd.who))
+                        .await;
                 }
+                continue;
             }
             if name == "login" {
                 // The whole flow (link, code prompt, result) answers in the
@@ -4463,23 +4662,18 @@ async fn connect_and_run(
                 tokio::spawn(async move { login_flow(client, chat_id, channel, arg, chat_states, login_owner, harness, me, owner_name).await; });
                 continue;
             }
-            if control_command(&name).is_some() {
-                // A control command arriving as a REPLY may be answering one of
-                // our finalized {% mafold/ask %} cards (e.g. the /resume picker, whose
-                // option labels are the commands themselves) — stamp the card
-                // answered everywhere before running it.
-                if let Some(rid) = m.reply_to_id.as_deref() {
-                    let at = Dest::chat(&m.conversation_id)
-                        .channel(m.channel_id.as_deref())
-                        .thread(m.thread_root_id.as_deref());
-                    stamp_finalized_ask(client, at, rid, my_username, trimmed).await;
-                }
-                let access_ctx = AccessCtx {
-                    is_owner: allow.read().await.owner.as_deref() == Some(sender_lc.as_str()),
-                };
-                handle_control(client, workdir, owner.read().await.clone(), &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, workdirs, chat_states, harness, access_ctx, my_username).await;
-                continue;
+            // A control command arriving as a REPLY may be answering one of
+            // our finalized {% mafold/ask %} cards (e.g. the /resume picker, whose
+            // option labels are the commands themselves) — stamp the card
+            // answered everywhere before running it.
+            if let Some(rid) = m.reply_to_id.as_deref() {
+                let at = Dest::chat(&m.conversation_id)
+                    .channel(m.channel_id.as_deref())
+                    .thread(m.thread_root_id.as_deref());
+                stamp_finalized_ask(client, at, rid, my_username, trimmed).await;
             }
+            handle_control(client, workdir, owner.read().await.clone(), &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, workdirs, chat_states, harness, standing, &sender_lc, my_username).await;
+            continue;
         }
 
         // Group reply gate: in a group, only answer when @-mentioned, replied-to,
@@ -4609,6 +4803,13 @@ async fn connect_and_run(
             let arrived = arrived;
             // Same lifetime, same reason: every early return below clears it.
             let mut pending = pending;
+            // Another bot's message may be passing someone on: the person its
+            // chain started from (`trusted_turn`). Asked only of a bot's
+            // message, here in the task so the loop isn't held up; an answer
+            // that doesn't come is today's rule, the sender's own.
+            let relayed_for = if sender_is_bot { relayed_for(&client, &trigger_id).await } else { None };
+            let words_standing = standing(&turn_sender, relayed_for.as_deref()).await;
+            let words_guest = words_standing == Standing::Guest;
             // ── The floor's wait (`.docs/a2a-v2.md`) ── Seat 0 falls straight
             // through; every seat behind it sleeps its slot out first and then
             // asks the ONE question that matters: has anybody opened this
@@ -4652,11 +4853,23 @@ async fn connect_and_run(
             }
             // Harness-emulated slash commands (config dumps, /logout, mocks);
             // anything not emulated falls through to the harness as a prompt.
+            // Not for a guest (`trusted`): they read and change the owner's own
+            // Claude Code (`/memory`, `/skills`, `/config`, `/logout` …) — a
+            // guest's `/…` goes through as words (`unslash`). Inside the circle
+            // each is still asked its `Who`: `/logout` is the owner's alone.
             let trimmed = content.trim();
-            if let Some(rest) = trimmed.strip_prefix('/') {
+            let as_guest = words_guest;
+            if let Some(rest) = trimmed.strip_prefix('/').filter(|_| !as_guest) {
                 let mut it = rest.splitn(2, char::is_whitespace);
                 let name = it.next().unwrap_or("").to_lowercase();
                 let arg = it.next().unwrap_or("").trim();
+                let who = harness.command_who(&name);
+                if !words_standing.may(who) {
+                    println!("  (/{name} isn't @{sender_username}'s to run → refused)");
+                    let dest = Dest::chat(&chat_id).channel(channel_id.as_deref()).thread(thread_root.as_deref());
+                    let _ = client.send_to(dest, &not_yours(&name, who)).await;
+                    return;
+                }
                 // THIS chat's session, not "whichever transcript was touched
                 // last": several chats routinely share a workdir, and their
                 // daemon sessions race for newest-mtime. `/usage` reporting a
@@ -4719,7 +4932,9 @@ async fn connect_and_run(
                 let carried = steering::carried(attachments.iter().map(|a| a.kind.as_str()));
                 let steered = steer_in_order(
                     &chat_states, &arrived, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
-                    from, reply_to_id.as_deref(), &content, &carried,
+                    // A bot passing on someone outside the owner's circle is
+                    // that someone: only into a guest's turn (`trusted_turn`).
+                    from, Some(words_guest), reply_to_id.as_deref(), &content, &carried,
                     // Borrows only — the normal-turn path below still owns both,
                     // and re-downloads nothing: whatever this fetched is already
                     // in `~/.mafold/attachments` under the same content name.
@@ -4867,6 +5082,7 @@ async fn connect_and_run(
                     if first { &attachments } else { NO_ATTACHMENTS },
                     &sessions, &coord, &chat_states, &harness,
                     model.clone(), effort.clone(), thinking, system.clone(), account.clone(), &turn_sender,
+                    relayed_for.as_deref(),
                     if first { group_context.clone() } else { None },
                     if first { &lookback_photos } else { NO_PHOTOS },
                     // Only the round that answers the message is billed to
@@ -4902,15 +5118,6 @@ async fn connect_and_run(
     Ok(WsExit::Dropped)
 }
 
-/// What `/access` needs from the daemon's live state: whether the asker is the
-/// owner, and the two config values the reply reads out. Snapshotted at the
-/// call site so the control path holds no lock across the send.
-struct AccessCtx {
-    /// Only the owner may PROPOSE a tier change; anyone past the gate may read
-    /// the current one. The tier and price tag themselves come from the live
-    /// `OwnerConfig` `handle_control` already receives.
-    is_owner: bool,
-}
 
 /// What the owner agrees to by moving a bot to the paid tier. Shown by
 /// `/access paid` ABOVE the one-tap card that actually flips the switch, so
@@ -5063,28 +5270,32 @@ async fn deliver_intro_decision(
     }
 }
 
-/// Cancel EVERY in-flight turn in a conversation, all channels. Only the legacy
-/// `events.cancelRun` broadcast (no `message_id`, older clients) uses this —
-/// that event carries no channel, so narrowing it would silently drop turns it
-/// was meant to reach. Returns how many were signalled.
-async fn cancel_all(chat_states: &ChatStates, chat_id: &str) -> usize {
-    cancel_matching(chat_states, chat_id, |_| true).await
+/// Is `t` a turn a stop from `by` reaches? The owner's circle stops anyone's;
+/// a guest only a guest's turn they started. `/stop` is open to anyone
+/// (`CONTROL`) so that a guest can brake their own run — not anybody else's in
+/// the room. "A guest's turn" matters when `by` is a bot passing a guest on:
+/// the turns it started for the owner's circle carry its name too.
+fn stops(t: &TurnHandle, standing: Standing, by: &str) -> bool {
+    standing != Standing::Guest || (t.guest && t.owner == by)
 }
 
 /// Cancel the in-flight turns of ONE forum channel (`None` = `#all`, which is a
-/// scope of its own, NOT a wildcard) — the `/stop` command, which answers in the
-/// channel it was typed in and must only reach that far.
+/// scope of its own, NOT a wildcard) that `by` may stop ([`stops`]) — the
+/// `/stop` command, which answers in the channel it was typed in and must only
+/// reach that far.
 ///
 /// `/stop` used to go conversation-wide, so stopping one runaway task also
 /// killed whatever unrelated work was running in the other channels.
-async fn cancel_channel(chat_states: &ChatStates, chat_id: &str, channel: Option<&str>) -> usize {
-    cancel_matching(chat_states, chat_id, |t| t.channel.as_deref() == channel).await
+async fn cancel_channel(chat_states: &ChatStates, chat_id: &str, channel: Option<&str>, standing: Standing, by: &str) -> usize {
+    cancel_matching(chat_states, chat_id, |_, t| t.channel.as_deref() == channel && stops(t, standing, by)).await
 }
 
+/// Cancel the turns `keep` picks, by draft message id and handle. Returns how
+/// many were signalled.
 async fn cancel_matching(
     chat_states: &ChatStates,
     chat_id: &str,
-    keep: impl Fn(&TurnHandle) -> bool,
+    keep: impl Fn(&str, &TurnHandle) -> bool,
 ) -> usize {
     let notifies: Vec<Arc<Notify>> = chat_states
         .lock()
@@ -5092,9 +5303,9 @@ async fn cancel_matching(
         .get(chat_id)
         .map(|s| {
             s.turns
-                .values()
-                .filter(|t| keep(t))
-                .map(|t| t.cancel.clone())
+                .iter()
+                .filter(|(id, t)| keep(id, t))
+                .map(|(_, t)| t.cancel.clone())
                 .collect()
         })
         .unwrap_or_default();
@@ -5240,8 +5451,26 @@ async fn steer_turn<Fut: std::future::Future<Output = String>>(
     carried: &str,
     body: impl FnOnce(String) -> Fut,
 ) -> Option<Steered> {
+    steer_turn_as(chat_states, chat_id, channel, thread, from, None, reply_to, text, carried, body).await
+}
+
+/// [`steer_turn`], saying whether the words are a guest's when the caller
+/// knows better than the sender's own handle (`steer_in_order`).
+#[allow(clippy::too_many_arguments)]
+async fn steer_turn_as<Fut: std::future::Future<Output = String>>(
+    chat_states: &ChatStates,
+    chat_id: &str,
+    channel: Option<&str>,
+    thread: Option<&str>,
+    from: Speaker<'_>,
+    from_guest: Option<bool>,
+    reply_to: Option<&str>,
+    text: &str,
+    carried: &str,
+    body: impl FnOnce(String) -> Fut,
+) -> Option<Steered> {
     inject_into_live_turn(
-        chat_states, chat_id, channel, thread, from, reply_to, text,
+        chat_states, chat_id, channel, thread, from, from_guest, reply_to, text,
         Seam::User(carried.to_string()), body,
     )
     .await
@@ -5320,6 +5549,9 @@ async fn steer_in_order<Fut: std::future::Future<Output = String>>(
     channel: Option<&str>,
     thread: Option<&str>,
     from: Speaker<'_>,
+    // Whether these words are a guest's (`trusted_turn`), when the caller
+    // knows better than `from`'s own handle — a bot relaying someone.
+    from_guest: Option<bool>,
     reply_to: Option<&str>,
     text: &str,
     carried: &str,
@@ -5349,7 +5581,7 @@ async fn steer_in_order<Fut: std::future::Future<Output = String>>(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    steer_turn(chat_states, chat_id, channel, thread, from, reply_to, text, carried, body).await
+    steer_turn_as(chat_states, chat_id, channel, thread, from, from_guest, reply_to, text, carried, body).await
 }
 
 /// The body of the above, with the SEAM left open.
@@ -5370,6 +5602,9 @@ async fn inject_into_live_turn<Fut: std::future::Future<Output = String>>(
     // top-level message was folded into whatever thread turn was running.
     thread: Option<&str>,
     from: Speaker<'_>,
+    // Whether what arrives is a guest's (`trusted_turn`): a bot relaying
+    // someone, or a guest's background work. `None` = judge `from` by itself.
+    from_guest: Option<bool>,
     reply_to: Option<&str>,
     text: &str,
     seam: Seam,
@@ -5404,13 +5639,30 @@ async fn inject_into_live_turn<Fut: std::future::Future<Output = String>>(
     // NEW renderer (`ev_tx2`/`ev_tx3`) under the same handle, and the seam sent
     // down the pre-fetch clone would have gone nowhere anyone could see.
     // Its owner crosses too: whose turn it is decides how the words are framed.
-    let (turn_id, owner) = {
+    let (turn_id, owner, turn_guest) = {
         let states = chat_states.lock().await;
         let st = states.get(chat_id)?;
         let pick = pick_turn(st, &from, reply_to, channel, thread)?;
-        (pick.cancel.clone(), pick.owner.clone())
+        (pick.cancel.clone(), pick.owner.clone(), pick.guest)
     };
     let cross = owner != from.lc;
+    // A turn the owner's circle started runs on the owner's own Claude Code
+    // (`trusted`): a guest's words don't ride in on it — they get a turn of
+    // their own, as a guest — and neither does a guest's background work. The
+    // circle's background work doesn't ride in a guest's turn either: it may
+    // carry what the owner's skills made. (The circle's words may: they say
+    // what they choose to.)
+    let from_guest = match from_guest {
+        Some(g) => g,
+        None => !trusted(from.lc).await,
+    };
+    let mixes = match seam {
+        Seam::User(_) => !turn_guest && from_guest,
+        _ => turn_guest != from_guest,
+    };
+    if mixes {
+        return None;
+    }
     // Only HERE do we pay for the download. A normal message's attachments are
     // fetched inside `handle`, after `harness.prewarm()` already has the cold
     // `claude` starting; hoisting that fetch above the pick would charge every
@@ -5582,22 +5834,6 @@ fn listens(t: &TurnHandle, channel: Option<&str>, thread: Option<&str>) -> bool 
     steering::on_surface(t.channel.as_deref(), t.thread.as_deref(), channel, thread)
 }
 
-/// Cancel ONE turn by its draft message id (the run-card Stop button → it stops
-/// just that card's turn). Returns true if a matching turn was signalled.
-async fn cancel_turn(chat_states: &ChatStates, chat_id: &str, msg_id: &str) -> bool {
-    let notify = chat_states
-        .lock()
-        .await
-        .get(chat_id)
-        .and_then(|s| s.turns.get(msg_id).map(|t| t.cancel.clone()));
-    if let Some(n) = notify {
-        n.notify_one();
-        true
-    } else {
-        false
-    }
-}
-
 /// The Claude login a chat's NON-turn interactions speak for, as process env
 /// (empty = this machine's own login, and every harness but Claude Code).
 ///
@@ -5616,6 +5852,32 @@ fn seat_env_for(harness_id: &str, preferred: Option<&str>) -> Vec<(String, Strin
         .and_then(|n| crate::accounts::load().get(n).cloned())
         .map(|a| a.env())
         .unwrap_or_default()
+}
+
+/// A turn's reasoning tier judged for the seat `env` selects
+/// ([`crate::harness::effort_for_turn`]), as what the turn carries: the tier
+/// to pass, a note for the top of the reply, a refusal. A refusal also sends
+/// this machine's answer up again — the menu offered the tier, so the menu is
+/// behind the machine.
+async fn effort_verdict(
+    client: &Client,
+    harness: &Arc<dyn Harness>,
+    env: &[(String, String)],
+    model: Option<&str>,
+    effort: Option<&str>,
+    preferred: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    use crate::harness::EffortVerdict as V;
+    match crate::harness::effort_for_turn(harness.as_ref(), env, model, effort).await {
+        V::Pass(e) => (e, None, None),
+        V::NoDial(note) => (None, Some(note), None),
+        V::Refuse(why) => {
+            println!("⛔ {why}");
+            let (client, harness, preferred) = (client.clone(), harness.clone(), preferred.map(str::to_string));
+            tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred).await });
+            (None, None, Some(why))
+        }
+    }
 }
 
 /// Run a daemon control command. Replies in-chat; never invokes claude.
@@ -5637,12 +5899,17 @@ async fn handle_control(
     workdirs: &Workdirs,
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
-    // `/access`: the current tier + price tag for anyone allowed to ask, and
-    // the two change proposals for the owner alone.
-    access_ctx: AccessCtx,
+    // Where the asker stands — already allowed this command's `who`. The arms
+    // open to anyone still read it: a guest's `/clear` and `/compact` act on
+    // their own `#guest` session, `/stop` on their own runs, and `/access`
+    // proposes a change to the owner alone.
+    standing: Standing,
+    // Who typed it (lowercased) — whose runs a guest's `/stop` reaches.
+    sender: &str,
     // Whose daemon this is — `/account` pins are kept beside its cursor.
     my_username: &str,
 ) {
+    let guest = standing == Standing::Guest;
     // A session key is only meaningful together with the directory its turns
     // run in (see `turn_session_key`), so the arms that touch one resolve the
     // effective workdir first. One config read, and only for those arms —
@@ -5655,7 +5922,7 @@ async fn handle_control(
         let cc = TurnConfig::fetch(client, chat_id, None, &owner).await;
         let surface_cwd = workdirs.lock().await.get(&base_key).cloned();
         let (dir, ns) = resolve_turn_workdir(surface_cwd.as_deref(), cc.cwd.as_deref(), None, workdir);
-        let k = turn_session_key(chat_id, channel_id, ns, &dir);
+        let k = guest_session(turn_session_key(chat_id, channel_id, ns, &dir), guest);
         (dir, k, cc.account)
     } else {
         (workdir.to_string(), base_key.clone(), owner.account.clone())
@@ -5669,7 +5936,12 @@ async fn handle_control(
         "clear" | "new" => {
             {
                 let mut s = sessions.lock().await;
-                if s.remove(&skey).is_some() { save_sessions(&s); }
+                let mut gone = s.remove(&skey).is_some();
+                // The owner's circle clears the room, guests' conversation included.
+                if !guest {
+                    gone |= s.remove(&guest_session(skey.clone(), true)).is_some();
+                }
+                if gone { save_sessions(&s); }
             }
             let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "🧹 Context cleared — starting fresh.").await;
         }
@@ -5687,7 +5959,7 @@ async fn handle_control(
                 // (slow) claude run never blocks the message loop.
                 let (client, workdir, chat_id, skey, channel, sessions, env) =
                     (client.clone(), turn_workdir.clone(), chat_id.to_string(), skey.clone(), channel_id.map(str::to_string), sessions.clone(), seat_env.clone());
-                tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions, env).await; });
+                tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions, env, guest).await; });
             }
         }
         "resume" => {
@@ -5713,9 +5985,11 @@ async fn handle_control(
         "stop" => {
             // Scoped to the channel it was typed in — each stopped task finalizes
             // its own draft with a stop notice. Other channels keep running; use
-            // the run card's Stop button to reach a specific one.
-            if cancel_channel(chat_states, chat_id, channel_id).await == 0 {
-                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "Nothing is running right now.").await;
+            // the run card's Stop button to reach a specific one. A guest's
+            // reaches only their own ([`stops`]).
+            if cancel_channel(chat_states, chat_id, channel_id, standing, sender).await == 0 {
+                let none = if guest { "Nothing of yours is running right now." } else { "Nothing is running right now." };
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), none).await;
             }
         }
         "model" => {
@@ -5740,7 +6014,7 @@ async fn handle_control(
             // daemon silently ignores. Redirect instead.
             if harness.id() == "codex" {
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
-                    "Codex has no per-chat thinking budget. Its reasoning depth is set by **Reasoning effort** (minimal/low/medium/high) in this bot's Customize sheet.").await;
+                    "Codex has no per-chat thinking budget. Its reasoning depth is set by **Reasoning effort** in this bot's Customize sheet — the tiers there are the ones this machine's codex offers for each model.").await;
                 return;
             }
             // Default budget for a bare `/think on` — enough for visible reasoning
@@ -5927,12 +6201,12 @@ async fn handle_control(
                             states.entry(chat_id.to_string()).or_default().account = Some(n.clone());
                             save_pins_to(&pins_path(my_username), &pins_of(&states));
                         }
-                        account_pin_receipt(&n, cfg_account.as_deref(), access_ctx.is_owner)
+                        account_pin_receipt(&n, cfg_account.as_deref())
                     }
                     None => unknown(&n),
                 },
                 AccountArg::Bot(n) => match crate::accounts::load().get(&n) {
-                    Some(_) => account_bot_receipt(&n, access_ctx.is_owner),
+                    Some(_) => account_bot_receipt(&n),
                     None => unknown(&n),
                 },
             };
@@ -5953,13 +6227,16 @@ async fn handle_control(
                     "🔐 Access: {}\n🏷 Price tag (model): {price}\n\n/access paid — free for me and whitelisted users; anyone else pays tokens\n/access whitelist — only me and whitelisted users",
                     if paid { "free for me and whitelisted users; anyone else pays tokens" } else { "only me and whitelisted users" }
                 ),
-                "paid" if !access_ctx.is_owner => not_owner.into(),
+                "paid" if standing != Standing::Owner => not_owner.into(),
                 "paid" => format!("{ACCESS_PAID_DISCLOSURE}\n\n{{% mafold/customize field=\"access\" value=\"paid\" /%}}"),
-                "whitelist" | "off" if !access_ctx.is_owner => not_owner.into(),
+                "whitelist" | "off" if standing != Standing::Owner => not_owner.into(),
                 "whitelist" | "off" => "已改回第一档提议：只有我和白名单用户能用，不计费。点卡片生效。\n\n{% mafold/customize field=\"access\" value=\"\" /%}".into(),
                 other => format!("Unknown `/access {other}` — use `/access`, `/access paid`, or `/access whitelist`."),
             };
             let _ = client.send_to(dest, &text).await;
+        }
+        "help" if guest => {
+            let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &guest_help(harness.id())).await;
         }
         "help" => {
             // Harness-aware: codex has no /compact, no /think, and its headless
@@ -5967,7 +6244,7 @@ async fn handle_control(
             let text = if harness.id() == "codex" {
                 "I'm a Codex agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nReasoning depth is set by the **Reasoning effort** field in this bot's Customize sheet."
             } else {
-                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /account [name] — which Claude account this chat runs on (I move to another one by myself when a usage window fills up)\n• /login [name] — sign in to Anthropic; with a name, add a second account on this machine\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
+                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /account [name] — owner only: which Claude account this chat runs on (I move to another one by myself when a usage window fills up)\n• /login [name] — owner only: sign in to Anthropic; with a name, add a second account on this machine\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
             };
             let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), text).await;
         }
@@ -5979,7 +6256,8 @@ async fn handle_control(
 /// session so the prior context is summarized (frees tokens, keeps continuity),
 /// keep resuming the compacted session, and post a card. Best-effort: on any
 /// failure it tells the user and leaves the existing session untouched.
-async fn compact_session(client: Client, workdir: String, chat_id: String, skey: String, channel: Option<String>, sessions: Sessions, env: Vec<(String, String)>) {
+#[allow(clippy::too_many_arguments)]
+async fn compact_session(client: Client, workdir: String, chat_id: String, skey: String, channel: Option<String>, sessions: Sessions, env: Vec<(String, String)>, guest: bool) {
     let channel_id = channel.as_deref();
     let prior = sessions.lock().await.get(&skey).cloned();
     let Some(sid) = prior else {
@@ -5995,8 +6273,15 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "mafold".into());
-    let guard = serde_json::json!({ "hooks": crate::compact_hook::settings(&exe) }).to_string();
+    let guard = serde_json::json!({ "hooks": crate::compact_hook::settings(&exe) });
+    // A guest's session is compacted the way its turns run (`Mount::guest`):
+    // on none of the owner's own Claude Code, or the summary could carry it in.
+    let owner = guest.then(crate::harness::claude_code::owner_settings);
+    let guard = crate::harness::claude_code::guest_settings(guard, owner.as_ref()).to_string();
     let mut cmd = crate::platform::command(crate::harness::program("claude"));
+    if guest {
+        cmd.arg("--setting-sources").arg("project,local");
+    }
     cmd.arg("-p").arg("/compact")
         .arg("--resume").arg(&sid)
         .arg("--output-format").arg("json")
@@ -6287,30 +6572,24 @@ fn bot_account_card(name: &str) -> String {
 ///
 /// 2026-09-27: linsky pinned Rei's DM and expected the whole bot — and Muse,
 /// a different bot — to switch. The receipt says exactly what changed, for
-/// how long, and (to the owner) where the whole-bot switch is.
-fn account_pin_receipt(name: &str, bot_setting: Option<&str>, is_owner: bool) -> String {
-    let mut out = format!(
+/// how long, and where the whole-bot switch is (`/account` is the owner's
+/// alone — its row in `CONTROL`).
+fn account_pin_receipt(name: &str, bot_setting: Option<&str>) -> String {
+    format!(
         "This conversation now runs on account `{name}` — this conversation only (every channel in it). \
          My other conversations keep following the bot setting ({}), and other bots on this machine aren't affected. \
          It stays until `/account reset`.\n\
-         It's a preference, not a wall: if that window fills up I still move a turn to another login and say so.",
-        bot_setting_phrase(bot_setting)
-    );
-    if is_owner {
-        out.push_str(&format!("\n\nTo run the whole bot on `{name}` instead:\n{}", bot_account_card(name)));
-    }
-    out
+         It's a preference, not a wall: if that window fills up I still move a turn to another login and say so.\n\n\
+         To run the whole bot on `{name}` instead:\n{}",
+        bot_setting_phrase(bot_setting),
+        bot_account_card(name),
+    )
 }
 
 /// The reply to `/account <name> --bot`: a proposal to run the WHOLE bot on
 /// `name`. It pins nothing — the owner's tap on the card applies it, the same
 /// way `/access` proposes and the tap consents.
-fn account_bot_receipt(name: &str, is_owner: bool) -> String {
-    if !is_owner {
-        return format!(
-            "Only the owner can switch the whole bot's account. `/account {name}` pins just this conversation."
-        );
-    }
+fn account_bot_receipt(name: &str) -> String {
     format!(
         "Run every conversation of this bot on `{name}`? Tap Apply — conversations pinned with `/account` keep their pin.\n\n{}",
         bot_account_card(name)
@@ -7837,7 +8116,7 @@ fn resume_turns(
                     &client, &j.workdir, j.workdir_ns, &bot, &j.chat, j.thread.as_deref(),
                     j.channel.as_deref(), &prompt, &[], &sessions, &coord, &chat_states, &harness,
                     j.model.clone(), j.effort.clone(), j.thinking, j.system.clone(), j.account.clone(),
-                    &j.sender, None, &[], None, j.pays, r, j.settles.as_deref(),
+                    &j.sender, j.relayed_for.as_deref(), None, &[], None, j.pays, r, j.settles.as_deref(),
                 )
                 .await
                 {
@@ -8009,6 +8288,9 @@ async fn handle(
     // it actually runs on is chosen below — see `crate::accounts::choose`.
     account: Option<String>,
     turn_sender: &str,
+    // When `turn_sender` is a bot passing someone on: who (`trusted_turn`).
+    // `Some("")` = a guest's, nobody in particular (a guest's background work).
+    relayed_for: Option<&str>,
     group_context: Option<String>,
     // Photos the same person posted in the few messages before the trigger —
     // see `recent_group_context`. Empty for a turn where they sent none.
@@ -8038,12 +8320,21 @@ async fn handle(
     // The bot's drive (`crate::drive`): the plugin folders its skills come
     // from. The agent's memory stays in its own folder.
     let drive = crate::drive::current();
-    let mount = crate::drive::mount(drive.as_deref()).await;
+    let mut mount = crate::drive::mount(drive.as_deref()).await;
     let _settle = crate::drive::AfterTurn;
+    // A guest's turn (`trusted`) runs on none of the owner's own Claude Code
+    // — a process of its own (`Mount::guest`) — and is held to the plugins
+    // mounted here, this bot's drive and Mafold's own, for its skills.
+    let guest = !trusted_turn(turn_sender, relayed_for).await;
+    mount.guest = guest;
+    let skill_plugins = guest.then(|| {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        crate::drive::gated_plugins(&mount, &crate::discover::installed_plugin_names(&home))
+    });
     // (A bot whose memory once lived in its drive, cli 0.9.130–0.9.133, kept
     // those conversations under `<key>#drive`. The plain key is the session
     // from before — the one that uses the agent's own memory folder.)
-    let skey = turn_session_key(chat_id, channel_id, workdir_ns, workdir);
+    let skey = guest_session(turn_session_key(chat_id, channel_id, workdir_ns, workdir), guest);
     let prior = match &resumed {
         Some(r) => r.session.clone(),
         None => sessions.lock().await.get(&skey).cloned(),
@@ -8052,7 +8343,22 @@ async fn handle(
     // session is keyed at, under the bot that owns the session. Exported to the
     // agent so any background task it detaches is registered here and reported
     // back HERE, by ME (see `surface_tag`).
-    let surface = surface_tag(bot, chat_id, channel_id);
+    let surface = guest_tag(surface_tag(bot, chat_id, channel_id), guest);
+    // The reasoning tier, held to what THIS machine's binary says the turn's
+    // model takes (`harness::effort_for_turn`) — before anything is started
+    // for it. Passed as picked, or refused out loud; never run at another.
+    // What was ASKED is what the journal keeps: a turn picked up after a
+    // restart is judged again, never run at the verdict's `None`.
+    let requested_effort = effort.clone();
+    let (effort, effort_note, refused) = effort_verdict(
+        client,
+        harness,
+        &seat_env_for(harness.id(), account.as_deref()),
+        model.as_deref(),
+        requested_effort.as_deref(),
+        account.as_deref(),
+    )
+    .await;
     // Start the harness process NOW, while the work below is still waiting on
     // the network (the apps/rooms round trip, the draft). A cold `claude` takes
     // ~1.3s to come up and those are the same seconds; this spends them once.
@@ -8060,19 +8366,22 @@ async fn handle(
     // The seat here is the PREFERENCE, not the choice `accounts::choose` makes
     // further down — that one can differ when the preferred login's window is
     // full. A turn that fails over simply finds nothing warm and starts cold,
-    // which is what every turn did before this existed.
-    harness.prewarm(crate::harness::TurnShape {
-        conv: chat_id.to_string(),
-        surface: surface.clone(),
-        workdir: workdir.to_string(),
-        session: prior.clone(),
-        model: model.clone(),
-        effort: effort.clone(),
-        thinking,
-        system: system.clone(),
-        env: seat_env_for(harness.id(), account.as_deref()),
-        mount: mount.clone(),
-    });
+    // which is what every turn did before this existed. (A refused turn starts
+    // nothing.)
+    if refused.is_none() {
+        harness.prewarm(crate::harness::TurnShape {
+            conv: chat_id.to_string(),
+            surface: surface.clone(),
+            workdir: workdir.to_string(),
+            session: prior.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            thinking,
+            system: system.clone(),
+            env: seat_env_for(harness.id(), account.as_deref()),
+            mount: mount.clone(),
+        });
+    }
 
     // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
     let nanos = std::time::SystemTime::now()
@@ -8148,6 +8457,7 @@ async fn handle(
                 steer_file: steer_file.clone(),
                 can_steer: harness.can_steer(),
                 pays,
+                guest,
             },
         );
         // Under the same lock: from here on the turn itself is what the
@@ -8203,12 +8513,13 @@ async fn handle(
                     thread: thread_root.map(str::to_string),
                     trigger: trigger_id.map(str::to_string),
                     sender: turn_sender.to_string(),
+                    relayed_for: relayed_for.map(str::to_string),
                     pays,
                     workdir: workdir.to_string(),
                     workdir_ns,
                     harness: harness.id().to_string(),
                     model: model.clone(),
-                    effort: effort.clone(),
+                    effort: requested_effort.clone(),
                     thinking,
                     system: system.clone(),
                     account: account.clone(),
@@ -8247,6 +8558,11 @@ async fn handle(
             if let Some(block) = crate::chat::context_block(client).await {
                 full_prompt = format!("{block}\n\n{full_prompt}");
             }
+            // A channel created without a name is named by the agent answering
+            // in it. One listChannels, channel turns only; silence on any error.
+            if let Some(block) = crate::chat::untitled_channel_block(client, chat_id, channel_id).await {
+                full_prompt = format!("{block}\n\n{full_prompt}");
+            }
             // No per-turn credential block: a granted agent calls
             // `mafold connection call` itself, and what it may reach is answered by the
             // grant check server-side rather than narrated into the prompt here.
@@ -8258,6 +8574,7 @@ async fn handle(
             attach_context(client, full_prompt, attachments, lookback_photos).await
         }
     };
+    let full_prompt = unslash(full_prompt, turn_sender, skill_plugins.as_deref());
     // With the prompt journaled, a restart can run this turn again by itself —
     // and replaying the trigger as well would start a second turn for it.
     if resumed.is_none() {
@@ -8299,6 +8616,23 @@ async fn handle(
         None
     };
     let mut env: Vec<(String, String)> = seat.as_ref().map(|a| a.env()).unwrap_or_default();
+    // The tier was judged for the PREFERRED seat, before anything was started;
+    // the seat chosen here can be another login, with an answer of its own on
+    // file. Judge it again for the seat that will actually run it. (A failover
+    // further down keeps this verdict: the model doesn't change, and which
+    // tiers a model takes is the binary's to say, not the login's.)
+    let (effort, effort_note, refused) =
+        if refused.is_none() && seat.is_some() && env != seat_env_for(harness.id(), account.as_deref()) {
+            effort_verdict(client, harness, &env, model.as_deref(), requested_effort.as_deref(), account.as_deref()).await
+        } else {
+            (effort, effort_note, refused)
+        };
+    // A tier the model has no dial for is said up top, like the seat — the
+    // owner set something this turn can't honour, and the reply is where they
+    // find out.
+    if let (Some(note), None) = (&effort_note, &resumed) {
+        let _ = ev_tx.send(AgentEvent::Text(format!("_{note}_\n\n")));
+    }
 
     // Which process is running this turn, for the generating card's heartbeat
     // (`Heartbeat::keepalive`). One for the whole turn: every attempt below —
@@ -8324,6 +8658,7 @@ async fn handle(
         steer_file: Some(steer_file.clone()),
         env: env.clone(),
         mount: mount.clone(),
+        skill_plugins: skill_plugins.clone(),
         proc: turn_proc.clone(),
     };
 
@@ -8367,7 +8702,18 @@ async fn handle(
     // reply reads as one turn that changed accounts — not a second reply that
     // rewrote the first. Dropped before the renderer is awaited.
     let ev_keep = ev_tx.clone();
-    let mut result = harness.run(turn, ev_tx).await;
+    let mut result = match &refused {
+        // Refused before anything ran: the reply says why, and the session is
+        // left exactly as it is — nothing about the conversation is wrong (see
+        // the `refused` gates below), only a setting. No session in the
+        // outcome, so nothing is written back over one a concurrent turn has
+        // moved on since this one read `prior`.
+        Some(why) => {
+            drop((turn, ev_tx));
+            Ok(crate::harness::TurnOutcome { error: Some(why.clone()), ..Default::default() })
+        }
+        None => harness.run(turn, ev_tx).await,
+    };
     // Drop this turn's handle NOW — the run is over (no more /stop or ask-answer
     // routing), and the handle holds a clone of the renderer's event sender: the
     // renderer only exits once EVERY sender is gone, so removing the handle after
@@ -8459,6 +8805,7 @@ async fn handle(
                     steer_file: steer_file.clone(),
                     can_steer: harness.can_steer(),
                     pays,
+                    guest,
                 },
             );
         }
@@ -8494,6 +8841,7 @@ async fn handle(
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
             mount: mount.clone(),
+            skill_plugins: skill_plugins.clone(),
             proc: turn_proc.clone(),
         };
         result = harness.run(again, ev_keep.clone()).await;
@@ -8538,6 +8886,7 @@ async fn handle(
                         steer_file: steer_file.clone(),
                         can_steer: harness.can_steer(),
                         pays,
+                        guest,
                     },
                 );
             }
@@ -8581,6 +8930,7 @@ async fn handle(
                 steer_file: Some(steer_file.clone()),
                 env: env.clone(),
                 mount: mount.clone(),
+                skill_plugins: skill_plugins.clone(),
                 proc: turn_proc.clone(),
             };
             result = harness.run(retry, ev_tx2).await;
@@ -8620,6 +8970,7 @@ async fn handle(
     let continuing = resumed.as_ref().is_some_and(|r| r.continues);
     let resumed_errored = prior.is_some()
         && !continuing
+        && refused.is_none()
         && matches!(&result, Ok(o) if o.error.is_some() && !seat_trouble(o) && !o.stopped && !o.produced);
     if resumed_errored {
         let why = result.as_ref().ok().and_then(|o| o.error.clone()).unwrap_or_default();
@@ -8641,6 +8992,7 @@ async fn handle(
                     steer_file: steer_file.clone(),
                     can_steer: harness.can_steer(),
                     pays,
+                    guest,
                 },
             );
         }
@@ -8675,6 +9027,7 @@ async fn handle(
             steer_file: Some(steer_file.clone()),
             env: env.clone(),
             mount: mount.clone(),
+            skill_plugins: skill_plugins.clone(),
             proc: turn_proc.clone(),
         };
         result = harness.run(fresh, ev_tx3).await;
@@ -8693,6 +9046,17 @@ async fn handle(
     // Completion-wakeup eligibility: only a CLEAN end (not /stop, not an error
     // path) with background shells left running arms the monitor below.
     let clean_end = matches!(&result, Ok(o) if !o.stopped && o.error.is_none());
+    // …and how it ended when it wasn't clean, for whoever reads the reply as
+    // done work (the garden's 动态): the notice appended below is all the text
+    // says, and a stopped turn's text may be nothing else.
+    let outcome = match &result {
+        Ok(o) if o.stopped => Some(crate::client::TurnEnd::Stopped),
+        // An error, or a run that ended producing nothing ("_(the agent
+        // produced no output)_" is the whole reply): not done work.
+        Ok(o) if o.error.is_some() || !o.produced => Some(crate::client::TurnEnd::Failed),
+        Ok(_) => None,
+        Err(_) => Some(crate::client::TurnEnd::Failed),
+    };
     // A post-renderer append makes the stored final markdoc stale — a live card
     // edit would drop that trailing text, so such turns arm without live edits.
     let mut post_appended = false;
@@ -8736,7 +9100,7 @@ async fn handle(
             // the next message ("继续") started on a blank session. A broken
             // session dies BEFORE producing anything; that is the only shape
             // this drop is for.
-            if o.error.is_some() && !seat_trouble(&o) && prior.is_some() && !o.produced {
+            if o.error.is_some() && !seat_trouble(&o) && prior.is_some() && !o.produced && refused.is_none() {
                 drop_session(sessions, &skey, prior.as_deref()).await;
             } else if let Some(sid) = o.session {
                 let mut s = sessions.lock().await;
@@ -8780,7 +9144,7 @@ async fn handle(
     let _ = std::fs::remove_file(&steer_file);
     // A picked-up turn answers the message the killed one was opened for.
     let answered = trigger_id.or(resumed.as_ref().and_then(|r| r.journal.trigger.as_deref()));
-    match client.finish_draft(&msg_id, &final_content, if clean_end { answered } else { None }).await {
+    match client.finish_draft(&msg_id, &final_content, if clean_end { answered } else { None }, outcome).await {
         Ok(true) => println!("→ finalized reply for chat {chat_id}"),
         Ok(false) => println!("→ reply {msg_id} completion delivery in progress"),
         Err(e) => eprintln!("reply {msg_id} completion queued for retry: {e:#}"),
@@ -8821,6 +9185,7 @@ async fn handle(
                 system,
                 account,
                 turn_sender.to_string(),
+                guest,
                 shells,
                 live_msg,
             );
@@ -8966,6 +9331,16 @@ fn surface_tag(bot: &str, chat_id: &str, channel_id: Option<&str>) -> String {
     )
 }
 
+/// A guest's surface (`trusted`): its own registry key, so its background
+/// tasks are watched, shown and woken apart from the owner's circle's — and
+/// its process (the surface is in the pool key) is never theirs. Marked on the
+/// bot component, which keeps the key's three parts and its channel intact.
+const GUEST_MARK: &str = "--guest";
+
+fn guest_tag(tag: String, guest: bool) -> String {
+    if guest { format!("{tag}{GUEST_MARK}") } else { tag }
+}
+
 /// One component of a `surface_tag`, reduced to the filename-safe alphabet.
 /// Runs collapse (`opsdu:claude-code` → `opsdu_claude-code`, `a::b` → `a_b`) so
 /// a component can never contain the `__` that separates them.
@@ -9005,7 +9380,7 @@ fn classify_registration(name: &str, me: &str) -> Option<Registration> {
     let stem = name.strip_suffix(".pid")?;
     let tag = stem.rsplit_once('.').map(|(t, _)| t).unwrap_or(stem);
     Some(match surface_split(tag) {
-        Some((_, _, bot)) if bot == me => Registration::Mine(tag.to_string()),
+        Some((_, _, bot)) if bot == me || bot.strip_suffix(GUEST_MARK) == Some(me) => Registration::Mine(tag.to_string()),
         Some(_) => Registration::Theirs,
         None => Registration::Unclaimable,
     })
@@ -9269,6 +9644,8 @@ fn arm_bg_wakeup(
     system: Option<String>,
     account: Option<String>,
     turn_sender: String,
+    // Whose tasks these are: a guest's are a registry of their own (`guest_tag`).
+    guest: bool,
     shells: u64,
     live_msg: Option<(String, String)>,
 ) {
@@ -9287,7 +9664,7 @@ fn arm_bg_wakeup(
     let live_slot = || LIVE.get_or_init(|| StdMutex::new(HashMap::new()));
     // Registry tag — the surface this turn ran on (conv + forum channel), the
     // same key `bash_hook` registered its detached tasks under.
-    let tag = surface_tag(&bot, &chat_id, channel_id.as_deref());
+    let tag = guest_tag(surface_tag(&bot, &chat_id, channel_id.as_deref()), guest);
     // The monitor key IS the registry key (plus the workdir, which can differ
     // per chat): one monitor per registry, so two monitors can never race for
     // the same registrations.
@@ -9436,8 +9813,9 @@ fn arm_bg_wakeup(
                 if let Some(outcome) = inject_into_live_turn(
                     &chat_states, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
                     // Free: a wrap-up is billed to nobody, so it may land in
-                    // whichever unbilled turn is running here, whoever's.
-                    Speaker::person(&turn_sender), None, &prompt, Seam::Notice(line),
+                    // whichever unbilled turn is running here, whoever's — of
+                    // its own kind: a guest's work only into a guest's turn.
+                    Speaker::person(&turn_sender), Some(guest), None, &prompt, Seam::Notice(line),
                     // A wrap-up is text and only text; nothing to fetch.
                     |t| async move { t },
                 )
@@ -9479,8 +9857,9 @@ fn arm_bg_wakeup(
                         model.clone(), effort.clone(), thinking, system.clone(), account.clone(),
                         // A background-task wrap-up isn't someone asking about a
                         // picture — no trigger message, so nothing to look back
-                        // from, and nothing to bill: it runs free.
-                        &turn_sender, None, &[],
+                        // from, and nothing to bill: it runs free. A guest's
+                        // tasks wake as a guest's, whoever armed the monitor.
+                        &turn_sender, guest.then_some(""), None, &[],
                         None,
                         false,
                         None,
@@ -9968,8 +10347,9 @@ async fn render_loop(
                     tx.push(&ev); // the seam goes in first, so it travels along
                     // No trigger on the replacement: the server bills one
                     // draft per triggering message, and the one it opened for
-                    // this turn is being carried, not answered twice.
-                    match client.create_draft(&chat_id, thread_root.as_deref(), channel_id.as_deref(), None).await {
+                    // this turn is being carried, not answered twice. What it
+                    // does carry over is who the turn's chain started from.
+                    match client.create_draft_carrying(&chat_id, thread_root.as_deref(), channel_id.as_deref(), &msg_id).await {
                         Ok(fresh) => {
                             let carried = format!("{}{}", tx.snapshot(), generating_tag!());
                             if client.edit_draft(&fresh, &carried).await.is_ok() {
@@ -10094,6 +10474,87 @@ async fn render_loop(
     let out = tx.finish_folded();
     let _ = client.edit_draft(&msg_id, &out).await;
     *final_md.lock().unwrap() = out;
+}
+
+/// The access list every test that needs one agrees on (`ACCESS` is set once
+/// per process): an owner, a whitelisted friend and a blacklisted foe, named
+/// so no other test's speakers are any of them.
+#[cfg(test)]
+const GATE_OWNER: &str = "gate-owner";
+#[cfg(test)]
+fn gate_access() {
+    let _ = ACCESS.set(Arc::new(RwLock::new(AllowList::build(Some(GATE_OWNER), &["gate-friend".into()], &["gate-foe".into()], false))));
+}
+
+#[cfg(test)]
+mod skill_gate_tests {
+    use super::*;
+
+    /// A slash command typed on a turn the owner didn't start reaches Claude
+    /// Code as words unless it names a mounted plugin's skill; on the owner's
+    /// turn (`None`) nothing changes.
+    /// A guest's background tasks are a registry of their own, and the daemon
+    /// that started them still finds them after a restart.
+    #[test]
+    fn a_guests_tasks_have_a_registry_key_of_their_own() {
+        let mine = surface_tag("opsdu:claude-code", "c1", Some("ch"));
+        let guests = guest_tag(mine.clone(), true);
+        assert_ne!(mine, guests);
+        assert_eq!(guest_tag(mine.clone(), false), mine);
+        assert_eq!(crate::harness::forum_channel_of(&guests).as_deref(), Some("ch"), "the channel stays readable");
+        let me = tag_part("opsdu:claude-code");
+        assert_eq!(classify_registration(&format!("{guests}.123.pid"), &me), Some(Registration::Mine(guests.clone())));
+        assert_eq!(classify_registration(&format!("{mine}.123.pid"), &me), Some(Registration::Mine(mine.clone())));
+        let theirs = guest_tag(surface_tag("linsky:opus48", "c1", Some("ch")), true);
+        assert_eq!(classify_registration(&format!("{theirs}.1.pid"), &me), Some(Registration::Theirs));
+    }
+
+    #[test]
+    fn a_non_owner_slash_command_goes_in_as_words() {
+        let plugins = vec!["tea-bot".to_string(), "mafold".to_string()];
+        let p = |s: &str| unslash(s.to_string(), "ada", Some(&plugins));
+        for typed in ["/geo-audit https://x.com", "  /superpowers:brainstorming", "/compact"] {
+            let out = p(typed);
+            assert!(out.starts_with("(@ada typed this as a slash command. It was not run"), "{out}");
+            assert!(out.ends_with(typed), "the words are all still there: {out}");
+        }
+        for kept in ["/tea-bot:brew green", "/mafold:mafold-room", "hello /geo", "a/b"] {
+            assert_eq!(p(kept), kept);
+        }
+        assert_eq!(unslash("/geo-audit x".into(), "ada", None), "/geo-audit x", "the owner's turn");
+    }
+
+    /// The owner's circle is who drives the bot for free: the owner, whoever
+    /// they whitelisted, and a bot of either. Everyone else is a guest — and a
+    /// guest's turns keep a session of their own.
+    #[tokio::test]
+    async fn the_owners_circle_is_who_drives_the_bot_for_free() {
+        gate_access();
+        for t in [GATE_OWNER, "@Gate-Owner ", "gate-friend", "gate-friend:helper", "gate-owner:claude-code"] {
+            assert!(trusted(t).await, "{t}");
+        }
+        for g in ["stranger", "stranger:bot", "gate-foe", "gate-foe:bot", ""] {
+            assert!(!trusted(g).await, "{g}");
+        }
+        assert_eq!(guest_session("c1#ch".into(), true), "c1#ch#guest");
+        assert_eq!(guest_session("c1#ch".into(), false), "c1#ch");
+    }
+
+    /// The owner's own bot passing someone on is that someone asking: the
+    /// turn is the circle's only if both the bot and the person it relays are
+    /// in it. The relay's word only narrows — and `""` (a guest's background
+    /// work, nobody in particular) is a guest.
+    #[tokio::test]
+    async fn a_relayed_request_is_held_to_the_person_it_started_from() {
+        gate_access();
+        assert!(trusted_turn(GATE_OWNER, None).await);
+        assert!(trusted_turn("gate-owner:public", None).await, "no relay known: the bot's own standing");
+        assert!(trusted_turn("gate-owner:public", Some("gate-friend")).await);
+        assert!(trusted_turn("gate-owner:public", Some(GATE_OWNER)).await);
+        assert!(!trusted_turn("gate-owner:public", Some("stranger")).await, "the owner's bot relaying a stranger");
+        assert!(!trusted_turn("gate-owner:public", Some("")).await);
+        assert!(!trusted_turn("stranger", Some(GATE_OWNER)).await, "a stranger's bot naming the owner gains nothing");
+    }
 }
 
 #[cfg(test)]
@@ -10297,6 +10758,7 @@ mod deliver_ask_answer_tests {
                 steer_file: String::new(),
                 can_steer: true,
                 pays: false,
+                guest: false,
             },
         );
         let states: ChatStates = Arc::new(Mutex::new(HashMap::from([("conv-1".to_string(), st)])));
@@ -11153,7 +11615,7 @@ mod customize_seed_tests {
 
     /// The sheet must offer the tiers `claude --effort` accepts — the daemon has
     /// always passed this through (`Turn::effort` → `--effort`), so a sheet
-    /// without the field is a dial nobody can reach. `minimal` is codex-only.
+    /// without the field is a dial nobody can reach.
     #[test]
     fn claude_sheet_offers_the_effort_tiers_claude_accepts() {
         let s = stock("claude-code");
@@ -11162,11 +11624,14 @@ mod customize_seed_tests {
         assert!(s.iter().any(|f| f["key"] == "thinking"), "{s:#?}");
     }
 
-    /// Codex keeps its own ladder (no xhigh/max) and no thinking budget.
+    /// Codex's bootstrap ladder is only what every codex build takes — no
+    /// `minimal` (no current model offers it), no xhigh/max (an old build can't
+    /// parse them); the real menu comes from `model/list` once the machine
+    /// reports. No thinking budget.
     #[test]
-    fn codex_sheet_keeps_its_own_ladder() {
+    fn codex_sheet_bootstraps_with_what_every_codex_takes() {
         let s = stock("codex");
-        assert_eq!(opts(&s, "effort"), ["minimal", "low", "medium", "high"]);
+        assert_eq!(opts(&s, "effort"), ["low", "medium", "high"]);
         assert!(!s.iter().any(|f| f["key"] == "thinking"), "{s:#?}");
     }
 
@@ -11446,6 +11911,72 @@ mod gate_tests {
         assert!(runs(e("clear"), true, true));
         // a DM
         assert!(runs(e("clear"), false, false));
+    }
+
+    /// Whose each command is, declared on its row — every road a command
+    /// arrives by asks this, never a list of names. 2026-10-08: on a bot open
+    /// to everyone, a stranger could `/login` over the owner's sign-in,
+    /// `/account forget` it, `/model` the whole chat, `/cwd` it anywhere on
+    /// the disk, read `/status`'s account and paths, and `/stop` the circle's runs.
+    #[test]
+    fn the_table_declares_whose_each_command_is() {
+        use super::Who;
+        let of = |w: Who| super::CONTROL.iter().filter(|c| c.who == w).map(|c| c.name).collect::<Vec<_>>();
+        assert_eq!(of(Who::Owner), ["account", "login"], "the machine's Claude sign-ins");
+        assert_eq!(of(Who::Circle), ["model", "think", "resume", "status", "cwd"], "the owner's machine, or the whole chat");
+        // What's left acts only on the guest's own: their `#guest` session,
+        // their runs, or reads what anyone let in may know.
+        assert_eq!(of(Who::Anyone), ["clear", "new", "stop", "compact", "access", "help"]);
+    }
+
+    #[test]
+    fn standing_decides_who_may_run_what() {
+        use super::{Standing as S, Who as W};
+        for (s, anyone, circle, owner) in [(S::Guest, true, false, false), (S::Circle, true, true, false), (S::Owner, true, true, true)] {
+            assert_eq!((s.may(W::Anyone), s.may(W::Circle), s.may(W::Owner)), (anyone, circle, owner), "{s:?}");
+        }
+    }
+
+    /// `*` and the paid tier open the door; they don't put anyone in the
+    /// circle. A blacklisted name is a guest even when whitelisted.
+    #[test]
+    fn an_open_door_does_not_make_a_circle() {
+        use super::Standing as S;
+        let a = al(Some("ops"), &["ann", "bob"], &["bob"], true);
+        assert_eq!(a.standing("ops", None), S::Owner);
+        assert_eq!(a.standing("@OPS ", None), S::Owner);
+        assert_eq!(a.standing("ops:claude", None), S::Circle, "the owner's bot is not the owner");
+        assert_eq!(a.standing("ann", None), S::Circle);
+        assert_eq!(a.standing("ann:helper", None), S::Circle);
+        assert_eq!(a.standing("stranger", None), S::Guest);
+        assert_eq!(a.standing("bob", None), S::Guest, "deny wins");
+        assert_eq!(a.standing("ops:claude", Some("stranger")), S::Guest, "relaying a stranger");
+        assert_eq!(a.standing("ops:claude", Some("ops")), S::Circle);
+        let paid = AllowList { paid: true, anyone: false, ..al(Some("ops"), &[], &[], false) };
+        assert_eq!(paid.standing("payer", None), S::Guest);
+    }
+
+    /// A guest's `/help` lists what they may run, read off the table — not
+    /// the owner's commands they'd only be refused.
+    #[test]
+    fn a_guests_help_lists_only_their_commands() {
+        for h in ["claude-code", "codex"] {
+            let text = super::guest_help(h);
+            for c in ["/clear", "/new", "/stop", "/access", "/help"] {
+                assert!(text.contains(&format!("• {c} — ")), "{h}: {text}");
+            }
+            for c in ["/login", "/account", "/model", "/think", "/resume", "/status", "/cwd"] {
+                assert!(!text.contains(&format!("{c} ")), "{h} offers {c}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_says_who_may() {
+        use super::Who;
+        assert!(super::not_yours("login", Who::Owner).contains("only its owner can"));
+        let c = super::not_yours("model", Who::Circle);
+        assert!(c.starts_with("`/model`") && c.contains("people they've whitelisted"), "{c}");
     }
 
     /// Build an AllowList directly (bypassing the env var) so the `allows` logic
@@ -12513,6 +13044,9 @@ mod steer_tests {
                 steer_file: f.clone(),
                 can_steer,
                 pays: false,
+                // Nobody these tests name is in the owner's circle except
+                // `GATE_OWNER` / `gate-friend`, whose turns say so themselves.
+                guest: true,
             },
             f,
             rx,
@@ -12531,6 +13065,65 @@ mod steer_tests {
         (TurnHandle { events: tx, ..t }, f, rx)
     }
 
+    /// `/stop` is open to a guest so they can brake their OWN run. 2026-10-08:
+    /// on a bot open to everyone, a stranger's `/stop` (or a tap on the run
+    /// card's Stop) stopped whatever the owner's circle had running too.
+    #[tokio::test]
+    async fn a_guests_stop_reaches_only_their_own_runs() {
+        let signalled = |n: Arc<Notify>| async move {
+            tokio::time::timeout(std::time::Duration::from_millis(20), n.notified()).await.is_ok()
+        };
+        let build = || {
+            let (mine, _) = turn("stranger", None, true);
+            let (circle, _) = turn(GATE_OWNER, None, true);
+            let circle = TurnHandle { guest: false, ..circle };
+            let (elsewhere, _) = turn("stranger", Some("ch"), true);
+            let n = (mine.cancel.clone(), circle.cancel.clone(), elsewhere.cancel.clone());
+            let mut st = ChatState::default();
+            st.turns.insert("d-mine".into(), mine);
+            st.turns.insert("d-circle".into(), circle);
+            st.turns.insert("d-elsewhere".into(), elsewhere);
+            let states: ChatStates = Arc::new(Mutex::new(HashMap::from([("c".to_string(), st)])));
+            (states, n)
+        };
+
+        let (states, (mine, circle, elsewhere)) = build();
+        assert_eq!(cancel_channel(&states, "c", None, Standing::Guest, "stranger").await, 1);
+        assert!(signalled(mine).await);
+        assert!(!signalled(circle).await, "a guest stopped the circle's run");
+        assert!(!signalled(elsewhere).await, "still only this channel");
+
+        let (states, (mine, circle, _)) = build();
+        assert_eq!(cancel_channel(&states, "c", None, Standing::Circle, "gate-friend").await, 2);
+        assert!(signalled(mine).await && signalled(circle).await, "the circle's brake reaches every run here");
+
+        // The run card's Stop names one draft: a guest's tap on someone else's does nothing.
+        let (states, (_, circle, _)) = build();
+        let by_button = |draft: &'static str, s: Standing, by: &'static str| {
+            let states = states.clone();
+            async move { cancel_matching(&states, "c", |id, t| id == draft && stops(t, s, by)).await }
+        };
+        assert_eq!(by_button("d-circle", Standing::Guest, "stranger").await, 0);
+        assert!(!signalled(circle.clone()).await);
+        assert_eq!(by_button("d-circle", Standing::Owner, GATE_OWNER).await, 1);
+        assert!(signalled(circle).await);
+
+        // An open bot of the owner's passing a guest's `/stop` on: its name is
+        // on the turns it started for the owner too. Only its guests' stop.
+        let relay = "gate-owner:public";
+        let (for_owner, _) = turn(relay, None, true);
+        let for_owner = TurnHandle { guest: false, ..for_owner };
+        let (for_guest, _) = turn(relay, None, true);
+        let n = (for_owner.cancel.clone(), for_guest.cancel.clone());
+        let mut st = ChatState::default();
+        st.turns.insert("d-owner".into(), for_owner);
+        st.turns.insert("d-guest".into(), for_guest);
+        let states: ChatStates = Arc::new(Mutex::new(HashMap::from([("c".to_string(), st)])));
+        assert_eq!(cancel_channel(&states, "c", None, Standing::Guest, relay).await, 1);
+        assert!(!signalled(n.0).await, "a guest, through the owner's bot, stopped the owner's run");
+        assert!(signalled(n.1).await);
+    }
+
     /// A background task reporting in is NOT the user speaking. It rides the same
     /// mailbox — one delivery path, no second mechanism — but the seam it draws
     /// is a NOTICE: a steer line would put the wrap-up prompt in the user's
@@ -12546,6 +13139,7 @@ mod steer_tests {
             None,
             None,
             Speaker::person("ops"),
+            None,
             None,
             prompt,
             Seam::Notice("2 个后台任务跑完了".into()),
@@ -12633,6 +13227,76 @@ mod steer_tests {
         steer_turn(states, chat, channel, thread, from, reply_to, text, "", |t| async move { t }).await
     }
 
+    /// A guest's words never ride in a turn the owner's circle started — it
+    /// runs on the owner's own Claude Code (`trusted`): they're given back, to
+    /// start a guest's turn of their own. Someone whitelisted still steers it,
+    /// and the owner's words still fold into a guest's turn, on its terms.
+    #[tokio::test]
+    async fn a_guests_words_dont_ride_in_the_owners_circles_turn() {
+        gate_access();
+        let (t, f) = turn(GATE_OWNER, None, true);
+        let t = TurnHandle { guest: false, ..t };
+        let s = states(vec![("d1", t)]).await;
+        let out = steer_turn(&s, "c1", None, None, Speaker::person("stranger"), None, "use the pricing skill", "", |t| async move { t }).await;
+        assert!(out.is_none(), "given back to start its own turn, as a guest");
+        assert!(std::fs::read_to_string(&f).unwrap_or_default().is_empty(), "nothing left in the owner's mailbox");
+        let out = steer_turn(&s, "c1", None, None, Speaker::person("gate-friend"), None, "and this", "", |t| async move { t }).await;
+        assert!(out.is_some(), "someone the owner whitelisted still steers it");
+        let _ = std::fs::remove_file(&f);
+
+        let (t, f) = turn("stranger", None, true);
+        let s = states(vec![("d2", t)]).await;
+        let out = steer_turn(&s, "c1", None, None, Speaker::person(GATE_OWNER), None, "also this", "", |t| async move { t }).await;
+        assert!(out.is_some(), "the owner's words in a guest's turn are held to that turn's rules");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// The owner's own bot passing on a stranger — or a guest's work it
+    /// started — is a guest's, whatever the bot's own name says: the caller's
+    /// word (`from_guest`) decides, not the handle.
+    #[tokio::test]
+    async fn the_owners_bot_speaking_for_a_guest_is_a_guest() {
+        gate_access();
+        for seam in [Seam::User(String::new()), Seam::Notice("done".into())] {
+            let (t, f) = turn(GATE_OWNER, None, true);
+            let circle = TurnHandle { guest: false, ..t };
+            let s = states(vec![("d1", circle)]).await;
+            let out = inject_into_live_turn(&s, "c1", None, None, Speaker::person("gate-owner:public"), Some(true), None, "run the pricing skill", seam, |t| async move { t }).await;
+            assert!(out.is_none(), "kept out of the circle's turn");
+            let _ = std::fs::remove_file(&f);
+        }
+        let (t, f) = turn(GATE_OWNER, None, true);
+        let s = states(vec![("d2", TurnHandle { guest: false, ..t })]).await;
+        let out = inject_into_live_turn(&s, "c1", None, None, Speaker::person("gate-owner:public"), Some(false), None, "and this", Seam::User(String::new()), |t| async move { t }).await;
+        assert!(out.is_some(), "relaying someone in the circle, it may");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// Background work only reports into a turn of its own kind: the circle's
+    /// may carry what the owner's skills made, a guest's what a guest asked
+    /// for. Either one into the other's turn is given back, to run as its own.
+    #[tokio::test]
+    async fn a_wrapup_only_reports_into_a_turn_of_its_own_kind() {
+        gate_access();
+        let wrapup = |s: ChatStates, from: &'static str| async move {
+            inject_into_live_turn(&s, "c1", None, None, Speaker::person(from), None, None, "(tasks finished)", Seam::Notice("done".into()), |t| async move { t }).await
+        };
+        let (t, f) = turn(GATE_OWNER, None, true);
+        let circle = TurnHandle { guest: false, ..t };
+        assert!(wrapup(states(vec![("d1", circle)]).await, "").await.is_none(), "a guest's tasks into the circle's turn");
+        let _ = std::fs::remove_file(&f);
+        let (t, f) = turn(GATE_OWNER, None, true);
+        let circle = TurnHandle { guest: false, ..t };
+        assert!(wrapup(states(vec![("d2", circle)]).await, GATE_OWNER).await.is_some());
+        let _ = std::fs::remove_file(&f);
+        let (guest, f) = turn("stranger", None, true);
+        assert!(wrapup(states(vec![("d3", guest)]).await, GATE_OWNER).await.is_none(), "the circle's tasks into a guest's turn");
+        let _ = std::fs::remove_file(&f);
+        let (guest, f) = turn("stranger", None, true);
+        assert!(wrapup(states(vec![("d4", guest)]).await, "").await.is_some());
+        let _ = std::fs::remove_file(&f);
+    }
+
     async fn states(turns: Vec<(&str, TurnHandle)>) -> ChatStates {
         let s: ChatStates = Default::default();
         {
@@ -12669,7 +13333,7 @@ mod steer_tests {
     }
 
     async fn steer_after(s: &ChatStates, a: &Arrived, who: &str, channel: Option<&str>, text: &str) -> Option<Steered> {
-        steer_in_order(s, a, "c1", channel, None, Speaker::person(who), None, text, "", |t| async move { t }).await
+        steer_in_order(s, a, "c1", channel, None, Speaker::person(who), None, None, text, "", |t| async move { t }).await
     }
 
     /// 2026-09-27 #失败不可见, the whole incident in one test. Two @s from the
@@ -12755,7 +13419,7 @@ mod steer_tests {
         assert!(steer_after(&s, &a, "ops", None, "first").await.is_none());
         assert!(steer_after(&s, &elsewhere, "ops", Some("ch2"), "another channel").await.is_none());
         assert!(
-            steer_in_order(&s, &threaded, "c1", None, Some("root-9"), Speaker::person("eons"), None, "in a thread", "", |t| async move { t })
+            steer_in_order(&s, &threaded, "c1", None, Some("root-9"), Speaker::person("eons"), None, None, "in a thread", "", |t| async move { t })
                 .await
                 .is_none()
         );
@@ -12922,7 +13586,7 @@ mod steer_tests {
         let s = states(vec![("d1", t)]).await;
         let prompt = "(background task(s) you started earlier have finished.)";
         let out = inject_into_live_turn(
-            &s, "c1", None, None, Speaker::person("ops"), None, prompt,
+            &s, "c1", None, None, Speaker::person("ops"), None, None, prompt,
             Seam::Notice("后台任务跑完了".into()), |t| async move { t },
         )
         .await;
@@ -13575,19 +14239,18 @@ mod account_scope_tests {
     /// what it actually changed, and for how long.
     #[test]
     fn a_pin_receipt_says_this_conversation_only_and_until_reset() {
-        let r = account_pin_receipt("new5x", None, false);
+        let r = account_pin_receipt("new5x", None);
         assert!(r.contains("this conversation only"), "{r}");
         assert!(r.contains("other bots on this machine"), "{r}");
         assert!(r.contains("until `/account reset`"), "{r}");
         assert!(r.contains("machine's own login"), "names what the rest of the bot is on: {r}");
-        assert!(!r.contains("mafold/customize"), "no card for someone who can't apply it: {r}");
     }
 
-    /// The owner is offered the whole-bot switch right there, as the same
-    /// one-tap proposal `/access` uses — the tap applies it.
+    /// The owner — the only one `/account` runs for — is offered the whole-bot
+    /// switch right there, as the same one-tap proposal `/access` uses.
     #[test]
     fn the_owner_gets_a_one_tap_card_for_the_whole_bot() {
-        let r = account_pin_receipt("new5x", Some("default"), true);
+        let r = account_pin_receipt("new5x", Some("default"));
         assert!(r.contains(CARD), "{r}");
     }
 
@@ -13601,16 +14264,12 @@ mod account_scope_tests {
         assert_eq!(parse_account_arg("forget work"), AccountArg::Forget("work".into()));
     }
 
-    /// `--bot` proposes; it never claims to have pinned anything. Only the
-    /// owner gets the card — anyone else is told who can.
+    /// `--bot` proposes; it never claims to have pinned anything.
     #[test]
     fn the_bot_receipt_is_a_proposal_only_the_owner_can_apply() {
-        let owner = account_bot_receipt("new5x", true);
+        let owner = account_bot_receipt("new5x");
         assert!(owner.contains(CARD), "{owner}");
         assert!(!owner.contains("now runs on"), "--bot must not claim a pin: {owner}");
-        let other = account_bot_receipt("new5x", false);
-        assert!(!other.contains("mafold/customize"), "{other}");
-        assert!(other.contains("Only the owner"), "{other}");
     }
 
     /// Bare `/account` names both layers: what the bot runs on, and what
@@ -13725,6 +14384,8 @@ mod windows_background_tests {
         let old = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);
         let tag = "ci__windows__test";
+        // The report lands in a turn the owner's circle started, from their own task.
+        gate_access();
         let (live, done) = super::bgtasks_scan(tag);
         assert_eq!(live, 0);
         assert_eq!(done.len(), 1, "the daemon must discover completion for its report turn");
@@ -13741,16 +14402,16 @@ mod windows_background_tests {
         let (events, mut notices) = tokio::sync::mpsc::unbounded_channel();
         let states: ChatStates = Default::default();
         states.lock().await.entry("ci".into()).or_default().turns.insert("report-turn".into(), TurnHandle {
-            cancel: Arc::new(Notify::new()), ask_file: None, owner: "owner".into(),
+            cancel: Arc::new(Notify::new()), ask_file: None, owner: GATE_OWNER.into(),
             channel: Some("windows".into()), thread: None, events, steer_file: mailbox.clone(),
-            can_steer: true, pays: false,
+            can_steer: true, pays: false, guest: false,
         });
         arm_bg_wakeup(
             Client::new("http://127.0.0.1:1".into(), "local-test".into()), home.clone(), false,
             "test".into(), "ci".into(), None, Some("windows".into()),
             Default::default(), ExecCoord::new(None), states,
             Arc::new(crate::harness::claude_code::ClaudeCode),
-            None, None, None, None, None, "owner".into(), 1, None,
+            None, None, None, None, None, GATE_OWNER.into(), false, 1, None,
         );
         let notice = tokio::time::timeout(Duration::from_secs(20), notices.recv()).await.unwrap().unwrap();
         assert!(matches!(notice, AgentEvent::Notice(_)), "completion must dispatch a report notice");

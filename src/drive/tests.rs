@@ -252,11 +252,13 @@ fn a_process_with_another_mount_is_another_pool_key() {
     use crate::harness::{cc_conn::PoolKey, Mount};
     let k = || PoolKey::new("c", "s", "/w", None, None, None, None, &[]);
     let none = Mount::default();
-    let skills = Mount { plugin_dirs: vec!["/d".into()] };
-    let two = Mount { plugin_dirs: vec!["/m".into(), "/d".into()] };
+    let skills = Mount { plugin_dirs: vec!["/d".into()], ..Default::default() };
+    let two = Mount { plugin_dirs: vec!["/m".into(), "/d".into()], ..Default::default() };
     assert_eq!(k().with_mount(&skills), k().with_mount(&skills));
     assert_ne!(k().with_mount(&none), k().with_mount(&skills));
     assert_ne!(k().with_mount(&skills), k().with_mount(&two));
+    let guest = Mount { guest: true, ..skills.clone() };
+    assert_ne!(k().with_mount(&skills), k().with_mount(&guest), "a guest's process is never an owner's");
 }
 
 #[test]
@@ -265,4 +267,72 @@ fn plugin_labels_are_plain_and_never_mafold() {
     assert_eq!(plugin_label("fei_pota:Study Bot"), "study-bot");
     assert_eq!(plugin_label("x:mafold"), "mafold-bot");
     assert_eq!(plugin_label("x:__"), "bot");
+}
+
+/// SK-02 PR2: a turn its owner didn't start may only invoke skills from the
+/// mounted plugins; the reason names the ones it may use. Other tools, and a
+/// gate with nothing to hold (the owner's turn), are no opinion.
+#[test]
+fn the_skill_gate_holds_a_non_owner_turn_to_the_mounted_plugins() {
+    let plugins = vec!["tea-bot".to_string(), "mafold".to_string()];
+    let gate = |input: serde_json::Value| skill_gate("Skill", &input, &plugins);
+    for ok in ["tea-bot:brew", "mafold:mafold-room", "/tea-bot:brew"] {
+        assert_eq!(gate(json!({ "skill": ok })), None, "{ok}");
+    }
+    for no in ["superpowers:brainstorming", "geo", "price", "tea-bot", "vercel:deploy", "", "Mafold:mafold-video"] {
+        let d = gate(json!({ "skill": no, "args": "x" })).unwrap_or_else(|| panic!("{no} must be refused"));
+        assert_eq!(d["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(d["hookSpecificOutput"]["permissionDecision"], "deny");
+        let why = d["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(why.contains("`tea-bot:…` and `mafold:…`"), "{why}");
+    }
+    // Older Claude Code named the skill `command`.
+    assert!(gate(json!({ "command": "superpowers:brainstorming" })).is_some());
+    assert_eq!(gate(json!({ "command": "tea-bot:brew" })), None);
+    // Not the Skill tool: nothing to say (a claude from cli 0.9.130–0.9.133
+    // still calls `drive-hook` for file writes).
+    assert_eq!(skill_gate("Write", &json!({ "file_path": "/x" }), &plugins), None);
+    // Nothing mounted: every skill is the owner's.
+    let none = skill_gate("Skill", &json!({ "skill": "tea-bot:brew" }), &[]).unwrap();
+    assert!(none["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("none are mounted here"));
+}
+
+#[test]
+fn a_plugin_goes_by_its_manifest_name() {
+    let d = tmp("plugin-name");
+    assert_eq!(plugin_name(&d), None);
+    std::fs::create_dir_all(d.join(".claude-plugin")).unwrap();
+    std::fs::write(d.join(".claude-plugin").join("plugin.json"), r#"{"name":"tea-bot"}"#).unwrap();
+    assert_eq!(plugin_name(&d).as_deref(), Some("tea-bot"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A mounted plugin named like one of the owner's installed plugins can't
+/// vouch for its skills — `<name>:<skill>` is all a call says — so that name
+/// is held on turns the owner didn't start.
+#[test]
+fn a_mounted_name_the_owner_also_installed_is_held() {
+    let root = tmp("gated-plugins");
+    let mut dirs = vec![];
+    for (dir, name) in [("mafold", "mafold"), ("drive", "vercel")] {
+        let d = root.join(dir);
+        std::fs::create_dir_all(d.join(".claude-plugin")).unwrap();
+        std::fs::write(d.join(".claude-plugin").join("plugin.json"), format!(r#"{{"name":"{name}"}}"#)).unwrap();
+        dirs.push(d.to_string_lossy().into_owned());
+    }
+    let mount = crate::harness::Mount { plugin_dirs: dirs, ..Default::default() };
+    assert_eq!(gated_plugins(&mount, &[]), vec!["mafold".to_string(), "vercel".to_string()]);
+    assert_eq!(gated_plugins(&mount, &["vercel".to_string(), "superpowers".to_string()]), vec!["mafold".to_string()]);
+
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+    std::fs::write(
+        home.join(".claude/plugins/installed_plugins.json"),
+        r#"{"version":2,"plugins":{"vercel@claude-plugins-official":[{"installPath":"/x"}],"superpowers@m":[]}}"#,
+    )
+    .unwrap();
+    let mut names = crate::discover::installed_plugin_names(&home);
+    names.sort();
+    assert_eq!(names, vec!["superpowers".to_string(), "vercel".to_string()]);
+    let _ = std::fs::remove_dir_all(&root);
 }

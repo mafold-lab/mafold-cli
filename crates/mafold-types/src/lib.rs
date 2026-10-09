@@ -649,6 +649,11 @@ pub struct Channel {
     /// Channel icon: a single emoji. None = the default "#" tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Created without a name: `name` is a placeholder in the creator's
+    /// language until the first real name lands. Clients show it as an
+    /// untitled channel; anyone who may post in it may name it once.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub untitled: bool,
     /// Pinned message ids in THIS channel, newest first.
     ///
     /// A pin belongs to the timeline it was made in. `Conversation::

@@ -108,7 +108,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount, proc } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount, skill_plugins, proc } = turn;
         let _ = sink.send(AgentEvent::Stats(RunStats {
             effort: effort.clone(), ..Default::default()
         }));
@@ -223,6 +223,7 @@ impl Harness for ClaudeCode {
             steer: steer_file.clone().unwrap_or_default(),
             perm: ask_file.as_ref().map(|af| format!("{af}.perm")).unwrap_or_default(),
             surface: surface.clone(),
+            skill_plugins,
         };
         crate::turnenv::write(&crate::turnenv::path_for(&conn.id), &tenv);
         // An OLDER `mafold` on the agent's $PATH still reads `MAFOLD_DRAFT` from
@@ -697,6 +698,10 @@ impl Harness for ClaudeCode {
             crate::commands::Outcome::Reply(text) => CommandOutcome::Reply(text),
             crate::commands::Outcome::Forward => CommandOutcome::Forward,
         }
+    }
+
+    fn command_who(&self, name: &str) -> super::Who {
+        crate::commands::who(name)
     }
 
     async fn status_line(&self, env: &[(String, String)]) -> String {
@@ -1218,6 +1223,17 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         for d in &shape.mount.plugin_dirs {
             cmd.arg("--plugin-dir").arg(d);
         }
+        // A guest's turn (`Mount::guest`) runs on none of the owner's own
+        // Claude Code: `user` drops out of the setting sources, and with it
+        // their skills, plugins and CLAUDE.md. Measured on CC 2.1.289: the
+        // `--plugin-dir` plugins, the `--settings` hooks, the control-channel
+        // hooks and `--resume` all stay (`scripts/skill-gate-probe`).
+        if shape.mount.guest {
+            cmd.arg("--setting-sources").arg("project,local");
+        }
+        // …but the owner's guardrails and plumbing come along, merged into the
+        // daemon's own settings blob (`guest_settings`).
+        let guest_carry = shape.mount.guest.then(owner_settings);
         if let Some(m) = &shape.model {
             cmd.arg("--model").arg(m);
         }
@@ -1309,9 +1325,15 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         let always = {
             let mut hooks = crate::compact_hook::settings(exe);
             hooks.insert("PreToolUse".into(), serde_json::json!([bash_hook.clone()]));
-            serde_json::json!({ "hooks": hooks }).to_string()
+            guest_settings(serde_json::json!({ "hooks": hooks }), guest_carry.as_ref()).to_string()
         };
         pre.push(bash_hook);
+        // The skill gate's command form (`crate::drive::skill_gate`); in
+        // process it is a control-channel hook (`cc_conn`).
+        pre.push(serde_json::json!({
+            "matcher": "Skill",
+            "hooks": [{ "type": "command", "command": format!("\"{exe}\" drive-hook") }]
+        }));
         {
             pre.push(serde_json::json!({
                 "matcher": "AskUserQuestion",
@@ -1355,7 +1377,7 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
             // to read the CURRENT turn rather than the environment this process
             // was born with), so this is kept as the fallback for a CLI that
             // can't do that. Attaching both would fire every hook twice.
-            hook_settings = Some(serde_json::json!({ "hooks": hooks }).to_string());
+            hook_settings = Some(guest_settings(serde_json::json!({ "hooks": hooks }), guest_carry.as_ref()).to_string());
         }
         cmd.kill_on_drop(true);
         let mut forks = false;
@@ -1383,6 +1405,33 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
             }
         }
         Built { cmd, hook_settings, always, forks }
+}
+
+/// What a guest's process keeps of the owner's own `settings.json` (`user`),
+/// merged into the daemon's settings blob: the owner's guardrails
+/// (`permissions` — an `ask` or `deny` rule binds under
+/// `--dangerously-skip-permissions`, and a guest is who it most has to bind)
+/// and what the process needs to reach a model at all (`env`, `apiKeyHelper`,
+/// `model`). Not their hooks, plugins or anything else: those are the owner's
+/// own Claude Code, which a guest doesn't run on. `None` = not a guest.
+pub(crate) fn guest_settings(mut blob: Value, user: Option<&Value>) -> Value {
+    let Some(user) = user else { return blob };
+    if let Some(o) = blob.as_object_mut() {
+        for k in ["permissions", "env", "apiKeyHelper", "model"] {
+            if let Some(v) = user.get(k) {
+                o.entry(k).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    blob
+}
+
+/// The owner's own `settings.json`, as JSON (`Null` when there is none).
+pub(crate) fn owner_settings() -> Value {
+    crate::permission_mcp::user_settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or_default()
 }
 
 /// The first non-empty line of `t`, bounded — a subagent's report can be pages
@@ -1672,6 +1721,7 @@ mod tests {
     fn every_spawn_path_carries_the_drive_mount_and_leaves_memory_alone() {
         let mount = super::super::Mount {
             plugin_dirs: vec!["/h/.mafold/plugins/mafold".into(), "/h/.mafold/drives/0123456789ab".into()],
+            ..Default::default()
         };
         let sid = format!("mount-test-{}", std::process::id());
         let fresh = super::super::TurnShape { session: None, mount: mount.clone(), ..resuming(&sid) };
@@ -1688,11 +1738,64 @@ mod tests {
                 let v: Value = serde_json::from_str(&blob).unwrap();
                 assert!(v.get("autoMemoryDirectory").is_none(), "{label}: {blob}");
                 assert!(v["hooks"]["PreToolUse"].is_array(), "the hooks are still there: {blob}");
-                assert!(!blob.contains("drive-hook"), "{label}: {blob}");
             }
+            // The skill gate: its command form in the fallback set only — in
+            // process it is a control-channel hook, and both would fire twice.
+            assert!(!b.always.contains("drive-hook"), "{label}: {}", b.always);
+            let fallback: Value = serde_json::from_str(b.hook_settings.as_deref().unwrap()).unwrap();
+            let gate: Vec<&Value> = fallback["hooks"]["PreToolUse"].as_array().unwrap().iter().filter(|h| h["matcher"] == "Skill").collect();
+            assert_eq!(gate.len(), 1, "{label}: {fallback}");
+            assert_eq!(gate[0]["hooks"][0]["command"], "\"mafold\" drive-hook", "{label}");
         }
         let plain = build_cmd(&resuming(&sid), "mafold", false);
         assert!(!args(&plain).iter().any(|a| a == "--plugin-dir"));
+    }
+
+    /// What a guest's process keeps of the owner's settings: their guardrails
+    /// and what reaching a model needs — never their hooks or plugins, and
+    /// never over the daemon's own keys.
+    #[test]
+    fn a_guest_keeps_the_owners_guardrails_and_nothing_else() {
+        let owner = serde_json::json!({
+            "permissions": { "deny": ["Bash(git push *)"], "ask": ["Bash(rm *)"] },
+            "env": { "HTTPS_PROXY": "http://127.0.0.1:7890" },
+            "apiKeyHelper": "/usr/local/bin/key",
+            "model": "opus",
+            "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "owner-hook" }] }] },
+            "enabledPlugins": { "superpowers@m": true },
+        });
+        let ours = serde_json::json!({ "hooks": { "PreToolUse": [] }, "model": "daemon-pick" });
+        let v = guest_settings(ours.clone(), Some(&owner));
+        assert_eq!(v["permissions"]["deny"][0], "Bash(git push *)");
+        assert_eq!(v["env"]["HTTPS_PROXY"], "http://127.0.0.1:7890");
+        assert_eq!(v["apiKeyHelper"], "/usr/local/bin/key");
+        assert_eq!(v["model"], "daemon-pick", "the daemon's own keys win");
+        assert_eq!(v["hooks"], ours["hooks"], "not the owner's hooks");
+        assert!(v.get("enabledPlugins").is_none());
+        assert_eq!(guest_settings(ours.clone(), None), ours, "not a guest: untouched");
+    }
+
+    /// A guest's process loads none of the owner's own Claude Code, on every
+    /// way it starts — and nothing about setting sources is said for anyone
+    /// else's.
+    #[test]
+    fn a_guests_process_leaves_the_owners_own_settings_out() {
+        let sid = format!("guest-test-{}", std::process::id());
+        let mount = super::super::Mount { plugin_dirs: vec!["/h/.mafold/plugins/mafold".into()], guest: true };
+        let fresh = super::super::TurnShape { session: None, mount: mount.clone(), ..resuming(&sid) };
+        let resumed = super::super::TurnShape { mount: mount.clone(), ..resuming(&sid) };
+        for (label, b) in [
+            ("fresh", build_cmd(&fresh, "mafold", false)),
+            ("resumed", build_cmd(&resumed, "mafold", false)),
+            ("forked", build_cmd(&resumed, "mafold", true)),
+        ] {
+            let a = args(&b);
+            let sources: Vec<&str> = a.windows(2).filter(|w| w[0] == "--setting-sources").map(|w| w[1].as_str()).collect();
+            assert_eq!(sources, ["project,local"], "{label}: {a:?}");
+            assert!(a.windows(2).any(|w| w[0] == "--plugin-dir" && w[1] == "/h/.mafold/plugins/mafold"), "{label}");
+        }
+        let owners = super::super::TurnShape { mount: super::super::Mount { guest: false, ..mount }, ..resuming(&sid) };
+        assert!(!args(&build_cmd(&owners, "mafold", false)).iter().any(|a| a == "--setting-sources"));
     }
 
     /// A turn whose session another turn of ours is running resumes it as a

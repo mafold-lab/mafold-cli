@@ -23,6 +23,17 @@ pub enum MeProbe {
     AuthRejected,
 }
 
+/// What the server knows of whom a message is, ultimately, from
+/// (`messageOrigin`).
+pub struct MessageOrigin {
+    /// The person whose message started its chain; `""` when its turn
+    /// answered more than one; `None` when nobody knows for sure.
+    pub person: Option<String>,
+    /// Sent by a bot anyone at all may drive (a `*` whitelist, the paid
+    /// tier) — whose word can't vouch for whom it speaks.
+    pub open: bool,
+}
+
 /// Where a message goes. In a forum the conversation is only HALF an address:
 /// the channel, the thread it hangs under and the message it answers each narrow
 /// it further, and every one of them is part of "reply where you were asked".
@@ -132,6 +143,19 @@ pub(crate) const REPLAY_METHODS: &[&str] = &[
     "events.messageNew", "events.threadReply", "events.messageComplete", "events.chatCleared",
 ];
 
+/// How a turn ended when it didn't end cleanly — `botFinalize`'s `outcome`.
+/// The reply's text can't say it for us: a stopped turn's whole reply may be
+/// cards a preview never reads, leaving "⏹ Stopped." as all a list shows
+/// (linsky's garden, 2026-10-07). An older server ignores the field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnEnd {
+    /// Someone stopped it.
+    Stopped,
+    /// It died on an error: the agent's, the harness's, a stall.
+    Failed,
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub http: reqwest::Client,
@@ -237,6 +261,13 @@ impl Client {
 
     pub async fn me(&self) -> Result<Value> {
         self.post("getMe", json!({})).await
+    }
+
+    /// Who message `message_id` is, ultimately, from (`messageOrigin`). An
+    /// error (a server from before it) says nothing either way.
+    pub async fn message_origin(&self, message_id: &str) -> Result<MessageOrigin> {
+        let v = self.post("messageOrigin", json!({ "message_id": message_id })).await?;
+        Ok(MessageOrigin { person: v["origin"].as_str().map(str::to_lowercase), open: v["open"].as_bool().unwrap_or(false) })
     }
 
     /// `getMe`, but with an AUTH REJECTION (401/403 — token revoked / bot
@@ -607,6 +638,12 @@ impl Client {
     /// (0.9.56→0.9.63; diagnosed in the field by @linsky:opus48).
     pub async fn send_to(&self, dest: Dest<'_>, text: &str) -> Result<Value> {
         let mut body = json!({ "chat_id": dest.chat_id, "text": text });
+        // Sent from inside a turn (an agent's `mafold send`): name the turn's
+        // reply, and the server stamps this with whom the turn speaks for
+        // (`messageOrigin`). The daemon's own notices run outside any turn.
+        if let Some(draft) = crate::turnenv::draft() {
+            body["carries"] = json!(draft);
+        }
         if let Some(ch) = dest.channel_id {
             body["channel_id"] = json!(ch);
         }
@@ -896,7 +933,21 @@ retry {attempt}/{} in {delay:?}…",
         trigger_id: Option<&str>,
     ) -> Result<String> {
         let deadline = std::time::SystemTime::now() + LINK_WAIT;
-        self.create_draft_until(chat_id, thread_root_id, channel_id, trigger_id, deadline).await
+        self.create_draft_until(chat_id, thread_root_id, channel_id, trigger_id, None, deadline).await
+    }
+
+    /// A draft that carries on a turn whose first draft is `carries` — a
+    /// steer's fresh one. No trigger (it bills nothing new); the server copies
+    /// over who the turn's chain started from (`messageOrigin`).
+    pub async fn create_draft_carrying(
+        &self,
+        chat_id: &str,
+        thread_root_id: Option<&str>,
+        channel_id: Option<&str>,
+        carries: &str,
+    ) -> Result<String> {
+        let deadline = std::time::SystemTime::now() + LINK_WAIT;
+        self.create_draft_until(chat_id, thread_root_id, channel_id, None, Some(carries), deadline).await
     }
 
     /// [`Self::create_draft`] with the give-up time spelled out. Wall-clock on
@@ -908,6 +959,7 @@ retry {attempt}/{} in {delay:?}…",
         thread_root_id: Option<&str>,
         channel_id: Option<&str>,
         trigger_id: Option<&str>,
+        carries: Option<&str>,
         deadline: std::time::SystemTime,
     ) -> Result<String> {
         // TYPED through the core: ids parse to real Uuids up front (a malformed
@@ -924,12 +976,13 @@ retry {attempt}/{} in {delay:?}…",
         // A trigger id we can't parse is a trigger we don't have: the turn runs
         // free rather than dying on a malformed id nobody typed.
         let trigger = trigger_id.filter(|t| !t.is_empty()).and_then(|t| uuid::Uuid::parse_str(t).ok());
+        let carries = carries.and_then(|c| uuid::Uuid::parse_str(c).ok());
         let api = self.api();
         let mut delay = std::time::Duration::from_millis(500);
         let mut connect_tries = 0;
         let mut blip_retried = false;
         let draft = loop {
-            let err = match api.bot_create_draft(chat, root, channel, trigger).await {
+            let err = match api.bot_create_draft(chat, root, channel, trigger, carries).await {
                 Ok(m) => break m,
                 Err(e) => e,
             };
@@ -1192,23 +1245,32 @@ retry {attempt}/{} in {delay:?}…",
     }
     /// RETRIED: finalizing an already-finalized message is a no-op server-side,
     /// and an unfinalized draft is precisely the "forever generating" bubble.
-    pub async fn finalize(&self, message_id: &str, success_for: Option<&str>) -> Result<()> {
-        self.post_idempotent("botFinalize", json!({ "message_id": message_id, "success_for": success_for }))
-            .await?;
+    pub async fn finalize(&self, message_id: &str, success_for: Option<&str>, outcome: Option<TurnEnd>) -> Result<()> {
+        self.post_idempotent(
+            "botFinalize",
+            json!({ "message_id": message_id, "success_for": success_for, "outcome": outcome }),
+        )
+        .await?;
         Ok(())
     }
 
     /// Persist the final snapshot before attempting either write. A periodic
     /// daemon task retries pending entries, including after process restart.
-    pub async fn finish_draft(&self, message_id: &str, content: &str, success_for: Option<&str>) -> Result<bool> {
+    pub async fn finish_draft(
+        &self,
+        message_id: &str,
+        content: &str,
+        success_for: Option<&str>,
+        outcome: Option<TurnEnd>,
+    ) -> Result<bool> {
         if let Some(outbox) = &self.drafts {
-            if let Err(e) = outbox.complete(message_id, content, success_for) {
+            if let Err(e) = outbox.complete(message_id, content, success_for, outcome) {
                 eprintln!("draft {message_id} completion journal failed: {e:#}");
             }
             outbox.deliver(self, message_id).await
         } else {
             self.edit_draft(message_id, content).await?;
-            self.finalize(message_id, success_for).await?;
+            self.finalize(message_id, success_for, outcome).await?;
             Ok(true)
         }
     }
@@ -2244,7 +2306,7 @@ mod lost_turn_tests {
         let c = Client::new(format!("http://{addr}"), "t".into());
         let deadline = std::time::SystemTime::now() + std::time::Duration::from_millis(1200);
         let err = c
-            .create_draft_until("11111111-2222-3333-4444-555555555555", None, None, None, deadline)
+            .create_draft_until("11111111-2222-3333-4444-555555555555", None, None, None, None, deadline)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("botCreateDraft failed"), "{err:#}");

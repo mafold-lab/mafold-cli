@@ -219,12 +219,17 @@ pub struct TurnShape {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mount {
     pub plugin_dirs: Vec<String>,
+    /// A guest's turn — someone outside the owner's circle started it
+    /// (`crate::agent`, trust): the process loads none of the owner's own
+    /// Claude Code (their `~/.claude/skills`, plugins, `CLAUDE.md`, settings),
+    /// only the project's and the plugin folders above.
+    pub guest: bool,
 }
 
 impl Mount {
-    /// Stable text for the pool key.
+    /// Stable text for the pool key: a guest's process is never an owner's.
     pub fn signature(&self) -> String {
-        self.plugin_dirs.join(",")
+        format!("{}{}", self.plugin_dirs.join(","), if self.guest { "|guest" } else { "" })
     }
 }
 
@@ -312,6 +317,11 @@ pub struct Turn {
     pub env: Vec<(String, String)>,
     /// See [`Mount`].
     pub mount: Mount,
+    /// On a guest's turn (`Mount::guest`): the only plugins it may invoke
+    /// skills from — the ones in `mount` — so the owner's own skills stay
+    /// theirs even if the process has them (`crate::drive::skill_gate`).
+    /// `None` on a turn the owner's circle started.
+    pub skill_plugins: Option<Vec<String>>,
     /// Where the harness says which process is running this turn — see
     /// [`TurnProc`]. Every harness must serve from it, or its long tool calls
     /// read as «No signal».
@@ -361,6 +371,21 @@ pub enum CommandOutcome {
     Handled,
     /// Not a harness command — forward the raw text to the harness as a prompt.
     Forward,
+}
+
+/// Who may run a command. Every road a command arrives by asks it — a typed
+/// `/name`, the run card's Stop button, a card's Refresh — so none of them
+/// can hand a stranger what another one refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    /// Anyone the access gate let in. A guest's acts only on what is theirs:
+    /// their own `#guest` session, their own runs.
+    Anyone,
+    /// The owner's circle (`agent::trusted`): it reads the owner's machine, or
+    /// changes how the agent runs for everyone in the chat.
+    Circle,
+    /// The owner alone: the Claude sign-ins the machine holds.
+    Owner,
 }
 
 /// What a harness's CLI on THIS machine turned out to accept, as [`Harness::caps`]
@@ -618,6 +643,14 @@ pub trait Harness: Send + Sync {
         env: &[(String, String)],
     ) -> CommandOutcome;
 
+    /// Who may run `name` through [`Self::command`]. Everything it answers
+    /// reads or changes the owner's own CLI, so by default the owner's circle;
+    /// a harness whose command touches the machine's sign-in says so.
+    fn command_who(&self, name: &str) -> Who {
+        let _ = name;
+        Who::Circle
+    }
+
     /// One-line status (e.g. auth account) appended to `/status`, for the seat
     /// `env` selects. Empty = none.
     async fn status_line(&self, env: &[(String, String)]) -> String {
@@ -643,6 +676,14 @@ pub trait Harness: Send + Sync {
     async fn caps(&self, env: &[(String, String)], version: &str) -> Option<HarnessProbe> {
         let (_, _) = (env, version);
         None
+    }
+
+    /// Which login a [`Self::caps`] answer is true for, as a cache key: two
+    /// logins can have two rosters, and one must never be read as the other's.
+    /// Claude Code keys its logins by directory (`crate::accounts`); a harness
+    /// that keys them some other way says so here.
+    fn seat_key(&self, env: &[(String, String)]) -> String {
+        crate::accounts::Account::from_env(env).name
     }
 
     /// The harness CLI's own version string (e.g. Claude Code `2.1.198`, Codex
@@ -840,21 +881,185 @@ pub async fn caps_report(h: &dyn Harness, env: &[(String, String)]) -> Option<Ha
         return None;
     }
     let version = h.cli_version().await;
-    let seat = crate::accounts::Account::from_env(env).name;
+    let seat = h.seat_key(env);
     if let Some(c) = cached_caps(h.id(), &seat) {
         // An unknown version can't confirm freshness, and re-probing is cheap
-        // next to reporting a roster that moved.
-        if !version.is_empty() && c.version == version {
+        // next to reporting a roster that moved. Nor can a same-version answer
+        // stand forever: codex's roster comes from its server as well as its
+        // build, so a model or a tier can arrive without an upgrade.
+        if !version.is_empty() && c.version == version && SeatHealth::now() - c.probed_at < CAPS_MAX_AGE_SECS {
             return Some(c);
         }
     }
-    let probe = h.caps(env, &version).await?;
+    probe_and_cache(h, env, &version, &seat).await
+}
+
+/// How long a same-version answer on file is reported as-is, at daemon start.
+const CAPS_MAX_AGE_SECS: i64 = 6 * 3600;
+
+/// Ask the binary ([`Harness::caps`]) and keep the answer for the seat.
+async fn probe_and_cache(h: &dyn Harness, env: &[(String, String)], version: &str, seat: &str) -> Option<HarnessCaps> {
+    let probe = h.caps(env, version).await?;
     if probe.is_empty() {
         return None;
     }
-    let caps = probe.report(h.id(), &version);
-    cache_caps(h.id(), &seat, &caps);
+    let caps = probe.report(h.id(), version);
+    cache_caps(h.id(), seat, &caps);
     Some(caps)
+}
+
+/// What a turn passes as its reasoning tier — held to what THIS machine's
+/// binary said the turn's model takes ([`Harness::caps`]), and to nothing
+/// written here.
+///
+/// Every harness CLI we drive treats a tier it doesn't take the same way:
+/// quietly. `claude --effort <unknown>` warns once on a stderr nobody reads and
+/// runs the default; the codex adapter used to keep its own table of four tiers
+/// and drop the rest, so `ultra` — offered by the sheet because codex itself
+/// reports it — ran at whatever `~/.codex/config.toml` said (2026-10-08, the
+/// owner picked ultra and every turn ran medium). A tier the owner picked is
+/// either run as picked or refused out loud; nothing in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffortVerdict {
+    /// Hand the harness this tier (`None` = its own default).
+    Pass(Option<String>),
+    /// The model has no reasoning dial at all (Haiku): it runs exactly as it
+    /// always can, without one — and the reply says the setting didn't apply.
+    NoDial(String),
+    /// Not a tier this model takes on this machine. The turn doesn't run; the
+    /// reply says why and what it does take.
+    Refuse(String),
+}
+
+/// How long an answer on file stands before a verdict against the owner's pick
+/// re-asks the binary even at the same version — a codex roster comes from its
+/// server as well as from its build, so a tier can appear without an upgrade.
+/// Also how long a re-ask that FAILED holds off the next one.
+const REASK_AFTER_SECS: i64 = 600;
+
+/// The most a re-ask may hold a turn up. It runs before the turn's bubble
+/// exists, so past this the answer on file stands.
+const REASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One re-ask at a time on this process, and when each seat's last one failed.
+fn reask_gate() -> &'static tokio::sync::Mutex<std::collections::HashMap<String, i64>> {
+    static GATE: OnceLock<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// Judge `effort` for a turn of `model` on `h`, for the seat `env` selects.
+///
+/// The answer on file (the daemon's startup probe, [`caps_report`]) decides —
+/// a file read, nothing spawned. Before overruling the owner's pick, though
+/// (refusing it, or dropping it as a dial the model hasn't got), the binary is
+/// asked again when it moved since (an upgrade brings tiers its old answer
+/// never had) or the answer is old: the verdict must be about the binary that
+/// would run the turn. With nothing on file at all — the probe hasn't finished,
+/// or this harness can't be asked — the tier goes through as it is and the
+/// harness answers for itself; probing from here would put a process start in
+/// front of every turn of a harness that never answers.
+pub async fn effort_for_turn(
+    h: &dyn Harness,
+    env: &[(String, String)],
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> EffortVerdict {
+    let Some(want) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
+        return EffortVerdict::Pass(None);
+    };
+    let seat = h.seat_key(env);
+    let Some(known) = cached_caps(h.id(), &seat) else {
+        return EffortVerdict::Pass(Some(want.to_lowercase()));
+    };
+    let verdict = judge_effort(&known, model, want);
+    if matches!(verdict, EffortVerdict::Pass(_)) {
+        return verdict;
+    }
+    let version = h.cli_version().await;
+    let fresh_enough = |c: &HarnessCaps| {
+        (version.is_empty() || version == c.version) && SeatHealth::now() - c.probed_at < REASK_AFTER_SECS
+    };
+    if fresh_enough(&known) {
+        return verdict;
+    }
+    let key = format!("{}/{seat}", h.id());
+    let mut failed = reask_gate().lock().await;
+    // Another turn may have re-asked while this one waited for the gate.
+    if let Some(c) = cached_caps(h.id(), &seat).filter(|c| fresh_enough(c)) {
+        return judge_effort(&c, model, want);
+    }
+    if failed.get(&key).is_some_and(|at| SeatHealth::now() - at < REASK_AFTER_SECS) {
+        return verdict;
+    }
+    match tokio::time::timeout(REASK_TIMEOUT, probe_and_cache(h, env, &version, &seat)).await {
+        Ok(Some(fresh)) => {
+            failed.remove(&key);
+            judge_effort(&fresh, model, want)
+        }
+        _ => {
+            failed.insert(key, SeatHealth::now());
+            verdict
+        }
+    }
+}
+
+/// The verdict one report gives. Pure, so every case is a test.
+fn judge_effort(caps: &HarnessCaps, model: Option<&str>, want: &str) -> EffortVerdict {
+    let is = |t: &String| t.eq_ignore_ascii_case(want);
+    let here = format!("{} {}", caps.harness, caps.version);
+    let list = |tiers: &[&String]| tiers.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ");
+    // A mode (`ultracode`) sits at the same dial for every model.
+    if let Some(m) = caps.modes.iter().find(|m| is(&m.id)) {
+        return EffortVerdict::Pass(Some(m.id.clone()));
+    }
+    // An empty list on a model means "no dial" only in a report that gives
+    // models tiers at all; in one that never does, it means the build didn't
+    // say, and the union below (empty, so it passes) is the honest answer.
+    let per_model = caps.models.iter().any(|m| !m.efforts.is_empty());
+    let named = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .and_then(|m| caps.model(m))
+        .filter(|m| per_model || !m.efforts.is_empty());
+    if let Some(m) = named {
+        if let Some(t) = m.efforts.iter().find(|t| is(t)) {
+            return EffortVerdict::Pass(Some(t.clone()));
+        }
+        if m.efforts.is_empty() {
+            return EffortVerdict::NoDial(format!(
+                "{} has no reasoning-effort setting on this machine ({here}), so `{want}` doesn't apply to it — running without one",
+                m.display
+            ));
+        }
+        return EffortVerdict::Refuse(format!(
+            "reasoning effort `{want}` isn't one {} takes on this machine ({here}) — it takes {}. \
+             Pick one of those (Customize ▸ Reasoning effort), or a model that takes `{want}` \
+             (Customize ▸ Model, or `/model` in this chat); nothing ran at another tier.",
+            m.display,
+            list(&m.efforts.iter().collect::<Vec<_>>())
+        ));
+    }
+    // No model named, or one this report doesn't list: which model the harness
+    // ends up on isn't something the report can say, so the tier is held to
+    // what ANY model here takes.
+    let mut tiers: Vec<&String> = Vec::new();
+    for t in caps.models.iter().flat_map(|m| m.efforts.iter()).chain(caps.efforts.iter()) {
+        if !tiers.contains(&t) {
+            tiers.push(t);
+        }
+    }
+    if let Some(t) = tiers.iter().find(|t| is(t)) {
+        return EffortVerdict::Pass(Some((*t).clone()));
+    }
+    // A report that names no tiers has nothing to hold the turn to.
+    if tiers.is_empty() {
+        return EffortVerdict::Pass(Some(want.to_lowercase()));
+    }
+    EffortVerdict::Refuse(format!(
+        "reasoning effort `{want}` isn't one any model takes on this machine ({here}) — the tiers here are {}. \
+         Pick one of those in Customize ▸ Reasoning effort; nothing ran at another tier.",
+        list(&tiers)
+    ))
 }
 
 fn caps_cache_path(harness: &str, seat: &str) -> PathBuf {
@@ -1271,5 +1476,166 @@ mod path_resolution_tests {
         assert!(names.iter().all(|n| LAUNCHABLE_EXTS
             .iter()
             .any(|e| n.ends_with(e))));
+    }
+}
+
+#[cfg(test)]
+mod effort_verdict_tests {
+    use super::*;
+
+    fn model(id: &str, display: &str, efforts: &[&str]) -> ModelCap {
+        ModelCap {
+            id: id.into(),
+            resolved: None,
+            aliases: Vec::new(),
+            display: display.into(),
+            description: None,
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    fn report(harness: &str, version: &str, models: Vec<ModelCap>) -> HarnessCaps {
+        HarnessCaps {
+            harness: harness.into(),
+            version: version.into(),
+            machine: "m".into(),
+            machine_name: None,
+            account: None,
+            probed_at: 0,
+            source: CapsSource::Handshake,
+            models,
+            efforts: Vec::new(),
+            modes: Vec::new(),
+        }
+    }
+
+    const FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+    const NO_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+    /// What codex 0.161.0's `model/list` said on 2026-10-08, trimmed.
+    fn codex() -> HarnessCaps {
+        report(
+            "codex",
+            "0.161.0",
+            vec![
+                model("gpt-6.1-sol", "GPT-6.1-Sol", FULL),
+                model("gpt-6-luna", "GPT-6-Luna", NO_ULTRA),
+                model("gpt-5.5", "GPT-5.5", &["low", "medium", "high", "xhigh"]),
+            ],
+        )
+    }
+
+    /// The field bug: ultra on a model that lists it goes through AS ultra —
+    /// not dropped for the config file's medium.
+    #[test]
+    fn a_tier_the_model_lists_passes_verbatim() {
+        let c = codex();
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "ultra"), EffortVerdict::Pass(Some("ultra".into())));
+        // …spelled the way the binary spells it.
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "Ultra"), EffortVerdict::Pass(Some("ultra".into())));
+        // The tiers the old table clamped to `high` are themselves again.
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "xhigh"), EffortVerdict::Pass(Some("xhigh".into())));
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "max"), EffortVerdict::Pass(Some("max".into())));
+    }
+
+    /// Per model, not per machine: Luna takes no ultra even though Sol does,
+    /// and the refusal names the model, the binary, and what it does take.
+    #[test]
+    fn a_tier_this_model_lacks_is_refused_with_its_list() {
+        let EffortVerdict::Refuse(why) = judge_effort(&codex(), Some("gpt-6-luna"), "ultra") else {
+            panic!("ultra on Luna must be refused");
+        };
+        assert!(why.contains("`ultra`"), "{why}");
+        assert!(why.contains("GPT-6-Luna"), "{why}");
+        assert!(why.contains("codex 0.161.0"), "{why}");
+        assert!(why.contains("low, medium, high, xhigh, max"), "{why}");
+        assert!(matches!(judge_effort(&codex(), Some("gpt-5.5"), "max"), EffortVerdict::Refuse(_)));
+    }
+
+    /// No model named (the harness picks its own) or one the report doesn't
+    /// list: held to what ANY model here takes.
+    #[test]
+    fn without_a_listed_model_the_union_decides() {
+        let c = codex();
+        for m in [None, Some(""), Some("gpt-7-preview")] {
+            assert_eq!(judge_effort(&c, m, "ultra"), EffortVerdict::Pass(Some("ultra".into())), "{m:?}");
+            let EffortVerdict::Refuse(why) = judge_effort(&c, m, "minimal") else {
+                panic!("no model here takes minimal any more ({m:?})");
+            };
+            assert!(why.contains("low, medium, high, xhigh, max, ultra"), "{why}");
+        }
+    }
+
+    /// Claude's own gap, same door: the 4.6 line has no xhigh while every
+    /// newer model does, so the sheet's union offers it.
+    #[test]
+    fn claude_models_are_held_to_their_own_tiers() {
+        let c = report(
+            "claude-code",
+            "2.1.289",
+            vec![
+                model("opus", "Opus 5.5", &["low", "medium", "high", "xhigh", "max"]),
+                model("claude-opus-4-6", "Opus 4.6", &["low", "medium", "high", "max"]),
+                model("haiku", "Haiku 4.5", &[]),
+            ],
+        );
+        assert_eq!(judge_effort(&c, Some("opus"), "xhigh"), EffortVerdict::Pass(Some("xhigh".into())));
+        assert!(matches!(judge_effort(&c, Some("claude-opus-4-6"), "xhigh"), EffortVerdict::Refuse(_)));
+        // A model with no dial at all runs as it always can — and says so.
+        let EffortVerdict::NoDial(note) = judge_effort(&c, Some("haiku"), "high") else {
+            panic!("haiku has no effort dial");
+        };
+        assert!(note.contains("Haiku 4.5") && note.contains("`high`"), "{note}");
+    }
+
+    /// A model is matched by any spelling the report gives it.
+    #[test]
+    fn a_model_is_found_by_its_resolved_id_too() {
+        let mut m = model("opus", "Opus 4.6", &["low", "medium", "high", "max"]);
+        m.resolved = Some("claude-opus-4-6".into());
+        let c = report("claude-code", "2.1.289", vec![m]);
+        assert!(matches!(judge_effort(&c, Some("claude-opus-4-6"), "xhigh"), EffortVerdict::Refuse(_)));
+    }
+
+    /// A mode sits at the same dial for every model.
+    #[test]
+    fn a_reported_mode_passes() {
+        let mut c = report("claude-code", "2.1.289", vec![model("opus", "Opus", &["low", "max"])]);
+        c.modes.push(ModeCap { id: "ultracode".into(), pins_effort: None });
+        assert_eq!(judge_effort(&c, Some("opus"), "ultracode"), EffortVerdict::Pass(Some("ultracode".into())));
+    }
+
+    /// A report that names no tiers can't hold anyone to them.
+    #[test]
+    fn a_report_without_tiers_judges_nothing() {
+        let c = report("codex", "0.1.0", vec![model("gpt-x", "GPT-X", &[])]);
+        assert_eq!(judge_effort(&c, None, "high"), EffortVerdict::Pass(Some("high".into())));
+        // Named, too: a build that gives no model any tiers hasn't said the
+        // model lacks a dial — the tier goes through, not dropped as "NoDial".
+        assert_eq!(judge_effort(&c, Some("gpt-x"), "High"), EffortVerdict::Pass(Some("high".into())));
+        // …and the tiers it did learn some other way (`--effort` complaint) hold.
+        let mut c = c;
+        c.efforts = vec!["low".into(), "high".into()];
+        assert_eq!(judge_effort(&c, Some("gpt-x"), "high"), EffortVerdict::Pass(Some("high".into())));
+        assert!(matches!(judge_effort(&c, Some("gpt-x"), "max"), EffortVerdict::Refuse(_)));
+    }
+
+    /// A refusal says how to get out of it from wherever the model came from —
+    /// the sheet, or a chat's own `/model`.
+    #[test]
+    fn a_refusal_names_both_ways_out() {
+        let EffortVerdict::Refuse(why) = judge_effort(&codex(), Some("gpt-6-luna"), "ultra") else {
+            panic!("ultra on Luna must be refused");
+        };
+        assert!(why.contains("Customize ▸ Reasoning effort") && why.contains("`/model`"), "{why}");
+    }
+
+    /// Unset stays unset, without looking anything up.
+    #[tokio::test]
+    async fn no_effort_is_the_harness_default() {
+        let h = codex::Codex;
+        for e in [None, Some(""), Some("  ")] {
+            assert_eq!(effort_for_turn(&h, &[], Some("gpt-6.1-sol"), e).await, EffortVerdict::Pass(None));
+        }
     }
 }

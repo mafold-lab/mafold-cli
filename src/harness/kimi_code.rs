@@ -76,6 +76,9 @@ impl Harness for KimiCode {
             // Claude Code's today; Kimi's `extra_skill_dirs` is wired after it
             // is measured (`.docs/bot-drive-v1.md` §5.5).
             mount: _,
+            // No PreToolUse hook to hold it with: Kimi has no Skill tool
+            // gate yet (`crate::drive::skill_gate`).
+            skill_plugins: _,
             proc,
         } = turn;
         if !Path::new(&workdir).is_dir() {

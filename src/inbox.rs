@@ -1918,6 +1918,28 @@ async fn look(
     // the window (a pinned loop once sat out three hours of one this way while
     // another login on the machine was free). Each login is tried at most once.
     let outcome = loop {
+        // The tier, held to what this machine's binary says the model takes —
+        // the same door a bot's turn goes through (`harness::effort_for_turn`):
+        // run as picked, or not at all and the log says why.
+        let env = with_seat(&ctx.env, seat.as_ref());
+        let effort = match harness::effort_for_turn(
+            ctx.harness.as_ref(),
+            &env,
+            ctx.opts.model.as_deref(),
+            ctx.opts.effort.as_deref(),
+        )
+        .await
+        {
+            harness::EffortVerdict::Pass(e) => e,
+            harness::EffortVerdict::NoDial(note) => {
+                eprintln!("inbox: {note}");
+                None
+            }
+            harness::EffortVerdict::Refuse(why) => {
+                eprintln!("inbox: {why}");
+                break Ok(harness::TurnOutcome { error: Some(why), ..Default::default() });
+            }
+        };
         let turn = Turn {
             prompt: prompt.clone(),
             conv: String::new(),
@@ -1926,15 +1948,19 @@ async fn look(
             workdir: ctx.workdir.clone(),
             session: session_seen.clone().or_else(|| if dry { None } else { state.session.clone() }),
             model: ctx.opts.model.clone(),
-            effort: ctx.opts.effort.clone(),
+            effort,
             thinking: None,
             cancel: cancel.clone(),
             system: Some(preamble(&ctx.me, ctx.principal.as_deref())),
             ask_file: None,
             steer_file: Some(steer_file.clone()),
-            env: with_seat(&ctx.env, seat.as_ref()),
-            // The inbox speaks as a PERSON; people have no bot drive to mount.
-            mount: Default::default(),
+            env,
+            // The inbox speaks as a PERSON; people have no bot drive to mount —
+            // only Mafold's own plugin (`mafold:mafold-video`, …), which used to
+            // reach it through `~/.claude/skills`.
+            mount: crate::drive::mount(None).await,
+            // It runs for the person whose skills these are.
+            skill_plugins: None,
             // …and no generating card whose heartbeat it would keep.
             proc: Default::default(),
         };

@@ -117,6 +117,7 @@ Once shots exist, list them under the second rule (`🎬 镜 1 · 标题 · 5s �
 | `wallet can't cover this clip` | Nothing was submitted and nothing was spent. Say whose wallet is short (the bot owner's) and by how much the tool said; don't retry until they top up. |
 | `503 … not configured` | Generation isn't set up on this server. Say so plainly: nothing was submitted and nothing was spent. |
 | still running after 15 min | Leave it; give the job id; `mafold video status <id>` later. |
+| `N reads of <job> failed in a row` | The network or the vendor was out of reach for minutes — `--wait` already retried. The job is NOT known to have failed and may still finish (and bill): don't say it failed, don't resubmit; give the job id and read it again later. |
 
 ## Keys and other people's money
 

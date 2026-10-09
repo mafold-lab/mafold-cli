@@ -339,6 +339,17 @@ struct Source {
 /// that matches is the one that is in force. Read from THIS process: it is a
 /// child of claude, so its working directory and `CLAUDE_CONFIG_DIR` are
 /// claude's own.
+/// The user's own `settings.json` — `$CLAUDE_CONFIG_DIR` when set, else
+/// `~/.claude`.
+pub fn user_settings_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+    match (std::env::var_os("CLAUDE_CONFIG_DIR"), home) {
+        (Some(dir), _) => Some(std::path::PathBuf::from(dir).join("settings.json")),
+        (None, Some(h)) => Some(h.join(".claude").join("settings.json")),
+        (None, None) => None,
+    }
+}
+
 fn settings_sources() -> Vec<Source> {
     #[cfg(target_os = "macos")]
     let managed = "/Library/Application Support/ClaudeCode/managed-settings.json";
@@ -353,12 +364,7 @@ fn settings_sources() -> Vec<Source> {
         }
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
-    let user = match (std::env::var_os("CLAUDE_CONFIG_DIR"), &home) {
-        (Some(dir), _) => Some(std::path::PathBuf::from(dir).join("settings.json")),
-        (None, Some(h)) => Some(h.join(".claude").join("settings.json")),
-        (None, None) => None,
-    };
-    if let Some(path) = user {
+    if let Some(path) = user_settings_path() {
         let shown = match home.as_ref().and_then(|h| path.strip_prefix(h).ok()) {
             Some(rel) => format!("~/{}", rel.to_string_lossy().replace('\\', "/")),
             None => path.to_string_lossy().into_owned(),

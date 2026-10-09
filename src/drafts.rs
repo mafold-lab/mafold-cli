@@ -47,6 +47,9 @@ pub struct Journal {
     pub trigger: Option<String>,
     /// Lowercased handle of whoever the turn is for (`TurnHandle::owner`).
     pub sender: String,
+    /// The person another bot's message was relaying, when `sender` is that
+    /// bot (`agent::trusted_turn`) — a turn picked back up is held to the same.
+    pub relayed_for: Option<String>,
     pub pays: bool,
     pub workdir: String,
     pub workdir_ns: bool,
@@ -147,6 +150,11 @@ struct Entry {
     content: Option<String>,
     #[serde(default)]
     success_for: Option<String>,
+    /// How the turn ended when it didn't end cleanly (`botFinalize`'s `outcome`).
+    /// A word this build doesn't know (a later cli's, before a rollback) reads
+    /// as nothing said — never as an unreadable entry whose draft nobody finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_outcome")]
+    outcome: Option<crate::client::TurnEnd>,
     /// The live turn behind this draft, while it runs ([`Journal`]).
     #[serde(default)]
     turn: Option<Journal>,
@@ -170,6 +178,10 @@ impl Entry {
     fn settles(&self) -> Option<String> {
         self.settles.clone().or_else(|| self.turn.as_ref().and_then(|t| t.settles.clone()))
     }
+}
+
+fn lenient_outcome<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<crate::client::TurnEnd>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(d)?.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 pub struct Outbox {
@@ -250,7 +262,9 @@ impl Outbox {
                         continue;
                     }
                     Verdict::Discard => entry.discard = true,
-                    Verdict::Finalize => {}
+                    // Cut off, not finished — what the server's own boot sweep
+                    // says of a hosted reply a restart interrupted.
+                    Verdict::Finalize => entry.outcome = Some(crate::client::TurnEnd::Failed),
                 }
             }
             // Delivered from here, or finalized as it stands: either way it has
@@ -299,6 +313,7 @@ impl Outbox {
             ready: false,
             content: None,
             success_for: None,
+            outcome: None,
             turn: None,
             at: now_secs(),
             discard: false,
@@ -377,11 +392,18 @@ impl Outbox {
         let mut entries = self.entries.lock().unwrap();
         if let Some(entry) = entries.get_mut(id) {
             entry.ready = true;
+            entry.outcome = Some(crate::client::TurnEnd::Failed); // cut off, not finished
             let _ = self.persist(id, entry);
         }
     }
 
-    pub fn complete(&self, id: &str, content: &str, success_for: Option<&str>) -> Result<()> {
+    pub fn complete(
+        &self,
+        id: &str,
+        content: &str,
+        success_for: Option<&str>,
+        outcome: Option<crate::client::TurnEnd>,
+    ) -> Result<()> {
         let mut entries = self.entries.lock().unwrap();
         // The journal goes; what the reply settles stays with it.
         let settles = entries.get(id).and_then(Entry::settles);
@@ -390,6 +412,7 @@ impl Outbox {
             ready: true,
             content: Some(content.into()),
             success_for: success_for.map(str::to_string),
+            outcome,
             turn: None,
             at: now_secs(),
             discard: false,
@@ -415,7 +438,7 @@ impl Outbox {
     }
 
     pub async fn deliver(&self, client: &Client, id: &str) -> Result<bool> {
-        let (content, success_for, discard) = {
+        let (content, success_for, outcome, discard) = {
             let mut entries = self.entries.lock().unwrap();
             let Some(entry) = entries.get_mut(id) else {
                 return Ok(true);
@@ -424,7 +447,7 @@ impl Outbox {
                 return Ok(false);
             }
             entry.delivering = true;
-            (entry.content.clone(), entry.success_for.clone(), entry.discard)
+            (entry.content.clone(), entry.success_for.clone(), entry.outcome, entry.discard)
         };
         let result = async {
             if discard {
@@ -447,7 +470,7 @@ impl Outbox {
                     self.persist(id, entry)?;
                 }
             }
-            client.finalize(id, success_for.as_deref()).await?;
+            client.finalize(id, success_for.as_deref(), outcome).await?;
             self.forget(id)?;
             Ok(true)
         }
@@ -511,7 +534,7 @@ mod tests {
         let settles = |key: &str| Some(key.to_string());
         // Finished, never delivered.
         old.journal(done, Journal { settles: settles("boot"), prompt: Some("p".into()), ..Default::default() });
-        old.complete(done, "INTRO-OK", None).unwrap();
+        old.complete(done, "INTRO-OK", None, None).unwrap();
         // Cut off with words on screen: finalized as it stands.
         old.journal(cut, Journal { settles: settles("cut"), prompt: Some("p".into()), produced: true, ..Default::default() });
         // Killed before it asked the model anything: thrown away, still owed.
@@ -536,9 +559,12 @@ mod tests {
         let old = Outbox::load(dir.clone(), |_| false).unwrap();
         let a = "00000000-0000-0000-0000-000000000001";
         let b = "00000000-0000-0000-0000-000000000002";
+        let c = "00000000-0000-0000-0000-000000000003";
         old.track(a).unwrap();
         old.track(b).unwrap();
-        old.complete(b, "the final answer", Some(a)).unwrap();
+        old.track(c).unwrap();
+        old.complete(b, "the final answer", Some(a), None).unwrap();
+        old.complete(c, "⏹ Stopped.", None, Some(crate::client::TurnEnd::Stopped)).unwrap();
         // Simulate a different live daemon; this test process's own PID is
         // deliberately recoverable across an exec-based update.
         for (id, entry) in old.entries.lock().unwrap().iter_mut() {
@@ -558,6 +584,9 @@ mod tests {
         assert!(entries[a].success_for.is_none(), "recovered partial output is not success");
         assert_eq!(entries[b].content.as_deref(), Some("the final answer"));
         assert_eq!(entries[b].success_for.as_deref(), Some(a));
+        assert_eq!(entries[a].outcome, Some(crate::client::TurnEnd::Failed), "a turn the crash cut off didn't finish");
+        assert_eq!(entries[b].outcome, None);
+        assert_eq!(entries[c].outcome, Some(crate::client::TurnEnd::Stopped), "how it ended goes out with the retry");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -581,7 +610,7 @@ mod tests {
         outbox.track(id).unwrap();
         outbox.deliver(&client, id).await.unwrap(); // active: no network call
         outbox
-            .complete(id, "complete text, no footer needed", None)
+            .complete(id, "complete text, no footer needed", None, None)
             .unwrap();
         assert!(outbox.deliver(&client, id).await.is_err());
         assert!(!outbox.entries.lock().unwrap()[id].delivering);
@@ -708,6 +737,25 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// An entry from a later daemon (rolled back past it) whose `outcome` is a
+    /// word this build doesn't know is still delivered — saying nothing about
+    /// how the turn ended, never left unreadable with its draft unfinished.
+    #[test]
+    fn an_outcome_this_build_doesnt_know_is_nothing_said() {
+        let dir = dir("later");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "00000000-0000-0000-0000-000000000014";
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            br#"{"pid":1,"ready":true,"content":"done","success_for":null,"outcome":"superseded"}"#,
+        )
+        .unwrap();
+        let o = Outbox::load_at(dir.clone(), |_| false, SystemTime::now()).unwrap();
+        let e = &o.entries.lock().unwrap()[id];
+        assert!(e.ready && e.content.as_deref() == Some("done") && e.outcome.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A steer moves the reply to a fresh draft; the turn's journal moves with
     /// it, or a restart after the steer would have nothing to pick up.
     #[test]
@@ -736,7 +784,7 @@ mod tests {
         let o = Outbox::load(dir.clone(), |_| false).unwrap();
         o.track(id).unwrap();
         o.journal(id, journal(Some("p"), Some("s"), true));
-        o.complete(id, "the answer", None).unwrap();
+        o.complete(id, "the answer", None, None).unwrap();
         die(&o);
         let next = Outbox::load(dir.clone(), |_| false).unwrap();
         assert!(next.take_resumable().is_empty());
@@ -806,7 +854,7 @@ mod tests {
         let id = "00000000-0000-0000-0000-000000000004";
         let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
         outbox.track(id).unwrap();
-        outbox.complete(id, "full final answer", None).unwrap();
+        outbox.complete(id, "full final answer", None, None).unwrap();
         assert!(outbox.deliver(&client, id).await.is_err());
         let recovered = Outbox::load(dir.clone(), |_| false).unwrap();
         assert!(recovered.entries.lock().unwrap()[id].content.is_none());
