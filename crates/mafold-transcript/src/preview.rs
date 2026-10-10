@@ -55,7 +55,13 @@ pub enum CardLabel {
     /// The publisher opted the card out of previews (`"preview": false`) —
     /// chrome such as a reply's usage footer, which says nothing about what
     /// was said. Every bot reply ended its row with "… Result" before this.
-    Hidden,
+    ///
+    /// It still carries its published name (blank ⇒ the slug): hidden means
+    /// "don't add yourself to what was said", not "make a message that is
+    /// nothing but you say nothing". A turn that ran its tools and answered
+    /// nothing is all trace and stamp; quoted, it read "Attachment" — it had
+    /// none (2026-10-10). With nothing else to say, its first card names it.
+    Hidden(String),
 }
 
 pub fn message_preview(
@@ -72,6 +78,9 @@ pub fn message_text(
     text: &str,
     mut label: impl FnMut(&str, Option<&str>) -> Option<CardLabel>,
 ) -> String {
+    // The first hidden card's name: what the message is called when nothing
+    // else in it says anything.
+    let mut unsaid: Option<String> = None;
     let named = crate::prose::map_card_text(text, preview_prose, |tag, attrs| {
         // A bare tag (`{% result /%}`) is from before `owner/slug`, when every
         // card was Mafold's: its name and its opt-out are those of the official
@@ -79,13 +88,18 @@ pub fn message_text(
         // "result" at the end of a quote (2026-10-07). Names only: rendering
         // still never resolves a bare tag.
         let tag = official(tag);
+        let slug = || tag.rsplit('/').next().unwrap_or(&tag).to_owned();
         match label(&tag, version(attrs)) {
-            Some(CardLabel::Hidden) => String::new(),
+            Some(CardLabel::Hidden(name)) => {
+                unsaid.get_or_insert_with(|| if name.trim().is_empty() { slug() } else { name });
+                String::new()
+            }
             Some(CardLabel::Name(name)) if !name.trim().is_empty() => name,
-            _ => tag.rsplit('/').next().unwrap_or(&tag).to_owned(),
+            _ => slug(),
         }
     });
-    named.split_whitespace().collect::<Vec<_>>().join(" ")
+    let said = named.split_whitespace().collect::<Vec<_>>().join(" ");
+    if said.is_empty() { unsaid.map(|n| n.trim().to_owned()).unwrap_or_default() } else { said }
 }
 
 /// The tag a preview names a card by: `owner/slug` as written, a bare tag as
@@ -287,11 +301,12 @@ mod tests {
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
             let out = message_preview(case["content"].as_str().unwrap(), |tag, version| {
-                if hidden.contains(&tag) {
-                    return Some(CardLabel::Hidden);
-                }
                 let key = version.map_or_else(|| tag.to_owned(), |v| format!("{tag}@{v}"));
-                case["names"][&key].as_str().map(|n| CardLabel::Name(n.to_owned()))
+                let name = case["names"][&key].as_str();
+                if hidden.contains(&tag) {
+                    return Some(CardLabel::Hidden(name.unwrap_or_default().to_owned()));
+                }
+                name.map(|n| CardLabel::Name(n.to_owned()))
             });
             assert_eq!(out, case["expected"].as_str().unwrap(), "{}", case["name"]);
             assert!(out.chars().count() <= PREVIEW_CHARS);

@@ -173,5 +173,19 @@
     "content": "| C:\\\\| x |\n|---|---|",
     "names": {},
     "expected": "C:\\\\ x"
+  },
+  {
+    "name": "a message of nothing but hidden cards is named by its first",
+    "content": "{% mafold/trace summary=\"Ran 8 tools\" steps=\"8\" %}\n{% mafold/run summary=\"Ran 2 tools\" %}{% mafold/tool name=\"web_search\" /%}{% /mafold/run %}\n{% /mafold/trace %}\n\n{% mafold/run summary=\"Ran 1 tool\" %}{% mafold/tool name=\"name_channel\" /%}{% /mafold/run %}\n\n{% mafold/result duration=\"48.9s\" %}\n{}\n{% /mafold/result %}",
+    "names": {"mafold/trace": "Agent trace", "mafold/run": "Run", "mafold/result": "Result"},
+    "hidden": ["mafold/trace", "mafold/run", "mafold/result"],
+    "expected": "Agent trace"
+  },
+  {
+    "name": "a hidden card with no published name is named by its slug",
+    "content": "{% mafold/run summary=\"Ran 1 tool\" %}{% mafold/tool name=\"Bash\" /%}{% /mafold/run %}",
+    "names": {},
+    "hidden": ["mafold/run"],
+    "expected": "run"
   }
 ]

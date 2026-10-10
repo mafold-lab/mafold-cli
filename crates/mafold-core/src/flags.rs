@@ -75,6 +75,22 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "linsky",
         added: "2026-10",
     },
+    // `modelBot:<handle>` is an official model bot's LAUNCH: the server keeps
+    // the bot coming-soon (off the roster, silent in its DMs) for everyone the
+    // flag is not on for, and a key with no record is CLOSED there — a launch
+    // is opened on purpose (`Store::model_bot_live_for`). Named by the bot's
+    // own profile (`templates/official/<handle>.json` `launch_flag`); clients
+    // read nothing from it, the roster they fetch already reflects it.
+    FlagMeta {
+        key: "modelBot:gemini",
+        default: false,
+        dev_default: false,
+        label: "Gemini official bot",
+        description: "Opens @gemini (Gemini on the router's Google seat, paid from the reader's \
+                      google wallet). Until it is on for you, @gemini stays coming soon.",
+        owner: "ops",
+        added: "2026-10",
+    },
     FlagMeta {
         key: "starterTutorial",
         default: false,
@@ -181,6 +197,22 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
                       edge (mafold-mac's sidebar rail; the desktop shell's window lights at its head), \
                       and Settings > Chat Folders offers left / top. Off = the strip across the top, \
                       no choice offered.",
+        owner: "ops",
+        added: "2026-10",
+    },
+    // realopsdu 10-11: people convert by hand because nothing says payments
+    // already convert. The wallet's head says it now; off until verified on
+    // dev and released.
+    FlagMeta {
+        key: "walletAutoFirst",
+        default: false,
+        dev_default: false,
+        label: "Wallet: auto convert first",
+        description: "The wallet states auto convert in its head (the switch, the funding pocket) and \
+                      Convert drops from the action pills to one row under it; the Settings tab goes, \
+                      the starter tutorial's convert scene teaches auto convert, and the Premium card \
+                      moves from the wallet to Settings. Off = the old layout. (Activity names auto \
+                      converts either way — that reads the server's `auto` field, not this flag.)",
         owner: "ops",
         added: "2026-10",
     },

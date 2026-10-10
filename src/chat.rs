@@ -531,7 +531,10 @@ pub(crate) fn attachment_name(a: &Value) -> String {
 /// `[🔒 only …]` and `[/🔒]` — an agent reading it must know where the part the
 /// room can't see ends, or it repeats it to the room.
 pub(crate) fn readable_body(text: &str) -> String {
-    let worded = mafold_transcript::only::readable(text);
+    // A failed turn's card is machinery (`model_view` cuts it) but its NEWS is
+    // not: it reads as one line, or the reply prints as «—».
+    let failed = mafold_transcript::render::failure_cards_as_text(text);
+    let worded = mafold_transcript::only::readable(&failed);
     let flattened = crate::agent::model_view(&worded);
     let mut out = String::new();
     let mut rest = flattened.as_str();
@@ -1026,11 +1029,16 @@ fn untitled_block_from(list: &Value, chat: &str, channel_id: &str) -> Option<Str
     if ch["untitled"].as_bool() != Some(true) {
         return None;
     }
+    // In the FIRST step, never "once you have replied" — the reply is the last
+    // thing a turn says, and a rename after it either buried the answer under
+    // the folded trail or, hosted, ended a turn on the rename with no answer at
+    // all (mafold-api `brains/platform.rs`, same wording).
     Some(format!(
-        "[UNTITLED CHANNEL — the channel you are answering in has no name yet. Once you have \
-replied and know what it is about, name it: `mafold channels rename {chat} {channel_id} <a few \
-words, in the conversation's language, no #>`. Name it once; if it answers that the channel \
-already has a name, leave it.]"
+        "[UNTITLED CHANNEL — the channel you are answering in has no name yet. Name it in your \
+FIRST step, alongside whatever else you do there: `mafold channels rename {chat} {channel_id} <a \
+few words for what it is about, in the conversation's language, no #>`. Naming is housekeeping, \
+not a reply — the person never sees it as an answer, so your answer to them is still the last \
+thing you write. Name it once; if it answers that the channel already has a name, leave it.]"
     ))
 }
 
@@ -1155,6 +1163,17 @@ mod tests {
         assert!(rec.contains("差 3 行"), "record was collapsed instead of expanded: {rec}");
     }
 
+    /// A failed turn reads as one. Its card is machinery (`model_view` cuts it
+    /// with its body), and a reply that was ONLY the card printed as «—» —
+    /// the line used to say `⚠️ Agent stopped: …`. The raw error stays out.
+    #[test]
+    fn a_failed_turn_reads_as_failed_not_as_nothing() {
+        let f = mafold_transcript::failure::classify("Credit balance is too low");
+        let line = readable_body(&format!("查到一半{}", mafold_transcript::render::failure_card(&f)));
+        assert_eq!(line, "查到一半 ⚠️ [这一轮失败:credit]");
+        assert!(!line.contains("Credit balance"), "the raw is the owner's: {line}");
+    }
+
     /// What an agent reads back must not include another agent's machinery —
     /// least of all a compaction summary, whose flagged lines are approvals no
     /// person gave. Cut with its body, by the same strip the prompts use; the
@@ -1211,6 +1230,8 @@ mod tests {
         ]);
         let block = untitled_block_from(&list, "conv-1", "c-new").expect("untitled");
         assert!(block.contains("mafold channels rename conv-1 c-new "), "{block}");
+        // Named first, never after the reply: the answer is the turn's last word.
+        assert!(block.contains("FIRST step") && !block.contains("Once you have replied"), "{block}");
         assert!(untitled_block_from(&list, "conv-1", "c-old").is_none());
         assert!(untitled_block_from(&list, "conv-1", "gone").is_none());
         // The list arrives either bare or wrapped in `items`.

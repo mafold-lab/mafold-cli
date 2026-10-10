@@ -1020,7 +1020,9 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
     // as prose, and when it's long keep its tail: clipping from the front is
     // exactly how this loop read "no answer yet" into replies that had one.
     let body = if is_bot(m) {
-        let prose = mafold_transcript::render::strip_cards(raw);
+        // A failed turn still reads as one: its card becomes a line before the
+        // cards go, or the reply is «—» and a half answer looks whole.
+        let prose = mafold_transcript::render::strip_cards(&mafold_transcript::render::failure_cards_as_text(raw));
         head_tail(&collapse_blank(&prose), BOT_HEAD, BOT_TAIL)
     } else {
         clip(&crate::chat::readable_body(raw), BODY_MAX)
@@ -2104,17 +2106,26 @@ async fn look(
         if dry { "dry-run,本来会发" } else { "发了" },
         if carded > 0 { format!(" · 提案卡 {carded} 件等你勾") } else { String::new() },
         if stopped { " · ⏹ 已停" } else { "" },
-        err.as_deref().map(|e| format!(" · ⚠️ {}", clip(e, 200))).unwrap_or_default()
+        // The headline says THAT it failed; what and why is the shared failure
+        // card at the end of the log — this line used to carry the raw error.
+        if err.is_some() { " · ⚠️ 没跑完" } else { "" }
     );
+    // The card, at the end of what the run did — the same one a reply that
+    // dies ends on (`agent::failure_card`), with the seat's limit when that
+    // is what stopped it.
+    let failed = err.as_deref().map(|e| {
+        let limit = outcome.as_ref().ok().and_then(|o| o.limit.as_ref());
+        format!("\n\n{}", crate::agent::failure_card(&ctx.me, e, limit))
+    });
     if dry {
         // Nothing leaves the machine: the trace and what it WOULD have sent.
         println!("{head}\n");
         for line in std::fs::read_to_string(&ctx.journal).unwrap_or_default().lines() {
             println!("  would: {line}");
         }
-        println!("\n{}", tx_log.finish_folded());
+        println!("\n{}{}", tx_log.finish_folded(), failed.as_deref().unwrap_or(""));
     } else if let Some(log_chat) = &ctx.log_chat {
-        let body = clip(&tx_log.finish_folded(), LOG_MAX);
+        let body = format!("{}{}", clip(&tx_log.finish_folded(), LOG_MAX), failed.as_deref().unwrap_or(""));
         let dest = Dest::chat(log_chat).channel(ctx.log_channel.as_deref());
         match ctx.client.send_to(dest, &format!("{head}\n\n{body}")).await {
             Ok(m) => {

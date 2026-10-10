@@ -530,7 +530,7 @@ fn map_tool(name: &str, args: &Value) -> (String, Value) {
         ),
         // SendDMail, TaskList/TaskOutput/TaskStop, EnterPlanMode/ExitPlanMode, … →
         // a generic tool card (name + best-effort detail from the renderer).
-        other => (other.to_string(), args.clone()),
+        other => (other.to_string(), super::model_tool_input(other, args)),
     }
 }
 
@@ -743,7 +743,7 @@ mod tests {
             proc: &proc,
         };
         let (out, after) =
-            crate::harness::orphan_fixture::kill_mid_turn(run_once(&p, None), &proc, Duration::from_secs(20)).await;
+            crate::harness::orphan_fixture::kill_mid_turn(run_once(&p, None), &proc, &dir, Duration::from_secs(20)).await;
         let _ = std::fs::remove_dir_all(&dir);
 
         let out = out

@@ -193,10 +193,16 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                     .as_str()
                     .map(|p| format!(" @{p}"))
                     .unwrap_or_default();
-                let memo = tx["memo"]
-                    .as_str()
-                    .map(|m| format!("  ({m})"))
-                    .unwrap_or_default();
+                // `auto`: the wallet ran this convert to fund a payment — the
+                // server's field (it used to ride in the memo as "auto"), and
+                // the memo is then the bill it paid for.
+                let auto = tx["auto"].as_bool() == Some(true);
+                let memo = match (auto, tx["memo"].as_str()) {
+                    (true, Some(m)) => format!("  (auto · {m})"),
+                    (true, None) => "  (auto)".to_string(),
+                    (false, Some(m)) => format!("  ({m})"),
+                    (false, None) => String::new(),
+                };
                 let conv = match (tx["to_amount"].as_i64(), tx["to_currency"].as_str()) {
                     (Some(a), Some(c)) => format!(" → +{} {c}", fmt(a)),
                     _ => String::new(),

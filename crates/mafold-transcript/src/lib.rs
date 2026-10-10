@@ -20,6 +20,7 @@
 //! the one axis [`Transcript`] deliberately leaves to the caller.
 
 pub mod event;
+pub mod failure;
 pub mod lint;
 pub mod mention;
 pub mod only;

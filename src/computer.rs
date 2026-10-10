@@ -37,7 +37,7 @@ pub fn executor() -> Executor {
 }
 
 async fn run(job: Job) -> Result<Value> {
-    match job {
+    let done = match job {
         Job::Exec {
             cmd,
             cwd,
@@ -46,6 +46,33 @@ async fn run(job: Job) -> Result<Value> {
         Job::Spawn { cmd, cwd } => spawn(&cmd, cwd.as_deref()).await,
         Job::Status { task_id, tail } => status(&task_id, tail),
         Job::Kill { task_id } => kill(&task_id),
+    };
+    signed(done)
+}
+
+/// Which process ran this, and with what rights. A command runs with exactly
+/// the token of the process that answered — nothing here raises or lowers it —
+/// so when "Access is denied" comes back, this is the line that says why: the
+/// process holding the machine wasn't elevated (linsky's ThinkBook,
+/// 2026-10-08, where nobody could tell which of five processes had answered).
+fn served_by() -> Value {
+    json!({ "pid": std::process::id(), "elevated": crate::platform::elevated() })
+}
+
+/// Every answer says who ran it — the failures too, since those are the ones
+/// somebody has to explain.
+fn signed(done: Result<Value>) -> Result<Value> {
+    match done {
+        Ok(Value::Object(mut answer)) => {
+            answer.insert("served_by".into(), served_by());
+            Ok(Value::Object(answer))
+        }
+        Ok(other) => Ok(other),
+        Err(e) => Err(format!(
+            "{e} (pid {}, {})",
+            std::process::id(),
+            if crate::platform::elevated() { "elevated" } else { "not elevated" }
+        )),
     }
 }
 
@@ -691,6 +718,22 @@ mod tests {
         assert_eq!(out["exit_code"], json!(0));
         assert_eq!(out["truncated"], json!(true));
         assert!(out["stdout"].as_str().unwrap().len() <= MAX_OUTPUT);
+    }
+
+    /// Every answer — and every failure — names the process that ran it and
+    /// whether it was elevated: the one fact a caller needs when a command
+    /// comes back "Access is denied", and could not get (2026-10-08).
+    #[tokio::test]
+    async fn every_answer_says_which_process_ran_it_and_with_what_rights() {
+        let ok = run(Job::Exec { cmd: "echo hi".into(), cwd: None, timeout_ms: 5_000 }).await.unwrap();
+        assert_eq!(ok["served_by"]["pid"], json!(std::process::id()));
+        assert_eq!(ok["served_by"]["elevated"], json!(crate::platform::elevated()));
+
+        let err = run(Job::Exec { cmd: "echo x".into(), cwd: Some("/no/such/place/at/all".into()), timeout_ms: 5_000 })
+            .await
+            .unwrap_err();
+        assert!(err.contains(&format!("pid {}", std::process::id())), "{err}");
+        assert!(err.contains("elevated"), "{err}");
     }
 
     #[tokio::test]

@@ -25,8 +25,9 @@ pub(crate) const RATE_LIMIT_CARD: &str = "{% mafold/ratelimit ";
 /// card as the model answering in cards: a turn that ended on tools and a
 /// limit folded its last group out of sight.
 /// The compaction card joined when it started carrying the summary: it is the
-/// compaction notice line in card form.
-pub(crate) const NOTICE_CARDS: [&str; 2] = ["mafold/ratelimit", "mafold/compact"];
+/// compaction notice line in card form. The failure card ([`failure_card`]) is
+/// a notice too: a turn that died said nothing, whatever card says so.
+pub(crate) const NOTICE_CARDS: [&str; 3] = ["mafold/ratelimit", "mafold/compact", "mafold/error"];
 pub(crate) const COMPACTED_PREFIX: &str = "_🗜️ ";
 pub(crate) const STEER_PREFIX: &str = "> ↩︎ ";
 /// A driver notice ([`AgentEvent::Notice`]): something that happened AROUND the
@@ -581,6 +582,137 @@ pub fn compact_card(before: Option<u64>, after: Option<u64>, auto: bool, summary
     format!("\n{{% mafold/compact{attrs} %}}\n{{% {only} for=\"owner\" %}}\n{body}{{% /{only} %}}\n{{% /mafold/compact %}}\n")
 }
 
+/// A failed turn, told to the reader — `{% mafold/error %}`, the one shape for
+/// every producer's failure ([`crate::failure`]).
+///
+/// The card draws the sentence from `kind` in the READER's language, so the
+/// public attributes carry only what that needs: `kind`, the provider's
+/// `status`, and `payer` — whose wallet a balance card is about, so a room can
+/// see whom to ask. Everything else is the payer's: the amounts (what the turn
+/// needed, what their wallet could give) and the raw error, which can carry a
+/// balance, a seat, a host. Those go in the body inside
+/// `{% mafold/only for="@payer" %}` (`owner` when nobody pays through a wallet),
+/// the same wrapper the compaction summary uses: the server cuts the block from
+/// everyone else's copy, and the card draws «only for …» there instead.
+///
+/// Body, inside that block: `key|value` lines first (`need`, `have`,
+/// `currency`, `usd` — the USD price per 1M units of `currency`), then the raw
+/// error, verbatim but for card delimiters. No body at all ⇒ self-closing.
+pub fn failure_card(f: &crate::failure::Failure) -> String {
+    let payer = f.payer.as_deref().and_then(handle);
+    let mut attrs = format!(" kind=\"{}\"", f.kind.as_str());
+    // A step id is a word the card looks up (`imagegen`), never prose — anything
+    // else is dropped rather than escaped into an attribute.
+    if let Some(step) = f.step.as_deref().filter(|s| is_step_id(s)) {
+        attrs.push_str(&format!(" step=\"{step}\""));
+    }
+    if let Some(s) = f.status {
+        attrs.push_str(&format!(" status=\"{s}\""));
+    }
+    if let Some(p) = &payer {
+        attrs.push_str(&format!(" payer=\"{p}\""));
+    }
+    // When a limit lifts is nobody's secret — the card says it in the reader's
+    // own clock time, so it rides in the open.
+    if let Some(w) = f.window.as_deref().map(attr_esc).filter(|w| !w.is_empty()) {
+        attrs.push_str(&format!(" window=\"{}\"", neutralize(&w)));
+    }
+    if let Some(t) = f.resets_at.filter(|t| *t > 0) {
+        attrs.push_str(&format!(" resets_at=\"{t}\""));
+    }
+    let mut body = String::new();
+    if let Some(n) = f.need {
+        body.push_str(&format!("need|{n}\n"));
+    }
+    if let Some(n) = f.have {
+        body.push_str(&format!("have|{n}\n"));
+    }
+    if let Some(c) = f.currency.as_deref().map(line_esc).filter(|c| !c.is_empty()) {
+        body.push_str(&format!("currency|{}\n", neutralize(&c)));
+    }
+    if let Some(u) = f.usd_out.filter(|u| u.is_finite() && *u > 0.0) {
+        body.push_str(&format!("usd|{u}\n"));
+    }
+    let raw = f.detail.trim();
+    if !raw.is_empty() {
+        body.push_str(&block_esc(raw));
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    if body.is_empty() {
+        return format!("\n{{% mafold/error{attrs} /%}}\n");
+    }
+    let only = crate::only::TAG;
+    let reader = f.reader.as_deref().and_then(handle);
+    let who = payer.or(reader).map_or_else(|| "owner".to_string(), |p| format!("@{p}"));
+    format!("\n{{% mafold/error{attrs} %}}\n{{% {only} for=\"{who}\" %}}\n{body}{{% /{only} %}}\n{{% /mafold/error %}}\n")
+}
+
+/// `imagegen`, `video_submit`: lowercase ASCII words — what a step id may be.
+fn is_step_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A handle as it may go into an attribute: lowercase, no `@`, nothing that
+/// could end a quote or a tag.
+fn handle(h: &str) -> Option<String> {
+    let h = h.trim().trim_start_matches('@').to_lowercase();
+    (!h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))).then_some(h)
+}
+
+/// The tag every failure card opens with ([`failure_card`]).
+const ERROR_CARD: &str = "{% mafold/error";
+
+/// Each failure card ([`failure_card`]) as one line of words — for the readers
+/// that take a reply as TEXT: the daemon's inbox digest and `mafold read`.
+/// Both drop cards with their bodies, and a turn that failed then read as an
+/// empty reply («—»), or a half answer as a whole one; the line used to be
+/// `⚠️ Agent stopped: <raw>`. Only the kind and status go into the words: the
+/// raw error is the payer's, and a text reader is often someone else.
+pub fn failure_cards_as_text(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(at) = rest.find(ERROR_CARD) {
+        let after = &rest[at + ERROR_CARD.len()..];
+        // `{% mafold/errors …` is some other card, not this one.
+        if !after.starts_with(|c: char| c.is_whitespace() || c == '/' || c == '%') {
+            out.push_str(&rest[..at + ERROR_CARD.len()]);
+            rest = after;
+            continue;
+        }
+        let Some(close) = after.find("%}") else { break };
+        let attrs = after[..close].trim();
+        let mut end = at + ERROR_CARD.len() + close + 2;
+        if !attrs.ends_with('/') {
+            // The body is block-escaped, so the first close tag is this card's.
+            match rest[end..].find("{% /mafold/error %}") {
+                Some(k) => end += k + "{% /mafold/error %}".len(),
+                None => end = rest.len(),
+            }
+        }
+        let kind = crate::preview::attr(attrs, "kind").unwrap_or("unknown");
+        let status = crate::preview::attr(attrs, "status").map(|s| format!(" · HTTP {s}")).unwrap_or_default();
+        // A step card is one tool that failed inside an answered turn: saying
+        // «这一轮失败» there would tell another agent the whole reply is void.
+        let what = match crate::preview::attr(attrs, "step") {
+            Some(step) => format!("{step} 失败"),
+            None => "这一轮失败".to_string(),
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(&format!("⚠️ [{what}:{kind}{status}]"));
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `md` without its failure cards, bodies and all — what a reply DELIVERED,
+/// for whoever prices it by what it says (`metering::delivered_text`).
+pub fn strip_failure_cards(md: &str) -> String {
+    strip_cards_where(md, |name| name == "mafold/error")
+}
+
 /// Card delimiters in untrusted text, broken so they can't open or close a card.
 fn neutralize(s: &str) -> String {
     s.replace("{%", "{ %").replace("%}", "% }")
@@ -893,7 +1025,24 @@ fn ask_tag(input: &Value) -> String {
         Some(a) => format!(" action=\"{}\"", attr_esc(a)),
         None => String::new(),
     };
-    format!("\n{{% mafold/ask{action} %}}\n{}{{% /mafold/ask %}}\n", block_esc(&body))
+    // `user` (optional): the one person who may answer, when that is not
+    // whoever the reply is addressed to — a guest's permission prompt waits on
+    // the bot's owner. Drawing only (the card's `GateActions addressee`): a
+    // reader known to be someone else gets «waiting for @user» instead of
+    // buttons. Who may answer is the daemon's decision either way.
+    let user = match input["user"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(u) => format!(" user=\"{}\"", attr_esc(u)),
+        None => String::new(),
+    };
+    // `prompt` (optional): which permission prompt this card is. The card
+    // sends it back with the tap, and the daemon only counts a verdict for the
+    // prompt it names — every prompt of a turn draws in the same draft, and a
+    // late tap must not land on the next one.
+    let prompt = match input["prompt"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => format!(" prompt=\"{}\"", attr_esc(p)),
+        None => String::new(),
+    };
+    format!("\n{{% mafold/ask{action}{user}{prompt} %}}\n{}{{% /mafold/ask %}}\n", block_esc(&body))
 }
 
 /// How much of an ask's `detail` goes into the card. Under `block_esc`'s 4000 so
@@ -1055,6 +1204,7 @@ pub fn is_transcript_card(name: &str) -> bool {
             | "mafold/thinking"
             | "mafold/compact"
             | "mafold/ratelimit"
+            | "mafold/error"
             | "mafold/result"
             | "mafold/generating"
             | "mafold/bgtasks"
@@ -1540,6 +1690,36 @@ mod stamp_tests {
         assert!(full.contains("{% /mafold/ask %}"), "closer intact: {full}");
     }
 
+    /// A guest's permission prompt names the one person who may answer it —
+    /// the bot's owner — so the card can tell everyone else who it waits on.
+    /// Absent, the card is drawn exactly as before.
+    #[test]
+    fn an_ask_names_who_answers_it_when_told() {
+        let input = |user: Option<&str>| {
+            let mut input = serde_json::json!({
+                "action": "perm:answer",
+                "questions": [{ "header": "Bash", "multiSelect": false, "question": "rm x",
+                                "options": [{ "label": "allow", "description": "" }] }],
+            });
+            if let Some(u) = user {
+                input["user"] = serde_json::json!(u);
+            }
+            input
+        };
+        let named = super::ask_tag(&input(Some("ops")));
+        assert!(named.contains("{% mafold/ask action=\"perm:answer\" user=\"ops\" %}"), "{named}");
+        let mut with_id = input(Some("ann,ops"));
+        with_id["prompt"] = serde_json::json!("p1");
+        let tagged = super::ask_tag(&with_id);
+        assert!(tagged.contains("{% mafold/ask action=\"perm:answer\" user=\"ann,ops\" prompt=\"p1\" %}"), "{tagged}");
+        let mut stamped = named.clone();
+        assert!(stamp_ask_answered(&mut stamped, "allow"));
+        assert!(stamped.contains("user=\"ops\" answered=\"allow\""), "the stamp keeps it: {stamped}");
+        let bare = super::ask_tag(&input(None));
+        assert!(bare.contains("{% mafold/ask action=\"perm:answer\" %}"), "{bare}");
+        assert!(!bare.contains("user="), "{bare}");
+    }
+
     /// A settled card is never re-stamped — with or without other attributes,
     /// which is the property the old literal needle got for free.
     #[test]
@@ -2016,6 +2196,130 @@ mod notice_tests {
             assert!(!left.contains(gone), "{gone} survived:\n{left}");
         }
         assert!(strip_notices("plain prose\n\nmore prose").contains("more prose"));
+    }
+}
+
+#[cfg(test)]
+mod failure_card_tests {
+    use super::{failure_card, is_notice_line, is_transcript_card, strip_transcript_cards};
+    use crate::failure::{classify, wallet_short, Failure, FailureKind};
+    use crate::only::{view_for, Author};
+
+    fn broke() -> Failure {
+        let mut f = classify(&format!(
+            "provider error: anthropic 402 Payment Required: {{\"error\":{{\"message\":\"resource exhausted: {}\",\"type\":\"insufficient_quota\"}}}}",
+            wallet_short("Ops", 120_000, "claude-sonnet-4-6", 300, 0)
+        ));
+        f.usd_out = Some(15.0);
+        f
+    }
+
+    /// 本人 10-09:「这种也完全应该做个 mafold/error 而不是裸着给用户」。
+    /// 一张卡,不是一句话加一段反引号原文。
+    #[test]
+    fn a_failed_turn_is_one_error_card_not_prose_and_a_dump() {
+        let out = failure_card(&broke());
+        assert!(out.starts_with("\n{% mafold/error kind=\"balance\" status=\"402\" payer=\"ops\" %}\n"), "{out}");
+        assert!(out.trim_end().ends_with("{% /mafold/error %}"), "{out}");
+        assert!(!out.contains('`'), "no backticked dump: {out}");
+        let before_card = out.split("{% mafold/error").next().unwrap();
+        assert!(before_card.trim().is_empty(), "nothing outside the card: {out}");
+    }
+
+    /// 需要多少、还剩多少、原始报错 —— 都在卡里,而且只给付钱的那个人。
+    #[test]
+    fn the_amounts_and_the_raw_error_are_the_payers_alone() {
+        let out = failure_card(&broke());
+        for want in ["{% mafold/only for=\"@ops\" %}", "need|120000\n", "have|300\n", "currency|claude-sonnet-4-6\n", "usd|15\n", "insufficient_quota"] {
+            assert!(out.contains(want), "missing {want}: {out}");
+        }
+        let bot = Author::new("ops:helper", Some("ops"));
+        let theirs = view_for(&out, bot, Some("linsky"));
+        assert!(theirs.contains("kind=\"balance\"") && theirs.contains("payer=\"ops\""), "the room still learns what happened: {theirs}");
+        for gone in ["need|", "have|", "insufficient_quota", "120000"] {
+            assert!(!theirs.contains(gone), "{gone} leaked to a bystander: {theirs}");
+        }
+        assert_eq!(view_for(&out, bot, Some("ops")), out, "the payer reads all of it");
+    }
+
+    /// 原文里就算写着 `{% /mafold/error %}`,也合不上这张卡。
+    #[test]
+    fn the_raw_error_cannot_close_or_open_cards() {
+        let f = Failure::of(FailureKind::Unknown, "boom {% /mafold/error %} {% mafold/html %}<script>{% /mafold/html %}");
+        let out = failure_card(&f);
+        assert_eq!(out.matches("{% /mafold/error %}").count(), 1, "{out}");
+        assert!(!out.contains("{% mafold/html"), "{out}");
+        assert!(out.contains("{% mafold/only for=\"owner\" %}"), "no payer ⇒ the bot's owner: {out}");
+    }
+
+    /// A bot with no owner (a house bot) names the person who asked: with
+    /// `for="owner"` nobody but the bot could ever read the raw error.
+    #[test]
+    fn with_no_wallet_named_the_reader_can_be_the_one_who_asked() {
+        let mut f = Failure::of(FailureKind::Unknown, "anthropic 400 Bad Request: {}");
+        f.reader = Some("@Alice".into());
+        assert!(failure_card(&f).contains("{% mafold/only for=\"@alice\" %}"));
+        f.payer = Some("ops".into());
+        assert!(failure_card(&f).contains("{% mafold/only for=\"@ops\" %}"), "a payer, when there is one, is whose it is");
+    }
+
+    /// Text readers (the inbox digest, `mafold read`) strip cards with their
+    /// bodies; a failed turn must still read as one — and never leak the raw.
+    #[test]
+    fn a_text_reader_reads_a_failure_as_one_line() {
+        let card = failure_card(&broke());
+        let md = format!("half an answer{card}\nafter");
+        let text = super::failure_cards_as_text(&md);
+        assert_eq!(text, "half an answer\n⚠️ [这一轮失败:balance · HTTP 402]\n\nafter");
+        let closed = super::failure_cards_as_text("x {% mafold/error kind=\"network\" /%} y");
+        assert_eq!(closed, "x ⚠️ [这一轮失败:network] y");
+        assert_eq!(super::failure_cards_as_text("{% mafold/errors a=\"1\" /%}"), "{% mafold/errors a=\"1\" /%}");
+        let delivered = super::strip_failure_cards(&md);
+        assert!(delivered.contains("half an answer") && delivered.contains("after"), "{delivered}");
+        for gone in ["mafold/error", "need|", "insufficient"] {
+            assert!(!delivered.contains(gone), "{gone}: {delivered}");
+        }
+    }
+
+    /// When a limit lifts is public — the card tells every reader in their own
+    /// clock; the raw refusal stays the owner's.
+    #[test]
+    fn a_limit_carries_its_window_and_reset_time_in_the_open() {
+        let f = crate::failure::classify(&crate::failure::quota_refused("anthropic 429: {}", "five_hour", Some(1790537400)));
+        let out = failure_card(&f);
+        assert!(out.contains("kind=\"rate_limit\" status=\"429\" window=\"five_hour\" resets_at=\"1790537400\" %}"), "{out}");
+    }
+
+    #[test]
+    fn nothing_to_fold_is_a_self_closing_card() {
+        let f = Failure::of(FailureKind::Unavailable, "  ");
+        assert_eq!(failure_card(&f), "\n{% mafold/error kind=\"unavailable\" /%}\n");
+    }
+
+    /// One step of an answered turn (the picture) failed: same card, says which
+    /// step; a text reader hears «imagegen 失败», not «这一轮失败» — the reply
+    /// around it stands. A step id that isn't a plain word never reaches an attribute.
+    #[test]
+    fn a_failed_step_is_the_same_card_scoped_to_the_step() {
+        let f = crate::failure::classify(&crate::failure::content_blocked("图被拦下:IMAGE_SAFETY")).in_step("imagegen");
+        let out = failure_card(&f);
+        assert!(out.starts_with("\n{% mafold/error kind=\"blocked\" step=\"imagegen\" %}"), "{out}");
+        let text = super::failure_cards_as_text(&format!("这是你要的图{out}"));
+        assert_eq!(text.trim(), "这是你要的图\n⚠️ [imagegen 失败:blocked]");
+        let turn = super::failure_cards_as_text(&failure_card(&Failure::of(FailureKind::Unavailable, "x")));
+        assert!(turn.contains("⚠️ [这一轮失败:unavailable]"), "{turn}");
+        let odd = failure_card(&Failure::of(FailureKind::Unknown, "").in_step("image gen\" onload=\""));
+        assert!(!odd.contains("step="), "{odd}");
+    }
+
+    /// 它是我们自己的记账,不是模型写的内容:下一轮不能原样喂回模型(连带原始
+    /// JSON),也不能当成「模型回答了」。
+    #[test]
+    fn the_card_is_machinery_and_a_notice() {
+        assert!(is_transcript_card("mafold/error"));
+        let out = failure_card(&broke());
+        assert_eq!(strip_transcript_cards(&format!("half an answer{out}")).trim(), "half an answer");
+        assert!(is_notice_line(out.trim_start().lines().next().unwrap()));
     }
 }
 

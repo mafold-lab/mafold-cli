@@ -103,6 +103,12 @@ mod imp {
             }
         }
     }
+
+    /// Does this process run with administrative rights — root, here? Every
+    /// command it starts inherits exactly that; mafold never raises or lowers it.
+    pub fn elevated() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
 }
 
 // ──────────────────────────── Windows ───────────────────────────
@@ -180,6 +186,34 @@ mod imp {
         use windows_sys::Win32::System::Console::GetConsoleProcessList;
         let mut pids = [0u32; 1];
         unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 1) != 0 }
+    }
+
+    /// Does this process run with administrative rights — an elevated token,
+    /// here? An administrator's console that wasn't opened "as administrator"
+    /// runs with the filtered (Medium) token and answers no. Every command
+    /// this process starts inherits exactly what it has; mafold never raises
+    /// or lowers it.
+    pub fn elevated() -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut len = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut TOKEN_ELEVATION as *mut core::ffi::c_void,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            );
+            CloseHandle(token);
+            ok != 0 && elevation.TokenIsElevated != 0
+        }
     }
 }
 

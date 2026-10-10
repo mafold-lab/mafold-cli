@@ -252,6 +252,26 @@ pub fn turn_env(conv: &str, surface: &str) -> [(&'static str, String); 2] {
     ]
 }
 
+/// A tool call's input as the MODEL wrote it, minus what only the daemon may
+/// say about an ask: `action` (where its tap goes — `perm:answer` is what makes
+/// it a permission prompt, `claude_code::permission_watcher`'s alone), `user`
+/// (who alone may answer it) and `prompt` (which permission prompt a verdict
+/// is for). A model that put them on its own question drew a card passing for
+/// one of the owner's rules — on a guest's turn, copied into the owner's DM as
+/// one — or hid its buttons from the person it was asking. Every harness that
+/// hands a model's tool call to the transcript passes it through here.
+pub(crate) fn model_tool_input(name: &str, input: &Value) -> Value {
+    let mut input = input.clone();
+    if name.eq_ignore_ascii_case("AskUserQuestion") {
+        if let Some(o) = input.as_object_mut() {
+            for key in ["action", "user", "prompt"] {
+                o.remove(key);
+            }
+        }
+    }
+    input
+}
+
 /// The forum channel inside a surface tag (`{conv}__{channel}__{bot}`, built by
 /// `agent::surface_tag`; the channel part is empty on `#all`). Ids are uuids,
 /// which the tag keeps verbatim. Anything that isn't a three-part tag has no
@@ -1304,14 +1324,17 @@ pub(crate) mod orphan_fixture {
     use std::time::{Duration, Instant};
 
     /// A stand-in harness: prints `line`, starts a child that inherits its
-    /// stdout (and outlives it), then idles until it is killed.
+    /// stdout (and outlives it), says so in `dir/forked`, then idles until it
+    /// is killed.
     pub fn script(dir: &Path, line: &str) -> PathBuf {
+        let forked = dir.join("forked");
         #[cfg(windows)]
         {
             // `start /b` shares this console AND its handles — the pipe included.
             let path = dir.join("harness.cmd");
             let s = format!(
-                "@echo off\r\necho {line}\r\nstart /b ping -n 30 127.0.0.1\r\nping -n 30 127.0.0.1 >nul\r\n"
+                "@echo off\r\necho {line}\r\nstart /b ping -n 30 127.0.0.1\r\ntype nul > \"{}\"\r\nping -n 30 127.0.0.1 >nul\r\n",
+                forked.display()
             );
             std::fs::write(&path, s).unwrap();
             path
@@ -1320,41 +1343,45 @@ pub(crate) mod orphan_fixture {
         {
             use std::os::unix::fs::PermissionsExt;
             let path = dir.join("harness.sh");
-            let s = format!("#!/bin/sh\ncat <<'MAFOLD_JSON'\n{line}\nMAFOLD_JSON\nsleep 30 &\nsleep 30\n");
+            let s = format!(
+                "#!/bin/sh\ncat <<'MAFOLD_JSON'\n{line}\nMAFOLD_JSON\nsleep 30 &\n: > '{}'\nsleep 30\n",
+                forked.display()
+            );
             std::fs::write(&path, s).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         }
     }
 
-    /// Drive `run` until `proc` names the process serving it, let the script
-    /// print and fork, kill that process — and give the turn `limit` to end.
-    /// Returns its outcome (None: still open at `limit`) and how long after the
-    /// kill it ended.
+    /// Drive `run` until the [`script`] in `dir` has printed and forked, kill
+    /// the process serving it — and give the turn `limit` to end. Returns its
+    /// outcome (None: still open at `limit`) and how long after the kill it
+    /// ended.
+    ///
+    /// On its marker, not on a clock: a fixed two seconds killed the script
+    /// before it ran at all whenever exec was slow — on macOS a brand-new
+    /// script can sit in `/bin/sh` before the real shell loads for longer
+    /// than that while other tests spawn theirs — and with nothing holding
+    /// the pipe the turn ended on EOF instead of the exit it is here to test.
     pub async fn kill_mid_turn<F: std::future::Future>(
         run: F,
         proc: &TurnProc,
+        dir: &Path,
         limit: Duration,
     ) -> (Option<F::Output>, Duration) {
         tokio::pin!(run);
         let started = Instant::now();
+        let forked = dir.join("forked");
         let pid = loop {
             tokio::select! {
                 _ = &mut run => panic!("the turn ended before its process was killed"),
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
-            if let Some(pid) = proc.pid() {
+            if let Some(pid) = proc.pid().filter(|_| forked.exists()) {
                 break pid;
             }
-            assert!(started.elapsed() < Duration::from_secs(20), "no process ever served the turn");
+            assert!(started.elapsed() < Duration::from_secs(20), "the script never forked under a turn");
         };
-        let settle = Instant::now();
-        while settle.elapsed() < Duration::from_secs(2) {
-            tokio::select! {
-                _ = &mut run => panic!("the turn ended before its process was killed"),
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
         crate::platform::terminate(pid);
         let killed = Instant::now();
         let out = tokio::time::timeout(limit, &mut run).await.ok();

@@ -854,6 +854,10 @@ struct TurnHandle {
     /// reply's text is written here (which turn it belongs to is the reply target,
     /// so concurrent asks never cross). Cleared when consumed or the turn ends.
     ask_file: Option<String>,
+    /// Set while the ask this turn is parked on is a PERMISSION prompt, not a
+    /// question the model asked — which changes who may answer it
+    /// ([`may_answer`]). Armed and cleared with `ask_file`.
+    perm: Option<PermAsk>,
     /// The lowercased username that triggered this turn (only they may answer its
     /// AskUserQuestion — a bystander can't answer someone else's agent question).
     owner: String,
@@ -894,6 +898,27 @@ struct TurnHandle {
     /// A guest's turn (`trusted`), as decided when it started — the process it
     /// runs in was fixed then, whatever the access list says later.
     guest: bool,
+}
+
+/// A permission prompt a turn is parked on: one of the owner's own `ask` rules
+/// (`permission_mcp`) wanting a person's yes before a tool call runs.
+///
+/// A guest's turn carries the owner's rules too (`claude_code::guest_settings`
+/// — a guest is who they most have to bind), so the person who asked for the
+/// turn is not who decides: the owner is ([`may_answer`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PermAsk {
+    /// Which prompt: the id `permission_mcp` published it under, on its card as
+    /// `prompt=`. A verdict is written for this prompt, and a tap naming
+    /// another — a late one, on a card that has since moved on — is not one.
+    prompt: String,
+    /// The copy put in front of the owner — their DM with this bot, and the
+    /// message in it — once it is posted ([`post_owner_copy`]). Only on a turn
+    /// whose prompts are the owner's alone ([`owner_decides`]: a guest's, a
+    /// bot's): the owner may not be in that room, and a card they can't see
+    /// is a prompt nobody can answer. A tap on the copy answers this turn
+    /// (`deliver_ask_answer`).
+    copy: Option<(String, String)>,
 }
 
 /// A message on its way to becoming a turn.
@@ -2249,6 +2274,11 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // per-turn on the claude child (concurrent turns can't share a global).
     std::env::set_var("MAFOLD_BOT_TOKEN", &client.token);
     std::env::set_var("MAFOLD_BASE", &client.base);
+    // …and a character type, when the daemon was started without one, so the
+    // agent's shell counts characters, not bytes (`utf8_ctype_fill`).
+    if let Some(ctype) = utf8_ctype_fill(|k| std::env::var(k).ok()) {
+        std::env::set_var("LC_CTYPE", ctype);
+    }
     if let Err(e) = crate::room::install_skill() {
         eprintln!("room skill install skipped: {e}");
     }
@@ -3227,6 +3257,44 @@ fn host_locale() -> Option<String> {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
 }
 
+/// The `LC_CTYPE` to hand the agent's processes when nothing decides it.
+///
+/// A daemon started by launchd or systemd inherits no locale, so everything the
+/// agent runs works in the C locale, where a character IS a byte: `cut -c1-80`,
+/// `awk`'s `substr` clip a Chinese line mid-character and the tool card shows
+/// `�` (2026-10-10, a dozen replies). Only the character type is filled in, and
+/// only when none of `LC_ALL` / `LC_CTYPE` / `LANG` is set: the language of
+/// messages (`host_locale`), sorting and number formats stay the host's, and a
+/// locale someone chose — even `C` — is theirs.
+///
+/// The agent's shell then behaves as it does in the owner's own Terminal,
+/// including there: macOS `sed` / `tr` refuse bytes that aren't UTF-8 (a GBK
+/// file) with "illegal byte sequence" instead of passing them through.
+fn utf8_ctype_fill(get: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    if ["LC_ALL", "LC_CTYPE", "LANG"].iter().any(|k| get(k).is_some_and(|v| !v.trim().is_empty())) {
+        return None;
+    }
+    utf8_ctype()
+}
+
+/// A UTF-8 character type this system can actually load. Every macOS ships
+/// `en_US.UTF-8`. On Linux `C.UTF-8` only when glibc has it on disk: where it
+/// doesn't (CentOS 7), naming it would change nothing but make every `perl`
+/// print "Setting locale failed" into the tool output. Windows has no `LC_*`
+/// to speak of.
+fn utf8_ctype() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("en_US.UTF-8")
+    } else if cfg!(target_os = "linux") {
+        ["/usr/lib/locale/C.utf8", "/usr/lib/locale/C.UTF-8"]
+            .iter()
+            .any(|p| std::path::Path::new(p).exists())
+            .then_some("C.UTF-8")
+    } else {
+        None
+    }
+}
+
 /// Which language to introduce yourself in — the owner's setting, read off
 /// their account.
 ///
@@ -4074,9 +4142,11 @@ async fn connect_and_run(
         // chat message, which is the entire point: the room stays clean).
         //
         // Authorization is the same rule the message road uses and it lives in
-        // `deliver_ask_answer`: only the person the question was put to may
-        // answer it. A verdict for a turn we don't hold, or from anyone else,
-        // is simply not delivered.
+        // `deliver_ask_answer` (`may_answer`): the owner, or someone they
+        // whitelisted on a turn of their own — never a guest, whose turn runs
+        // under the owner's rules. The server relays every tap without judging
+        // and has already told the tapper "ok", so a refusal is said here, to
+        // them, or their card sits on «sent» with nothing coming.
         if method == "events.permissionAnswer" {
             let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
             let from = env["params"]["from"].as_str().unwrap_or("").to_lowercase();
@@ -4087,8 +4157,29 @@ async fn connect_and_run(
             if answer.is_empty() {
                 continue;
             }
-            if deliver_ask_answer(chat_states, &conv_id, &msg_id, &from, &answer).await {
-                println!("← permission {answer} from @{from} on {msg_id}");
+            let (standing, owner) = {
+                let a = allow.read().await;
+                (a.standing(&from, None), a.owner.clone())
+            };
+            // `allow|<prompt>`: the card names the prompt it is (`PermAsk::prompt`);
+            // a card from before that sends the bare code.
+            let (code, prompt) = match answer.split_once('|') {
+                Some((code, prompt)) => (code.trim(), Some(prompt.trim())),
+                None => (answer.as_str(), None),
+            };
+            let tap = Answer::Verdict { code, prompt };
+            match deliver_ask_answer(chat_states, &conv_id, &msg_id, &from, standing, is_bot_handle(&from), tap).await {
+                Delivery::Delivered => println!("← permission {answer} from @{from} on {msg_id}"),
+                Delivery::NotTheirs { starter } => {
+                    println!("← permission {answer} from @{from} on {msg_id} (not theirs to answer → alert)");
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        let lang = intro_lang_for(&client, &from).await;
+                        let (title, text) = not_theirs_alert(lang, owner.as_deref(), starter.as_deref());
+                        let _ = client.push_alert(&from, Some(title), &text, "error").await;
+                    });
+                }
+                Delivery::NotParked => {}
             }
             continue;
         }
@@ -4591,14 +4682,22 @@ async fn connect_and_run(
         // AskUserQuestion answer routing (concurrency-safe): a turn blocked on an
         // ask is answered by REPLYING to that turn's draft message. The reply
         // target (message_id) picks the exact turn, so two concurrent asks never
-        // cross. Only the turn's own triggering sender may answer it. `/stop`
+        // cross. Who may answer is `may_answer`'s: a question, the turn's own
+        // sender; a permission prompt, the owner's call, never a bot's — and
+        // to a permission prompt a reply is words, a no that carries them,
+        // never a yes (only a tap on its card approves; `Answer::Words`).
+        // Refused, the reply goes on as words to the running turn. `/stop`
         // falls through to cancel instead.
         if let Some(rid) = m.reply_to_id.as_deref() {
             // `/stop` falls through to cancel instead of being read as an answer.
-            if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel"))
-                && deliver_ask_answer(chat_states, &m.conversation_id, rid, &sender_lc, trimmed).await
-            {
-                continue;
+            if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
+                let standing = allow.read().await.standing(&sender_lc, None);
+                let words = Answer::Words(trimmed);
+                if deliver_ask_answer(chat_states, &m.conversation_id, rid, &sender_lc, standing, sender_is_bot, words).await
+                    == Delivery::Delivered
+                {
+                    continue;
+                }
             }
         }
 
@@ -4665,12 +4764,15 @@ async fn connect_and_run(
             // A control command arriving as a REPLY may be answering one of
             // our finalized {% mafold/ask %} cards (e.g. the /resume picker, whose
             // option labels are the commands themselves) — stamp the card
-            // answered everywhere before running it.
+            // answered everywhere before running it. (Not a live draft's: see
+            // the same guard where a turn starts.)
             if let Some(rid) = m.reply_to_id.as_deref() {
-                let at = Dest::chat(&m.conversation_id)
-                    .channel(m.channel_id.as_deref())
-                    .thread(m.thread_root_id.as_deref());
-                stamp_finalized_ask(client, at, rid, my_username, trimmed).await;
+                if !has_turn(chat_states, &m.conversation_id, Some(rid)).await {
+                    let at = Dest::chat(&m.conversation_id)
+                        .channel(m.channel_id.as_deref())
+                        .thread(m.thread_root_id.as_deref());
+                    stamp_finalized_ask(client, at, rid, my_username, trimmed).await;
+                }
             }
             handle_control(client, workdir, owner.read().await.clone(), &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, workdirs, chat_states, harness, standing, &sender_lc, my_username).await;
             continue;
@@ -4900,15 +5002,23 @@ async fn connect_and_run(
             // no blocking hook), stamp the answer into that card via editMessage
             // before running the turn. Mirror of the live-turn stamp: the card
             // becomes one-shot on every client, across reloads.
-            if let Some(rid) = &reply_to_id {
-                // THE ONE THE USER REPORTED. `channel_id` used to be dropped
-                // here, so an ask card posted in a forum channel was looked for
-                // in `#all`, never found, and never stamped — it came back
-                // unanswered on every reload.
-                let at = Dest::chat(&chat_id)
-                    .channel(channel_id.as_deref())
-                    .thread(thread_root.as_deref());
-                stamp_finalized_ask(&client, at, rid, &me_user, &content).await;
+            // A draft a turn still holds is not one of those: its card is the
+            // live one, answered only through `deliver_ask_answer` — a reply
+            // that got this far was NOT its answer (someone it isn't theirs to
+            // answer: a guest typing `allow` under the owner's permission
+            // prompt), and stamping their words into it would show «allowed»
+            // over a prompt still waiting.
+            if let Some(rid) = reply_to_id.as_deref() {
+                if !has_turn(&chat_states, &chat_id, Some(rid)).await {
+                    // THE ONE THE USER REPORTED. `channel_id` used to be dropped
+                    // here, so an ask card posted in a forum channel was looked for
+                    // in `#all`, never found, and never stamped — it came back
+                    // unanswered on every reload.
+                    let at = Dest::chat(&chat_id)
+                        .channel(channel_id.as_deref())
+                        .thread(thread_root.as_deref());
+                    stamp_finalized_ask(&client, at, rid, &me_user, &content).await;
+                }
             }
             // ── the second guard ── Everything above this line is a COMMAND
             // (`/stop`, `/model`, a harness's own `/usage`, an ask answer) and
@@ -5178,36 +5288,160 @@ async fn has_turn(chat_states: &ChatStates, chat_id: &str, msg_id: Option<&str>)
 /// two are the same event, which is why the stamp/unblock/disarm sequence lives
 /// here once instead of being written out at each caller.
 ///
+/// `chat_id` / `draft_id` name the card that was answered: the turn's own
+/// draft, or — a permission prompt only the owner may answer — the copy put in
+/// front of the owner in their DM ([`PermAsk::copy`]), which answers the turn
+/// it was copied from. `bot`: the answerer is an AI account, whatever its
+/// standing ([`may_answer`]).
+///
 /// Order matters: the stamp goes into the renderer channel BEFORE the answer
 /// file, so the card flips to "answered" ahead of whatever the resumed agent
-/// streams next. Returns false when nobody is parked here, or when `from` is
-/// not the person the question was put to — a bystander may not answer someone
-/// else's prompt.
+/// streams next. Nothing is delivered when nobody is parked there, when `from`
+/// (standing `standing`) may not answer what is ([`may_answer`]), or when a
+/// verdict names a prompt other than the one open.
 async fn deliver_ask_answer(
     chat_states: &ChatStates,
     chat_id: &str,
     draft_id: &str,
     from: &str,
-    answer: &str,
-) -> bool {
-    let parked = {
-        let g = chat_states.lock().await;
-        g.get(chat_id)
-            .and_then(|s| s.turns.get(draft_id))
-            .and_then(|t| match &t.ask_file {
-                Some(f) if t.owner == from => Some((f.clone(), t.events.clone())),
-                _ => None,
-            })
-    };
-    let Some((ask_file, events)) = parked else { return false };
-    let _ = events.send(AgentEvent::AskAnswered(answer.to_string()));
-    let _ = std::fs::write(&ask_file, answer);
-    if let Some(s) = chat_states.lock().await.get_mut(chat_id) {
-        if let Some(t) = s.turns.get_mut(draft_id) {
-            t.ask_file = None;
-        }
+    standing: Standing,
+    bot: bool,
+    answer: Answer<'_>,
+) -> Delivery {
+    let mut g = chat_states.lock().await;
+    let Some(t) = parked_turn(&mut g, chat_id, draft_id) else { return Delivery::NotParked };
+    let Some(ask_file) = t.ask_file.clone() else { return Delivery::NotParked };
+    // A permission card's tap answers a permission prompt and nothing else.
+    if matches!(answer, Answer::Verdict { .. }) && t.perm.is_none() {
+        return Delivery::NotParked;
     }
-    true
+    if !may_answer(t, standing, bot, from) {
+        return Delivery::NotTheirs { starter: (t.perm.is_some() && !owner_decides(t)).then(|| t.owner.clone()) };
+    }
+    // A verdict has a file of its own (`permission_mcp::verdict_file`), and
+    // names the prompt it is for; what lands in the turn's ask mailbox answers
+    // a question, whoever gave it.
+    let (to, record, said) = match (&t.perm, answer) {
+        (Some(p), Answer::Verdict { code, prompt }) => {
+            if prompt.is_some_and(|id| id != p.prompt) {
+                eprintln!("permission: @{from}'s {code} names prompt {prompt:?}, not the one open — not delivered");
+                return Delivery::NotParked;
+            }
+            let record = crate::permission_mcp::verdict_record(&p.prompt, true, code);
+            (crate::permission_mcp::verdict_file(&ask_file), record, code)
+        }
+        (Some(p), Answer::Words(w)) => {
+            let record = crate::permission_mcp::verdict_record(&p.prompt, false, w);
+            (crate::permission_mcp::verdict_file(&ask_file), record, w)
+        }
+        (None, Answer::Words(w)) => (ask_file, w.to_string(), w),
+        (None, Answer::Verdict { .. }) => return Delivery::NotParked,
+    };
+    let _ = t.events.send(AgentEvent::AskAnswered(said.to_string()));
+    write_whole(&to, &record);
+    t.ask_file = None;
+    t.perm = None;
+    Delivery::Delivered
+}
+
+/// An answer as it arrived, by which road.
+#[derive(Clone, Copy, Debug)]
+enum Answer<'a> {
+    /// A tap on a permission card (`perm:answer`): the verdict code, and the
+    /// prompt the card says it is (`None` from a card drawn before `prompt=`).
+    Verdict { code: &'a str, prompt: Option<&'a str> },
+    /// Words — a reply to the draft: a question's answer, or, to a permission
+    /// prompt, a no that carries them (only a tap approves).
+    Words(&'a str),
+}
+
+/// `content` into `path` in one step, so a reader polling it never sees half.
+fn write_whole(path: &str, content: &str) {
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, content).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// The turn the card `chat_id` / `draft_id` belongs to: the turn whose draft
+/// it is, else the one whose permission prompt it is the owner's copy of.
+fn parked_turn<'a>(states: &'a mut HashMap<String, ChatState>, chat_id: &str, draft_id: &str) -> Option<&'a mut TurnHandle> {
+    if states.get(chat_id).is_some_and(|s| s.turns.contains_key(draft_id)) {
+        return states.get_mut(chat_id)?.turns.get_mut(draft_id);
+    }
+    states.values_mut().flat_map(|s| s.turns.values_mut()).find(|t| {
+        t.perm
+            .as_ref()
+            .and_then(|p| p.copy.as_ref())
+            .is_some_and(|(c, m)| c == chat_id && m == draft_id)
+    })
+}
+
+/// What became of an answer handed to [`deliver_ask_answer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// It reached the parked turn and unblocked it.
+    Delivered,
+    /// Nobody is parked there: a turn we don't hold, or one not waiting on
+    /// anyone — already answered, expired, over.
+    NotParked,
+    /// Someone is, but it is not this person's to answer ([`may_answer`]).
+    /// `starter`: on a permission prompt, the one besides the owner who may —
+    /// a whitelisted person, on their own turn.
+    NotTheirs { starter: Option<String> },
+}
+
+/// May `by`, standing `standing`, answer what turn `t` is parked on?
+///
+/// A question the MODEL asked is put to whoever it is talking to: only the
+/// person who started the turn answers it — a bystander may not answer someone
+/// else's question.
+///
+/// A permission prompt is not a question to that person. It is the owner's
+/// own rule saying a PERSON must say yes, and a guest's turn runs under the
+/// owner's rules — which makes the guest who started it the one person who
+/// must not be able to give it. So: the owner answers any of them; someone the
+/// owner whitelisted by name, the prompts of a turn they started themselves
+/// (the owner's circle runs on the owner's own Claude Code already); a guest,
+/// none — not even on their own turn; a bot, none either, the owner's own
+/// included: it is not a person, and whose words it is passing on when it
+/// taps is not something a tap can say. Those prompts are put in front of the
+/// owner instead ([`owner_decides`], [`post_owner_copy`]).
+fn may_answer(t: &TurnHandle, standing: Standing, bot: bool, by: &str) -> bool {
+    if t.perm.is_none() {
+        return t.owner == by;
+    }
+    if bot || is_bot_handle(by) {
+        return false;
+    }
+    match standing {
+        Standing::Owner => true,
+        Standing::Circle => !owner_decides(t) && t.owner == by,
+        Standing::Guest => false,
+    }
+}
+
+/// Who may answer a permission prompt on a turn `sender` started, as its card
+/// names them (`user=`) — [`may_answer`] drawn: the owner alone when the
+/// owner decides ([`owner_decides`]) or started the turn; else the starter
+/// first, then the owner.
+fn perm_answerers(sender: &str, owner_decides: bool, owner: &str) -> Vec<String> {
+    if owner_decides || sender == owner {
+        vec![owner.to_string()]
+    } else {
+        vec![sender.to_string(), owner.to_string()]
+    }
+}
+
+/// Is a permission prompt on `t` the owner's alone to answer — because
+/// whoever started the turn can't ([`may_answer`]): a guest, or a bot.
+fn owner_decides(t: &TurnHandle) -> bool {
+    t.guest || is_bot_handle(&t.owner)
+}
+
+/// A bot's handle: `<owner>:<label>` (what [`AllowList::circle`] reads too).
+fn is_bot_handle(handle: &str) -> bool {
+    handle.contains(':')
 }
 
 /// Act on the owner's tap under a drafted introduction: post the exact bytes
@@ -6917,6 +7151,39 @@ fn seat_trouble(o: &crate::harness::TurnOutcome) -> bool {
     o.limit.is_some() || o.error.as_deref().is_some_and(crate::accounts::signed_out_error)
 }
 
+/// What a turn that died ends on: the `{% mafold/error %}` card — the same one
+/// a hosted agent's failed turn ends on, read by the same reader
+/// (`mafold_transcript::failure`). This used to be `⚠️ Agent stopped: <raw>`,
+/// the harness's error string pasted into the reply; now the reader gets a
+/// sentence in their own language and what to do, with the raw text folded
+/// into the card for the bot's owner.
+///
+/// `bot` is this daemon's handle (`owner:label`): a harness billed through
+/// the Mafold router draws on the owner's wallet, so a refusal that doesn't
+/// name its payer is the owner's.
+///
+/// `limit`: the seat said no (`rate_limit_event` rejected) and nothing could
+/// take the turn over. What the harness said in structure beats what its
+/// error text happens to say — the window and when it lifts go on the card,
+/// which is now the turn's ONE limit card (the event used to render its own
+/// `{% mafold/ratelimit %}` too, two cards for one refusal).
+pub(crate) fn failure_card(bot: &str, err: &str, limit: Option<&crate::harness::LimitHit>) -> String {
+    use mafold_transcript::failure::{classify, FailureKind};
+    let mut f = classify(err);
+    if f.kind == FailureKind::Balance && f.payer.is_none() {
+        f.payer = bot.split_once(':').map(|(owner, _)| owner.to_string());
+    }
+    // Only for a failure that IS the limit (or one nothing else explains): a
+    // refusal the run recovered from earlier must not relabel a later context
+    // overflow or a 529 as "wait until HH:MM" (review, 10-10).
+    if let Some(hit) = limit.filter(|_| matches!(f.kind, FailureKind::RateLimit | FailureKind::Unknown)) {
+        f.kind = FailureKind::RateLimit;
+        f.window = Some(hit.kind.clone()).filter(|k| !k.is_empty());
+        f.resets_at = hit.resets_at.or(f.resets_at);
+    }
+    mafold_transcript::render::failure_card(&f).trim().to_string()
+}
+
 fn wall_footer(why: &[(String, String)], logins: usize) -> String {
     if why.is_empty() {
         return if logins <= 1 {
@@ -8450,6 +8717,7 @@ async fn handle(
             TurnHandle {
                 cancel: cancel.clone(),
                 ask_file: None,
+                perm: None,
                 owner: turn_sender.to_string(),
                 channel: channel_id.map(str::to_string),
                 thread: thread_root.map(str::to_string),
@@ -8798,6 +9066,7 @@ async fn handle(
                 TurnHandle {
                     cancel: cancel.clone(),
                     ask_file: None,
+                    perm: None,
                     owner: turn_sender.to_string(),
                     channel: channel_id.map(str::to_string),
                 thread: thread_root.map(str::to_string),
@@ -8879,6 +9148,7 @@ async fn handle(
                     TurnHandle {
                         cancel: cancel.clone(),
                         ask_file: None,
+                        perm: None,
                         owner: turn_sender.to_string(),
                         channel: channel_id.map(str::to_string),
                 thread: thread_root.map(str::to_string),
@@ -8985,6 +9255,7 @@ async fn handle(
                 TurnHandle {
                     cancel: cancel.clone(),
                     ask_file: None,
+                    perm: None,
                     owner: turn_sender.to_string(),
                     channel: channel_id.map(str::to_string),
                 thread: thread_root.map(str::to_string),
@@ -9076,14 +9347,22 @@ async fn handle(
                 // below whenever the run got as far as producing output, so the
                 // next message resumes with context; only a resume that died
                 // before producing anything is dropped (see there).
-                final_content.push_str(&format!("{sep}⚠️ Agent stopped: {err}"));
+                // Closed first: a run that died mid code block must not leave
+                // the card inside the fence, where it reads as code.
+                if o.produced {
+                    final_content = mafold_transcript::render::heal_open_code(&final_content);
+                }
+                final_content.push_str(sep);
+                final_content.push_str(&failure_card(bot, err, o.limit.as_ref()));
                 if o.limit.is_some() || walled {
                     // Every login on this machine is out (or there is only
                     // one). Say what would have helped, right here.
                     final_content.push_str(&wall_footer(&wall_why, crate::accounts::load().accounts.len()));
                 }
             } else if !o.produced {
-                final_content.push_str("_(the agent produced no output)_");
+                // Nothing said and nothing done: a turn that didn't answer —
+                // the same card as any other (it was a bare italic line).
+                final_content.push_str(&failure_card(bot, "the agent produced no output", None));
                 post_appended = true;
             }
             // Persist the new session on a clean turn. But if the turn ERRORED on
@@ -9125,7 +9404,7 @@ async fn handle(
             // to retry for these: the next message would fail the same way. Still
             // drop a resumed session, since we can't tell it apart from a bad one.
             drop_session(sessions, &skey, prior.as_deref()).await;
-            final_content.push_str(&format!("⚠️ Agent error: {e:#}"));
+            final_content.push_str(&failure_card(bot, &format!("{e:#}"), None));
         }
     }
     // (The turn handle was already dropped above, before awaiting the renderer.)
@@ -9995,6 +10274,200 @@ fn awaiting_after(ev: &AgentEvent, current: Option<String>, owner: &str) -> Opti
     }
 }
 
+/// Is this AskUserQuestion input a permission prompt (`permission_mcp`), not a
+/// question the model asked? Read off the action its card answers through —
+/// the one thing the two always differ in.
+fn is_permission_ask(input: &Value) -> bool {
+    input["action"].as_str().is_some_and(|a| a.trim() == crate::permission_mcp::ACTION)
+}
+
+/// This bot's owner, as the access list knows them.
+async fn bot_owner() -> Option<String> {
+    ACCESS.get()?.read().await.owner.clone()
+}
+
+/// The owner's copy of a permission prompt, as posted.
+struct Posted {
+    dm: String,
+    id: String,
+    text: String,
+}
+
+/// The copy of a permission prompt put in front of the owner
+/// ([`post_owner_copy`]), from the moment it is sent until the prompt settles:
+/// then it is stamped with the same verdict as the card in the room, so it
+/// stops offering buttons for a question nobody is waiting on any more.
+/// Dropped unsettled — the turn ended under it: stopped, crashed, cut off — it
+/// is stamped expired, because the prompt died with the process that asked.
+struct OwnerCopy {
+    client: Client,
+    sending: Option<tokio::task::JoinHandle<Option<Posted>>>,
+    posted: Option<Posted>,
+}
+
+impl OwnerCopy {
+    fn new(client: Client) -> Self {
+        Self { client, sending: None, posted: None }
+    }
+
+    /// A new prompt's copy is on its way. Prompts are sequential, so one still
+    /// open here was never settled.
+    fn send(&mut self, post: tokio::task::JoinHandle<Option<Posted>>) {
+        self.settle(crate::permission_mcp::EXPIRED);
+        self.sending = Some(post);
+    }
+
+    /// The copy's DM and message id, the first time this is asked after its
+    /// post came back.
+    async fn landed(&mut self) -> Option<(String, String)> {
+        if !self.sending.as_ref().is_some_and(|h| h.is_finished()) {
+            return None;
+        }
+        self.posted = self.sending.take()?.await.ok().flatten();
+        self.posted.as_ref().map(|p| (p.dm.clone(), p.id.clone()))
+    }
+
+    /// The prompt settled with `answer`: stamp the copy — now, or once it
+    /// lands if it is still on its way.
+    fn settle(&mut self, answer: &str) {
+        let (sending, posted) = (self.sending.take(), self.posted.take());
+        if sending.is_none() && posted.is_none() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let (client, answer) = (self.client.clone(), answer.to_string());
+        rt.spawn(async move {
+            let posted = match (posted, sending) {
+                (Some(p), _) => Some(p),
+                (None, Some(h)) => h.await.ok().flatten(),
+                (None, None) => None,
+            };
+            let Some(p) = posted else { return };
+            if let Some(stamped) = mafold_transcript::render::stamp_unanswered_ask(&p.text, &answer) {
+                let _ = client
+                    .call("editMessage", serde_json::json!({ "message_id": p.id, "text": stamped }))
+                    .await;
+            }
+        });
+    }
+}
+
+impl Drop for OwnerCopy {
+    fn drop(&mut self) {
+        self.settle(crate::permission_mcp::EXPIRED);
+    }
+}
+
+/// Put a permission prompt only the owner may answer ([`owner_decides`]: a
+/// guest's turn, a bot's) in front of them: a copy of its card in their DM
+/// with this bot, under a line saying who asked and where.
+///
+/// The card in the room waits on the owner (`may_answer`), but the owner may
+/// not be in that room — and the server only relays a tap from someone who
+/// is. Their DM they are always in. A tap on the copy answers the turn it was
+/// copied from (`deliver_ask_answer` → `parked_turn`), and the copy is settled
+/// along with the prompt ([`OwnerCopy`]).
+async fn post_owner_copy(client: Client, owner: String, room: String, asker: String, card: String) -> Option<Posted> {
+    let dm = match client.resolve_chat(&owner).await {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("permission: couldn't open the DM with @{owner} ({e:#}) — @{asker}'s prompt waits on them in {room} only");
+            return None;
+        }
+    };
+    let lang = intro_lang_for(&client, &owner).await;
+    let place = match client.get_chat(&room).await {
+        Ok(c) if c["kind"].as_str() == Some("group") => match c["title"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => Place::Named(t.to_string()),
+            None => Place::Group,
+        },
+        Ok(_) => Place::Direct,
+        Err(_) => Place::Unknown,
+    };
+    let text = format!("{}\n{card}", owner_copy_lead(lang, &asker, &place));
+    let sent = match client.send_to(Dest::chat(&dm), &text).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("permission: couldn't put @{asker}'s prompt in front of @{owner} ({e:#})");
+            return None;
+        }
+    };
+    let id = sent["id"].as_str()?.to_string();
+    println!("→ @{asker}'s permission prompt in {room} put in front of @{owner} ({dm})");
+    Some(Posted { dm, id, text })
+}
+
+/// Where someone asked for a turn, as the owner's copy of its prompt says it.
+enum Place {
+    /// A group with a name.
+    Named(String),
+    /// A group without one.
+    Group,
+    /// Their DM with the bot.
+    Direct,
+    /// Couldn't tell.
+    Unknown,
+}
+
+/// The line above the owner's copy of a prompt only they may answer: who
+/// asked, where, and that it is the owner's alone to answer. The card under it
+/// says what and why.
+fn owner_copy_lead(lang: IntroLang, asker: &str, place: &Place) -> String {
+    match lang {
+        IntroLang::Zh => {
+            let at = match place {
+                Place::Named(t) => format!("在「{t}」里"),
+                Place::Group => "在一个群里".to_string(),
+                Place::Direct => "在跟我的私聊里".to_string(),
+                Place::Unknown => "在跟我的对话里".to_string(),
+            };
+            format!(
+                "@{asker} {at}让我做的这一步，碰到了你设置里要人批准的规则。只有你能批，@{asker} 自己批不了；10 分钟内没人批就不执行。"
+            )
+        }
+        IntroLang::En => {
+            let at = match place {
+                Place::Named(t) => format!("in “{t}”"),
+                Place::Group => "in a group".to_string(),
+                Place::Direct => "in a DM with me".to_string(),
+                Place::Unknown => "in a conversation with me".to_string(),
+            };
+            format!(
+                "@{asker} asked me for this {at}, and one of your settings says a person has to approve it first. \
+                 Only you can — @{asker} can't approve it themselves. If nobody does within 10 minutes, it won't run."
+            )
+        }
+    }
+}
+
+/// What someone hears when they tap a permission prompt that isn't theirs to
+/// answer (`may_answer`): the server already told their card "ok", so without
+/// this it sits on «sent» with nothing coming. `starter`: who else may, besides
+/// the owner (`Delivery::NotTheirs`).
+fn not_theirs_alert(lang: IntroLang, owner: Option<&str>, starter: Option<&str>) -> (&'static str, String) {
+    let starter = starter.filter(|s| Some(*s) != owner);
+    match (lang, owner, starter) {
+        (IntroLang::Zh, Some(o), Some(s)) => (
+            "不归你批",
+            format!("你点的不算：这一步要 @{s} 或这个 agent 的主人 @{o} 来批。没人批准就不会执行。"),
+        ),
+        (IntroLang::Zh, Some(o), None) => ("不归你批", format!("你点的不算：这一步要这个 agent 的主人 @{o} 来批。没人批准就不会执行。")),
+        (IntroLang::Zh, None, _) => ("不归你批", "你点的不算：这一步不归你批。没人批准就不会执行。".to_string()),
+        (IntroLang::En, Some(o), Some(s)) => (
+            "Not yours to approve",
+            format!("Your tap didn't count: approving this is up to @{s} or @{o}, who owns this agent. If nobody approves it, it won't run."),
+        ),
+        (IntroLang::En, Some(o), None) => (
+            "Not yours to approve",
+            format!("Your tap didn't count: approving this is up to @{o}, who owns this agent. If nobody approves it, it won't run."),
+        ),
+        (IntroLang::En, None, _) => (
+            "Not yours to approve",
+            "Your tap didn't count: approving this isn't up to you. If nobody approves it, it won't run.".to_string(),
+        ),
+    }
+}
+
 /// The generating card's heartbeat: `beat`, and `beatAt` — when it last moved.
 ///
 /// The card can only judge its producer by this. A beat that stops moving for
@@ -10159,6 +10632,9 @@ async fn render_loop(
     // Whose tap the turn is parked on, while an ask card is open — see
     // `awaiting_after`. Rides the generating card as `awaiting=`.
     let mut awaiting: Option<String> = None;
+    // The copy of a permission prompt put in front of the owner, from
+    // the moment it is sent until the prompt settles (`OwnerCopy`).
+    let mut owner_copy = OwnerCopy::new(client.clone());
     macro_rules! bump_beat {
         () => {
             hb.bump(mafold_transcript::stats::now_ms())
@@ -10224,8 +10700,23 @@ async fn render_loop(
             journaled_child = child;
             journal_progress(&client, &msg_id, None, child, None);
         }
+        // The owner's copy of a guest's prompt has landed in their DM: from
+        // now on a tap there answers this turn (`parked_turn`). Recorded here,
+        // against the draft the turn is in NOW, rather than by the task that
+        // posted it.
+        if let Some(copy) = owner_copy.landed().await {
+            if let Some(p) = chat_states
+                .lock()
+                .await
+                .get_mut(&chat_id)
+                .and_then(|s| s.turns.get_mut(&msg_id))
+                .and_then(|t| t.perm.as_mut())
+            {
+                p.copy = Some(copy);
+            }
+        }
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
-            Ok(Some(ev)) => {
+            Ok(Some(mut ev)) => {
                 // ── daemon-only bookkeeping, before the transcript sees it ──
                 // Liveness: `beat` bumps on stream ACTIVITY, which is not the
                 // same as content. Session ids, the ask answer and the end-of-
@@ -10233,16 +10724,36 @@ async fn render_loop(
                 // bump. (Silence while the process still runs is the
                 // keepalive's job, at the top of this loop.)
                 //
-                // Parked on a person: only the turn's owner can answer its card
-                // (`deliver_ask_answer`), so that is who the card waits on.
-                let owner = match &ev {
-                    AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => chat_states
-                        .lock()
-                        .await
-                        .get(&chat_id)
-                        .and_then(|s| s.turns.get(&msg_id))
-                        .map(|t| t.owner.clone())
-                        .unwrap_or_default(),
+                // Parked on a person: whoever may answer its card
+                // (`may_answer`) is who the card waits on. A question: the
+                // turn's sender. A permission prompt: the bot's owner — and, on
+                // a whitelisted person's own turn, them first. The card carries
+                // those names (`user=`), so everyone else reads «waiting for
+                // @…» instead of buttons; one only the owner may answer
+                // (`owner_decides`) is also put in front of them, in their DM
+                // (`post_owner_copy`): (owner, who asked).
+                let mut copy_for: Option<(String, String)> = None;
+                let owner = match &mut ev {
+                    AgentEvent::ToolCall { name, input, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => {
+                        let (sender, decides) = chat_states
+                            .lock()
+                            .await
+                            .get(&chat_id)
+                            .and_then(|s| s.turns.get(&msg_id))
+                            .map(|t| (t.owner.clone(), owner_decides(t)))
+                            .unwrap_or_default();
+                        match bot_owner().await {
+                            Some(o) if is_permission_ask(input) => {
+                                let names = perm_answerers(&sender, decides, &o);
+                                input["user"] = serde_json::json!(names.join(","));
+                                if decides {
+                                    copy_for = Some((o, sender));
+                                }
+                                names[0].clone()
+                            }
+                            _ => sender,
+                        }
+                    }
                     _ => String::new(),
                 };
                 awaiting = awaiting_after(&ev, awaiting.take(), &owner);
@@ -10395,12 +10906,15 @@ async fn render_loop(
                 // the harness, nobody tapped) has no one else to. Left armed,
                 // the next reply to this draft was taken as the answer to a card
                 // that had stopped listening — swallowed instead of steering.
-                if let AgentEvent::AskAnswered(_) = &ev {
+                // The owner's copy of it, if any, settles the same way.
+                if let AgentEvent::AskAnswered(answer) = &ev {
                     if let Some(st) = chat_states.lock().await.get_mut(&chat_id) {
                         if let Some(t) = st.turns.get_mut(&msg_id) {
                             t.ask_file = None;
+                            t.perm = None;
                         }
                     }
+                    owner_copy.settle(answer);
                 }
 
                 let advance = tx.push(&ev);
@@ -10425,20 +10939,46 @@ async fn render_loop(
                     // 300ms tick — this is the "middle states" the transcript
                     // model promises (工具第一时间返回, no batching).
                     Advance::Immediate => {
-                        push_running!(true);
                         // AskUserQuestion blocks the turn: mark THIS turn (by
                         // its draft id) as awaiting an answer. The user answers
                         // by replying to this draft, so concurrent asks in one
-                        // conversation never cross.
-                        if let AgentEvent::ToolCall { name, .. } = &ev {
+                        // conversation never cross. Marked BEFORE the card is
+                        // pushed: nobody can tap a card that isn't up yet, so
+                        // no answer meets a turn not yet marked as waiting on
+                        // the kind of ask it is.
+                        //
+                        // A permission prompt marks the turn as such until it
+                        // settles — even if a question of the model's arrives
+                        // on top of it: the stricter rule is the one that keeps
+                        // a guest from answering on the owner's behalf.
+                        if let AgentEvent::ToolCall { name, input, .. } = &ev {
                             if name.eq_ignore_ascii_case("AskUserQuestion") {
+                                let perm = is_permission_ask(input);
                                 if let Some(st) = chat_states.lock().await.get_mut(&chat_id) {
                                     if let Some(t) = st.turns.get_mut(&msg_id) {
                                         t.ask_file = Some(ask_file.clone());
+                                        if perm {
+                                            // Prompts come one at a time: a new
+                                            // one is the one open now.
+                                            let prompt = input["prompt"].as_str().unwrap_or("").to_string();
+                                            t.perm = Some(PermAsk { prompt, copy: None });
+                                        }
+                                    }
+                                }
+                                if let Some((owner, asker)) = copy_for.take().filter(|_| perm) {
+                                    if let Some(card) = mafold_transcript::render::render(&ev, &mut HashMap::new()) {
+                                        owner_copy.send(tokio::spawn(post_owner_copy(
+                                            client.clone(),
+                                            owner,
+                                            chat_id.clone(),
+                                            asker,
+                                            card,
+                                        )));
                                     }
                                 }
                             }
                         }
+                        push_running!(true);
                     }
                     // Final snapshot WITHOUT the generating card; handle()
                     // finalizes. Done is terminal: return NOW so no later
@@ -10743,7 +11283,39 @@ mod heartbeat_tests {
 mod deliver_ask_answer_tests {
     use super::*;
 
+    /// `ans` from `from` as it arrives for what is parked there: a tap on a
+    /// permission card (naming no prompt, like a card drawn before `prompt=`),
+    /// else a reply to a question.
+    async fn answer(states: &ChatStates, conv: &str, draft: &str, from: &str, standing: Standing, ans: &str) -> Delivery {
+        let perm = {
+            let mut g = states.lock().await;
+            parked_turn(&mut g, conv, draft).is_some_and(|t| t.perm.is_some())
+        };
+        let a = if perm { Answer::Verdict { code: ans, prompt: None } } else { Answer::Words(ans) };
+        deliver_ask_answer(states, conv, draft, from, standing, is_bot_handle(from), a).await
+    }
+
+    fn may(t: &TurnHandle, standing: Standing, by: &str) -> bool {
+        may_answer(t, standing, false, by)
+    }
+
+    /// What a delivery left in the verdict file, for the open prompt `p`.
+    fn tapped(p: &str, code: &str) -> String {
+        crate::permission_mcp::verdict_record(p, true, code)
+    }
+
     fn parked(owner: &str, ask_file: &str) -> (ChatStates, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        parked_on(owner, ask_file, None, false)
+    }
+
+    /// A turn `owner` started (`guest`: from outside the owner's circle),
+    /// parked on a permission prompt when `perm` is set, else on a question.
+    fn parked_on(
+        owner: &str,
+        ask_file: &str,
+        perm: Option<PermAsk>,
+        guest: bool,
+    ) -> (ChatStates, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut st = ChatState::default();
         st.turns.insert(
@@ -10751,6 +11323,7 @@ mod deliver_ask_answer_tests {
             TurnHandle {
                 cancel: Arc::new(Notify::new()),
                 ask_file: Some(ask_file.to_string()),
+                perm,
                 owner: owner.into(),
                 channel: None,
                 thread: None,
@@ -10758,11 +11331,260 @@ mod deliver_ask_answer_tests {
                 steer_file: String::new(),
                 can_steer: true,
                 pays: false,
-                guest: false,
+                guest,
             },
         );
         let states: ChatStates = Arc::new(Mutex::new(HashMap::from([("conv-1".to_string(), st)])));
         (states, rx)
+    }
+
+    /// 2026-10-10 viewer audit, P1: on an open bot a guest's turn runs under
+    /// the owner's `ask` rules, and the prompt was answerable by whoever
+    /// started the turn — so the guest approved the owner's guarded `rm`
+    /// themselves, and the owner was never asked.
+    #[tokio::test]
+    async fn a_guest_cannot_approve_the_owners_rule_on_their_own_turn() {
+        let f = scratch("guest-perm");
+        let verdict = crate::permission_mcp::verdict_file(&f);
+        let (states, _rx) = parked_on("eve", &f, Some(PermAsk::default()), true);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "eve", Standing::Guest, "allow").await,
+            Delivery::NotTheirs { starter: None },
+        );
+        assert!(!std::path::Path::new(&verdict).exists(), "the guest's own Allow must not reach the agent");
+        // Still armed — and the owner's yes is the one that counts.
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "ops", Standing::Owner, "allow").await,
+            Delivery::Delivered,
+        );
+        assert_eq!(std::fs::read_to_string(&verdict).unwrap(), tapped("", "allow"));
+        assert!(!std::path::Path::new(&f).exists(), "a verdict is not an answer to a question");
+        let _ = std::fs::remove_file(&verdict);
+    }
+
+    /// A question the model asked and a permission prompt answer into
+    /// different files, so whatever a guest may answer for themselves never
+    /// reaches the prompt (`permission_mcp::verdict_file`).
+    #[tokio::test]
+    async fn a_guests_answer_to_their_question_is_not_a_verdict() {
+        let f = scratch("guest-question");
+        let (states, _rx) = parked_on("eve", &f, None, true);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "eve", Standing::Guest, "allow").await,
+            Delivery::Delivered,
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "allow");
+        assert!(!std::path::Path::new(&crate::permission_mcp::verdict_file(&f)).exists());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// A bot never approves a permission prompt — not one of the owner's, not
+    /// even on a turn it started itself: the rule asks for a person, and a tap
+    /// can't say whose words the bot was passing on. Its turns' prompts are
+    /// the owner's to answer, put in front of them like a guest's.
+    #[tokio::test]
+    async fn a_bot_cannot_approve_even_its_own_turns_prompt() {
+        let f = scratch("bot-perm");
+        let (states, _rx) = parked_on("ops:helper", &f, Some(PermAsk::default()), false);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "ops:helper", Standing::Circle, "allow").await,
+            Delivery::NotTheirs { starter: None },
+        );
+        assert!(!std::path::Path::new(&crate::permission_mcp::verdict_file(&f)).exists());
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "ops", Standing::Owner, "allow").await,
+            Delivery::Delivered,
+        );
+        let _ = std::fs::remove_file(crate::permission_mcp::verdict_file(&f));
+    }
+
+    /// The other half of the same hole: a typed reply to the draft is an
+    /// answer too (`permission_mcp::decide` reads `allow` as a yes), and goes
+    /// through the same gate.
+    #[tokio::test]
+    async fn a_guest_typing_allow_is_refused_the_same_way() {
+        let f = scratch("guest-typed");
+        let (states, _rx) = parked_on("eve", &f, Some(PermAsk::default()), true);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "eve", Standing::Guest, "Allow").await,
+            Delivery::NotTheirs { starter: None },
+        );
+        assert!(!std::path::Path::new(&f).exists());
+        assert!(!std::path::Path::new(&crate::permission_mcp::verdict_file(&f)).exists());
+    }
+
+    /// Who may answer a permission prompt, by standing and whose turn it is.
+    #[test]
+    fn who_may_answer_a_permission_prompt() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn = |owner: &str, guest: bool, perm: bool| TurnHandle {
+            cancel: Arc::new(Notify::new()),
+            ask_file: Some("f".into()),
+            perm: perm.then(PermAsk::default),
+            owner: owner.into(),
+            channel: None,
+            thread: None,
+            events: tx.clone(),
+            steer_file: String::new(),
+            can_steer: true,
+            pays: false,
+            guest,
+        };
+        // A guest's turn: the owner, and nobody else — not the guest, not
+        // someone whitelisted, not even the owner's bot that relayed it.
+        let guests = turn("eve", true, true);
+        assert!(may(&guests, Standing::Owner, "ops"));
+        assert!(!may(&guests, Standing::Guest, "eve"));
+        assert!(!may(&guests, Standing::Circle, "ann"));
+        let relayed = turn("ops:helper", true, true);
+        assert!(!may(&relayed, Standing::Circle, "ops:helper"));
+        assert!(owner_decides(&guests) && owner_decides(&relayed));
+        // A bot's turn, the owner's own bot, for the owner's circle: still the
+        // owner's call — the rule asks for a person.
+        let bots = turn("ops:helper", false, true);
+        assert!(!may(&bots, Standing::Circle, "ops:helper"));
+        assert!(may(&bots, Standing::Owner, "ops"));
+        assert!(owner_decides(&bots));
+        // A whitelisted member's own turn: them, and the owner.
+        let anns = turn("ann", false, true);
+        assert!(may(&anns, Standing::Circle, "ann"));
+        assert!(may(&anns, Standing::Owner, "ops"));
+        assert!(!may(&anns, Standing::Circle, "bob"));
+        assert!(!may(&anns, Standing::Guest, "eve"));
+        assert!(!may(&anns, Standing::Circle, "ann:bot"), "not even ann's own bot");
+        assert!(!owner_decides(&anns));
+        // The owner's own turn: the owner.
+        let owners = turn("ops", false, true);
+        assert!(may(&owners, Standing::Owner, "ops"));
+        assert!(!may(&owners, Standing::Circle, "ann"));
+        // A question the model asked stays the asker's to answer — a guest
+        // still answers their own, and the owner doesn't answer it for them.
+        let question = turn("eve", true, false);
+        assert!(may(&question, Standing::Guest, "eve"));
+        assert!(!may(&question, Standing::Owner, "ops"));
+    }
+
+    /// A guest's prompt is put in front of the owner in their DM; a tap on
+    /// that copy answers the turn it was copied from — and only the owner's.
+    #[tokio::test]
+    async fn the_owners_copy_answers_the_guests_turn() {
+        let f = scratch("copy");
+        let copy = PermAsk { copy: Some(("owner-dm".into(), "copy-1".into())), ..Default::default() };
+        let (states, mut rx) = parked_on("eve", &f, Some(copy), true);
+        // The guest can't reach it through the copy either (they aren't in
+        // that DM, but the gate doesn't lean on that).
+        assert_eq!(
+            answer(&states,"owner-dm", "copy-1", "eve", Standing::Guest, "allow").await,
+            Delivery::NotTheirs { starter: None },
+        );
+        assert_eq!(
+            answer(&states,"owner-dm", "copy-1", "ops", Standing::Owner, "deny").await,
+            Delivery::Delivered,
+        );
+        let verdict = crate::permission_mcp::verdict_file(&f);
+        assert_eq!(std::fs::read_to_string(&verdict).unwrap(), tapped("", "deny"));
+        match rx.try_recv() {
+            Ok(AgentEvent::AskAnswered(a)) => assert_eq!(a, "deny"),
+            other => panic!("expected the room's card to be stamped, got {other:?}"),
+        }
+        // Settled: neither card answers again.
+        assert_eq!(
+            answer(&states,"owner-dm", "copy-1", "ops", Standing::Owner, "allow").await,
+            Delivery::NotParked,
+        );
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "ops", Standing::Owner, "allow").await,
+            Delivery::NotParked,
+        );
+        let _ = std::fs::remove_file(&verdict);
+    }
+
+    /// A tap names the prompt its card is; a late one — the same card approved
+    /// a second time after the turn moved on to its next prompt — doesn't land
+    /// on the prompt open now. The verdict written names the open prompt.
+    #[tokio::test]
+    async fn a_verdict_only_counts_for_the_prompt_it_names() {
+        let f = scratch("prompt-id");
+        let verdict = crate::permission_mcp::verdict_file(&f);
+        let open = PermAsk { prompt: "p2".into(), copy: None };
+        let (states, _rx) = parked_on("ann", &f, Some(open), false);
+        let late = Answer::Verdict { code: "allow", prompt: Some("p1") };
+        assert_eq!(
+            deliver_ask_answer(&states, "conv-1", "draft-1", "ops", Standing::Owner, false, late).await,
+            Delivery::NotParked,
+        );
+        assert!(!std::path::Path::new(&verdict).exists(), "p1's Allow approved p2");
+        let mine = Answer::Verdict { code: "allow", prompt: Some("p2") };
+        assert_eq!(
+            deliver_ask_answer(&states, "conv-1", "draft-1", "ops", Standing::Owner, false, mine).await,
+            Delivery::Delivered,
+        );
+        assert_eq!(std::fs::read_to_string(&verdict).unwrap(), tapped("p2", "allow"));
+        let _ = std::fs::remove_file(&verdict);
+    }
+
+    /// To a permission prompt, a reply is words — delivered, but as words,
+    /// which `permission_mcp` reads as a no. A tap on a permission card, on the
+    /// other hand, answers nothing but a permission prompt.
+    #[tokio::test]
+    async fn words_reach_a_prompt_as_words_and_a_permission_tap_answers_no_question() {
+        let f = scratch("words");
+        let verdict = crate::permission_mcp::verdict_file(&f);
+        let (states, _rx) = parked_on("ops", &f, Some(PermAsk::default()), false);
+        assert_eq!(
+            deliver_ask_answer(&states, "conv-1", "draft-1", "ops", Standing::Owner, false, Answer::Words("allow")).await,
+            Delivery::Delivered,
+        );
+        assert_eq!(std::fs::read_to_string(&verdict).unwrap(), crate::permission_mcp::verdict_record("", false, "allow"));
+        let _ = std::fs::remove_file(&verdict);
+
+        let q = scratch("words-q");
+        let (states, _rx) = parked_on("ops", &q, None, false);
+        let tap = Answer::Verdict { code: "allow", prompt: None };
+        assert_eq!(
+            deliver_ask_answer(&states, "conv-1", "draft-1", "ops", Standing::Owner, false, tap).await,
+            Delivery::NotParked,
+        );
+        assert!(!std::path::Path::new(&q).exists());
+    }
+
+    /// An AI account the server says is one (`sender_is_bot`) stands where a
+    /// bot does even without the `owner:label` shape — whitelisted or not.
+    #[tokio::test]
+    async fn an_ai_account_without_a_bot_handle_still_cannot_approve() {
+        let f = scratch("ai-account");
+        let (states, _rx) = parked_on("mafold", &f, Some(PermAsk::default()), false);
+        assert_eq!(
+            deliver_ask_answer(&states, "conv-1", "draft-1", "mafold", Standing::Circle, true, Answer::Words("allow")).await,
+            Delivery::NotTheirs { starter: Some("mafold".into()) },
+        );
+        assert!(!std::path::Path::new(&crate::permission_mcp::verdict_file(&f)).exists());
+    }
+
+    /// What the card says about who may answer agrees with `may_answer`.
+    #[test]
+    fn the_card_names_whoever_may_answer() {
+        assert_eq!(perm_answerers("eve", true, "ops"), ["ops"], "a guest's: the owner alone");
+        assert_eq!(perm_answerers("ops:helper", true, "ops"), ["ops"], "a bot's: the owner alone");
+        assert_eq!(perm_answerers("ops", false, "ops"), ["ops"], "the owner's own: once");
+        assert_eq!(perm_answerers("ann", false, "ops"), ["ann", "ops"], "a whitelisted person's: them, then the owner");
+    }
+
+    /// Refused on a whitelisted member's own prompt, the tapper is told who
+    /// else may answer it besides the owner.
+    #[tokio::test]
+    async fn a_refusal_names_who_may_answer() {
+        let f = scratch("circle-perm");
+        let (states, _rx) = parked_on("ann", &f, Some(PermAsk::default()), false);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "bob", Standing::Circle, "allow").await,
+            Delivery::NotTheirs { starter: Some("ann".into()) },
+        );
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "ann", Standing::Circle, "allow").await,
+            Delivery::Delivered,
+        );
+        let _ = std::fs::remove_file(crate::permission_mcp::verdict_file(&f));
     }
 
     fn scratch(tag: &str) -> String {
@@ -10775,10 +11597,16 @@ mod deliver_ask_answer_tests {
     async fn a_bystander_cannot_answer_someone_elses_prompt() {
         let f = scratch("bystander");
         let (states, _rx) = parked("alice", &f);
-        assert!(!deliver_ask_answer(&states, "conv-1", "draft-1", "bob", "Allow").await);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "bob", Standing::Circle, "Allow").await,
+            Delivery::NotTheirs { starter: None },
+        );
         assert!(!std::path::Path::new(&f).exists(), "bob's Allow must not reach the agent");
         // Still armed — alice can still answer it.
-        assert!(deliver_ask_answer(&states, "conv-1", "draft-1", "alice", "Allow").await);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "alice", Standing::Guest, "Allow").await,
+            Delivery::Delivered,
+        );
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "Allow");
         let _ = std::fs::remove_file(&f);
     }
@@ -10789,12 +11617,18 @@ mod deliver_ask_answer_tests {
     async fn answering_stamps_then_disarms() {
         let f = scratch("once");
         let (states, mut rx) = parked("alice", &f);
-        assert!(deliver_ask_answer(&states, "conv-1", "draft-1", "alice", "Deny").await);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "alice", Standing::Circle, "Deny").await,
+            Delivery::Delivered,
+        );
         match rx.try_recv() {
             Ok(AgentEvent::AskAnswered(a)) => assert_eq!(a, "Deny"),
             other => panic!("expected the card stamp first, got {other:?}"),
         }
-        assert!(!deliver_ask_answer(&states, "conv-1", "draft-1", "alice", "Allow").await);
+        assert_eq!(
+            answer(&states,"conv-1", "draft-1", "alice", Standing::Circle, "Allow").await,
+            Delivery::NotParked,
+        );
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "Deny", "the second tap must not overwrite");
         let _ = std::fs::remove_file(&f);
     }
@@ -10803,11 +11637,43 @@ mod deliver_ask_answer_tests {
     async fn a_verdict_for_a_turn_we_do_not_hold_is_dropped() {
         let f = scratch("nosuch");
         let (states, _rx) = parked("alice", &f);
-        assert!(!deliver_ask_answer(&states, "conv-1", "other-draft", "alice", "Allow").await);
-        assert!(!deliver_ask_answer(&states, "other-conv", "draft-1", "alice", "Allow").await);
+        assert_eq!(
+            answer(&states,"conv-1", "other-draft", "alice", Standing::Owner, "Allow").await,
+            Delivery::NotParked,
+        );
+        assert_eq!(
+            answer(&states,"other-conv", "draft-1", "alice", Standing::Owner, "Allow").await,
+            Delivery::NotParked,
+        );
         assert!(!std::path::Path::new(&f).exists());
     }
-}
+
+    /// The copy is stamped with the room card's verdict once the prompt
+    /// settles, and expired when the turn ends with it still open.
+    #[test]
+    fn the_owners_copy_reads_as_its_prompt_did() {
+        let text = "@eve asked me for this.\n\n{% mafold/ask action=\"perm:answer\" user=\"ops\" %}\nq|Bash|0|rm x\no|allow|\no|deny|\n{% /mafold/ask %}\n";
+        let stamped = mafold_transcript::render::stamp_unanswered_ask(text, crate::permission_mcp::EXPIRED).unwrap();
+        assert!(stamped.contains("{% mafold/ask action=\"perm:answer\" user=\"ops\" answered=\"expired\" %}"), "{stamped}");
+        assert!(stamped.starts_with("@eve asked me for this."), "the lead line stays");
+    }
+
+    #[test]
+    fn the_lead_names_who_asked_and_where() {
+        let zh = owner_copy_lead(IntroLang::Zh, "eve", &Place::Named("周会群".into()));
+        assert!(zh.contains("@eve") && zh.contains("「周会群」") && zh.contains("只有你能批"), "{zh}");
+        let en = owner_copy_lead(IntroLang::En, "eve", &Place::Direct);
+        assert!(en.contains("@eve") && en.contains("a DM with me") && en.contains("Only you can"), "{en}");
+        // An untitled group is still a group, not a DM.
+        let en = owner_copy_lead(IntroLang::En, "eve", &Place::Group);
+        assert!(en.contains("in a group") && !en.contains("DM"), "{en}");
+        let (_, alert) = not_theirs_alert(IntroLang::En, Some("ops"), None);
+        assert!(alert.contains("@ops") && !alert.contains(" or "), "{alert}");
+        let (_, alert) = not_theirs_alert(IntroLang::Zh, Some("ops"), Some("ann"));
+        assert!(alert.contains("@ann") && alert.contains("@ops"), "{alert}");
+        let (_, alert) = not_theirs_alert(IntroLang::En, Some("ops"), Some("ops"));
+        assert!(!alert.contains(" or "), "the owner's own turn names the owner once: {alert}");
+    }}
 
 #[cfg(test)]
 mod surface_tag_tests {
@@ -12604,7 +13470,7 @@ mod intro_tests {
     use super::{
         card_attr, claim_intro, customize_fields, greeting_mode, intro_brief, intro_lang,
         intro_review_card, is_our_stock_seed, release_intro, split_intro_review,
-        stamp_intro_review, Greeting, IncomingMessage, IntroLang, IntrosLive,
+        stamp_intro_review, utf8_ctype, utf8_ctype_fill, Greeting, IncomingMessage, IntroLang, IntrosLive,
     };
 
     /// THE regression guard, and the reason the review gate exists at all.
@@ -12777,6 +13643,43 @@ mod intro_tests {
     fn an_unserved_language_lands_on_the_baseline() {
         assert_eq!(intro_lang(Some("ja"), None), IntroLang::En);
         assert_eq!(intro_lang(None, None), IntroLang::En);
+    }
+
+    /// A daemon with no locale hands its agent a UTF-8 character type; one with
+    /// any locale — even an explicit `C` — keeps it.
+    #[test]
+    fn a_daemon_without_a_locale_lends_its_agent_utf8() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        let filled = utf8_ctype_fill(env(&[]));
+        assert_eq!(filled, utf8_ctype());
+        if cfg!(target_os = "macos") {
+            assert_eq!(filled, Some("en_US.UTF-8"));
+        }
+        assert_eq!(utf8_ctype_fill(env(&[("LANG", "  "), ("LC_ALL", "")])), filled, "blank is unset");
+        for pairs in [&[("LC_ALL", "C")][..], &[("LC_CTYPE", "zh_CN.GB18030")], &[("LANG", "en_GB.UTF-8")]] {
+            assert_eq!(utf8_ctype_fill(env(pairs)), None, "{pairs:?} is the host's choice");
+        }
+        // LC_MESSAGES alone says nothing about what a character is.
+        assert_eq!(utf8_ctype_fill(env(&[("LC_MESSAGES", "zh_CN.UTF-8")])), filled);
+    }
+
+    /// The name we hand out must be one this system actually has: under it,
+    /// `cut -c` keeps a Chinese character whole, where the C locale splits it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_lent_locale_makes_the_shell_count_characters() {
+        let cut = |ctype: Option<&str>| {
+            let mut cmd = crate::platform::std_command("/bin/sh");
+            cmd.args(["-c", "printf '钥匙曾交给' | cut -c1-3"]).env_clear().env("PATH", "/usr/bin:/bin");
+            if let Some(c) = ctype {
+                cmd.env("LC_CTYPE", c);
+            }
+            String::from_utf8_lossy(&cmd.output().unwrap().stdout).trim().to_string()
+        };
+        assert_ne!(cut(None), "钥匙曾", "control: the C locale must split it, or this proves nothing");
+        assert_eq!(cut(utf8_ctype_fill(|_| None)), "钥匙曾");
     }
 
     /// Never set (the wire contract's `None` ⇒ device locale) → the locale of
@@ -13037,6 +13940,7 @@ mod steer_tests {
             TurnHandle {
                 cancel: Arc::new(Notify::new()),
                 ask_file: None,
+                perm: None,
                 owner: owner.to_string(),
                 channel: channel.map(str::to_string),
                 thread: None,
@@ -14170,6 +15074,66 @@ mod login_receipt_tests {
 }
 
 #[cfg(test)]
+mod failure_card_tests {
+    use super::failure_card;
+
+    /// A self-hosted turn that dies ends on the same `{% mafold/error %}` card a
+    /// hosted one does — not `⚠️ Agent stopped: <raw>` pasted into the reply.
+    #[test]
+    fn a_harness_error_is_the_shared_card_with_the_raw_folded_in() {
+        let raw = "Credit balance is too low";
+        let card = failure_card("opsdu:claude-code", raw, None);
+        assert!(card.starts_with("{% mafold/error kind=\"credit\""), "{card}");
+        assert!(card.ends_with("{% /mafold/error %}"), "{card}");
+        assert!(card.contains("{% mafold/only for=\"owner\" %}\nCredit balance is too low\n"), "{card}");
+        assert!(!card.contains("Agent stopped"), "{card}");
+    }
+
+    /// A router-billed harness that the wallet refused: the amounts go to the
+    /// wallet's owner — the bot's namespace when the refusal didn't say.
+    #[test]
+    fn a_wallet_refusal_is_the_owners_to_read() {
+        let card = failure_card(
+            "opsdu:claude-code",
+            "API Error: 402 {\"error\":{\"message\":\"resource exhausted: insufficient balance: need 900 claude-sonnet-4-6, have 3 plus convertible\",\"type\":\"insufficient_quota\"}}",
+            None,
+        );
+        assert!(card.starts_with("{% mafold/error kind=\"balance\" status=\"402\" payer=\"opsdu\" %}"), "{card}");
+        assert!(card.contains("{% mafold/only for=\"@opsdu\" %}\nneed|900\nhave|3\n"), "{card}");
+    }
+
+    /// A seat that said no, with nobody to take over: ONE card, carrying the
+    /// window and when it lifts — the harness's own word on it, whatever its
+    /// error text says. (The refusal used to render a `{% mafold/ratelimit %}`
+    /// of its own as well: two cards for one turn that didn't run.)
+    #[test]
+    fn a_walled_limit_is_one_card_that_knows_when_it_lifts() {
+        let hit = crate::harness::LimitHit { kind: "five_hour".into(), resets_at: Some(1790537400) };
+        let card = failure_card("opsdu:claude-code", "You've hit your session limit · resets 3pm", Some(&hit));
+        assert!(card.starts_with("{% mafold/error kind=\"rate_limit\" window=\"five_hour\" resets_at=\"1790537400\""), "{card}");
+        assert_eq!(card.matches("{% mafold/").count(), 2, "the card and its owner's block, nothing else: {card}");
+    }
+
+    /// A seat refusal the run got past says nothing about a later, different
+    /// failure: the prompt-too-long it died on stays a context card.
+    #[test]
+    fn an_old_limit_does_not_relabel_a_different_failure() {
+        let hit = crate::harness::LimitHit { kind: "seven_day_opus".into(), resets_at: Some(1790537400) };
+        let card = failure_card("opsdu:claude-code", "API Error: 400 prompt is too long: 212000 tokens > 200000 maximum", Some(&hit));
+        assert!(card.starts_with("{% mafold/error kind=\"context\""), "{card}");
+        assert!(!card.contains("resets_at"), "{card}");
+    }
+
+    /// Nothing said, nothing done: the same card as any turn that didn't
+    /// answer — not a bare English italic line.
+    #[test]
+    fn a_turn_that_produced_nothing_is_the_empty_card() {
+        let card = failure_card("opsdu:claude-code", "the agent produced no output", None);
+        assert!(card.starts_with("{% mafold/error kind=\"empty\""), "{card}");
+    }
+}
+
+#[cfg(test)]
 mod wall_footer_tests {
     use super::wall_footer;
 
@@ -14402,7 +15366,7 @@ mod windows_background_tests {
         let (events, mut notices) = tokio::sync::mpsc::unbounded_channel();
         let states: ChatStates = Default::default();
         states.lock().await.entry("ci".into()).or_default().turns.insert("report-turn".into(), TurnHandle {
-            cancel: Arc::new(Notify::new()), ask_file: None, owner: GATE_OWNER.into(),
+            cancel: Arc::new(Notify::new()), ask_file: None, perm: None, owner: GATE_OWNER.into(),
             channel: Some("windows".into()), thread: None, events, steer_file: mailbox.clone(),
             can_steer: true, pays: false, guest: false,
         });

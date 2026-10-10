@@ -685,7 +685,15 @@ impl Transcript {
                     }
                     counts.retain(|_, n| *n > 0);
                     let steps = self.steps.saturating_sub(self.last_group.1);
-                    (&self.full[..j], &self.full[j..], counts, steps)
+                    // …and so does what was said in the same breath: the lid
+                    // closes where the group BEFORE it ended, not where the last
+                    // one starts. Cut at the start and a model that wrote its
+                    // answer and then made one more call (naming the channel)
+                    // had that answer shut under the lid, the call's pill the
+                    // only thing left on show. (Field case: conv df712566,
+                    // 2026-10-10 00:46Z — rescued only by having one group.)
+                    let cut = self.full[..j].rfind(CLOSE).map_or(j, |k| k + CLOSE.len());
+                    (&self.full[..cut], &self.full[cut..], counts, steps)
                 }
                 _ => return plain(&self.full),
             }
@@ -1166,6 +1174,8 @@ mod fold_tests {
         let close = md.find("{% /mafold/trace %}").expect("folded");
         assert!(md.find("cargo test").expect("last group") > close, "{md}");
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
+        // The sentence that introduced the last group goes out with it.
+        assert!(md.find("Now the edit").expect("its narration") > close, "{md}");
         // The group left on show is no longer the lid's to claim: the trail
         // holds the Read and says so, and the Bash below it is counted once.
         let lid = &md[..close];
@@ -1210,6 +1220,32 @@ mod fold_tests {
         let close = md.find("{% /mafold/trace %}").expect("lid");
         assert!(md[open..close].contains("{% mafold/run "), "lid holds a group:\n{md}");
         assert!(md.find("cargo test").unwrap() > close, "{md}");
+    }
+
+    /// The answer written in the same step as one last call — a hosted agent
+    /// replying and then naming its untitled channel — with nothing said after
+    /// the call. The answer is the reply; it must not go under the lid with the
+    /// research, leaving only the naming pill on show. (Field shape: conv
+    /// df712566, 2026-10-10 00:46Z, which escaped only by having one group.)
+    #[test]
+    fn an_answer_given_with_the_last_call_stays_in_the_open() {
+        let mut t = Transcript::new();
+        t.push(&call("s", "web_search", json!({"query": "台北市長 民調"})));
+        t.push(&result("s", "3014 chars"));
+        t.push(&call("o", "open_url", json!({"url": "https://example.com/poll"})));
+        t.push(&result("o", "2110 chars"));
+        t.push(&AgentEvent::Text("最新一份是 TVBS 10 月 8 日的：蒋 49%，沈 41%。".into()));
+        t.push(&call("n", "name_channel", json!({"name": "台北市长选举民调"})));
+        t.push(&result("n", "Named the channel #台北市长选举民调."));
+        t.push(&done());
+        let md = t.finish_folded();
+        let open = md.find("{% mafold/trace").expect("folded");
+        let close = md.find("{% /mafold/trace %}").expect("lid");
+        let answer = md.find("最新一份是 TVBS").expect("answer kept");
+        assert!(answer > close, "the answer went under the lid:\n{md}");
+        assert!(md.find("name=\"name_channel\"").unwrap() > answer, "{md}");
+        assert!(md[open..close].contains("web_search"), "the research is the lid's:\n{md}");
+        assert!(md[open..close].contains("steps=\"2\""), "lid counts its own two steps:\n{md}");
     }
 
     /// A reply that answers in a CARD (`{% mafold/html %}`) has an answer just

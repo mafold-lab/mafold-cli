@@ -26,14 +26,17 @@
 //!    same sink the model's own events go through — so the card paints, and the
 //!    daemon flips the turn into "awaiting answer" through the code path that
 //!    already existed. Nothing downstream learned a new concept.
-//! 3. We block on `$MAFOLD_ASK_FILE` — the same file, the same wait, the same
-//!    reply-to-the-draft routing as [`crate::ask_hook`].
+//! 3. We block on the verdict file beside `$MAFOLD_ASK_FILE` ([`verdict_file`])
+//!    — the same wait and the same reply-to-the-draft routing as
+//!    [`crate::ask_hook`], but not its file: a permission prompt is answered by
+//!    the owner, a question by whoever asked for the turn, and one mailbox let
+//!    the second's answer pass for the first's.
 //! 4. The tap comes back as `Allow` / `Deny` and we answer claude with
 //!    `{"behavior":"allow","updatedInput":…}` or `{"behavior":"deny","message":…}`.
 //! 5. No tap in time: deny, and append an expiry line so the watcher stamps the
 //!    card [`EXPIRED`] — closed, instead of offering Allow for a refused call.
 //!
-//! The ask mailbox is per TURN, so step 2 empties it before appending: an
+//! The verdict mailbox is per TURN, so step 2 empties it before appending: an
 //! answer already sitting there was a late tap on an earlier, expired card.
 //!
 //! **Fail closed.** No ask file, no answer in ten minutes, or any answer that
@@ -157,8 +160,75 @@ fn tool_descriptor() -> Value {
 struct Mailbox {
     /// Questions out — the harness watches this and draws the card.
     perm: Option<String>,
-    /// Answers in — the daemon writes the tap here (shared with `ask_hook`).
+    /// The turn's ask mailbox (`ask_hook`'s). The verdict comes back NEXT to
+    /// it, in [`verdict_file`] — never in it.
     ask: Option<String>,
+}
+
+/// Where the daemon writes a permission VERDICT for the turn whose ask mailbox
+/// is `ask_file`: a file of its own, not the mailbox a question the model asked
+/// is answered through.
+///
+/// The two are answered by different people. A question goes to whoever
+/// started the turn; a permission prompt is the owner's own rule asking for a
+/// yes, and on an open bot the person who started the turn may be a guest
+/// (`agent::may_answer`). Sharing one file, an answer the daemon let the guest
+/// give their own question — one that timed out unanswered and stayed armed,
+/// or one open alongside the prompt — was read here as the owner's approval.
+/// Only a delivery that passed the permission rule writes this file, and what
+/// it writes is a [`verdict_record`].
+pub fn verdict_file(ask_file: &str) -> String {
+    format!("{ask_file}.verdict")
+}
+
+/// One delivery into [`verdict_file`]: the prompt it was given for (the id
+/// [`decide`] published it under, carried on the card as `prompt=`), whether
+/// it was a TAP on the card's buttons or words someone typed, and the answer.
+///
+/// The prompt id is what keeps a yes on the prompt it was given for. Every
+/// prompt of a turn draws its card in the same draft, so a tap that arrives
+/// late — a second person approving the same card a moment after the first, a
+/// client still showing the buttons of a prompt that has since moved on —
+/// otherwise landed on whichever prompt was open by then, and ran a command
+/// nobody had been shown.
+///
+/// Only a tap can approve. Words are a no that carries them to the agent —
+/// even the word `allow`, which is what someone tapping «allow» on a question
+/// the MODEL asked would otherwise have handed a waiting prompt.
+pub fn verdict_record(prompt: &str, tapped: bool, answer: &str) -> String {
+    format!("{prompt}\t{}\n{answer}", if tapped { "tap" } else { "said" })
+}
+
+/// A delivery read back out of [`verdict_file`].
+#[derive(Debug, PartialEq, Eq)]
+enum Heard {
+    Tap(String),
+    Said(String),
+}
+
+/// The delivery in `content`, if it was given for `prompt`.
+fn heard_for(content: &str, prompt: &str) -> Option<Heard> {
+    let (head, answer) = content.split_once('\n')?;
+    let (id, kind) = head.split_once('\t')?;
+    if id != prompt {
+        return None;
+    }
+    let answer = answer.trim().to_string();
+    match kind {
+        "tap" => Some(Heard::Tap(answer)),
+        "said" => Some(Heard::Said(answer)),
+        _ => None,
+    }
+}
+
+/// A fresh id for one prompt ([`verdict_record`]): unique, not secret.
+fn new_prompt_id() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("p{nanos:x}{:x}{:x}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 impl Mailbox {
@@ -189,20 +259,26 @@ fn decide(args: &Value, mailbox: &Mailbox, within: std::time::Duration) -> Value
         ));
     };
 
-    // Empty the mailbox BEFORE publishing. It belongs to the turn, not to this
+    // The verdict's own file, beside the turn's ask mailbox (`verdict_file`).
+    let verdict = verdict_file(ask_file);
+
+    // Empty it BEFORE publishing. It belongs to the turn, not to this
     // question, and nobody can have answered this question yet — its card is
     // drawn from the line appended below. So anything already in there answers
     // an EARLIER prompt: a tap on a card that had timed out. Read as ours, that
     // tap approved a command its card never showed.
-    let _ = std::fs::remove_file(ask_file);
+    let _ = std::fs::remove_file(&verdict);
 
     // Publish the question. Appended, one JSON object per line: a turn can hit
-    // several gated calls, and each is a separate card.
+    // several gated calls, and each is a separate card — under an id of its
+    // own, which a verdict has to name to count (`verdict_record`).
     let tool_use_id = args["tool_use_id"].as_str().unwrap_or("");
+    let prompt = new_prompt_id();
     let mut record = json!({
         "tool_name": tool_name,
         "input": input,
         "tool_use_id": tool_use_id,
+        "prompt": prompt,
     });
     for key in ["rule", "rule_source"] {
         if let Some(v) = args[key].as_str().filter(|v| !v.is_empty()) {
@@ -216,33 +292,50 @@ fn decide(args: &Value, mailbox: &Mailbox, within: std::time::Duration) -> Value
         ));
     }
 
-    let answer = wait_for_answer(ask_file, within);
-    if answer.is_none() {
+    let heard = wait_for_verdict(&verdict, &prompt, within);
+    if heard.is_none() {
         // Close the card too: it would otherwise keep offering Allow for a call
         // that was just refused. Best-effort — the verdict below stands either way.
         let _ = append_line(perm_file, &json!({ "tool_use_id": tool_use_id, "expired": true }).to_string());
     }
-    match answer {
-        Some(ans) if ans.trim().eq_ignore_ascii_case(ALLOW) => json!({
+    match heard {
+        Some(Heard::Tap(ans)) if ans.eq_ignore_ascii_case(ALLOW) => json!({
             "behavior": "allow",
             // Echoed unchanged: we are a yes/no gate, not a rewriter. The one
             // place input is edited is `bash_hook`, and it does it there.
             "updatedInput": input,
         }),
-        Some(ans) if ans.trim().eq_ignore_ascii_case(DENY) => {
+        Some(Heard::Tap(ans)) if ans.eq_ignore_ascii_case(DENY) => {
             deny(format!("The user was asked to approve this `{tool_name}` call and declined."))
         }
-        // They answered with words instead of tapping. Still a no — but their
-        // words are the most useful thing the model could read right now, so
-        // they go through verbatim instead of being flattened into "denied".
-        Some(ans) if !ans.trim().is_empty() => deny(format!(
-            "The user was asked to approve this `{tool_name}` call and answered: {}",
-            ans.trim()
+        // They answered with words instead of tapping (or a tap sent something
+        // that isn't a code). Still a no — but their words are the most useful
+        // thing the model could read right now, so they go through verbatim
+        // instead of being flattened into "denied".
+        Some(Heard::Tap(ans) | Heard::Said(ans)) if !ans.is_empty() => deny(format!(
+            "The user was asked to approve this `{tool_name}` call and answered: {ans}"
         )),
         _ => deny(format!(
             "Nobody answered the approval request for this `{tool_name}` call in time, \
              so it was not run. Ask in plain text before trying again."
         )),
+    }
+}
+
+/// Wait for a verdict on `prompt` ([`verdict_record`]). A delivery for any
+/// other prompt — a late tap on a card that has since moved on — is thrown
+/// away and the wait goes on.
+fn wait_for_verdict(path: &str, prompt: &str, within: std::time::Duration) -> Option<Heard> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let content = wait_for_answer(path, left)?;
+        if let Some(heard) = heard_for(&content, prompt) {
+            return Some(heard);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
     }
 }
 
@@ -302,6 +395,9 @@ pub fn ask_card_input(record: &Value) -> Value {
         // command. `perm:answer` is relayed by the server straight to this
         // daemon (`events.permissionAnswer`) and posts nothing.
         "action": ACTION,
+        // Which prompt this is: the card sends it back with the tap, and a
+        // verdict only counts for the prompt it names (`verdict_record`).
+        "prompt": record["prompt"].as_str().unwrap_or(""),
         "questions": [{
             "header": tool,
             "multiSelect": false,
@@ -598,7 +694,7 @@ mod tests {
         let published = std::fs::read_to_string(m.perm.as_ref().unwrap()).unwrap();
         assert!(published.contains("\"command\":\"rm x\""), "{published}");
         // …and the answer was consumed, so the next question starts clean.
-        assert!(!std::path::Path::new(m.ask.as_ref().unwrap()).exists());
+        assert!(!std::path::Path::new(&verdict_file(m.ask.as_ref().unwrap())).exists());
     }
 
     #[test]
@@ -671,11 +767,72 @@ mod tests {
     fn a_late_tap_on_an_expired_prompt_cannot_approve_the_next_one() {
         let m = mailbox("late");
         assert_eq!(decide(&rm_x(), &m, INSTANT)["behavior"], "deny", "nobody answered the first one");
+        let first = published_prompt(std::fs::read_to_string(m.perm.as_ref().unwrap()).unwrap().lines().next().unwrap());
         // …and then somebody taps Allow on that stale card.
-        std::fs::write(m.ask.as_ref().unwrap(), ALLOW).unwrap();
+        std::fs::write(verdict_file(m.ask.as_ref().unwrap()), verdict_record(&first, true, ALLOW)).unwrap();
         let next = json!({ "tool_name": "Bash", "input": { "command": "rm -rf y" } });
         let v = decide(&next, &m, INSTANT);
         assert_eq!(v["behavior"], "deny", "an Allow meant for `rm x` ran `rm -rf y`: {v}");
+    }
+
+    /// The same late tap, landing AFTER the next prompt is out — a second
+    /// person approving a card the first already answered, or a client still
+    /// showing its buttons. It names the prompt it was given for, so the next
+    /// one doesn't take it.
+    #[test]
+    fn a_tap_for_an_earlier_prompt_landing_after_the_next_is_out_is_not_its_verdict() {
+        let m = mailbox("late-after");
+        let first = answered(&rm_x(), &m, 1, ALLOW);
+        assert_eq!(first["behavior"], "allow");
+        let p1 = published_prompt(std::fs::read_to_string(m.perm.as_ref().unwrap()).unwrap().lines().next().unwrap());
+        let (perm, verdict) = (m.perm.clone().unwrap(), verdict_file(m.ask.as_ref().unwrap()));
+        let late = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < until {
+                if std::fs::read_to_string(&perm).is_ok_and(|s| s.lines().count() >= 2) {
+                    std::fs::write(&verdict, verdict_record(&p1, true, ALLOW)).unwrap();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let next = json!({ "tool_name": "Bash", "input": { "command": "rm -rf ~/proj" } });
+        let v = decide(&next, &m, std::time::Duration::from_millis(800));
+        late.join().unwrap();
+        assert_eq!(v["behavior"], "deny", "the first card's second Allow ran `rm -rf ~/proj`: {v}");
+    }
+
+    /// Only a tap approves. Typed words — even exactly `allow`, which is what a
+    /// tap on a MODEL question's «allow» option arrives as — are a no that
+    /// carries them to the agent.
+    #[test]
+    fn typed_words_never_approve_even_allow() {
+        let v = delivered(&rm_x(), &mailbox("said-allow"), 1, "allow", false);
+        assert_eq!(v["behavior"], "deny", "{v}");
+        assert!(v["message"].as_str().unwrap().contains("answered: allow"), "{v}");
+    }
+
+    /// The turn's ask mailbox answers a question the MODEL asked — on an open
+    /// bot, possibly a guest's own. Nothing written there is a verdict: only
+    /// the daemon's permission-checked delivery writes `verdict_file`.
+    #[test]
+    fn an_answer_to_the_models_question_is_never_a_verdict() {
+        let m = mailbox("question");
+        let (perm, ask) = (m.perm.clone().unwrap(), m.ask.clone().unwrap());
+        let guest = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < until {
+                if std::fs::read_to_string(&perm).is_ok_and(|s| !s.is_empty()) {
+                    std::fs::write(&ask, ALLOW).unwrap();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let v = decide(&rm_x(), &m, std::time::Duration::from_millis(800));
+        guest.join().unwrap();
+        assert_eq!(v["behavior"], "deny", "an `allow` in the question mailbox approved the owner's rule: {v}");
+        assert_eq!(std::fs::read_to_string(m.ask.as_ref().unwrap()).unwrap(), ALLOW, "and it was left for its question");
     }
 
     /// The verdict is a fixed CODE, never the words on a button. The card writes
@@ -777,13 +934,20 @@ mod tests {
     /// out. Pre-seeding the mailbox instead is exactly the stale-tap case — it
     /// is discarded now, by design.
     fn answered(args: &Value, m: &Mailbox, nth: usize, answer: &str) -> Value {
-        let (perm, ask, answer) = (m.perm.clone().unwrap(), m.ask.clone().unwrap(), answer.to_string());
+        delivered(args, m, nth, answer, true)
+    }
+
+    /// [`answered`], as a tap (`tapped`) or as words someone typed — given for
+    /// the prompt the `nth` published line names, the way the daemon does.
+    fn delivered(args: &Value, m: &Mailbox, nth: usize, answer: &str, tapped: bool) -> Value {
+        let (perm, verdict, answer) = (m.perm.clone().unwrap(), verdict_file(m.ask.as_ref().unwrap()), answer.to_string());
         let tapper = std::thread::spawn(move || {
             let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while std::time::Instant::now() < until {
-                let out = std::fs::read_to_string(&perm).map(|s| s.lines().count()).unwrap_or(0);
-                if out >= nth {
-                    std::fs::write(&ask, &answer).unwrap();
+                let lines: Vec<String> = std::fs::read_to_string(&perm).map(|s| s.lines().map(String::from).collect()).unwrap_or_default();
+                if lines.len() >= nth {
+                    let prompt = published_prompt(&lines[nth - 1]);
+                    std::fs::write(&verdict, verdict_record(&prompt, tapped, &answer)).unwrap();
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -792,6 +956,11 @@ mod tests {
         let v = decide(args, m, std::time::Duration::from_secs(10));
         tapper.join().unwrap();
         v
+    }
+
+    /// The prompt id a published line carries.
+    fn published_prompt(line: &str) -> String {
+        serde_json::from_str::<Value>(line).unwrap()["prompt"].as_str().unwrap().to_string()
     }
 
     /// A private pair of files per test — no shared process state, so these all
