@@ -8,3 +8,8 @@ license = "MIT"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# A CommonMark reader for the tests: how a client (react-markdown / remark,
+# the same CommonMark rules) will actually read what the transcript writes.
+pulldown-cmark = { version = "0.13", default-features = false }

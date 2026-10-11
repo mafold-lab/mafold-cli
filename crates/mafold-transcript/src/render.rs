@@ -99,8 +99,8 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // alone, and the line's job, explaining minutes of silence, needs none.
         AgentEvent::Compacted { pre_tokens, post_tokens, summary, flagged } => Some(match (summary, pre_tokens) {
             (Some(s), _) => compact_card(*pre_tokens, *post_tokens, true, s, flagged),
-            (None, Some(n)) => format!("\n{COMPACTED_PREFIX}Context auto-compacted ({} before)_\n", fmt_count(*n)),
-            (None, None) => format!("\n{COMPACTED_PREFIX}Context auto-compacted_\n"),
+            (None, Some(n)) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted ({} before)_", fmt_count(*n))),
+            (None, None) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted_")),
         }),
         // Only a REFUSAL is news. The `allowed_*` states are threshold
         // warnings — the request went through, and Claude Code re-sends the
@@ -725,14 +725,27 @@ fn neutralize(s: &str) -> String {
 /// carries their words in their own bubble above. One line that says WHERE the
 /// correction entered is the whole job.
 pub fn steer_line(text: &str) -> String {
-    format!("\n{STEER_PREFIX}{}\n", line_esc(text))
+    own_block(&format!("{STEER_PREFIX}{}", line_esc(text)))
 }
 
 /// A driver notice ([`AgentEvent::Notice`]) — same quoted shape as a steer (it
 /// is the same kind of thing: not model output, but part of the timeline), with
 /// a different mark so the two don't read as each other.
 pub fn notice_line(text: &str) -> String {
-    format!("\n{NOTICE_PREFIX}{}\n", line_esc(text))
+    own_block(&format!("{NOTICE_PREFIX}{}", line_esc(text)))
+}
+
+/// One of the transcript's own one-line notes — a steer seam, a notice, the
+/// compaction line — as a block of its own: a blank line before AND after.
+///
+/// Markdown runs a line on into whatever touches it. Text right after a
+/// `> …` line is swallowed into the quote (lazy continuation); a plain
+/// `_…_` line merges into the paragraph on either side. And what comes next
+/// is usually the model's answer: 2026-10-11 the first paragraph after a
+/// `↩︎ …` seam rendered grey, inside it, on every reply that took a steer —
+/// daemon and hosted alike, both draw it here.
+fn own_block(line: &str) -> String {
+    format!("\n\n{line}\n\n")
 }
 
 /// One atomic step in a run group: a tool CALL and, once it lands, its RESULT.

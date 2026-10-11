@@ -216,6 +216,19 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-10",
     },
+    // The re-laid profile page (RN + web Profile). Its tab bar asks the api
+    // `getProfileTabs`; an api without the route just means no tab is left out.
+    FlagMeta {
+        key: "profileV2",
+        default: false,
+        dev_default: false,
+        label: "Profile: re-laid page",
+        description: "One header layout with or without a banner (avatar + actions, name, @handle · \
+                      presence, bio, who runs a bot), clear-history in ⋯, and a tab bar that keeps \
+                      only the tabs with something in them. Off = the old layout.",
+        owner: "ops",
+        added: "2026-10",
+    },
     FlagMeta {
         key: "moments",
         default: false,

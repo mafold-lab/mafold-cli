@@ -1317,6 +1317,61 @@ mod fold_tests {
         assert!(first < steer && steer < second, "{md}");
     }
 
+    /// Every paragraph of `md` as a reader gets it, with how many quotes deep
+    /// it sits — read by a CommonMark parser, the rules a client's
+    /// react-markdown / remark render with.
+    fn paragraphs(md: &str) -> Vec<(usize, String)> {
+        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+        let (mut out, mut depth, mut open) = (Vec::new(), 0usize, None::<String>);
+        for ev in Parser::new(md) {
+            match ev {
+                Event::Start(Tag::BlockQuote(_)) => depth += 1,
+                Event::End(TagEnd::BlockQuote(_)) => depth -= 1,
+                Event::Start(Tag::Paragraph) => open = Some(String::new()),
+                Event::End(TagEnd::Paragraph) => out.push((depth, open.take().unwrap_or_default())),
+                Event::Text(t) | Event::Code(t) => open.iter_mut().for_each(|p| p.push_str(&t)),
+                Event::SoftBreak | Event::HardBreak => open.iter_mut().for_each(|p| p.push(' ')),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// 2026-10-11: on every reply that took a steer, the answer's first
+    /// paragraph rendered grey, INSIDE the `↩︎ …` seam — the seam ended on a
+    /// single newline, and text right after a `> …` line is a lazy
+    /// continuation of the quote. The notice line has the same shape; the
+    /// compaction line (`_🗜️ …_`, no quote) merged into its neighbours' paragraph
+    /// instead. Each of the transcript's own lines, with prose right against it
+    /// on both sides, must stay a block of its own and leave the prose out.
+    #[test]
+    fn prose_next_to_a_seam_notice_or_compaction_line_stays_its_own_paragraph() {
+        let marks: [(&str, AgentEvent); 3] = [
+            ("↩︎ no, the other file", AgentEvent::Steered("no, the other file".into())),
+            ("⚠︎ parked by policy", AgentEvent::Notice("parked by policy".into())),
+            (
+                "🗜️ Context auto-compacted",
+                AgentEvent::Compacted { pre_tokens: Some(90_000), post_tokens: None, summary: None, flagged: vec![] },
+            ),
+        ];
+        for (mark, ev) in marks {
+            let mut t = Transcript::new();
+            t.push(&AgentEvent::Text("Working on it.".into()));
+            t.push(&ev);
+            t.push(&AgentEvent::Text("Here is the answer.".into()));
+            let md = t.finish();
+            let paras = paragraphs(&md);
+            let find = |needle: &str| paras.iter().find(|(_, p)| p.contains(needle)).cloned();
+            let (answer_depth, answer) = find("Here is the answer.").unwrap_or_else(|| panic!("{md:?}"));
+            assert_eq!(answer_depth, 0, "the answer is inside the {mark:?} quote: {md:?} → {paras:?}");
+            assert_eq!(answer, "Here is the answer.", "the answer ran into the {mark:?} line: {md:?} → {paras:?}");
+            let (_, before) = find("Working on it.").unwrap();
+            assert_eq!(before, "Working on it.", "the {mark:?} line ran into the prose before it: {md:?} → {paras:?}");
+            let (_, line) = find(mark).unwrap_or_else(|| panic!("{mark:?} missing: {paras:?}"));
+            assert!(!line.contains("answer") && !line.contains("Working"), "{mark:?} → {line:?}");
+        }
+    }
+
     /// An empty steer says nothing and must not punch a hole in the narration.
     #[test]
     fn an_empty_steer_is_a_no_op() {
