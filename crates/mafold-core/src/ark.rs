@@ -8,8 +8,10 @@
 //! 落地) is not its job: the agent hands the 24 h `video_url` to the server's
 //! `ingestUrl`, which is the one door every byte enters the registry through.
 //! Validation against the model table (known-bad combos, draft support) is
-//! the server's `videoSubmit` job on the house-key path; here the vendor's own
-//! refusal is quoted instead, so the two paths never disagree about a model.
+//! the server's `videoSubmit` job: `mafold video submit` asks it for a dry run
+//! before it calls `video.submit` here (2026-10-10, own key = the default), so
+//! the two paths never disagree about a model; a direct `connection call`
+//! gets the vendor's own refusal, quoted.
 //!
 //! Three methods, all one HTTP round trip, no streaming:
 //!   `video.submit`  {model, prompt, resolution?, ratio?, duration?, refs?,

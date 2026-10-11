@@ -1137,7 +1137,7 @@ retry {attempt}/{} in {delay:?}…",
     }
 
     pub async fn attach_media(&self, message_id: &str, path: &std::path::Path) -> Result<Value> {
-        self.attach_media_as(message_id, path, AttachAs::Detected).await
+        self.attach_media_as(message_id, path, AttachAs::Detected { original: false }).await
     }
 
     /// [`Self::attach_media`] with the kind chosen by the caller instead of the
@@ -1158,7 +1158,7 @@ retry {attempt}/{} in {delay:?}…",
             .unwrap_or("file")
             .to_string();
         let (kind, mime) = match how {
-            AttachAs::Detected => classify(&name, &bytes),
+            AttachAs::Detected { .. } => classify(&name, &bytes),
             // Refused rather than downgraded: the caller ASKED for a sticker,
             // and a PDF quietly arriving as a file card instead would read as
             // "sent" to an agent that never looks at the bubble.
@@ -1174,17 +1174,38 @@ retry {attempt}/{} in {delay:?}…",
             "file" => name.clone(),
             _ => retype(&name, mime),
         };
+        // A photo goes up as its ≤2560 view and inline strip, the original only
+        // when asked for (src/thumb.rs; flag thumbSend, evaluated for this bot
+        // and its owner). Decoding is CPU work: off the async runtime.
+        let derived = match how {
+            AttachAs::Detected { original } if kind == "photo" && crate::flags::enabled("thumbSend") => {
+                let (b, m) = (bytes.clone(), mime.to_string());
+                tokio::task::spawn_blocking(move || crate::thumb::derive(&b, &m, original)).await.ok().flatten()
+            }
+            _ => None,
+        };
         // uploadFile answers with the FILE itself (`{id, unique_id, mime, …}`,
         // file-id world — no urls). The attachment carries nothing but that id;
         // name/size/dimensions live on the registry row the server just wrote.
-        let up = self.upload_media(bytes, &upload_name, mime).await?;
+        let up = match derived {
+            Some(d) => {
+                let (view, view_name, view_mime) = if d.view_mime.is_empty() {
+                    (d.view, upload_name.clone(), mime)
+                } else {
+                    (d.view, retype(&name, d.view_mime), d.view_mime)
+                };
+                let orig = d.orig.map(|b| (b, upload_name.clone(), mime));
+                self.upload_media_parts(view, &view_name, view_mime, d.strip, orig).await?
+            }
+            None => self.upload_media(bytes, &upload_name, mime).await?,
+        };
         let file_id = up["id"].as_str().context("uploadFile returned no id")?;
         // `id` is the attachment's identity for the server's de-dup, so key it
         // on the file — re-attaching the same upload is a no-op, not a twin.
         let mut att = json!({ "kind": kind, "id": file_id, "file": file_id });
         let sticker_emoji = match how {
             AttachAs::Sticker { emoji } => Some(emoji.map(str::trim).filter(|e| !e.is_empty())),
-            AttachAs::Detected => None,
+            AttachAs::Detected { .. } => None,
         };
         if let Some(Some(e)) = sticker_emoji {
             att["emoji"] = json!(e);
@@ -1400,12 +1421,32 @@ retry {attempt}/{} in {delay:?}…",
     /// (`{id, unique_id, mime, size_bytes, filename?, w?, h?}`) — NOT the
     /// `{ok,result}` envelope. The `id` is the handle everything else uses.
     pub async fn upload_media(&self, bytes: Vec<u8>, filename: &str, mime: &str) -> Result<Value> {
-        let form = reqwest::multipart::Form::new().part(
+        self.upload_media_parts(bytes, filename, mime, None, None).await
+    }
+
+    /// [`Self::upload_media`] with the parts that may ride beside a picture
+    /// (`.docs/thumbnail-v1.md`): its inline `strip` (a small JPEG), and `orig`
+    /// — the untouched original (bytes, name, mime) the uploaded view replaces.
+    pub async fn upload_media_parts(
+        &self,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        strip: Option<Vec<u8>>,
+        orig: Option<(Vec<u8>, String, &str)>,
+    ) -> Result<Value> {
+        let mut form = reqwest::multipart::Form::new().part(
             "file",
             reqwest::multipart::Part::bytes(bytes)
                 .file_name(filename.to_string())
                 .mime_str(mime)?,
         );
+        if let Some(s) = strip {
+            form = form.part("strip", reqwest::multipart::Part::bytes(s).file_name("strip.jpg").mime_str("image/jpeg")?);
+        }
+        if let Some((b, name, m)) = orig {
+            form = form.part("orig", reqwest::multipart::Part::bytes(b).file_name(name).mime_str(m)?);
+        }
         let resp = self
             .http
             .post(format!("{}/api/uploadFile", self.base))
@@ -1675,7 +1716,9 @@ async fn ws_tunnel(
 #[derive(Debug, Clone, Copy)]
 pub enum AttachAs<'a> {
     /// Whatever the bytes are: a photo, a clip, or a file card (`classify`).
-    Detected,
+    /// `original`: a photo goes up as its view AND the untouched original
+    /// (`mafold attach --original`, `.docs/thumbnail-v1.md` §3.3).
+    Detected { original: bool },
     /// A sticker — the composers' `+ ▸ 表情` row. `emoji` is what it reads as
     /// where a picture can't be shown (push text, a quoted-reply preview).
     Sticker { emoji: Option<&'a str> },

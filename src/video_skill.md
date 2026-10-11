@@ -12,25 +12,53 @@ real money is spent, real files must survive, and the chat is the record.
 ## Tools (run them; never quote their answers from memory)
 
 - `mafold video models` — JSON: each model's resolutions, ratios, duration range,
-  combinations known to fail, and the price it is billed at (`price_usd_per_m`;
-  `walletable: false` = no price yet, so it can't be submitted). Read it before
-  you propose a plan.
+  combinations known to fail, and its price (`price_usd_per_m`;
+  `walletable: false` = no wallet price yet, so it can't run on Mafold's key —
+  on the owner's own key it still can). Read it before you propose a plan.
 - `mafold video submit --model <id> --resolution <480p|720p|1080p> --ratio <r> --duration <s> [--ref <role>=<path|url>]… "<prompt>"`
-  → JSON `{job_id, estimate, wallet}`. A `--ref` can be the local path of something the
+  → JSON `{job_id, estimate, …}`. A `--ref` can be the local path of something the
   user sent (it is uploaded for you) or a public URL. Roles: `first_frame`,
   `last_frame`, `reference_image`, `reference_video`, `reference_audio`.
   With any ref the ratio must be `adaptive` (the vendor follows the image).
   The tool refuses known-bad combinations before anything is spent.
 - The same command with `--dry-run` runs the same checks and prints the same
-  `estimate` without submitting — nothing is held or spent. This is how a plan
-  gets real numbers before anyone says yes.
-- Who pays: a submit holds the estimate on the Mafold token wallet of the bot's
-  owner (`wallet.payer`); when the clip finishes, the real count is taken from
-  it and the rest goes back. A failed or cancelled job costs nothing.
+  `estimate` without submitting — nothing is held or spent, and nobody is
+  asked for anything (it never posts a card). This is how a plan gets real
+  numbers before anyone says yes. Only a real `submit` asks the owner (below).
+- Who pays — the tool decides, and the answer says which:
+  - **The owner's own ModelArk key** (`billing.via: "own"`, job id `own:…`).
+    When the bot's owner has linked their own key, it is used by default: the
+    clip runs from their device and ModelArk bills **their own ModelArk
+    account**. The Mafold wallet is not touched — nothing held, nothing charged;
+    there is no `wallet` in the answer. `estimate` is at list price.
+  - **Mafold's key** (`wallet` in the answer), for owners without their own:
+    a submit holds the estimate on the Mafold token wallet of the bot's owner
+    (`wallet.payer`); when the clip finishes, the real count is taken from it
+    and the rest goes back.
+  - Either way a failed or cancelled job costs nothing. Don't pass `--via`
+    unless the owner told you to: `--via house` puts the clip on their Mafold
+    wallet even though they have their own key — only with their yes to that.
+  - The dry run says which before anything is spent. Their own key: `billing`
+    (`via: "own"`); `billing.allowed: false` means the owner hasn't let you
+    use it yet — tell them the real submit will ask them with a card. Mafold's
+    key: no `billing`; `own_key_linked: false` means their Mafold wallet pays.
+    `own_key_linked: true` there means they DO have their own key and this
+    machine can't use it (`own_key_unusable_here` says why — usually the owner
+    isn't signed in to Mafold on the machine you run on): a real submit will be
+    refused; pass that on, `--via house` only with their yes.
+  - Only a real `submit` asks the owner for permission (a consent card).
+    `status` / `cancel` on a job whose key you may no longer use don't ask —
+    they say so, and you pass that on.
+  - A `submit` that died on the network (no `job_id` came back) may still have
+    started a job, and nothing guards against a duplicate. Don't resubmit
+    blind: check `status` of any job id you do have, and on their own key ask
+    the owner to look in their ModelArk console first.
 - `mafold video status <job_id> --wait --attach` — waits (up to 15 min), then hangs
   the finished clip on the reply you are writing and prints the bill: the
-  vendor's count (`usage.output`, in `usage.unit`), `cost_usd`, and what the
-  wallet was charged (`wallet.charged`). Without `--wait` it only reads.
+  vendor's count (`usage.output`, in `usage.unit`) and `cost_usd`; on Mafold's
+  key also what the wallet was charged (`wallet.charged`), on their own key
+  `billing` (ModelArk bills them; `cost_usd` is at list price). Without
+  `--wait` it only reads.
 - `mafold video cancel <job_id>` — only a job still queued can be cancelled.
 - `mafold pin` pins the reply you are writing (prints its id); `mafold edit <id> --file <path>`
   replaces the text of a message you sent earlier. `mafold read --json` shows
@@ -53,9 +81,11 @@ real money is spent, real files must survive, and the chat is the record.
 2. **Land what you make.** Always `status --attach`, so the clip is saved in the
    chat. Vendor links expire after 24 h and are never the deliverable.
 3. **Only real numbers.** Estimates are labelled 估算 and come from the tool.
-   After a job, quote the vendor's count, `cost_usd` and `wallet.charged` as
-   printed. No invented prices, no guessed balances, no currency conversion
-   nobody asked for.
+   After a job, quote the vendor's count and `cost_usd` as printed — plus
+   `wallet.charged` on Mafold's key; on the owner's own key say it is billed
+   by ModelArk to their own account, at about `cost_usd` (list price). No
+   invented prices, no guessed balances, no currency conversion nobody asked
+   for.
 
 ## Shape of the work (adapt to what the user already gave)
 
@@ -72,10 +102,13 @@ real money is spent, real files must survive, and the chat is the record.
   at a time; lock what they approve.
 - **Plan**: model + shots + ratio (recommend one and say why) + the resolution
   question as an ask card whose options carry each resolution's real estimate
-  from the tool. Then submit only what was approved.
+  from the tool, and who pays (their own ModelArk account, or their Mafold
+  wallet — the dry run's `billing` / `own_key_linked` says which, above). Then
+  submit only what was approved.
 - **Deliver**: one message per shot version — the clip plus one line:
-  `镜 n · v k · model · resolution · tokens · $cost`. Then `mafold edit` the
-  pinned record (status words and the running bill).
+  `镜 n · v k · model · resolution · tokens · $cost` (on their own key:
+  `$cost · ModelArk`). Then `mafold edit` the pinned record (status words and
+  the running bill).
 
 ## The pinned record
 
@@ -112,20 +145,30 @@ Once shots exist, list them under the second rule (`🎬 镜 1 · 标题 · 5s �
 | `ark 400 …InvalidParameter…` | The vendor refused a parameter; fix it, same rule. |
 | job `failed` / `InternalServiceError` | The vendor bills only succeeded jobs. Offer one retry, ideally at another resolution or ratio. |
 | a content-policy refusal (codes with `Sensitive`) | Don't resubmit the same words. Explain plainly; offer a rephrase that keeps their intent. |
-| `succeeded` but `landing_error` | The clip expired at the vendor. Offer to re-run that shot (it costs again). |
-| `model_not_walletable` | That model has no price in the wallet yet, so nothing was submitted. Offer a model `models` shows as walletable. |
-| `wallet can't cover this clip` | Nothing was submitted and nothing was spent. Say whose wallet is short (the bot owner's) and by how much the tool said; don't retry until they top up. |
-| `503 … not configured` | Generation isn't set up on this server. Say so plainly: nothing was submitted and nothing was spent. |
+| `succeeded` but `landing_error` | The clip didn't make it into the chat. Read the job once more later; if the vendor's 24 h copy is gone, offer to re-run that shot (it costs again). |
+| `hasn't allowed @… to use it` from `submit` (a consent card was posted) | The owner has their own ModelArk key and hasn't let this bot use it yet. Nothing was submitted or spent. Say a card is waiting for them; their Allow brings you back — then run the same command. Don't switch to `--via house` on your own. |
+| `hasn't allowed @… ` from `status` / `cancel` | No card was posted. The job is untouched at ModelArk; tell the owner they can allow you under Settings ▸ Connections, then read it again. |
+| `doesn't hold … vault key yet` | Their key can't be opened on this machine. Nothing was spent. Tell the owner: opening Mafold on a device that has the key (web, mac, iOS) hands it over. `--via house` only if they say so. |
+| `ark 401` | ModelArk refused the owner's own key (wrong, revoked or expired). Nothing was spent. Ask the owner to link it again under Settings ▸ Connections. |
+| `own_key_linked` | The owner has their own key, and this machine couldn't use it (the message says why — usually they aren't signed in to Mafold on the machine you run on, and you can only reach their key where they are). Nothing was submitted. Pass that on; `--via house` only with their yes. |
+| `model_not_walletable` | (Mafold's key) That model has no price in the wallet yet, so nothing was submitted. Offer a model `models` shows as walletable. |
+| `wallet can't cover this clip` | (Mafold's key) Nothing was submitted and nothing was spent. Say whose wallet is short (the bot owner's) and by how much the tool said; don't retry until they top up. |
+| `503 … not configured` | (Mafold's key) Generation isn't set up on this server. Say so plainly: nothing was submitted and nothing was spent. |
 | still running after 15 min | Leave it; give the job id; `mafold video status <id>` later. |
-| `N reads of <job> failed in a row` | The network or the vendor was out of reach for minutes — `--wait` already retried. The job is NOT known to have failed and may still finish (and bill): don't say it failed, don't resubmit; give the job id and read it again later. |
+| `… failed in a row` / `couldn't reach the owner's own ModelArk key on the network` | The network or the vendor was out of reach — the tool already retried. The job is NOT known to have failed and may still finish (and bill): don't say it failed, don't resubmit; give the job id and read it again later. |
 
 ## Keys and other people's money
 
 - Keys are entered only in Mafold's own secure box (a connection card), never
   in chat. If someone pastes a key into the chat: don't use it, don't
   repeat it, ask them to delete that message and use the card.
-- Don't claim to know a wallet balance. If a submit says the wallet can't cover
-  the clip, quote that; nothing else tells you what is in it.
+- An owner's own ModelArk key is a Mafold connection: `mafold video` finds it
+  and uses it by default, on their device. You never see it and never handle
+  it — no `connection call` around the tool, no `--via` to dodge a consent
+  card.
+- Don't claim to know a wallet balance — or anything about their ModelArk
+  account. If a submit says the wallet can't cover the clip, quote that;
+  nothing else tells you what is in it.
 
 ## Honesty about what you did
 

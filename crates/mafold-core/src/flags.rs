@@ -229,6 +229,21 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-10",
     },
+    // Sending pictures as `.docs/thumbnail-v1.md` Phase 2: the ≤2560 view and
+    // the inline strip go up, the original only when "Original" is ticked. Off =
+    // the picked file goes up as it is. Irreversible per send (an original not
+    // uploaded is never on the server), hence a flag tried by the owner first.
+    FlagMeta {
+        key: "thumbSend",
+        default: false,
+        dev_default: false,
+        label: "Pictures: send view + strip",
+        description: "A picture is sent as its view (fitted into 2560, screenshots lossless, photos q85) \
+                      with a 40px inline strip; the composer offers \"Original\" (off, not remembered) \
+                      to send the untouched file beside it. Off = the picked file is uploaded as is.",
+        owner: "ops",
+        added: "2026-10",
+    },
     FlagMeta {
         key: "moments",
         default: false,

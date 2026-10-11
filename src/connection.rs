@@ -262,14 +262,20 @@ async fn require_connection_use(
     if bot.is_empty() {
         bail!("running as a bot with no resolvable identity; refusing to touch @{owner}'s `{name}`");
     }
-    let rows: Vec<(String, String, bool)> = human
-        .call("listConnectionGrants", json!({}))
+    let rows = use_grants(human)
         .await
-        .context("couldn't check connection grants; refusing rather than assuming access")?
-        .get("items")
-        .and_then(|i| i.as_array())
-        .cloned()
-        .unwrap_or_default()
+        .context("couldn't check connection grants; refusing rather than assuming access")?;
+    if let Some(msg) = connection_use_denied(Some(&bot), owner, name, &rows) {
+        bail!(msg);
+    }
+    Ok(())
+}
+
+/// The owner's `(grantee, connection, can_use)` rows — what
+/// [`connection_use_denied`] judges. On the HUMAN session: the api answers
+/// `listConnectionGrants` to the person and nobody else.
+async fn use_grants(human: &Client) -> Result<Vec<(String, String, bool)>> {
+    Ok(as_array(&human.call("listConnectionGrants", json!({})).await?, "items")
         .iter()
         .map(|g| {
             (
@@ -278,11 +284,7 @@ async fn require_connection_use(
                 g.get("can_use").and_then(|b| b.as_bool()).unwrap_or(false),
             )
         })
-        .collect();
-    if let Some(msg) = connection_use_denied(Some(&bot), owner, name, &rows) {
-        bail!(msg);
-    }
-    Ok(())
+        .collect())
 }
 
 /// Whether this process is a bot's turn (the daemon sets `MAFOLD_BOT_TOKEN`
@@ -426,6 +428,19 @@ async fn auto_approve_pending(client: &Client, umk: &Key, key_id: &str) {
 }
 
 pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(Key, String, DeviceKey)> {
+    open_vault(client, sess, true).await
+}
+
+/// [`unlock`], with its one branch that STARTS a vault behind `mint`.
+///
+/// `mafold video` opens the owner's vault to reach a ModelArk key it has
+/// already seen in their connection list — so a vault exists somewhere, and
+/// minting a fresh one here would orphan it. The mint is also the only branch
+/// that prints, and `mafold video` answers in JSON on stdout: a "✓ vault
+/// created" line there is a broken answer for the agent reading it. With
+/// `mint` false a machine that holds no key gets [`KeyNotHandedOver`], and
+/// nothing is said.
+async fn open_vault(client: &Client, sess: &session::Session, mint: bool) -> Result<(Key, String, DeviceKey)> {
     let dev = vault::device_key()?;
     let reg = register(client, sess, &dev).await?;
 
@@ -442,7 +457,7 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
         vault::forget_cached_umk();
     }
 
-    if reg["first"].as_bool() == Some(true) {
+    if mint && reg["first"].as_bool() == Some(true) {
         // Nobody can approve us because nobody holds a key yet: this account's
         // vault starts here.
         let umk = Key::random();
@@ -483,7 +498,23 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
         // this message only appears when none of them has been online since
         // this machine registered, so the only accurate instruction is to open
         // Mafold somewhere and come back.
-        Err(_) => Err(anyhow::Error::new(KeyNotHandedOver)),
+        Err(e) => Err(no_key_yet(e)),
+    }
+}
+
+/// What a failed `getVaultKey` means. The server SAYING no key is wrapped for
+/// this machine (its 404, or any other answer it gives) is
+/// [`KeyNotHandedOver`]. A request that died on the way, or a server that fell
+/// over (502/503/504/429 — [`crate::video::retryable`]), is not an answer
+/// about the key at all, and stays the typed blink it is (2026-10-10): read as
+/// "this machine doesn't hold the vault key", one 502 ended `mafold video
+/// status --wait` on a job that was still running, with a sentence that sent
+/// the owner looking for a device.
+fn no_key_yet(e: anyhow::Error) -> anyhow::Error {
+    if crate::video::retryable(&e) {
+        e
+    } else {
+        anyhow::Error::new(KeyNotHandedOver)
     }
 }
 
@@ -2160,19 +2191,7 @@ async fn call(
     // the way around that.
     require_connection_use(base, client, &sess.username, name).await?;
     let mut rt = runtime(base, client, sess).await?;
-    // Two places this can run, and the runtime already knows which: a
-    // credential opens HERE (that is the whole vault), but a machine of yours
-    // answers on ITSELF. Asking the relay for something this process could have
-    // done would be a round trip to reach your own shell; running locally
-    // something bound to another laptop would be worse than a round trip.
-    let out = if rt.can_serve(name, method).await {
-        rt.call_any("cli", name, method, &args, false)
-            .await
-            .map_err(|e| anyhow!("{e}"))?
-    } else {
-        eprintln!("· {name} lives on another machine of yours — relaying");
-        relay(client, name, method, &args).await?
-    };
+    let out = call_native(&mut rt, client, name, method, &args).await?;
 
     // MCP wraps results in `content: [{type, text}]`. Unwrap the common
     // all-text case so a shell pipeline gets the payload rather than the
@@ -2196,6 +2215,293 @@ async fn call(
     }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+/// Run one method on a connection and hand back what it answered: the half of
+/// [`call`] that `mafold video` needs too, without the printing (its stdout is
+/// JSON an agent reads) and without the grant check (the caller makes it, once,
+/// before a loop of reads rather than on every one).
+///
+/// Two places this can run, and the runtime already knows which: a credential
+/// opens HERE (that is the whole vault), but a machine of yours answers on
+/// ITSELF. Asking the relay for something this process could have done would
+/// be a round trip to reach your own shell; running locally something bound to
+/// another laptop would be worse than a round trip.
+pub(crate) async fn call_native(
+    rt: &mut mafold_core::connections::Runtime,
+    client: &Client,
+    name: &str,
+    method: &str,
+    args: &Value,
+) -> Result<Value> {
+    if rt.can_serve(name, method).await {
+        rt.call_any("cli", name, method, args, false)
+            .await
+            .map_err(|e| anyhow!("{e}"))
+    } else {
+        eprintln!("· {name} lives on another machine of yours — relaying");
+        relay(client, name, method, args).await
+    }
+}
+
+// ── the owner's own video key (`mafold video`) ─────────────────────────────
+//
+// 2026-10-10, the cofounder:「我都连接了我自己的key，肯定是默认走我的key啊」.
+// A ModelArk key the owner linked as a connection is what `mafold video` runs
+// on by default, and the Mafold wallet stays out of it
+// (`.docs/connection-backed-models-v1.md`: "wallet 完全不参与"). What follows
+// answers the three questions that takes — is there such a key, may THIS turn
+// use it, can THIS machine open it — and prints nothing while doing it:
+// `mafold video` speaks JSON on stdout.
+//
+// The connections are listed on the OWNER's session, the same way `connection
+// call` in a bot's turn reaches them: `listConnections` and
+// `listConnectionGrants` answer the person and nobody else, so a bot daemon
+// sees its owner's key only on a machine its owner signed in to — which a
+// self-hosted bot's machine is.
+
+/// One of the owner's connections a `mafold video` run may use, with the
+/// owner's own session on this machine that can open it.
+pub(crate) struct KeyHolder {
+    /// The connection, as `listConnections` names it.
+    pub name: String,
+    /// Whose it is — the bot's owner, or the person themself.
+    pub owner: String,
+    base: String,
+    human: Client,
+    sess: session::Session,
+}
+
+impl KeyHolder {
+    /// Open the owner's vault here — never by starting one, never with a word
+    /// on stdout ([`open_vault`]). A machine the server says holds no key yet
+    /// answers [`KeyNotHandedOver`]; a blink on the way stays a typed blink.
+    pub(crate) async fn open(self) -> Result<OwnerVault> {
+        let (umk, _, _) = open_vault(&self.human, &self.sess, false).await?;
+        let KeyHolder { name, owner, base, human, sess } = self;
+        Ok(OwnerVault { name, owner, base, human, sess, umk })
+    }
+}
+
+/// The owner's vault, open on this machine for one connection — what `mafold
+/// video status --wait` holds across its reads, so the key is fetched once and
+/// not on every tick.
+pub(crate) struct OwnerVault {
+    pub name: String,
+    pub owner: String,
+    base: String,
+    human: Client,
+    sess: session::Session,
+    umk: Key,
+}
+
+impl OwnerVault {
+    /// One method on this connection ([`call_native`]). A fresh runtime per
+    /// call costs nothing a read would notice and keeps this `&self`: a wait
+    /// loop's reader is a plain closure, not a lock.
+    pub(crate) async fn call(&self, method: &str, args: &Value) -> Result<Value> {
+        let mut rt = core_runtime(&self.base, &self.sess, self.umk.clone());
+        call_native(&mut rt, &self.human, &self.name, method, args).await
+    }
+}
+
+/// Where a `mafold video` run stands with the owner's own key.
+pub(crate) enum OwnKey {
+    /// The owner has linked nothing driven by `ark-video` (or nothing by the
+    /// name asked for).
+    None { owner: String },
+    /// This machine can't tell — the owner isn't signed in here, the server
+    /// refused a list, or a bot turn couldn't say which bot it is. `why`, in
+    /// words. Not a reason to touch the wallet on its own: the server refuses a
+    /// house submit for an owner with a linked key (`own_key_linked`). Never a
+    /// network blink: that is [`own_ark_key`]'s `Err`, typed, so it is read
+    /// again rather than taken for an answer.
+    Unseen { why: String },
+    /// Usable by whoever is asking.
+    Use(KeyHolder),
+    /// Linked, but `bot` hasn't been allowed to use it. `asker` speaks as that
+    /// bot — the one who may ask the owner (`requestConnectionAccess`).
+    Denied { name: String, owner: String, bot: String, asker: Client },
+}
+
+/// Which of the owner's ModelArk rows a run lands on. `rows` are `(name,
+/// usable)`; `want` is a name the caller insists on (`--via own:<name>`, or
+/// the one inside an `own:` job id). By name, so two runs never pick two
+/// different ModelArk accounts for no reason; a row this turn may not use is
+/// reported only when no row is usable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Pick {
+    None,
+    Use(String),
+    Denied(String),
+}
+
+fn pick_ark(rows: &[(String, bool)], want: Option<&str>) -> Pick {
+    let mut rows: Vec<&(String, bool)> = rows
+        .iter()
+        .filter(|(name, _)| want.is_none_or(|w| name.eq_ignore_ascii_case(w.trim())))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some((name, _)) = rows.iter().find(|(_, usable)| *usable) {
+        return Pick::Use(name.clone());
+    }
+    rows.first().map_or(Pick::None, |(name, _)| Pick::Denied(name.clone()))
+}
+
+/// The owner's own ModelArk key for this run. Never prints. What the server
+/// answered it couldn't find out is [`OwnKey::Unseen`], with the reason in
+/// words; the one failure is a blink — a request that died on the way, or a
+/// server that fell over ([`crate::video::retryable`]) — handed back as the
+/// typed error it is (2026-10-10). Folded into `Unseen`, one 502 on
+/// `listConnections` read as "this machine can't reach the owner's key" and
+/// ended `status --wait` on a job that was still running; the caller reads
+/// again instead (`video::patiently`).
+///
+/// Who asks decides who owns: a bot's key holder is its owner (`getMe` →
+/// `parent_username`, else the part of the handle before `:`), a person's is
+/// themself. A bot is held to its grant; the person at their own terminal is
+/// not — the same rule as [`connection_use_denied`], and like
+/// [`require_connection_use`] it keys off `MAFOLD_BOT_TOKEN`, so a bot's turn
+/// speaking with a person's token (`--account`) is still a bot's turn.
+pub(crate) async fn own_ark_key(client: &Client, want: Option<&str>) -> Result<OwnKey> {
+    let me = match client.call("getMe", json!({})).await {
+        Ok(v) => v,
+        Err(e) => return unseen_unless_blink(e, "couldn't tell who is asking"),
+    };
+    let username = s(&me, "username");
+    let speaker_is_bot = s(&me, "kind") == "bot";
+    let owner = if speaker_is_bot {
+        Some(s(&me, "parent_username"))
+            .filter(|p| !p.trim().is_empty())
+            .or_else(|| username.split_once(':').map(|(o, _)| o.to_string()))
+            .unwrap_or_default()
+    } else {
+        username.clone()
+    };
+    let owner = owner.trim().to_lowercase();
+    if owner.is_empty() {
+        return Ok(OwnKey::Unseen { why: format!("@{username} has no owner on record") });
+    }
+    let as_bot: Option<(String, Client)> = if speaker_is_bot {
+        Some((username.clone(), client.clone()))
+    } else if bot_turn() {
+        let asker = Client::new(client.base.clone(), std::env::var("MAFOLD_BOT_TOKEN").unwrap_or_default());
+        let bot = match asker.call("getMe", json!({})).await {
+            Ok(v) => s(&v, "username"),
+            Err(e) if crate::video::retryable(&e) => return Err(e),
+            Err(_) => String::new(),
+        };
+        if bot.is_empty() {
+            return Ok(OwnKey::Unseen {
+                why: "this is a bot's turn and the bot couldn't be confirmed, so its grant on the \
+                      owner's key couldn't be checked"
+                    .into(),
+            });
+        }
+        Some((bot, asker))
+    } else {
+        None
+    };
+    let sess = if speaker_is_bot {
+        session::load_named(&owner)
+    } else {
+        // The person asking IS the owner, and this command already speaks
+        // with their session: use it as it is, saved here or not.
+        let (device_id, device_name) = session::machine();
+        Some(session::Session { token: client.token.clone(), username: username.clone(), device_id, device_name })
+    };
+    let Some(sess) = sess else {
+        // The known limit (2026-10-10): the vault opens only where its owner
+        // is signed in, and nothing yet relays a bot's video call to another
+        // of the owner's machines. Said as exactly that, because what follows
+        // is the server's `own_key_linked` refusal, and "use the wallet
+        // instead" is the owner's call, not the bot's.
+        return Ok(OwnKey::Unseen {
+            why: format!(
+                "@{owner} isn't signed in to Mafold on this machine, and a bot can use its owner's own key \
+                 only on a machine where the owner is (`mafold login` as @{owner} here fixes it)"
+            ),
+        });
+    };
+    let human = Client::new(client.base.clone(), sess.token.clone());
+    let bot = as_bot.as_ref().map(|(b, _)| b.as_str());
+    let picked = match ark_pick(&human, &owner, bot, want).await {
+        Ok(picked) => picked,
+        Err(e) => return unseen_unless_blink(e, &format!("couldn't read @{owner}'s connections")),
+    };
+    Ok(match picked {
+        Pick::None => OwnKey::None { owner },
+        Pick::Use(name) => OwnKey::Use(KeyHolder { name, owner, base: client.base.clone(), human, sess }),
+        Pick::Denied(name) => match as_bot {
+            Some((bot, asker)) => OwnKey::Denied { name, owner, bot, asker },
+            // Only a bot is ever denied; a person's own rows are theirs.
+            None => OwnKey::Use(KeyHolder { name, owner, base: client.base.clone(), human, sess }),
+        },
+    })
+}
+
+/// A lookup [`own_ark_key`] couldn't finish: the server's answer (a refusal,
+/// an expired session) is [`OwnKey::Unseen`] with `what` and the words; a
+/// blink ([`crate::video::retryable`]) is no answer, and goes back as the
+/// typed error it is.
+fn unseen_unless_blink(e: anyhow::Error, what: &str) -> Result<OwnKey> {
+    if crate::video::retryable(&e) {
+        return Err(e);
+    }
+    Ok(OwnKey::Unseen { why: format!("{what} ({e:#})") })
+}
+
+/// The provider pack's failure, typed again. `providers::ensure` answers in
+/// words — the core's `RpcError` flattened to its Display — so a request that
+/// died on the way is read back out of them (`connect failed: …` /
+/// `transport failed: …`), the way `video::own_failure` reads the ark
+/// driver's sentences. Anything else stays the sentence it was.
+fn registry_failure(e: anyhow::Error) -> anyhow::Error {
+    use mafold_core::RpcError;
+    let msg = format!("{e:#}");
+    let typed = if let Some((_, rest)) = msg.split_once("connect failed: ") {
+        RpcError::Connect(rest.to_string())
+    } else if let Some((_, rest)) = msg.split_once("transport failed: ") {
+        RpcError::Transport(rest.to_string())
+    } else {
+        return e;
+    };
+    anyhow::Error::new(typed).context("getConnectionProviders failed")
+}
+
+/// The network half of [`own_ark_key`], on the owner's session: their rows
+/// whose provider is driven by `ark-video` — read off the served registry, not
+/// off a slug — and which of them `bot` may use. Grants are only fetched for a
+/// bot, and only once there is a ModelArk row to ask about. Every failure
+/// keeps its type, so a blink is told from an answer by the caller.
+async fn ark_pick(human: &Client, owner: &str, bot: Option<&str>, want: Option<&str>) -> Result<Pick> {
+    let rows = as_array(&human.call("listConnections", json!({})).await?, "items");
+    let registry = registry(human).await.map_err(registry_failure)?;
+    let ark: Vec<String> = rows
+        .iter()
+        .filter(|c| {
+            let provider = s(c, "provider");
+            registry
+                .iter()
+                .any(|p| p.id == provider && p.native_api.as_deref() == Some(mafold_core::ark::DRIVER))
+        })
+        .map(|c| s(c, "name"))
+        .collect();
+    if ark.is_empty() {
+        return Ok(Pick::None);
+    }
+    let grants = match bot {
+        Some(_) => use_grants(human).await?,
+        None => Vec::new(),
+    };
+    let judged: Vec<(String, bool)> = ark
+        .into_iter()
+        .map(|name| {
+            let usable = connection_use_denied(bot, owner, &name, &grants).is_none();
+            (name, usable)
+        })
+        .collect();
+    Ok(pick_ark(&judged, want))
 }
 
 async fn rm(client: &Client, name: &str) -> Result<()> {
@@ -2936,7 +3242,13 @@ mod tests {
                         .find(|(m, _)| path == format!("/api/{m}"))
                         .map(|(_, v)| v.clone())
                         .unwrap_or_else(|| json!({}));
-                    let payload = json!({ "ok": true, "result": result }).to_string();
+                    // A reply carrying `__envelope` goes out as that whole
+                    // envelope: how a test makes the api refuse (`ok: false`
+                    // with a 4xx) or fall over (a 5xx) instead of answering.
+                    let payload = match result.get("__envelope") {
+                        Some(envelope) => envelope.to_string(),
+                        None => json!({ "ok": true, "result": result }).to_string(),
+                    };
                     let _ = sock
                         .write_all(
                             format!(
@@ -3074,6 +3386,128 @@ mod tests {
         assert_eq!(writes[0]["label"], "My office computer");
         assert_eq!(writes[0]["create_only"], false);
         assert!(api.calls("listConnections").is_empty(), "reconnect must not choose a free name");
+    }
+
+    /// `mafold video` lands on one ModelArk row, the same one every time: the
+    /// first usable by name, or the one asked for. A row this turn may not use
+    /// is reported only when no row is usable.
+    #[test]
+    fn video_picks_one_ark_row_by_name() {
+        let rows = |r: &[(&str, bool)]| r.iter().map(|(n, ok)| (n.to_string(), *ok)).collect::<Vec<_>>();
+        let two = rows(&[("ark-b", true), ("ark-a", true)]);
+        assert_eq!(pick_ark(&two, None), Pick::Use("ark-a".into()));
+        assert_eq!(pick_ark(&two, Some("ARK-B")), Pick::Use("ark-b".into()), "asked for by name");
+        assert_eq!(pick_ark(&two, Some("ark-c")), Pick::None, "a name that isn't there is no key");
+        let one_allowed = rows(&[("ark-a", false), ("ark-b", true)]);
+        assert_eq!(pick_ark(&one_allowed, None), Pick::Use("ark-b".into()));
+        assert_eq!(pick_ark(&one_allowed, Some("ark-a")), Pick::Denied("ark-a".into()));
+        assert_eq!(pick_ark(&rows(&[("ark-b", false), ("ark-a", false)]), None), Pick::Denied("ark-a".into()));
+        assert_eq!(pick_ark(&[], None), Pick::None);
+    }
+
+    /// Against the owner's own lists: their ModelArk rows are found by the
+    /// DRIVER their provider names (`ark-video`), not by slug; a person at
+    /// their own terminal uses theirs without a grant (and none is fetched); a
+    /// bot only what it was granted.
+    #[tokio::test]
+    async fn video_finds_the_owners_own_ark_key_and_who_may_use_it() {
+        seat_registry();
+        let api = spawn_api(vec![
+            (
+                "listConnections",
+                json!({ "items": [
+                    { "name": "notion", "provider": "notion" },
+                    { "name": "ark-b", "provider": "modelark" },
+                    { "name": "ark-a", "provider": "modelark" },
+                ]}),
+            ),
+            (
+                "listConnectionGrants",
+                json!({ "items": [
+                    { "grantee": "ops:cam", "connection": "ark-b", "can_use": true },
+                    { "grantee": "ops:cam", "connection": "notion", "can_use": true },
+                ]}),
+            ),
+        ]);
+        let human = Client::new(api.base.clone(), "s_test".into());
+        assert_eq!(ark_pick(&human, "ops", None, None).await.unwrap(), Pick::Use("ark-a".into()));
+        assert!(api.calls("listConnectionGrants").is_empty(), "the owner needs no grant to use their own key");
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), None).await.unwrap(), Pick::Use("ark-b".into()));
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), Some("ark-a")).await.unwrap(), Pick::Denied("ark-a".into()));
+        assert_eq!(ark_pick(&human, "ops", Some("ops:other"), None).await.unwrap(), Pick::Denied("ark-a".into()));
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), Some("notion")).await.unwrap(), Pick::None, "not a video key");
+
+        let none = spawn_api(vec![("listConnections", json!({ "items": [ { "name": "notion", "provider": "notion" } ] }))]);
+        let human = Client::new(none.base.clone(), "s_test".into());
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), None).await.unwrap(), Pick::None);
+        assert!(none.calls("listConnectionGrants").is_empty(), "no ModelArk row, no grant to ask about");
+    }
+
+    /// 2026-10-10: a blink while `mafold video` looks for — or opens — the
+    /// owner's key comes back as the typed error it is, which `--wait` reads
+    /// again; only what the server actually SAID is an answer (`Unseen`,
+    /// `KeyNotHandedOver`). Folded into those, one 502 ended a wait on a job
+    /// that was still running, saying this machine had no key.
+    #[tokio::test]
+    async fn video_tells_a_blink_from_an_answer_about_the_owners_key() {
+        use crate::video::retryable;
+        use mafold_core::RpcError;
+        seat_registry();
+        let fell_over = |code: u16| json!({ "__envelope": { "ok": false, "error_code": code, "description": "upstream down" } });
+        let human = |api: &MockApi| Client::new(api.base.clone(), "s_test".into());
+
+        // Who is asking: the api fell over, or nobody is listening at all.
+        let api = spawn_api(vec![("getMe", fell_over(502))]);
+        let e = own_ark_key(&human(&api), None).await.err().expect("a 502 is not an answer");
+        assert!(retryable(&e), "{e:#}");
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let e = own_ark_key(&Client::new(closed, "s_test".into()), None).await.err().expect("nothing answered");
+        assert!(retryable(&e), "{e:#}");
+
+        // The owner's lists, on their session.
+        let api = spawn_api(vec![("listConnections", fell_over(503))]);
+        assert!(retryable(&ark_pick(&human(&api), "ops", None, None).await.unwrap_err()));
+        let api = spawn_api(vec![
+            ("listConnections", json!({ "items": [ { "name": "ark", "provider": "modelark" } ] })),
+            ("listConnectionGrants", fell_over(429)),
+        ]);
+        assert!(retryable(&ark_pick(&human(&api), "ops", Some("ops:cam"), None).await.unwrap_err()));
+
+        // …which `own_ark_key` hands back as they are; a refusal is an answer.
+        let said = |code: u16, method: &str| {
+            anyhow::Error::new(RpcError::Api(format!(
+                r#"{{"ok":false,"error_code":{code},"description":"said {code}"}}"#
+            )))
+            .context(format!("{method} failed"))
+        };
+        match unseen_unless_blink(said(401, "listConnections"), "couldn't read @ops's connections") {
+            Ok(OwnKey::Unseen { why }) => assert!(why.contains("said 401"), "{why}"),
+            _ => panic!("the server's refusal is an answer"),
+        }
+        assert!(matches!(unseen_unless_blink(said(502, "listConnections"), "x"), Err(ref e) if retryable(e)));
+
+        // The provider pack's failure arrives flattened to words.
+        let e = registry_failure(anyhow!("no provider registry yet, and fetching one failed: connect failed: tcp connect error"));
+        assert!(retryable(&e) && format!("{e:#}").contains("tcp connect error"), "{e:#}");
+        assert!(retryable(&registry_failure(anyhow!(
+            "no provider registry yet, and fetching one failed: transport failed: getConnectionProviders: HTTP 502 — bad gateway"
+        ))));
+        assert!(!retryable(&registry_failure(anyhow!("pack signature doesn't verify"))));
+
+        // Opening the vault: "no key wrapped for this machine" only when the
+        // server said so.
+        assert!(no_key_yet(said(404, "getVaultKey")).downcast_ref::<KeyNotHandedOver>().is_some());
+        for blink in [
+            said(502, "getVaultKey"),
+            said(503, "getVaultKey"),
+            anyhow::Error::new(RpcError::Transport("connection reset".into())).context("getVaultKey failed"),
+        ] {
+            let e = no_key_yet(blink);
+            assert!(e.downcast_ref::<KeyNotHandedOver>().is_none() && retryable(&e), "{e:#}");
+        }
     }
 
     /// Names don't collide: a second Codex account makes a second row.

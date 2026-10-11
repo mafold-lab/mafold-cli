@@ -45,6 +45,7 @@ mod session;
 mod sites;
 mod steer_hook;
 mod supervisor;
+mod thumb;
 mod turnenv;
 mod update;
 mod vault;
@@ -259,6 +260,12 @@ enum Cmd {
         /// notification, a quoted reply: `--emoji 😂`.
         #[arg(long, requires = "sticker")]
         emoji: Option<String>,
+        /// Also upload each picture's untouched original. A picture goes up as
+        /// a view fitted into 2560 (screenshots lossless, photos JPEG q85) —
+        /// what everyone sees and models read; with this, readers can open the
+        /// original too. Pictures that already fit go up as they are anyway.
+        #[arg(long, conflicts_with = "sticker")]
+        original: bool,
     },
     /// Manage a forum's channels (list/create/rename/close/pin/delete).
     Channels {
@@ -788,13 +795,16 @@ async fn main() -> Result<()> {
         Cmd::Tap { message, action, value, fields } => {
             tap(&Client::new(cli.base, token?), &message, &action, value.as_deref(), fields.as_deref()).await?
         }
-        Cmd::Attach { files, message, sticker, emoji } => {
+        Cmd::Attach { files, message, sticker, emoji, original } => {
             let how = if sticker {
                 client::AttachAs::Sticker { emoji: emoji.as_deref() }
             } else {
-                client::AttachAs::Detected
+                client::AttachAs::Detected { original }
             };
-            attach(&Client::new(cli.base, token?), &files, message.as_deref(), how).await?
+            let client = Client::new(cli.base, token?);
+            // A one-shot process holds no flags yet; the daemon's are fresh.
+            flags::refresh(&client).await;
+            attach(&client, &files, message.as_deref(), how).await?
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::D1 { cmd } => d1::run(cmd, &Client::new(cli.base, token?)).await?,
@@ -1245,7 +1255,7 @@ async fn attach(
             .with_context(|| format!("attaching {}", path.display()))?;
         match how {
             client::AttachAs::Sticker { .. } => println!("✓ attached {} as a sticker", path.display()),
-            client::AttachAs::Detected => println!("✓ attached {}", path.display()),
+            client::AttachAs::Detected { .. } => println!("✓ attached {}", path.display()),
         }
     }
     Ok(())

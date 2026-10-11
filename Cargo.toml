@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.143"
+version = "0.9.144"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -28,6 +28,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "ti
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 futures-util = "0.3"
+# Pictures go up as a ≤2560 view + 40px strip (src/thumb.rs). Decoders for what
+# agents actually attach; WebP is encoded lossless only (screenshots), photos
+# as JPEG. No HEIC — those go up as they are.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

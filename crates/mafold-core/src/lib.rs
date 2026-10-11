@@ -19,7 +19,10 @@ pub mod flags;
 pub mod connections;
 pub mod providers;
 mod codex;
-mod ark;
+/// Public for its [`ark::DRIVER`] id: `mafold video` picks the owner's own
+/// ModelArk connection by the driver its provider row names, the same way
+/// `computer::DRIVER` / `google::DRIVER` are read — never by provider slug.
+pub mod ark;
 pub mod computer;
 pub mod google;
 pub mod mcp;
