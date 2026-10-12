@@ -10,7 +10,9 @@ fn version(attrs: &str) -> Option<&str> {
 
 /// One attribute of a tag's raw attribute run. Mirrors the generic attribute
 /// reader in cards/split.ts, so a value means here what it means to the card.
-pub(crate) fn attr<'a>(attrs: &'a str, want: &str) -> Option<&'a str> {
+/// Public so the api reads a card's declared URL fields by the same rule
+/// (`extmedia::urls`).
+pub fn attr<'a>(attrs: &'a str, want: &str) -> Option<&'a str> {
     let mut rest = attrs;
     let mut found = None;
     while !rest.is_empty() {

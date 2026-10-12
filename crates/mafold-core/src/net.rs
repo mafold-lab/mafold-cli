@@ -108,7 +108,30 @@ pub async fn rpc(base: &str, token: &str, method: &str, body: &str) -> Result<St
 /// 3s. Past a minute there is no server still thinking — there is a socket that
 /// will never speak. Large transfers are NOT at risk: media upload uses a raw
 /// multipart `fetch`, not this path.
+///
+/// The exceptions are the methods that pull a file into the registry before
+/// they answer — see [`budget_ms`].
 const RPC_TIMEOUT_MS: u64 = 60_000;
+
+/// The budget for the methods whose server work is a DOWNLOAD: `ingestUrl`
+/// (lands a public URL) and `videoStatus` (lands a finished clip the first time
+/// it reads `succeeded`). Both run `media::fetch_public_url`, which the server
+/// bounds at 600 s (`INGEST_URL_DEADLINE`, mafold-api/src/media.rs), and both
+/// drop the half-done download the moment the caller hangs up. So a minute did
+/// not make them fail faster — it made them never finish: from a machine whose
+/// link to the vendor CDN runs at 10–20 KB/s (2026-10-09, linsky's demo api), a
+/// 1–3 MB clip was billed and could never land, however often it was re-read.
+/// A little over the server's deadline, so its own refusal arrives first.
+const LANDING_RPC_TIMEOUT_MS: u64 = 610_000;
+
+/// How long `method` may go without an answer. One table for every platform,
+/// for the same reason as [`RPC_TIMEOUT_MS`].
+fn budget_ms(method: &str) -> u64 {
+    match method {
+        "ingestUrl" | "videoStatus" => LANDING_RPC_TIMEOUT_MS,
+        _ => RPC_TIMEOUT_MS,
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result<String, RpcError> {
@@ -145,7 +168,8 @@ pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result
         let text = resp.text().await.map_err(|e| RpcError::Transport(e.to_string()))?;
         unwrap_envelope_ex(status, &method_for_err, text)
     });
-    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(RPC_TIMEOUT_MS as u32));
+    let budget = budget_ms(method);
+    let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(budget as u32));
 
     match select(work, deadline).await {
         Either::Left((out, _)) => out,
@@ -155,7 +179,7 @@ pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result
             controller.abort();
             Err(RpcError::Transport(format!(
                 "{method}: no response in {}s — the connection appears to be down",
-                RPC_TIMEOUT_MS / 1000
+                budget / 1000
             )))
         }
     }
@@ -190,13 +214,13 @@ fn client() -> &'static reqwest::Client {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn rpc_ex(base: &str, token: &str, method: &str, body: &str) -> Result<String, RpcError> {
-    rpc_ex_within(base, token, method, body, RPC_TIMEOUT_MS).await
+    rpc_ex_within(base, token, method, body, budget_ms(method)).await
 }
 
 /// `rpc_ex` with the deadline spelled out. Exists so the timeout is TESTABLE:
 /// the shipping budget is a minute, and a test that actually waited one would
-/// never be run. Nothing else should call this — pick the budget by fixing
-/// `RPC_TIMEOUT_MS`, not per call site.
+/// never be run. Nothing else should call this — pick the budget in
+/// [`budget_ms`], not per call site.
 #[cfg(not(target_arch = "wasm32"))]
 async fn rpc_ex_within(
     base: &str,
@@ -614,6 +638,18 @@ mod tests {
         let mock = spawn_mock(vec![ok(r#"{"language":"zh-Hans"}"#)]);
         let out = rpc_ex_within(&mock.base, "tok", "getMe", "{}", 10_000).await.expect("getMe");
         assert_eq!(out, r#"{"language":"zh-Hans"}"#);
+    }
+
+    /// The landing methods wait out the server's own 600 s fetch deadline; every
+    /// other method keeps the one-minute floor.
+    #[test]
+    fn only_the_landing_methods_outwait_the_servers_fetch_deadline() {
+        for m in ["ingestUrl", "videoStatus"] {
+            assert!(budget_ms(m) > 600_000, "{m} must outlast INGEST_URL_DEADLINE");
+        }
+        for m in ["getMe", "videoSubmit", "videoCancel", "botEditDraft", "sendMessage"] {
+            assert_eq!(budget_ms(m), RPC_TIMEOUT_MS, "{m} keeps the one-minute floor");
+        }
     }
 
     // ── envelope unwrap (pure) ──

@@ -298,6 +298,13 @@ impl Client {
         self.post("getChats", json!({})).await
     }
 
+    /// Only the chats with something unread (main timeline or a channel) — what
+    /// the inbox glance looks at every few seconds. An api without the filter
+    /// answers with every chat; callers still check the counts themselves.
+    pub async fn unread_chats(&self) -> Result<Value> {
+        self.post("getChats", json!({ "unread_only": true })).await
+    }
+
     /// One account (`{ username, display_name, language, … }`). The daemon reads
     /// the OWNER's `language` — the cloud i18n setting every other Mafold client
     /// follows — to know which language to introduce itself in. (The api names

@@ -313,6 +313,27 @@ pub fn open_for_device(device_secret_b64: &str, blob: &str, wrapped_dek: &str) -
     open_with_dek(&dek, blob)
 }
 
+/// Trade a row's per-device seal ([`seal_for_devices`]) for one under the
+/// master key — the way every other row is sealed.
+///
+/// A per-device row opens only on the devices that existed when it was handed
+/// over: right for a week's loan, wrong for a value its owner keeps, which has
+/// to open on the laptop they buy next year too. Opens with THIS device's own
+/// wrap (whichever of `wraps` it is — trying them all needs no device id) and
+/// seals again under `umk` with a fresh DEK. The value never leaves here.
+pub fn reseal_device_row<'a>(
+    umk: &Key,
+    device_secret_b64: &str,
+    blob: &str,
+    wraps: impl IntoIterator<Item = &'a str>,
+) -> Result<SealedPayload> {
+    let plain = wraps
+        .into_iter()
+        .find_map(|w| open_for_device(device_secret_b64, blob, w).ok())
+        .ok_or_else(|| anyhow_lite::Error("this device holds none of the row's per-device keys".into()))?;
+    Ok(seal_payload(umk, &plain))
+}
+
 pub struct SharedPayload {
     pub blob: String,
     pub wrapped_dek: String,
@@ -425,6 +446,27 @@ mod tests {
             seal_for_devices(&[("x".into(), "not-a-key".into())], "{}").is_err(),
             "a malformed key fails the whole seal, not just that device"
         );
+    }
+
+    /// Kept rather than lent: a device that received the value re-seals it
+    /// under the master key, after which ANY device holding that key opens it
+    /// — and one that never received it can't do the re-sealing.
+    #[test]
+    fn a_per_device_row_reseals_under_the_master_key() {
+        let laptop = generate_device();
+        let desktop = generate_device();
+        let recipients = vec![
+            ("laptop".to_string(), laptop.public.clone()),
+            ("desktop".to_string(), desktop.public.clone()),
+        ];
+        let (blob, wraps) = seal_for_devices(&recipients, r#"{"value":"hunter2"}"#).unwrap();
+        let umk = Key::random();
+        let kept = reseal_device_row(&umk, &desktop.secret, &blob, wraps.values().map(String::as_str)).unwrap();
+        assert_eq!(open_payload(&umk, &kept.blob, &kept.wrapped_dek).unwrap(), r#"{"value":"hunter2"}"#);
+        assert_ne!(kept.blob, blob, "a fresh DEK, not the lent one");
+
+        let newcomer = generate_device();
+        assert!(reseal_device_row(&umk, &newcomer.secret, &blob, wraps.values().map(String::as_str)).is_err());
     }
 
     #[test]

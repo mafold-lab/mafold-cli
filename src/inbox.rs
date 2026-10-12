@@ -449,10 +449,10 @@ fn timeline_key(chat_id: &str, channel_id: Option<&str>) -> String {
     }
 }
 
-/// The glance: every timeline with an unread badge. One `getChats`, plus one
-/// `listChannels` per forum whose channels have unread.
+/// The glance: every timeline with an unread badge. One `getChats` (unread
+/// only), plus one `listChannels` per forum whose channels have unread.
 async fn unread_timelines(client: &Client, me_lc: &str) -> Result<Vec<Timeline>> {
-    let list = client.chats().await?;
+    let list = client.unread_chats().await?;
     let mut out = Vec::new();
     for c in list["items"].as_array().cloned().unwrap_or_default() {
         let Some(id) = c["id"].as_str() else { continue };
@@ -3047,5 +3047,61 @@ mod tests {
         assert!(p.contains("mafold tap <消息id> <action>"));
         assert!(p.contains("ask:answer") && p.contains("perm:answer"));
         assert!(p.contains("stop") && p.contains("只停你自己叫起来"));
+    }
+
+    /// The glance runs every few seconds and only wants what has unread, so it
+    /// asks the api for exactly that instead of every chat with its preview —
+    /// the full list it used to pull was most of the 210 getChats answers cut
+    /// short in Caddy's log (10-12). An api that predates `unread_only` sends
+    /// the whole list as before; the filter here still picks the unread ones.
+    #[tokio::test]
+    async fn the_glance_asks_only_for_chats_with_unread() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (path, body) = loop {
+                let mut chunk = [0; 8192];
+                let n = socket.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..n]);
+                let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                let header = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let len: usize = header
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() < end + 4 + len {
+                    continue;
+                }
+                let path = header.split_whitespace().nth(1).unwrap().to_string();
+                break (path, String::from_utf8_lossy(&bytes[end + 4..end + 4 + len]).to_string());
+            };
+            // An old api's answer: everything, read and unread alike.
+            let reply = json!({"ok": true, "result": {"items": [
+                {"id": "c-read", "kind": "direct", "participants": [], "unread_count": 0},
+                {"id": "c-new", "kind": "direct", "participants": [], "unread_count": 2},
+            ]}})
+            .to_string();
+            socket
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}", reply.len())
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            (path, body)
+        });
+        let client = Client::new(base, "test".into());
+        let tls = unread_timelines(&client, "me").await.unwrap();
+        let (path, body) = server.await.unwrap();
+        assert_eq!(path, "/api/getChats");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["unread_only"], json!(true), "the glance must ask for unread chats only: {body}");
+        assert_eq!(tls.iter().map(|t| t.chat_id.as_str()).collect::<Vec<_>>(), vec!["c-new"]);
     }
 }

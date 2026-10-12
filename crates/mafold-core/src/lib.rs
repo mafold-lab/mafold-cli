@@ -840,6 +840,25 @@ mod web {
             .to_string())
         }
 
+        /// Trade a secure-input row's per-device seal for one under this
+        /// vault's master key → `{blob, wrapped_dek}`. `device_wraps_json` is
+        /// the row's `device_wraps` object; `device_secret` is this browser's
+        /// own device key. The value is opened and sealed again in here and
+        /// never handed to JS.
+        #[wasm_bindgen(js_name = resealDeviceRow)]
+        pub fn reseal_device_row(
+            &self,
+            device_secret: String,
+            blob: String,
+            device_wraps_json: String,
+        ) -> Result<String, JsValue> {
+            let wraps: std::collections::BTreeMap<String, String> = serde_json::from_str(&device_wraps_json)
+                .map_err(|e| JsValue::from_str(&format!("device_wraps: {e}")))?;
+            let s = crate::vault::reseal_device_row(&self.umk, &device_secret, &blob, wraps.values().map(String::as_str))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            Ok(serde_json::json!({ "blob": s.blob, "wrapped_dek": s.wrapped_dek }).to_string())
+        }
+
         /// Open one → the payload JSON.
         #[wasm_bindgen(js_name = openPayload)]
         pub fn open_payload(&self, blob: String, wrapped_dek: String) -> Result<String, JsValue> {

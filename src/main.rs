@@ -267,6 +267,18 @@ enum Cmd {
         #[arg(long, conflicts_with = "sticker")]
         original: bool,
     },
+    /// What a public web page says about itself — title, site, description,
+    /// its own picture (og:image), icon and first body images with their alt
+    /// text. For an AGENT about to put a page's real picture in a reply
+    /// (`mafold/media`): web tools hand back a page's text, never its picture
+    /// addresses. Read-only; the server fetches the page.
+    Unfurl {
+        /// The page (public http/https).
+        url: String,
+        /// Print the raw JSON instead of readable lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage a forum's channels (list/create/rename/close/pin/delete).
     Channels {
         #[command(subcommand)]
@@ -805,6 +817,14 @@ async fn main() -> Result<()> {
             // A one-shot process holds no flags yet; the daemon's are fresh.
             flags::refresh(&client).await;
             attach(&client, &files, message.as_deref(), how).await?
+        }
+        Cmd::Unfurl { url, json } => {
+            let v = Client::new(cli.base, token?).call("unfurlUrl", serde_json::json!({ "url": url })).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", unfurl_lines(&v));
+            }
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::D1 { cmd } => d1::run(cmd, &Client::new(cli.base, token?)).await?,
@@ -1583,5 +1603,63 @@ mod send_target_tests {
         let card = serde_json::json!({ "content": "{% mafold/ask answered=\"Cloudflare\" %}\nq|部署|0|去哪?\no|Cloudflare|x\n{% /mafold/ask %}" });
         assert_eq!(after_tap(&card, &card, 0), "卡片已回答:「Cloudflare」");
         assert_eq!(answered_of("{% mafold/ask %}"), None);
+    }
+}
+
+/// `mafold unfurl`'s readable form: one fact per line, images numbered with
+/// their alt text and declared size — what an agent needs to pick one.
+fn unfurl_lines(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    for (key, label) in [
+        ("url", "url"),
+        ("title", "title"),
+        ("site_name", "site"),
+        ("description", "description"),
+        ("image", "image"),
+        ("touch_icon", "icon"),
+        ("favicon", "favicon"),
+    ] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            out.push_str(&format!("{label}: {s}\n"));
+        }
+    }
+    let images = v.get("images").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    if !images.is_empty() {
+        out.push_str("images:\n");
+        for (i, img) in images.iter().enumerate() {
+            let src = img.get("src").and_then(|x| x.as_str()).unwrap_or_default();
+            out.push_str(&format!("  {}. {src}", i + 1));
+            if let Some(alt) = img.get("alt").and_then(|x| x.as_str()) {
+                out.push_str(&format!(" — \"{alt}\""));
+            }
+            if let (Some(w), Some(h)) = (img.get("width").and_then(|x| x.as_u64()), img.get("height").and_then(|x| x.as_u64())) {
+                out.push_str(&format!(" ({w}×{h})"));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod unfurl_lines_tests {
+    use super::unfurl_lines;
+
+    #[test]
+    fn lists_facts_then_numbered_images() {
+        let v = serde_json::json!({
+            "url": "https://fuse.energy/technology",
+            "title": "Technology",
+            "site_name": "Fuse",
+            "image": "https://fuse.energy/og.jpg",
+            "images": [
+                {"src": "https://fuse.energy/titan.jpg", "alt": "TITAN", "width": 1600, "height": 1200},
+                {"src": "https://fuse.energy/zstar.jpg"}
+            ]
+        });
+        let s = unfurl_lines(&v);
+        assert!(s.starts_with("url: https://fuse.energy/technology\ntitle: Technology\nsite: Fuse\nimage: https://fuse.energy/og.jpg\n"));
+        assert!(s.contains("  1. https://fuse.energy/titan.jpg — \"TITAN\" (1600×1200)\n"));
+        assert!(s.contains("  2. https://fuse.energy/zstar.jpg\n"));
     }
 }

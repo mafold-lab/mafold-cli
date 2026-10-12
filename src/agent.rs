@@ -7564,7 +7564,10 @@ chat, so `env` and `show --reveal` refuse here\n\
 naming the ONE person who should provide it: \
 `{% mafold/connection-create provider=\"secret\" name=\"db_password\" for=\"<their username>\" why=\"<one line: what for>\" /%}`. \
 They type it into a protected box on their own device; it is sealed to your owner's machines and \
-arrives as connection `db_password` for 7 days. A message to you with `🔒 DB_PASSWORD` tells you it \
+arrives as connection `db_password` — kept for good when your owner is the one who fills it in, for 7 days \
+when anyone else does (`mafold connection list` shows the date; your owner keeps one in one click at \
+web ▸ Settings ▸ Connections — never send anyone to a terminal to store or re-add a key). \
+A message to you with `🔒 DB_PASSWORD` tells you it \
 is there — it wakes you by itself the moment they fill it in, even when they're someone you don't \
 otherwise take orders from, so don't ask anyone to @ you afterwards — then \
 `mafold connection run db_password -- sh -c '…\"$DB_PASSWORD\"…'`. If someone pastes a \

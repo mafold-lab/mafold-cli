@@ -39,6 +39,13 @@ pub enum SitesCmd {
         #[command(subcommand)]
         cmd: WorkerCmd,
     },
+    /// Site keys: a credential that deploys ONE of your sites (its files and
+    /// its Worker's code, never its bindings) and can do nothing else — what a
+    /// CI job holds instead of your account. Use one as `--token`.
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
     /// What your sites' backends used this month, against your allowance.
     /// Over a line, the platform pauses them (their /api/* answers 503).
     Usage {
@@ -134,6 +141,22 @@ pub enum WorkerCmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum KeyCmd {
+    /// Mint a key for one of your sites. Prints it ONCE — put it straight
+    /// into the CI secret; nothing can show it again.
+    Create {
+        site: String,
+        /// A label for your eyes when you decide which to revoke.
+        #[arg(long, default_value = "ci")]
+        name: String,
+    },
+    /// Your site keys (labels only).
+    List,
+    /// Revoke every key for this site.
+    Revoke { site: String },
 }
 
 const MIB: i64 = 1024 * 1024;
@@ -412,6 +435,36 @@ pub async fn run(cmd: SitesCmd, client: &Client) -> Result<()> {
                 } else {
                     println!("{site} wasn't paused");
                 }
+            }
+        },
+        SitesCmd::Key { cmd } => match cmd {
+            KeyCmd::Create { site, name } => {
+                let scope = format!("site.deploy:{}", site.trim().to_lowercase());
+                let out = client.call("createToken", json!({ "name": name, "scopes": [scope] })).await?;
+                let key = out["token"].as_str().context("the server didn't hand back a key")?;
+                // The key alone on stdout, so it can go straight into a secret:
+                // `mafold sites key create garden | gh secret set GARDEN_KEY`.
+                println!("{key}");
+                eprintln!("✓ a key that deploys {site} and nothing else — shown once; use it as --token");
+            }
+            KeyCmd::List => {
+                let out = client.call("listTokens", json!({})).await?;
+                let mut any = false;
+                for t in out.as_array().cloned().unwrap_or_default() {
+                    let scopes = t["scopes"].as_array().cloned().unwrap_or_default();
+                    if let Some(site) = scopes.iter().filter_map(Value::as_str).find_map(|s| s.strip_prefix("site.deploy:")) {
+                        any = true;
+                        println!("{site}  {}  {}", t["name"].as_str().unwrap_or("?"), t["created_at"].as_str().unwrap_or("?"));
+                    }
+                }
+                if !any {
+                    println!("(no site keys — `mafold sites key create <site>`)");
+                }
+            }
+            KeyCmd::Revoke { site } => {
+                let scope = format!("site.deploy:{}", site.trim().to_lowercase());
+                let out = client.call("revokeToken", json!({ "scope": scope })).await?;
+                println!("✓ revoked {} key(s) for {site}", out["revoked"].as_u64().unwrap_or(0));
             }
         },
         SitesCmd::Usage { site, month, user, json } => {

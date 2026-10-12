@@ -94,6 +94,18 @@ struct CardManifest {
     /// `false` keeps the card out of row previews (a reply's usage footer).
     #[serde(default)]
     preview: Option<bool>,
+    /// `true` = the card has a one-line intrinsic size and may sit inside a
+    /// line of text. Carried verbatim.
+    #[serde(default)]
+    inline: Option<bool>,
+    /// `{image?, page?}` — which fields name a picture to re-host or a page to
+    /// read. Carried verbatim; the server checks the shape.
+    #[serde(default)]
+    urls: Option<serde_json::Value>,
+    /// `{doc, example?, flag?, offer?}` — what agents are told about the card.
+    /// Carried verbatim; the server checks the shape.
+    #[serde(default)]
+    agent: Option<serde_json::Value>,
 }
 fn default_entry() -> String {
     "src/card.tsx".into()
@@ -246,6 +258,9 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         "composer": manifest.composer,
         "display_names": manifest.display_names,
         "preview": manifest.preview,
+        "inline": manifest.inline,
+        "urls": manifest.urls,
+        "agent": manifest.agent,
     });
     let r = client.publish_card(&meta, bundle).await?;
     let scope = r["scope"].as_str().unwrap_or("?");

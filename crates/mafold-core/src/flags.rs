@@ -244,6 +244,20 @@ pub static KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-10",
     },
+    // Inline media in replies (`.docs` design: 回复嵌图方案稿 v4): open_url lists
+    // a page's pictures, `unfurlUrl` answers, and the media/cite cards are
+    // offered to agents. Server-read with an explicit `unwrap_or(false)` — no
+    // record means OFF, not the usual open gate.
+    FlagMeta {
+        key: "inlineMedia",
+        default: false,
+        dev_default: false,
+        label: "Inline media in replies",
+        description: "Agents can put a page's real pictures in a reply: open_url lists them, unfurlUrl \
+                      answers, and the media / cite cards are offered. Off = none of it.",
+        owner: "ops",
+        added: "2026-10",
+    },
     FlagMeta {
         key: "moments",
         default: false,

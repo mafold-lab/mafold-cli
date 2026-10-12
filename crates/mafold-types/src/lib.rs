@@ -751,6 +751,104 @@ pub struct Message {
     /// typically empty; the pill text lives in `ServiceNotice.text`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceNotice>,
+    /// Pictures and pages the server fetched for this message (`Sidecar`).
+    /// Absent on the wire while empty. A plain field, not `flatten`: flatten
+    /// sends every message through serde's buffered map path, and this struct
+    /// is loaded wholesale at boot and serialized on every event.
+    #[serde(default, skip_serializing_if = "Sidecar::is_empty", deserialize_with = "lenient_sidecar")]
+    pub sidecar: Sidecar,
+}
+
+/// A sidecar that fails to parse costs the sidecar, never the message — the
+/// same bargain `lenient_attachments` strikes. A client older than a slot shape
+/// shows the text without pictures instead of losing a whole history page.
+fn lenient_sidecar<'de, D>(d: D) -> Result<Sidecar, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
+}
+
+/// A message's (or post's) pictures and pages, fetched FOR it by the server and
+/// kept BESIDE its text — the text itself is never rewritten. Keys are the URLs
+/// exactly as the content wrote them.
+///
+/// THIS IS THE WIRE FORM, i.e. what a client receives: the server stores each
+/// file as an `"mf-file:<id>"` string (`mafold-api` models.rs) and every
+/// response expands it into a full [`FileRef`] — or `null` when the file is
+/// gone — on the way out, the projection attachments get. So the file fields
+/// here are `Option<FileRef>` read through [`opt_file_ref`], which also takes a
+/// bare id.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Sidecar {
+    /// Picture URL → what became of it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub media: std::collections::BTreeMap<String, MediaSlot>,
+    /// Page URL → what the page says about itself.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pages: std::collections::BTreeMap<String, PageSlot>,
+}
+
+impl Sidecar {
+    pub fn is_empty(&self) -> bool {
+        self.media.is_empty() && self.pages.is_empty()
+    }
+}
+
+/// One picture: re-hosted on our CDN, still being fetched, or not to be had.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MediaSlot {
+    /// `file` is `None` only when the registry no longer has it.
+    Ready {
+        #[serde(default, deserialize_with = "opt_file_ref")]
+        file: Option<FileRef>,
+    },
+    Pending,
+    /// Refused for good (not public, not a picture, too large, gone) or given
+    /// up on — `reason` is for logs, never shown verbatim.
+    Failed {
+        #[serde(default)]
+        reason: String,
+    },
+    /// A state newer than this build: shown as nothing, never an error.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotState {
+    Ready,
+    #[default]
+    Pending,
+    Failed,
+    /// A state newer than this build.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One page: the name a source pill shows and the pictures it offers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageSlot {
+    #[serde(default)]
+    pub state: SlotState,
+    /// What a pill / source list shows — computed by the server (the
+    /// registrable domain unless the page's own site name matches it), never
+    /// taken from the author.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The re-hosted icon.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "opt_file_ref")]
+    pub icon: Option<FileRef>,
+    /// The re-hosted og:image.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "opt_file_ref")]
+    pub image: Option<FileRef>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1436,6 +1534,72 @@ impl HarnessCaps {
             || !self.modes.is_empty()
             || self.models.iter().any(|m| !m.efforts.is_empty())
             || self.source == CapsSource::None
+    }
+}
+
+#[cfg(test)]
+mod sidecar_wire_tests {
+    use super::*;
+
+    fn message_with(sidecar: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "conversation_id": "00000000-0000-0000-0000-000000000002",
+            "sender": { "username": "mafold", "display_name": "Mafold", "kind": "bot" },
+            "content": "TITAN {% mafold/cite src=\"https://fuse.energy\" /%}",
+            "created_at": "2026-10-12T00:00:00Z",
+            "reactions": [],
+            "sidecar": sidecar,
+        })
+    }
+
+    /// What the server SENDS: egress has expanded `"mf-file:<id>"` into a
+    /// FileRef, or into null when the file is gone. A client must read both —
+    /// one undecodable message fails the whole history page it rides in.
+    #[test]
+    fn an_egressed_sidecar_decodes() {
+        let v = message_with(serde_json::json!({
+            "media": {
+                "https://fuse.energy/titan.jpg": { "state": "ready", "file": { "id": "f1", "mime": "image/jpeg", "w": 1600, "h": 1200 } },
+                "https://fuse.energy/gone.jpg": { "state": "ready", "file": null },
+                "https://fuse.energy/wait.jpg": { "state": "pending" },
+                "https://fuse.energy/svg.svg": { "state": "failed", "reason": "not a picture" }
+            },
+            "pages": {
+                "https://fuse.energy": { "state": "ready", "label": "Fuse", "domain": "fuse.energy", "icon": { "id": "i1" }, "image": "bare-id" }
+            }
+        }));
+        let m: Message = serde_json::from_value(v).expect("decodes");
+        let titan = &m.sidecar.media["https://fuse.energy/titan.jpg"];
+        assert!(matches!(titan, MediaSlot::Ready { file: Some(f) } if f.id == "f1" && f.w == Some(1600)));
+        assert!(matches!(m.sidecar.media["https://fuse.energy/gone.jpg"], MediaSlot::Ready { file: None }));
+        let page = &m.sidecar.pages["https://fuse.energy"];
+        assert_eq!(page.label, "Fuse");
+        assert_eq!(page.icon.as_ref().map(|f| f.id.as_str()), Some("i1"));
+        assert_eq!(page.image.as_ref().map(|f| f.id.as_str()), Some("bare-id"), "a bare id reads too");
+    }
+
+    /// A state this build has never heard of is nothing, not an error; a sidecar
+    /// that does not parse at all costs the sidecar, never the message.
+    #[test]
+    fn newer_or_broken_sidecars_never_cost_the_message() {
+        let v = message_with(serde_json::json!({
+            "media": { "https://a.b/x.jpg": { "state": "quarantined", "until": 3 } },
+            "pages": { "https://a.b": { "state": "archived" } }
+        }));
+        let m: Message = serde_json::from_value(v).expect("decodes");
+        assert_eq!(m.sidecar.media["https://a.b/x.jpg"], MediaSlot::Unknown);
+        assert_eq!(m.sidecar.pages["https://a.b"].state, SlotState::Unknown);
+
+        let broken: Message = serde_json::from_value(message_with(serde_json::json!({ "media": [1, 2, 3] }))).expect("decodes");
+        assert!(broken.sidecar.is_empty());
+        let absent: Message = serde_json::from_value({
+            let mut v = message_with(serde_json::Value::Null);
+            v.as_object_mut().unwrap().remove("sidecar");
+            v
+        })
+        .expect("decodes");
+        assert!(absent.sidecar.is_empty());
     }
 }
 

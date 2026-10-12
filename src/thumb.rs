@@ -112,6 +112,14 @@ pub struct Derived {
     pub orig: Option<Vec<u8>>,
 }
 
+/// `keepEncodedView`: keep the new view only if it came out smaller than the
+/// original. One that didn't saves nobody a byte, so the original goes instead
+/// (and is then the only copy) — even past the 2560 box, which is there to
+/// save bytes, not to be met.
+pub fn keep_encoded_view(plan: &UploadPlan, encoded_bytes: u64, original_bytes: u64) -> bool {
+    matches!(plan.view, ViewPlan::Encode { .. }) && encoded_bytes < original_bytes
+}
+
 /// Decode, plan, encode. `None` = send the bytes as they are (not a picture
 /// we derive from, or one this build can't decode).
 pub fn derive(bytes: &[u8], mime: &str, original: bool) -> Option<Derived> {
@@ -131,10 +139,7 @@ pub fn derive(bytes: &[u8], mime: &str, original: bool) -> Option<Derived> {
         Encoding::Lossless => (encode_webp_lossless(&scaled)?, "image/webp"),
         Encoding::Lossy => (encode_jpeg(&scaled, quality)?, "image/jpeg"),
     };
-    // `keepEncodedView`: a view that came out bigger than an original which
-    // already fits the box is no improvement — the original goes instead (and
-    // is then the only copy). One that had to shrink the picture is kept.
-    if w0.max(h0) <= VIEW_EDGE && view.len() >= bytes.len() {
+    if !keep_encoded_view(&plan, view.len() as u64, bytes.len() as u64) {
         return as_is(strip);
     }
     Some(Derived { view, view_mime, strip, orig: (original && plan.offers_original).then(|| bytes.to_vec()) })
@@ -191,6 +196,33 @@ mod tests {
         assert!(t.cases.len() >= 8);
         for c in t.cases {
             assert_eq!(plan_upload(c.w, c.h, &c.mime, c.bytes), c.plan, "case {:?}", c.name);
+        }
+    }
+
+    /// The same `keep` table thumbPlan.spec.ts reads for `keepEncodedView`.
+    #[test]
+    fn keeping_the_view_matches_the_shared_case_table() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Keep {
+            name: String,
+            w: u32,
+            h: u32,
+            mime: String,
+            bytes: u64,
+            encoded_bytes: u64,
+            keep: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Table {
+            keep: Vec<Keep>,
+        }
+        let t: Table = serde_json::from_str(include_str!("../../client-shared/thumbPlan.cases.json")).unwrap();
+        assert!(t.keep.len() >= 5);
+        for c in t.keep {
+            let plan = plan_upload(c.w, c.h, &c.mime, c.bytes).expect(&c.name);
+            assert!(matches!(plan.view, ViewPlan::Encode { .. }), "case {:?}", c.name);
+            assert_eq!(keep_encoded_view(&plan, c.encoded_bytes, c.bytes), c.keep, "case {:?}", c.name);
         }
     }
 
