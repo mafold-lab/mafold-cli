@@ -226,8 +226,10 @@ const MIN_LOCAL: usize = 12;
 
 /// How long one sweep of the credential files is trusted. Short, because a
 /// token is rotated under a running daemon (`take_rotation`) and the new one
-/// must be masked from its first appearance; cheap, because it is a handful of
-/// small files read at most this often, not per draft push.
+/// must be masked from its first appearance; cheap enough, because it is a
+/// handful of small files read at most this often, not per draft push — plus,
+/// on a Mac, one `security` probe and one item read per Claude Code login
+/// (~10ms each, run in line on the write that finds the sweep stale).
 const RESWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Mask every credential this machine holds out of `body`, if `method` writes
@@ -301,10 +303,17 @@ fn local_credentials() -> Vec<String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let values = sweep(&home, &env);
+    // Never the real Keychain under test: a test's failure message prints
+    // what it scrubbed, and this is the path every client test's write takes.
+    let keychain = if cfg!(test) { None } else { crate::accounts::keychain() };
+    let mut seen = KEYCHAIN_SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    let values = sweep_with(&home, &env, keychain, seen.get_or_insert_with(Default::default));
     *cache = Some((Instant::now(), values.clone()));
     values
 }
+
+/// What each Keychain item said last, kept across sweeps (see [`sweep_with`]).
+static KEYCHAIN_SEEN: std::sync::Mutex<Option<KeychainSeen>> = std::sync::Mutex::new(None);
 
 /// Start the next call from a fresh sweep (a test that just planted a value).
 #[cfg(test)]
@@ -312,52 +321,117 @@ pub(crate) fn forget_sweep() {
     *SWEPT.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
+/// The last thing each Keychain item said, by service.
+type KeychainSeen = std::collections::HashMap<String, String>;
+
 /// Every credential under `home` and in `env`: the bot tokens the daemons on
 /// this machine run with, the people signed in here, the app secrets, this
-/// device's vault key, and each harness's own login — Claude Code (the file
-/// form; macOS keeps it in the Keychain, out of reach of a cheap sweep),
-/// Codex and Kimi — plus any environment variable named like a secret.
-pub(crate) fn sweep(home: &std::path::Path, env: &[(String, String)]) -> Vec<String> {
+/// device's vault key, and each harness's own login — Claude Code (wherever
+/// [`crate::accounts::LoginStore`] says: the Keychain on a Mac, with the MCP
+/// grants filed beside it), Codex and Kimi, for this process and for every
+/// daemon pinned elsewhere with `--env` — plus any environment variable
+/// named like a secret.
+///
+/// `keychain` is handed in so tests never read the real one into a list their
+/// failure messages print. `seen` is what each Keychain item said last: when
+/// the Keychain stops answering mid-session (it locked, a read timed out) its
+/// tokens stay on the list — they are as live as they were a sweep ago — and
+/// only "not there", a sign-out, takes them off.
+fn sweep_with(
+    home: &std::path::Path,
+    env: &[(String, String)],
+    keychain: Option<crate::accounts::Keychain>,
+    seen: &mut KeychainSeen,
+) -> Vec<String> {
+    use crate::accounts::{LoginStore, CONFIG_DIR_ENV, ENV as SECURESTORAGE_ENV};
     use std::path::PathBuf;
-    let var = |name: &str| env.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).filter(|v| !v.is_empty());
-    let mut json_files: Vec<PathBuf> = [
-        ".mafold/daemons.json",
-        ".mafold/session.json",
-        ".mafold/app-secrets.json",
-        ".mafold/device_key.json",
-        ".claude/.credentials.json",
-    ]
-    .iter()
-    .map(|f| home.join(f))
-    .collect();
-    // Every other Claude Code login this machine switches between
-    // (`accounts.rs`): each keeps its credential file in its own directory.
+    let daemons = read_json(&home.join(".mafold/daemons.json"));
+    let mut json_files: Vec<PathBuf> = [".mafold/session.json", ".mafold/app-secrets.json", ".mafold/device_key.json"]
+        .iter()
+        .map(|f| home.join(f))
+        .collect();
+
+    // The environments credentials are found through: this process's, and
+    // each daemon's `--env` pins over it — what that daemon actually runs
+    // with, and so whose output this sweep is masking.
+    let mut envs: Vec<Vec<(String, String)>> = vec![env.to_vec()];
+    for daemon in daemons.as_ref().and_then(|d| d["daemons"].as_array()).into_iter().flatten() {
+        if let Some(pins) = daemon["env"].as_object().filter(|p| !p.is_empty()) {
+            let mut pinned = env.to_vec();
+            pinned.extend(pins.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))));
+            envs.push(pinned);
+        }
+    }
+    // Every Claude Code login this machine switches between: `~/.claude`'s,
+    // the one each environment points at (a pinned seat, a
+    // `CLAUDE_CONFIG_DIR`), and each registered seat (`accounts.rs`). Each is
+    // read in BOTH its places — a leftover file's grant may still be live.
+    let mut claude = vec![LoginStore::default_in(home)];
+    let (mut codex_homes, mut kimi_homes) = (Vec::new(), Vec::new());
+    for e in &envs {
+        // The last value wins, as it does for the process the pins build.
+        let var = |name: &str| e.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone()).filter(|v| !v.is_empty());
+        claude.push(LoginStore::resolve(home, var(SECURESTORAGE_ENV).as_deref(), var(CONFIG_DIR_ENV).as_deref()));
+        codex_homes.push(var("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex")));
+        kimi_homes.push(var("KIMI_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".kimi")));
+    }
     if let Some(registry) = read_json(&home.join(".mafold/claude-accounts.json")) {
         for account in registry["accounts"].as_array().into_iter().flatten() {
             if let Some(dir) = account["dir"].as_str() {
-                json_files.push(PathBuf::from(dir).join(".credentials.json"));
+                claude.push(LoginStore::resolve(home, Some(dir), None));
             }
         }
     }
-    json_files.push(var("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex")).join("auth.json"));
-    let kimi = var("KIMI_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".kimi"));
-    if let Ok(dir) = std::fs::read_dir(kimi.join("credentials")) {
-        json_files.extend(dir.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")));
+    // Each place asked once: a Keychain read is a process spawn.
+    distinct(&mut claude);
+    distinct(&mut codex_homes);
+    distinct(&mut kimi_homes);
+    json_files.extend(codex_homes.iter().map(|c| c.join("auth.json")));
+    for kimi in &kimi_homes {
+        if let Ok(dir) = std::fs::read_dir(kimi.join("credentials")) {
+            json_files.extend(dir.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")));
+        }
     }
 
     let mut found = Vec::new();
+    if let Some(v) = &daemons {
+        collect_named(v, false, &mut found);
+    }
     for file in &json_files {
         if let Some(v) = read_json(file) {
             collect_named(&v, false, &mut found);
         }
     }
+    for login in &claude {
+        if let Some(read) = keychain {
+            // A failure — locked (one probe settles that for every item),
+            // or this item alone — leaves what it said last standing.
+            match read(&login.keychain_service) {
+                Ok(Some(blob)) => {
+                    seen.insert(login.keychain_service.clone(), blob);
+                }
+                Ok(None) => {
+                    seen.remove(&login.keychain_service);
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(v) = seen.get(&login.keychain_service).and_then(|blob| serde_json::from_str(blob).ok()) {
+            collect_named(&v, false, &mut found);
+        }
+        if let Some(v) = read_json(&login.file) {
+            collect_named(&v, false, &mut found);
+        }
+    }
     // `key = "value"` lines whose key is named like a secret (Kimi's provider
     // keys) — enough TOML for that, without parsing the rest of the file.
-    if let Ok(text) = std::fs::read_to_string(kimi.join("config.toml")) {
-        for line in text.lines() {
-            if let Some((key, value)) = line.split_once('=') {
-                if secret_name(key.trim()) {
-                    found.push(value.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+    for kimi in &kimi_homes {
+        if let Ok(text) = std::fs::read_to_string(kimi.join("config.toml")) {
+            for line in text.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    if secret_name(key.trim()) {
+                        found.push(value.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+                    }
                 }
             }
         }
@@ -374,6 +448,15 @@ pub(crate) fn sweep(home: &std::path::Path, env: &[(String, String)]) -> Vec<Str
     found.sort();
     found.dedup();
     found
+}
+
+/// Drop repeats, keeping first occurrences in order.
+fn distinct<T: PartialEq + Clone>(items: &mut Vec<T>) {
+    let mut kept: Vec<T> = Vec::with_capacity(items.len());
+    items.retain(|i| !kept.contains(i) && {
+        kept.push(i.clone());
+        true
+    });
 }
 
 fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -567,7 +650,7 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-        let found = sweep(&home, &env);
+        let found = sweep_with(&home, &env, None, &mut KeychainSeen::new());
         for want in [
             "mb_0000000000000000000000000000a001", // every bot on this machine
             "mb_0000000000000000000000000000a002",
@@ -604,6 +687,164 @@ mod tests {
             assert!(!found.iter().any(|f| f == not), "{not} is not a credential: {found:?}");
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// On a Mac Claude Code's logins are Keychain items and there is no file
+    /// to sweep, so its tokens — and the MCP grants filed beside them — were
+    /// never on the list: a bot printing one posted it to the room unmasked.
+    /// Every login the machine switches between counts: `~/.claude`'s and each
+    /// registered seat's (whose item is named after its directory).
+    #[test]
+    fn claude_logins_held_in_the_keychain_are_on_the_list() {
+        let home = fake_home("keychain");
+        let seat = home.join("claude-seat");
+        put(
+            &home.join(".mafold/claude-accounts.json"),
+            &serde_json::json!({"accounts": [{"name": "seat", "dir": seat}]}).to_string(),
+        );
+        let seat_item = format!("Claude Code-credentials-{}", crate::accounts::hash8(seat.to_str().unwrap()));
+        let keychain = move |service: &str| {
+            Ok(match service {
+                "Claude Code-credentials" => Some(
+                    serde_json::json!({
+                        "mcpOAuth": {"linear|abc": {"accessToken": "mcp_linear_access_0001", "clientId": "client-id-not-secret"}},
+                        "claudeAiOauth": {"accessToken": "sk-ant-oat01-keychain-0001", "refreshToken": "sk-ant-ort01-keychain-0001"},
+                    })
+                    .to_string(),
+                ),
+                s if s == seat_item => Some(r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-seat-kc-0001"}}"#.to_string()),
+                _ => None,
+            })
+        };
+        let found = sweep_with(&home, &[], Some(&keychain), &mut KeychainSeen::new());
+        for want in [
+            "sk-ant-oat01-keychain-0001",
+            "sk-ant-ort01-keychain-0001",
+            "mcp_linear_access_0001",
+            "sk-ant-oat01-seat-kc-0001",
+        ] {
+            assert!(found.iter().any(|f| f == want), "missed {want}: {found:?}");
+        }
+        assert!(!found.iter().any(|f| f == "client-id-not-secret"), "{found:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `CLAUDE_CONFIG_DIR` puts the login somewhere else — its file inside
+    /// that directory, its Keychain item named after it. Both are swept, and so
+    /// is `~/.claude`'s: the same person runs `claude` with and without it.
+    #[test]
+    fn a_login_moved_by_claude_config_dir_is_on_the_list() {
+        let home = fake_home("config-dir");
+        let config = home.join("claude-elsewhere");
+        put(&config.join(".credentials.json"), r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-cfg-file-0001"}}"#);
+        put(&home.join(".claude/.credentials.json"), r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-plain-0001"}}"#);
+        let config = config.to_str().unwrap().to_string();
+        let item = format!("Claude Code-credentials-{}", crate::accounts::hash8(&config));
+        let keychain = move |service: &str| {
+            Ok((service == item).then(|| r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-cfg-kc-0001"}}"#.to_string()))
+        };
+        let env = vec![("CLAUDE_CONFIG_DIR".to_string(), config.clone())];
+        let found = sweep_with(&home, &env, Some(&keychain), &mut KeychainSeen::new());
+        for want in ["sk-ant-oat01-cfg-file-0001", "sk-ant-oat01-cfg-kc-0001", "sk-ant-oat01-plain-0001"] {
+            assert!(found.iter().any(|f| f == want), "missed {want}: {found:?}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A daemon pinned to its own login with `mafold add --env` (a seat, a
+    /// `CLAUDE_CONFIG_DIR`, a `CODEX_HOME`) runs on credentials nothing else
+    /// points at — and prints its turns through this same sweep.
+    #[test]
+    fn a_login_a_daemon_is_pinned_to_is_on_the_list() {
+        let home = fake_home("pinned");
+        let config = home.join("pinned-claude");
+        let codex = home.join("pinned-codex");
+        put(&config.join(".credentials.json"), r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-pinned-file-0001"}}"#);
+        put(&codex.join("auth.json"), r#"{"tokens":{"access_token":"codex_pinned_access_0001"}}"#);
+        put(
+            &home.join(".mafold/daemons.json"),
+            &serde_json::json!({"daemons": [{
+                "name": "opsdu:pinned", "harness": "claude-code", "workdir": "/w", "token": "mb_0000000000000000000000000000d001",
+                "env": {"CLAUDE_CONFIG_DIR": config, "CODEX_HOME": codex},
+            }]})
+            .to_string(),
+        );
+        let config = config.to_str().unwrap().to_string();
+        let item = format!("Claude Code-credentials-{}", crate::accounts::hash8(&config));
+        let keychain = move |service: &str| {
+            Ok((service == item).then(|| r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-pinned-kc-0001"}}"#.to_string()))
+        };
+        let found = sweep_with(&home, &[], Some(&keychain), &mut KeychainSeen::new());
+        for want in ["sk-ant-oat01-pinned-file-0001", "sk-ant-oat01-pinned-kc-0001", "codex_pinned_access_0001"] {
+            assert!(found.iter().any(|f| f == want), "missed {want}: {found:?}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A Keychain that stops answering (it locked, a read timed out) doesn't
+    /// take its tokens off the list: they are as live as they were a sweep
+    /// ago. Only "not there" — signed out — drops them.
+    #[test]
+    fn a_keychain_that_stops_answering_keeps_what_it_said_last() {
+        let home = fake_home("seen");
+        let mut seen = KeychainSeen::new();
+        let says = |s: &'static str| {
+            move |_: &str| -> Result<Option<String>, String> { Ok(Some(format!(r#"{{"claudeAiOauth":{{"accessToken":"{s}"}}}}"#))) }
+        };
+        let locked = |_: &str| Err("the login Keychain is locked".to_string());
+        let gone = |_: &str| Ok(None);
+
+        assert!(sweep_with(&home, &[], Some(&says("sk-ant-oat01-was-live-0001")), &mut seen).iter().any(|f| f == "sk-ant-oat01-was-live-0001"));
+        let found = sweep_with(&home, &[], Some(&locked), &mut seen);
+        assert!(found.iter().any(|f| f == "sk-ant-oat01-was-live-0001"), "dropped while locked: {found:?}");
+        let found = sweep_with(&home, &[], Some(&gone), &mut seen);
+        assert!(!found.iter().any(|f| f == "sk-ant-oat01-was-live-0001"), "kept after sign-out: {found:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// One item that can't be read (an ACL another binary wrote, a read that
+    /// timed out) is that item's problem: every other login is still asked
+    /// for, or a seat's tokens stay off the list for as long as the first
+    /// item keeps failing. (A LOCKED Keychain is the whole Keychain's, and is
+    /// settled by one probe before any item is read — `accounts::keychain_lock`.)
+    #[test]
+    fn one_items_failure_doesnt_hide_the_others() {
+        let home = fake_home("one-fails");
+        let seats: Vec<_> = (0..3).map(|i| home.join(format!("seat-{i}"))).collect();
+        put(
+            &home.join(".mafold/claude-accounts.json"),
+            &serde_json::json!({"accounts": seats.iter().enumerate().map(|(i, d)| serde_json::json!({"name": format!("s{i}"), "dir": d})).collect::<Vec<_>>()}).to_string(),
+        );
+        let items: Vec<(String, String)> = seats
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (format!("Claude Code-credentials-{}", crate::accounts::hash8(d.to_str().unwrap())), format!("sk-ant-oat01-seat{i}-only-kc")))
+            .collect();
+        let keychain = move |service: &str| match items.iter().find(|(s, _)| s == service) {
+            Some((_, token)) => Ok(Some(format!(r#"{{"claudeAiOauth":{{"accessToken":"{token}"}}}}"#))),
+            None => Err("no answer from the Keychain in 2s — is it locked?".to_string()),
+        };
+        let found = sweep_with(&home, &[], Some(&keychain), &mut KeychainSeen::new());
+        for i in 0..3 {
+            let want = format!("sk-ant-oat01-seat{i}-only-kc");
+            assert!(found.contains(&want), "missed {want}: {found:?}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// This Mac, for real: its own Claude Code login is in the Keychain and in
+    /// no file, and the sweep that masks a bot's output now holds it. Prints
+    /// COUNTS only. `cargo test --bin mafold -- --ignored this_macs_keychain_login`.
+    #[test]
+    #[ignore = "reads this Mac's real Claude Code login out of the Keychain"]
+    fn this_macs_keychain_login_is_on_the_list() {
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let claude = |found: &[String]| found.iter().filter(|f| f.starts_with("sk-ant-o")).count();
+        let without = claude(&sweep_with(&home, &env, None, &mut KeychainSeen::new()));
+        let with = claude(&sweep_with(&home, &env, crate::accounts::keychain(), &mut KeychainSeen::new()));
+        println!("Claude Code tokens on the list: without the Keychain {without}, with it {with}");
+        assert!(with > without, "the Keychain added no Claude Code token");
     }
 
     #[test]

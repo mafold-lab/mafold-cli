@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.145"
+version = "0.9.146"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -38,6 +38,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 sha2 = "0.10"
+# NFC, the form Claude Code hashes a config directory in to name its Keychain
+# item (`accounts::LoginStore::resolve`). Already in the graph via mafold-types.
+unicode-normalization = "0.1.25"
 # Shared-room CRDT peer for the AI: same crate/version the API uses
 # (compact_room_log), so change blobs interop with web's @automerge/automerge.
 automerge = "0.5"

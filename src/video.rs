@@ -551,16 +551,17 @@ async fn own_submit(client: &Client, key: KeyHolder, mut body: Value, dry_run: b
 
 /// What ModelArk is handed for each `--ref` on the own-key path: where the
 /// server resolved it on the dry run (`ref_urls`) — a file id means nothing on
-/// the owner's device, and the driver sends links only. A ref with no link (a
-/// server without public storage inlines an image: `url: null`) is refused
-/// here, before anything is spent. An api from before `ref_urls` resolved the
-/// refs and kept the answer: a ref given as a link passes through as it was,
-/// one given as a file can't, and says so.
+/// the owner's device. That is a link, or on a server without public storage
+/// an inline `data:image/…` (the bytes the house path sends too); a ref with
+/// neither (`url: null` — a video or audio file there) is refused here, before
+/// anything is spent. An api from before `ref_urls` resolved the refs and kept
+/// the answer: a ref given as a link passes through as it was, one given as a
+/// file can't, and says so.
 fn vendor_refs(sent: &[Value], checked: &Value) -> Result<Vec<Value>> {
     let link = |r: &Value| -> Option<String> {
         r["url"]
             .as_str()
-            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://") || u.starts_with("data:image/"))
             .map(str::to_string)
     };
     let (refs, older) = match checked.get("ref_urls").and_then(Value::as_array) {
@@ -577,8 +578,8 @@ fn vendor_refs(sent: &[Value], checked: &Value) -> Result<Vec<Value>> {
                      own-key video) — pass a public https URL instead, or `--via house`"
                 )),
                 None => Err(anyhow!(
-                    "--ref {role}: this server has no public link for that file, and ModelArk fetches \
-                     refs by link — pass a public https URL instead, or `--via house`"
+                    "--ref {role}: this server has no public link for that file, and only an image \
+                     can travel inline — pass a public https URL instead, or `--via house`"
                 )),
             }
         })
@@ -1491,10 +1492,15 @@ mod tests {
                 json!({ "role": "reference_video", "url": "https://x.example/a.mp4" }),
             ]
         );
-        // A server without public storage inlined the image: no link, so
-        // refused before anything is spent.
-        let inline = json!({ "ref_urls": [{ "role": "first_frame", "url": null }] });
-        let e = vendor_refs(&sent[..1], &inline).unwrap_err().to_string();
+        // A server without public storage inlined the image: those bytes go
+        // to ModelArk as they would on the house path.
+        let png = "data:image/png;base64,iVBORw0KGgo=";
+        let inline = json!({ "ref_urls": [{ "role": "first_frame", "url": png }] });
+        assert_eq!(vendor_refs(&sent[..1], &inline).unwrap(), vec![json!({ "role": "first_frame", "url": png })]);
+        // Nothing ModelArk can read (a video file there): refused before
+        // anything is spent.
+        let none = json!({ "ref_urls": [{ "role": "first_frame", "url": null }] });
+        let e = vendor_refs(&sent[..1], &none).unwrap_err().to_string();
         assert!(e.contains("first_frame") && e.contains("--via house"), "{e}");
         // An api from before `ref_urls`: a link passes through, a file can't.
         assert_eq!(vendor_refs(&sent[1..], &json!({})).unwrap(), vec![sent[1].clone()]);

@@ -720,35 +720,20 @@ impl Harness for ClaudeCode {
         use crate::commands::UtilizationProbe as P;
         match crate::commands::probe_utilization(env).await {
             P::Ok(v) => {
-                let limits = v["limits"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|l| {
-                        let percent = l["percent"].as_f64()?;
-                        let kind = l["kind"].as_str().unwrap_or("usage").to_string();
-                        Some(SeatLimit {
-                            label: seat_limit_label(&kind, l),
-                            kind,
-                            percent,
-                            resets_at: l["resets_at"].as_str().and_then(crate::commands::iso_epoch_secs),
-                        })
-                    })
-                    .collect();
-                // The plan chip comes from `~/.claude.json`, which the LAST
-                // login to sign in owns — only the default seat can claim it.
+                // Shared usage semantics: a model-only wall or paid overage
+                // must not advertise the entire subscription as exhausted.
                 let tier = if crate::accounts::Account::from_env(env).is_default() {
                     crate::commands::plan_tier()
                 } else {
                     None
                 };
-                SeatHealth::from_limits(tier, limits)
+                seat_health_from_usage(&v, tier, crate::accounts::now())
             }
             P::NoCredential => SeatHealth::unauthenticated(),
             // Signed in, renewed on its next run — we didn't get to look.
             P::Stale => SeatHealth::unknown(),
             P::Http(s) => SeatHealth::from_status(s),
-            P::Unreachable => SeatHealth::unreachable(),
+            P::Unreachable | P::Unreadable(_) => SeatHealth::unreachable(),
         }
     }
 
@@ -804,6 +789,28 @@ impl Harness for ClaudeCode {
         }
         (!probe.is_empty()).then_some(probe)
     }
+}
+
+/// Report the actual windows while deriving usability from the SAME verdict
+/// that `/account` and pre-turn selection use, including overage and scope.
+fn seat_health_from_usage(v: &Value, tier: Option<String>, now: i64) -> SeatHealth {
+    let snapshot = crate::accounts::snapshot_from_usage(v, now);
+    let limits = v["limits"].as_array().into_iter().flatten()
+        .filter_map(|l| {
+            let percent = l["percent"].as_f64().filter(|percent| percent.is_finite() && *percent >= 0.0)?;
+            let kind = l["kind"].as_str().unwrap_or("usage").to_string();
+            Some(SeatLimit {
+                label: seat_limit_label(&kind, l), kind, percent,
+                resets_at: l["resets_at"].as_str().and_then(crate::commands::iso_epoch_secs),
+            })
+        }).collect();
+    let mut health = SeatHealth::from_limits(tier, limits);
+    health.state = match snapshot.state {
+        crate::accounts::SeatState::Exhausted { .. } => "exhausted",
+        crate::accounts::SeatState::Unknown => "unknown",
+        _ => "ok",
+    }.into();
+    health
 }
 
 /// A value `--effort` cannot possibly mean, used to make the binary state its
@@ -2090,6 +2097,40 @@ mod tests {
         assert_eq!(seat_limit_label("weekly_all", &Value::Null), "Week (all models)");
         assert_eq!(seat_limit_label("weekly_scoped", &scoped), "Week (Fable)");
         assert_eq!(seat_limit_label("some_new_window", &Value::Null), "Some new window");
+    }
+
+    #[test]
+    fn seat_health_uses_the_choosers_scope_and_overage_semantics() {
+        let now = 1_788_000_000;
+        let mut usage = serde_json::json!({
+            "limits": [{"kind":"weekly_scoped", "percent":100, "scope":{"model":{"display_name":"Fable"}}}]
+        });
+        let health = seat_health_from_usage(&usage, None, now);
+        assert_eq!(health.state, "ok");
+        assert_eq!(health.limits[0].percent, 100.0, "still report the model wall");
+        usage["limits"][0]["scope"] = Value::Null;
+        usage["limits"][0]["kind"] = "weekly_all".into();
+        assert_eq!(seat_health_from_usage(&usage, None, now).state, "exhausted");
+        usage["extra_usage"] = serde_json::json!({"is_enabled":true,"spend_limit_reached":false});
+        assert_eq!(seat_health_from_usage(&usage, None, now).state, "ok");
+        usage["extra_usage"]["spend_limit_reached"] = true.into();
+        assert_eq!(seat_health_from_usage(&usage, None, now).state, "exhausted");
+    }
+
+    #[test]
+    fn seat_health_rejects_invalid_usage_numbers_without_claiming_exhaustion() {
+        let usage = serde_json::json!({"limits":[
+            {"kind":"session", "percent":-1},
+            {"kind":"weekly_all", "percent":"unknown"},
+            {"kind":"weekly_scoped", "percent":null}
+        ]});
+        let health = seat_health_from_usage(&usage, None, 1000);
+        assert_eq!(health.state, "unknown");
+        assert!(health.limits.is_empty());
+        let zero = seat_health_from_usage(&serde_json::json!({"limits":[{"kind":"session","percent":0}]}), None, 1000);
+        assert_eq!(zero.state, "ok");
+        assert_eq!(zero.limits.len(), 1);
+        assert_eq!(zero.limits[0].percent, 0.0);
     }
 
     /// A real `initialize` answer (2.1.272, trimmed) becomes the roster, tiers

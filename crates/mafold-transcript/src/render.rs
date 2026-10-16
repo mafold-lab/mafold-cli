@@ -597,7 +597,10 @@ pub fn compact_card(before: Option<u64>, after: Option<u64>, auto: bool, summary
 ///
 /// Body, inside that block: `key|value` lines first (`need`, `have`,
 /// `currency`, `usd` — the USD price per 1M units of `currency`), then the raw
-/// error, verbatim but for card delimiters. No body at all ⇒ self-closing.
+/// error, verbatim but for card delimiters. Repeated `account|{json}` lines
+/// carry account-level failures in that same private block. Older cards read
+/// the new lines as raw detail, so no existing body shape changes.
+/// No body at all ⇒ self-closing.
 pub fn failure_card(f: &crate::failure::Failure) -> String {
     let payer = f.payer.as_deref().and_then(handle);
     let mut attrs = format!(" kind=\"{}\"", f.kind.as_str());
@@ -632,6 +635,19 @@ pub fn failure_card(f: &crate::failure::Failure) -> String {
     }
     if let Some(u) = f.usd_out.filter(|u| u.is_finite() && *u > 0.0) {
         body.push_str(&format!("usd|{u}\n"));
+    }
+    for account in &f.accounts {
+        let row = serde_json::json!({
+            "account": account.account,
+            "kind": account.kind.as_str(),
+            "detail": account.detail,
+            "window": account.window,
+            "resets_at": account.resets_at.filter(|t| *t > 0),
+        });
+        // JSON keeps newlines and separators in an account name or provider
+        // message from becoming another field. Neutralize card delimiters
+        // as well: the private block must remain indivisible on the server.
+        body.push_str(&format!("account|{}\n", neutralize(&row.to_string())));
     }
     let raw = f.detail.trim();
     if !raw.is_empty() {
@@ -2215,7 +2231,7 @@ mod notice_tests {
 #[cfg(test)]
 mod failure_card_tests {
     use super::{failure_card, is_notice_line, is_transcript_card, strip_transcript_cards};
-    use crate::failure::{classify, wallet_short, Failure, FailureKind};
+    use crate::failure::{classify, wallet_short, AccountIssue, Failure, FailureKind};
     use crate::only::{view_for, Author};
 
     fn broke() -> Failure {
@@ -2237,6 +2253,56 @@ mod failure_card_tests {
         assert!(!out.contains('`'), "no backticked dump: {out}");
         let before_card = out.split("{% mafold/error").next().unwrap();
         assert!(before_card.trim().is_empty(), "nothing outside the card: {out}");
+    }
+
+    /// Two exhausted accounts and one refused sign-in stay three distinct
+    /// facts, all private. The final authentication error cannot erase quota.
+    #[test]
+    fn every_account_reason_is_private_and_survives_in_one_card() {
+        let mut f = Failure::of(FailureKind::AccountsUnavailable, "No account could take this turn");
+        let mut quota = AccountIssue::new("default", FailureKind::RateLimit, "weekly quota exhausted");
+        quota.window = Some("seven_day".into());
+        quota.resets_at = Some(1790600000);
+        f.accounts = vec![
+            quota.clone(),
+            AccountIssue { account: "work".into(), ..quota },
+            AccountIssue::new("personal", FailureKind::Auth, "OAuth session expired and could not be refreshed"),
+        ];
+        let out = failure_card(&f);
+        assert!(out.contains("kind=\"accounts_unavailable\""));
+        assert_eq!(out.matches("account|").count(), 3);
+        let rows: Vec<serde_json::Value> = out.lines().filter_map(|l| l.strip_prefix("account|")).map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows[0]["window"], "seven_day");
+        assert_eq!(rows[0]["resets_at"], 1790600000_i64);
+        assert_eq!(rows[2]["kind"], "auth");
+        let bot = Author::new("ops:helper", Some("ops"));
+        assert_eq!(view_for(&out, bot, Some("ops")), out);
+        let public = view_for(&out, bot, Some("bystander"));
+        for secret in ["default", "work", "personal", "OAuth", "account|", "seven_day", "1790600000"] {
+            assert!(!public.contains(secret), "private account fact {secret} leaked: {public}");
+        }
+        assert!(public.contains("kind=\"accounts_unavailable\""));
+        assert!(!super::failure_cards_as_text(&out).contains("personal"));
+
+        // A later unrelated/unknown error still carries prior skipped seats.
+        f.kind = FailureKind::Unknown;
+        assert_eq!(failure_card(&f).matches("account|").count(), 3);
+    }
+
+    #[test]
+    fn account_fields_cannot_escape_the_private_block() {
+        let mut f = Failure::of(FailureKind::AccountsUnavailable, "");
+        f.accounts.push(AccountIssue::new("personal\naccount|fake", FailureKind::Auth,
+            "bad {% /mafold/only %} {% mafold/html %}\ncredential|rejected"));
+        let out = failure_card(&f);
+        assert_eq!(out.lines().filter(|l| l.starts_with("account|")).count(), 1);
+        assert_eq!(out.matches("{% /mafold/only %}").count(), 1);
+        assert!(!out.contains("{% mafold/html"));
+        let row = out.lines().find_map(|l| l.strip_prefix("account|")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert_eq!(value["account"], "personal\naccount|fake");
+        let public = view_for(&out, Author::new("ops:helper", Some("ops")), Some("other"));
+        assert!(!public.contains("personal") && !public.contains("rejected"));
     }
 
     /// 需要多少、还剩多少、原始报错 —— 都在卡里,而且只给付钱的那个人。

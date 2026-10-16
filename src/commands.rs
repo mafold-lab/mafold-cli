@@ -1123,7 +1123,7 @@ fn now_ms() -> i64 {
 pub(crate) fn oauth_token(env: &[(String, String)]) -> Option<String> {
     match stored_login(env) {
         StoredLogin::Fresh(t) => Some(t),
-        StoredLogin::Stale | StoredLogin::Missing => None,
+        StoredLogin::Stale | StoredLogin::Missing | StoredLogin::Unreadable(_) => None,
     }
 }
 
@@ -1143,36 +1143,28 @@ pub(crate) enum StoredLogin {
     /// it was skipped (a Muse turn on 2026-09-27 hit a full window with a
     /// second login sitting at 0%).
     Stale,
-    /// No credential, an unreadable one, or no way to renew it — which
-    /// includes a refresh token past its end.
+    /// No credential or no way to renew it, including an expired refresh token.
     Missing,
+    /// Storage could not be read; re-authenticating is not the remedy.
+    Unreadable(String),
 }
 
 pub(crate) fn stored_login(env: &[(String, String)]) -> StoredLogin {
-    match read_credential(env) {
-        Some(raw) => stored_login_from(&raw, now_ms()),
-        None => StoredLogin::Missing,
+    stored_login_read(read_credential(env), now_ms())
+}
+
+fn stored_login_read(raw: Result<String, crate::accounts::NoStoredLogin>, now: i64) -> StoredLogin {
+    match raw {
+        Ok(raw) => stored_login_from(&raw, now),
+        Err(e) if e.signed_out() => StoredLogin::Missing,
+        Err(e) => StoredLogin::Unreadable(e.to_string()),
     }
 }
 
-/// The seat's stored credential blob: `<dir>/.credentials.json`, else (macOS)
-/// the Keychain item Claude Code names after the directory.
-fn read_credential(env: &[(String, String)]) -> Option<String> {
-    let acct = crate::accounts::Account::from_env(env);
-    if let Ok(s) = std::fs::read_to_string(acct.credentials_file()) {
-        return Some(s);
-    }
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    let out = crate::platform::std_command("security")
-        .args(["find-generic-password", "-s", &acct.keychain_service(), "-w"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
+/// The seat's stored credential blob, from wherever Claude Code keeps it —
+/// the same reader `connection --import` uses ([`crate::accounts::LoginStore`]).
+fn read_credential(env: &[(String, String)]) -> Result<String, crate::accounts::NoStoredLogin> {
+    crate::accounts::Account::from_env(env).store_for(env).read()
 }
 
 /// Which credential the seat holds, as a short hash of its refresh token —
@@ -1180,26 +1172,28 @@ fn read_credential(env: &[(String, String)]) -> Option<String> {
 /// changed fingerprint is how a remembered refusal
 /// ([`crate::accounts::SignedOut`]) learns it no longer applies.
 pub(crate) fn credential_fingerprint(env: &[(String, String)]) -> Option<String> {
-    fingerprint_of(&read_credential(env)?)
+    fingerprint_of(&read_credential(env).ok()?)
 }
 
 /// [`credential_fingerprint`] on a blob already read.
 pub(crate) fn fingerprint_of(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    let r = v["claudeAiOauth"]["refreshToken"].as_str().filter(|s| !s.is_empty())?;
-    Some(crate::accounts::hash8(r))
+    let oauth = &v["claudeAiOauth"];
+    let token = oauth["refreshToken"].as_str().filter(|s| !s.is_empty())
+        .or_else(|| oauth["accessToken"].as_str().filter(|s| !s.is_empty()))?;
+    Some(crate::accounts::hash8(token))
 }
 
 /// [`stored_login`] on a credential blob already read — split out so the
 /// verdict is testable without a Keychain.
 pub(crate) fn stored_login_from(raw: &str, now_ms: i64) -> StoredLogin {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
-        return StoredLogin::Missing;
+        return StoredLogin::Unreadable("stored Claude credential is not valid JSON".into());
     };
     let o = &v["claudeAiOauth"];
     let renewable = o["refreshToken"].as_str().is_some_and(|s| !s.is_empty())
         && refresh_token_end(o).is_none_or(|end| end > now_ms);
-    match (o["accessToken"].as_str(), o["expiresAt"].as_i64()) {
+    match (o["accessToken"].as_str().filter(|s| !s.is_empty()), o["expiresAt"].as_i64()) {
         (Some(t), Some(exp)) if exp > now_ms => StoredLogin::Fresh(t.to_string()),
         (Some(t), None) => StoredLogin::Fresh(t.to_string()),
         _ if renewable => StoredLogin::Stale,
@@ -1223,7 +1217,7 @@ pub(crate) fn login_expiry_from(raw: &str) -> Option<i64> {
 
 /// [`login_expiry_from`] for the seat `env` selects.
 pub(crate) fn login_expiry(env: &[(String, String)]) -> Option<i64> {
-    login_expiry_from(&read_credential(env)?)
+    login_expiry_from(&read_credential(env).ok()?)
 }
 
 fn refresh_token_end(oauth: &serde_json::Value) -> Option<i64> {
@@ -1248,9 +1242,10 @@ pub(crate) enum UtilizationProbe {
     Ok(serde_json::Value),
     /// Upstream answered with a non-2xx status.
     Http(u16),
-    /// No readable credential on this machine, or one that can't be renewed —
-    /// no request was made.
+    /// No stored credential, or one that cannot be renewed; no request was made.
     NoCredential,
+    /// Storage is inaccessible, not signed out. Preserve the actionable reason.
+    Unreadable(String),
     /// The access token has lapsed but can be renewed ([`StoredLogin::Stale`]):
     /// the seat is signed in, its windows just can't be read until Claude
     /// Code runs on it. No request was made.
@@ -1269,6 +1264,7 @@ pub(crate) async fn probe_utilization(env: &[(String, String)]) -> UtilizationPr
         StoredLogin::Fresh(t) => t,
         StoredLogin::Stale => return UtilizationProbe::Stale,
         StoredLogin::Missing => return UtilizationProbe::NoCredential,
+        StoredLogin::Unreadable(why) => return UtilizationProbe::Unreadable(why),
     };
     let res = match reqwest::Client::new()
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -1377,7 +1373,7 @@ pub(crate) async fn login_identity(env: &[(String, String)]) -> WhoProbe {
         StoredLogin::Fresh(t) => t,
         // Signed in, just not renewed yet — who it is can't be asked with a
         // lapsed token, and "not signed in" would be false.
-        StoredLogin::Stale => return WhoProbe::Unknown,
+        StoredLogin::Stale | StoredLogin::Unreadable(_) => return WhoProbe::Unknown,
         StoredLogin::Missing => return WhoProbe::SignedOut,
     };
     let res = match reqwest::Client::new()
@@ -2823,8 +2819,20 @@ mod stored_login_tests {
     }
 
     #[test]
+    fn inaccessible_storage_is_never_reported_as_a_missing_login() {
+        let dir = std::env::temp_dir().join(format!("mafold-login-verdict-{}", std::process::id()));
+        let store = crate::accounts::LoginStore { file: dir.join("absent.json"), keychain_service: "synthetic".into() };
+        let empty = |_: &str| Ok(None);
+        let locked = |_: &str| Err("login Keychain is locked".to_string());
+        assert_eq!(super::stored_login_read(store.read_with(Some(&empty)), NOW), StoredLogin::Missing);
+        assert!(matches!(super::stored_login_read(store.read_with(Some(&locked)), NOW),
+            StoredLogin::Unreadable(why) if why.contains("Keychain is locked")));
+        assert_eq!(stored_login_from(&cred(Some(""), None, Some(NOW + 60_000)), NOW), StoredLogin::Missing);
+    }
+
+    #[test]
     fn junk_is_missing() {
-        assert_eq!(stored_login_from("not json", NOW), StoredLogin::Missing);
+        assert!(matches!(stored_login_from("not json", NOW), StoredLogin::Unreadable(_)));
         assert_eq!(stored_login_from("{}", NOW), StoredLogin::Missing);
     }
 }

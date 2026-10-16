@@ -745,25 +745,11 @@ fn collect(spec: &ProviderInfo, import: bool, from_env: bool)
     let mut out = serde_json::Map::new();
 
     if import {
-        let path = spec
-            .import_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("{} has no local credential file to import", spec.id))?;
-        let full = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(path);
-        let raw = std::fs::read_to_string(&full)
-            .with_context(|| format!("read {} — log in with that tool first", full.display()))?;
-        let parsed: Value = serde_json::from_str(&raw)
-            .with_context(|| format!("{} is not JSON", full.display()))?;
-        // Vendors nest their bag differently; search rather than hard-code a
-        // path per vendor, so a layout change costs nothing here.
-        for key in &spec.payload_keys {
-            if let Some(v) = find_key(&parsed, key) {
-                out.insert(key.to_string(), v);
-            }
-        }
-        if out.is_empty() {
-            bail!("found no recognizable fields in {}", full.display());
-        }
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let claude = crate::accounts::Account::default_login().store();
+        // A person clicked Connect: ask the Keychain now, not what it said a
+        // minute ago — they may have just unlocked it.
+        out = import_fields(spec, &home, &claude, crate::accounts::keychain_now())?;
     } else if from_env {
         let var = spec
             .env_var
@@ -791,6 +777,59 @@ fn collect(spec: &ProviderInfo, import: bool, from_env: bool)
         if f.required && !out.contains_key(&f.key) {
             bail!("{} is required for {}", f.label, spec.id);
         }
+    }
+    Ok(out)
+}
+
+/// The `--import` half of [`collect`], with what depends on where it runs
+/// passed in: `$HOME`, where this machine's Claude Code login actually is
+/// (`claude`), and the Keychain.
+fn import_fields(
+    spec: &ProviderInfo,
+    home: &std::path::Path,
+    claude: &crate::accounts::LoginStore,
+    keychain: Option<crate::accounts::Keychain>,
+) -> Result<serde_json::Map<String, Value>> {
+    let path = spec
+        .import_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("{} has no local credential file to import", spec.id))?;
+    let full = home.join(path);
+    // The path that names Claude Code's own login (`~/.claude`'s) is read
+    // where Claude Code actually keeps it: on a Mac the Keychain rather than
+    // this file, and under `CLAUDE_CONFIG_DIR` another directory altogether.
+    let (parsed, source) = if full == crate::accounts::LoginStore::default_in(home).file {
+        let store: Value = serde_json::from_str(&claude.read_with(keychain)?)
+            .context("the Claude Code login is not JSON")?;
+        // That store is a bag: Claude Code's own sign-in under `claudeAiOauth`,
+        // and beside it every MCP server's OAuth grant (`mcpOAuth.<server>`,
+        // the same `accessToken` names). Only the sign-in is searched, or a
+        // signed-out login would import some MCP server's token as this one.
+        let login = store
+            .get("claudeAiOauth")
+            .filter(|o| o.get("accessToken").and_then(Value::as_str).is_some_and(|t| !t.is_empty()))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("no Claude Code login on this machine — sign in with `claude` first (its stored credential holds no sign-in)")
+            })?;
+        (login, "the Claude Code login".to_string())
+    } else {
+        let raw = std::fs::read_to_string(&full)
+            .with_context(|| format!("read {} — log in with that tool first", full.display()))?;
+        let parsed: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("{} is not JSON", full.display()))?;
+        (parsed, full.display().to_string())
+    };
+    // Vendors nest their bag differently; search rather than hard-code a
+    // path per vendor, so a layout change costs nothing here.
+    let mut out = serde_json::Map::new();
+    for key in &spec.payload_keys {
+        if let Some(v) = find_key(&parsed, key) {
+            out.insert(key.to_string(), v);
+        }
+    }
+    if out.is_empty() {
+        bail!("found no recognizable fields in {source}");
     }
     Ok(out)
 }
@@ -3519,5 +3558,204 @@ mod tests {
         )]);
         let client = Client::new(api.base.clone(), "s_test".into());
         assert_eq!(free_name(&client, "codex-oauth").await, "codex-3");
+    }
+
+    // ── importing a vendor CLI's own login (`--import`, the web's Connect) ──
+
+    fn provider(id: &str) -> ProviderInfo {
+        provider_infos()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("no provider {id}"))
+    }
+
+    /// A `$HOME` of its own per test, empty unless the test writes into it.
+    fn import_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("mafold-import-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        home
+    }
+
+    /// Claude Code's store as it really is on a Mac (key names read off one,
+    /// 2026-10-14): MCP grants first, its own sign-in beside them.
+    fn claude_login(access: &str) -> String {
+        json!({
+            "mcpOAuth": { "linear|abc123": {
+                "serverName": "linear", "accessToken": "mcp-linear-token", "clientId": "c",
+            }},
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": format!("{access}-refresh"),
+                "expiresAt": 1_760_000_000_000_i64,
+                "scopes": ["user:inference"],
+            },
+        })
+        .to_string()
+    }
+
+    type KeychainFn = dyn Fn(&str) -> Result<Option<String>, String>;
+
+    /// [`import_fields`] on a machine where Claude Code's login is where it
+    /// is by default (`~/.claude`, the bare Keychain item).
+    fn import_default(
+        spec: &ProviderInfo,
+        home: &std::path::Path,
+        keychain: Option<crate::accounts::Keychain>,
+    ) -> Result<serde_json::Map<String, Value>> {
+        import_fields(spec, home, &crate::accounts::LoginStore::default_in(home), keychain)
+    }
+
+    /// fei's Mac, 2026-10-14: `claude` → `/login` succeeded, then Settings ▸
+    /// Connections ▸ Claude Code (OAuth) answered `read
+    /// /Users/feixia/.claude/.credentials.json — No such file or directory`.
+    /// On macOS Claude Code writes a login into the login Keychain (item
+    /// `Claude Code-credentials`) and deletes the plaintext file once that
+    /// write lands, so a reader that only knows the file finds nothing on
+    /// every Mac with a working login.
+    #[test]
+    fn a_mac_login_that_lives_only_in_the_keychain_imports() {
+        let home = import_home("keychain-only");
+        let keychain = |service: &str| match service {
+            "Claude Code-credentials" => Ok(Some(claude_login("sk-ant-oat01-kc"))),
+            _ => Ok(None),
+        };
+        let fields = import_default(&provider("claude-code-oauth"), &home, Some(&keychain))
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(fields["access_token"], "sk-ant-oat01-kc");
+        assert_eq!(fields["refresh_token"], "sk-ant-oat01-kc-refresh");
+        assert_eq!(fields["expires_at"], 1_760_000_000_000_i64);
+    }
+
+    /// Where both exist, the Keychain is the login Claude Code itself runs on
+    /// (it reads the Keychain first and only falls back to the file), so the
+    /// file is a leftover and importing it hands the vault a stale grant.
+    #[test]
+    fn the_keychain_wins_over_a_leftover_file() {
+        let home = import_home("both");
+        std::fs::write(home.join(".claude/.credentials.json"), claude_login("sk-ant-oat01-old")).unwrap();
+        let keychain = |_: &str| Ok(Some(claude_login("sk-ant-oat01-new")));
+        let fields = import_default(&provider("claude-code-oauth"), &home, Some(&keychain)).unwrap();
+        assert_eq!(fields["access_token"], "sk-ant-oat01-new");
+    }
+
+    /// The store also holds every MCP server's OAuth grant under the same
+    /// `accessToken` name. With no sign-in of Claude Code's own (an API-key
+    /// user, or a login Claude Code wiped when its refresh token ran out) the
+    /// import must say so — not hand the vault a Linear token labelled
+    /// Claude Code.
+    #[test]
+    fn an_mcp_grant_is_never_imported_as_the_claude_login() {
+        let home = import_home("mcp-only");
+        for store in [
+            json!({ "mcpOAuth": { "linear|abc": { "accessToken": "mcp-linear-token", "refreshToken": "mcp-r" } } }),
+            json!({ "mcpOAuth": { "linear|abc": { "accessToken": "mcp-linear-token" } },
+                    "claudeAiOauth": { "refreshTokenExpiresAt": 1_759_000_000_000_i64 } }),
+        ] {
+            let keychain = move |_: &str| Ok(Some(store.to_string()));
+            let err = import_default(&provider("claude-code-oauth"), &home, Some(&keychain)).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("sign in with `claude` first"), "{msg}");
+            assert!(!msg.contains("mcp-linear-token"), "{msg}");
+        }
+    }
+
+    /// Linux, Windows, and a Mac whose Keychain write failed: the file is the
+    /// login, exactly as before.
+    #[test]
+    fn a_login_file_imports_where_the_keychain_has_none() {
+        let home = import_home("file-only");
+        std::fs::write(home.join(".claude/.credentials.json"), claude_login("sk-ant-oat01-file")).unwrap();
+        let empty = |_: &str| Ok(None);
+        for keychain in [None, Some(&empty as &KeychainFn)] {
+            let fields = import_default(&provider("claude-code-oauth"), &home, keychain).unwrap();
+            assert_eq!(fields["access_token"], "sk-ant-oat01-file");
+        }
+    }
+
+    /// Signed in nowhere: the error names BOTH places it looked, so «run
+    /// `claude` and /login» is not answered with a file the Mac never had.
+    #[test]
+    fn no_login_anywhere_says_where_it_looked() {
+        let home = import_home("none");
+        let empty = |_: &str| Ok(None);
+        let err = import_default(&provider("claude-code-oauth"), &home, Some(&empty)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sign in with `claude` first"), "{msg}");
+        assert!(msg.contains("Claude Code-credentials"), "{msg}");
+        assert!(msg.contains(&home.join(".claude/.credentials.json").display().to_string()), "{msg}");
+    }
+
+    /// Signed in, but the Keychain wouldn't answer (locked, or a session with
+    /// no GUI login): say that, not "sign in" — `/login` again fixes nothing.
+    #[test]
+    fn a_locked_keychain_is_not_reported_as_signed_out() {
+        let home = import_home("locked");
+        let locked = |_: &str| Err("no answer from the Keychain in 2s — is it locked?".to_string());
+        let msg = format!("{:#}", import_default(&provider("claude-code-oauth"), &home, Some(&locked)).unwrap_err());
+        assert!(msg.contains("couldn't read the Claude Code login") && msg.contains("is it locked?"), "{msg}");
+        assert!(!msg.contains("sign in"), "{msg}");
+    }
+
+    /// `CLAUDE_CONFIG_DIR=<dir>` moves Claude Code's login with the rest of its
+    /// config: the file to `<dir>/.credentials.json`, the Keychain item to
+    /// `Claude Code-credentials-<sha256(dir)[..8]>`. The provider still names
+    /// `~/.claude/.credentials.json` — that is "Claude Code's own login", and
+    /// it is read wherever Claude Code put it.
+    #[test]
+    fn a_login_under_claude_config_dir_imports() {
+        let home = import_home("config-dir");
+        let config = home.join("elsewhere");
+        std::fs::create_dir_all(&config).unwrap();
+        let config = config.to_str().unwrap().to_string();
+        let claude = crate::accounts::Account::default_login().store_in(&home, Some(&config));
+        let item = format!("Claude Code-credentials-{}", crate::accounts::hash8(&config));
+
+        // A Mac: only the item named after the directory holds it.
+        let keychain = |service: &str| Ok((service == item).then(|| claude_login("sk-ant-oat01-cfg-kc")));
+        let fields = import_fields(&provider("claude-code-oauth"), &home, &claude, Some(&keychain))
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(fields["access_token"], "sk-ant-oat01-cfg-kc");
+
+        // Linux: the file inside that directory.
+        std::fs::write(std::path::Path::new(&config).join(".credentials.json"), claude_login("sk-ant-oat01-cfg-file")).unwrap();
+        let fields = import_fields(&provider("claude-code-oauth"), &home, &claude, None)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(fields["access_token"], "sk-ant-oat01-cfg-file");
+    }
+
+    /// This Mac, for real: `$HOME` and the login Keychain as they are, through
+    /// `collect` itself (the wiring, not just the seam). Without the Keychain
+    /// the import fails the way fei's did; with it the sign-in is found — and
+    /// is Claude Code's (`sk-ant-o…`), not one of the MCP grants beside it.
+    /// Prints field NAMES only. Needs a Mac signed in with `claude` and no
+    /// `~/.claude/.credentials.json`, so not in CI:
+    /// `cargo test --bin mafold -- --ignored this_macs_own_login`.
+    #[test]
+    #[ignore = "reads this Mac's real Claude Code login out of the Keychain"]
+    fn this_macs_own_login_imports_from_the_keychain() {
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        assert!(!home.join(".claude/.credentials.json").exists(), "the case is a Mac WITHOUT the file");
+        let spec = provider("claude-code-oauth");
+        let file_only = format!("{:#}", import_default(&spec, &home, None).unwrap_err());
+        println!("file only → {file_only}");
+        assert!(file_only.contains("no ") && file_only.contains(".credentials.json"), "{file_only}");
+        let fields = collect(&spec, true, false).unwrap_or_else(|e| panic!("{e:#}"));
+        println!("collect --import → fields {:?}", fields.keys().collect::<Vec<_>>());
+        assert!(fields["access_token"].as_str().is_some_and(|t| t.starts_with("sk-ant-o")));
+        assert!(fields["refresh_token"].as_str().is_some_and(|t| t.starts_with("sk-ant-o")));
+    }
+
+    /// The Keychain is asked about Claude Code's login and nothing else: a
+    /// file that is some other tool's (Codex keeps `~/.codex/auth.json`) is
+    /// read as the file it is.
+    #[test]
+    fn another_tools_file_never_asks_the_keychain() {
+        let home = import_home("codex");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), r#"{"tokens":{"access_token":"codex-at","refresh_token":"codex-rt"}}"#).unwrap();
+        let keychain = |service: &str| -> Result<Option<String>, String> { panic!("asked the Keychain for {service}") };
+        let fields = import_default(&provider("codex-oauth"), &home, Some(&keychain)).unwrap();
+        assert_eq!(fields["access_token"], "codex-at");
     }
 }

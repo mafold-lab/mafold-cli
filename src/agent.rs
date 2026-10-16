@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use mafold_transcript::failure::AccountIssue;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -2919,7 +2920,8 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
 /// nothing and the sheet keeps whatever it had.
 async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>) {
     let env = if harness.id() == "claude-code" {
-        crate::accounts::choose(preferred.as_deref(), None).await.account.env()
+        let Some(account) = crate::accounts::choose(preferred.as_deref(), None).await.account else { return };
+        account.env()
     } else {
         Vec::new()
     };
@@ -6406,9 +6408,10 @@ async fn handle_control(
             let text = match parse_account_arg(arg) {
                 AccountArg::List => account_list(cfg_account.as_deref(), pinned_account.as_deref()).await,
                 AccountArg::Forget(n) => {
-                    let mut reg = crate::accounts::load();
-                    if reg.remove(&n) {
-                        let _ = crate::accounts::save(&reg);
+                    let removed = crate::accounts::update_registry(|reg| reg.remove(&n));
+                    if let Err(e) = &removed {
+                        format!("Couldn't forget account `{n}`: {e}")
+                    } else if matches!(removed, Ok(true)) {
                         crate::accounts::forget_seat(&n);
                         format!("Forgot account `{n}`. Its credential directory is left alone — sign in again with `/login {n}` to bring it back.")
                     } else if n == crate::accounts::DEFAULT {
@@ -6705,23 +6708,15 @@ async fn account_list(bot_setting: Option<&str>, pin: Option<&str>) -> String {
     let current = pin.or(bot_setting).unwrap_or(crate::accounts::DEFAULT);
     let states = crate::accounts::list_states().await;
     let mut body = String::new();
-    for (a, snap, held) in &states {
+    for (a, snap, _) in &states {
         let mut v = snap.describe(now);
-        // The registry's own memory of a wall, when the probe no longer sees
-        // it (an unreachable endpoint, a cached answer): a turn still steps
-        // over this seat until the window rolls, so the list has to say so.
-        if let Some(x) = held {
-            if !v.starts_with("exhausted") {
-                v.push_str(&format!(" · held ({}) — {}", x.kind, crate::accounts::reset_hint(x.until, now)));
+        // A stored deadline is not proof of a usable sign-in. Never attach it
+        // to a missing, refused or unreadable credential, nor a failed probe.
+        if matches!(snap.state, crate::accounts::SeatState::Ok | crate::accounts::SeatState::Exhausted { .. } | crate::accounts::SeatState::Idle) {
+            let end = crate::commands::login_expiry(&a.env()).map(|ms| ms / 1000);
+            if let Some(note) = crate::accounts::login_expiry_note(&a.name, end, now) {
+                v.push_str(&format!(" · {note}"));
             }
-        }
-        // The seat's sign-in deadline: a login has a hard end (about four
-        // weeks out on the ones seen so far) that only `/login` resets, so
-        // the list says how long each has left — and warns before one runs
-        // out under a turn.
-        let end = crate::commands::login_expiry(&a.env()).map(|ms| ms / 1000);
-        if let Some(note) = crate::accounts::login_expiry_note(&a.name, end, now) {
-            v.push_str(&format!(" · {note}"));
         }
         if let Some(e) = &a.email {
             v.push_str(&format!(" · {e}"));
@@ -6913,19 +6908,21 @@ async fn login_flow(
     let mut added = false;
     let account = match (&wanted, harness.id()) {
         (Some(n), "claude-code") if n != crate::accounts::DEFAULT => {
-            let mut reg = crate::accounts::load();
-            let existed = reg.get(n).is_some();
-            match reg.add(n) {
-                Ok(a) => {
-                    if let Err(e) = crate::accounts::save(&reg) {
-                        let _ = client.send_to(dest(), &format!("Couldn't record the account: {e}")).await;
-                        return;
-                    }
-                    added = !existed;
+            let recorded = crate::accounts::update_registry(|reg| {
+                let existed = reg.get(n).is_some();
+                reg.add(n).map(|a| (a, !existed))
+            });
+            match recorded {
+                Ok(Ok((a, is_new))) => {
+                    added = is_new;
                     Some(a)
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = client.send_to(dest(), &e).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = client.send_to(dest(), &format!("Couldn't record the account: {e}")).await;
                     return;
                 }
             }
@@ -7051,9 +7048,11 @@ async fn login_flow(
     crate::accounts::forget_seat(&name);
     {
         // A fresh sign-in lifts a remembered refusal outright.
-        let mut reg = crate::accounts::load();
-        if reg.signed_out.remove(&name).is_some() {
-            let _ = crate::accounts::save(&reg);
+        if let Err(e) = crate::accounts::update_registry(|reg| {
+            reg.signed_out.remove(&name);
+            reg.clear_exhausted(&name);
+        }) {
+            let _ = client.send_to(dest(), &format!("Signed in, but couldn't clear the old account status: {e}")).await;
         }
     }
     let after = crate::commands::login_identity(&seat_env).await;
@@ -7151,6 +7150,55 @@ fn seat_trouble(o: &crate::harness::TurnOutcome) -> bool {
     o.limit.is_some() || o.error.as_deref().is_some_and(crate::accounts::signed_out_error)
 }
 
+/// Starting over discards context, so it requires positive evidence that the
+/// resumed transcript is missing. A generic zero-output error (authentication,
+/// network, spawn failure, or an unknown new vendor message) is not evidence.
+fn broken_resume(o: &crate::harness::TurnOutcome) -> bool {
+    if o.produced || o.stopped || seat_trouble(o) {
+        return false;
+    }
+    o.error.as_deref().is_some_and(|e| {
+        let lower = e.to_ascii_lowercase();
+        lower.contains("no conversation found with session id:")
+            || lower.contains("no conversation found with session id ")
+    })
+}
+
+/// Only an attempt that loaded context and did work (or completed cleanly)
+/// may advance the conversation. An init event from a failed fork cannot.
+pub(crate) fn retain_attempt_session(last: &mut Option<String>, o: &crate::harness::TurnOutcome) {
+    if o.produced || (!o.stopped && o.error.is_none()) {
+        if let Some(sid) = &o.session {
+            *last = Some(sid.clone());
+        }
+    }
+}
+
+/// Keep every account's latest observed reason for THIS turn. Runtime results
+/// replace a stale probe for the same account, without erasing other accounts.
+pub(crate) fn remember_account_issues(all: &mut Vec<AccountIssue>, issues: impl IntoIterator<Item = AccountIssue>) {
+    for issue in issues {
+        if let Some(old) = all.iter_mut().find(|x| x.account == issue.account) {
+            *old = issue;
+        } else {
+            all.push(issue);
+        }
+    }
+}
+
+fn private_account_note(note: &str) -> String {
+    let note = note.replace("{%", "{ %").replace("%}", "% }");
+    format!("\n{{% mafold/only for=\"owner\" %}}\n_{note}_\n{{% /mafold/only %}}\n\n")
+}
+
+pub(crate) fn account_attempt_issue(account: &str, err: &str, limit: Option<&crate::harness::LimitHit>) -> AccountIssue {
+    let failure = turn_failure("", err, limit);
+    let mut issue = AccountIssue::new(account, failure.kind, err);
+    issue.window = failure.window;
+    issue.resets_at = failure.resets_at;
+    issue
+}
+
 /// What a turn that died ends on: the `{% mafold/error %}` card — the same one
 /// a hosted agent's failed turn ends on, read by the same reader
 /// (`mafold_transcript::failure`). This used to be `⚠️ Agent stopped: <raw>`,
@@ -7168,6 +7216,10 @@ fn seat_trouble(o: &crate::harness::TurnOutcome) -> bool {
 /// which is now the turn's ONE limit card (the event used to render its own
 /// `{% mafold/ratelimit %}` too, two cards for one refusal).
 pub(crate) fn failure_card(bot: &str, err: &str, limit: Option<&crate::harness::LimitHit>) -> String {
+    failure_card_with_accounts(bot, err, limit, &[], false)
+}
+
+fn turn_failure(bot: &str, err: &str, limit: Option<&crate::harness::LimitHit>) -> mafold_transcript::failure::Failure {
     use mafold_transcript::failure::{classify, FailureKind};
     let mut f = classify(err);
     if f.kind == FailureKind::Balance && f.payer.is_none() {
@@ -7181,19 +7233,27 @@ pub(crate) fn failure_card(bot: &str, err: &str, limit: Option<&crate::harness::
         f.window = Some(hit.kind.clone()).filter(|k| !k.is_empty());
         f.resets_at = hit.resets_at.or(f.resets_at);
     }
-    mafold_transcript::render::failure_card(&f).trim().to_string()
+    f
 }
 
-fn wall_footer(why: &[(String, String)], logins: usize) -> String {
-    if why.is_empty() {
-        return if logins <= 1 {
-            "\n_This machine has only one Claude login, so there was nowhere to move this turn — `/login <name>` adds another; `/account` shows them._".to_string()
-        } else {
-            "\n_No other Claude account on this machine could take over — `/account` shows them._".to_string()
-        };
+pub(crate) fn failure_card_with_accounts(
+    bot: &str,
+    err: &str,
+    limit: Option<&crate::harness::LimitHit>,
+    accounts: &[AccountIssue],
+    unavailable: bool,
+) -> String {
+    let mut f = turn_failure(bot, err, limit);
+    if unavailable {
+        f.kind = mafold_transcript::failure::FailureKind::AccountsUnavailable;
+        // There is no single account-wide reset for a mixed pool. Each row
+        // carries its own window/time; auth problems do not recover on a timer.
+        f.window = None;
+        f.resets_at = None;
+        f.status = None;
     }
-    let each = why.iter().map(|(n, w)| format!("`{n}` {w}")).collect::<Vec<_>>().join("; ");
-    format!("\n_No other Claude account on this machine could take over: {each}. `/account` shows them all._")
+    f.accounts = accounts.to_vec();
+    mafold_transcript::render::failure_card(&f).trim().to_string()
 }
 
 /// What a finished `/login` changed.
@@ -8614,31 +8674,44 @@ async fn handle(
     // agent so any background task it detaches is registered here and reported
     // back HERE, by ME (see `surface_tag`).
     let surface = guest_tag(surface_tag(bot, chat_id, channel_id), guest);
+    // Choose before ANY account-dependent work, including capability probes
+    // and prewarming. Known blocked accounts must not start a Claude process.
+    let choice = if harness.id() == "claude-code" {
+        Some(crate::accounts::choose(account.as_deref(), model.as_deref()).await)
+    } else {
+        None
+    };
+    let seat_note = choice.as_ref().and_then(|c| c.note());
+    let (mut seat, mut account_issues) = match choice {
+        Some(c) => (c.account, c.skipped),
+        None => (None, Vec::new()),
+    };
+    let no_usable_account = harness.id() == "claude-code" && seat.is_none();
+    let mut env = seat.as_ref().map(|a| a.env()).unwrap_or_default();
+    let mut attempted_credential = seat.as_ref().and_then(|_| crate::commands::credential_fingerprint(&env));
     // The reasoning tier, held to what THIS machine's binary says the turn's
     // model takes (`harness::effort_for_turn`) — before anything is started
     // for it. Passed as picked, or refused out loud; never run at another.
     // What was ASKED is what the journal keeps: a turn picked up after a
     // restart is judged again, never run at the verdict's `None`.
     let requested_effort = effort.clone();
-    let (effort, effort_note, refused) = effort_verdict(
+    let (effort, effort_note, refused) = if no_usable_account {
+        (effort, None, None)
+    } else { effort_verdict(
         client,
         harness,
-        &seat_env_for(harness.id(), account.as_deref()),
+        &env,
         model.as_deref(),
         requested_effort.as_deref(),
         account.as_deref(),
     )
-    .await;
+    .await };
     // Start the harness process NOW, while the work below is still waiting on
     // the network (the apps/rooms round trip, the draft). A cold `claude` takes
     // ~1.3s to come up and those are the same seconds; this spends them once.
     //
-    // The seat here is the PREFERENCE, not the choice `accounts::choose` makes
-    // further down — that one can differ when the preferred login's window is
-    // full. A turn that fails over simply finds nothing warm and starts cold,
-    // which is what every turn did before this existed. (A refused turn starts
-    // nothing.)
-    if refused.is_none() {
+    // Prewarm only the selected account. A refused turn starts nothing.
+    if refused.is_none() && !no_usable_account {
         harness.prewarm(crate::harness::TurnShape {
             conv: chat_id.to_string(),
             surface: surface.clone(),
@@ -8648,7 +8721,7 @@ async fn handle(
             effort: effort.clone(),
             thinking,
             system: system.clone(),
-            env: seat_env_for(harness.id(), account.as_deref()),
+            env: env.clone(),
             mount: mount.clone(),
         });
     }
@@ -8872,32 +8945,13 @@ async fn handle(
     // and gets no seat at all. The choice can differ from the preference (a
     // full window, a login that isn't here): then the reply says so, up top,
     // because "whose quota is this burning" is never something to guess at.
-    let mut seat: Option<crate::accounts::Account> = if harness.id() == "claude-code" {
-        let choice = crate::accounts::choose(account.as_deref(), model.as_deref()).await;
-        if let Some(note) = choice.note() {
-            println!("{note}");
-            // A picked-up turn's bubble said this when it began; saying it
-            // again halfway down would only mark the seam.
-            if resumed.is_none() {
-                let _ = ev_tx.send(AgentEvent::Text(format!("_{note}_\n\n")));
-            }
+    if let Some(note) = &seat_note {
+        println!("{note}");
+        // A picked-up turn's bubble already said this when it began.
+        if resumed.is_none() {
+            let _ = ev_tx.send(AgentEvent::Text(private_account_note(note)));
         }
-        Some(choice.account)
-    } else {
-        None
-    };
-    let mut env: Vec<(String, String)> = seat.as_ref().map(|a| a.env()).unwrap_or_default();
-    // The tier was judged for the PREFERRED seat, before anything was started;
-    // the seat chosen here can be another login, with an answer of its own on
-    // file. Judge it again for the seat that will actually run it. (A failover
-    // further down keeps this verdict: the model doesn't change, and which
-    // tiers a model takes is the binary's to say, not the login's.)
-    let (effort, effort_note, refused) =
-        if refused.is_none() && seat.is_some() && env != seat_env_for(harness.id(), account.as_deref()) {
-            effort_verdict(client, harness, &env, model.as_deref(), requested_effort.as_deref(), account.as_deref()).await
-        } else {
-            (effort, effort_note, refused)
-        };
+    }
     // A tier the model has no dial for is said up top, like the seat — the
     // owner set something this turn can't honour, and the reply is where they
     // find out.
@@ -8983,8 +9037,19 @@ async fn handle(
             drop((turn, ev_tx));
             Ok(crate::harness::TurnOutcome { error: Some(why.clone()), ..Default::default() })
         }
+        None if no_usable_account => {
+            drop((turn, ev_tx));
+            Ok(crate::harness::TurnOutcome {
+                error: Some("No Claude account could take this turn".into()),
+                ..Default::default()
+            })
+        }
         None => harness.run(turn, ev_tx).await,
     };
+    let mut last_good_session = None;
+    if let Ok(o) = &result {
+        retain_attempt_session(&mut last_good_session, o);
+    }
     // Drop this turn's handle NOW — the run is over (no more /stop or ask-answer
     // routing), and the handle holds a clone of the renderer's event sender: the
     // renderer only exits once EVERY sender is gone, so removing the handle after
@@ -9010,39 +9075,42 @@ async fn handle(
     // said IN the reply, not only in the daemon log: "no other account could
     // take over" alone can't tell "there is none" from "there is one and it
     // was skipped", and the second is what a user can do something about.
-    let mut wall_why: Vec<(String, String)> = Vec::new();
     // The turn ran into a seat problem nobody could take over from — it gets
     // the footer that says why each other login was passed over.
-    let mut walled = false;
+    let mut walled = no_usable_account && refused.is_none();
     loop {
         let (cur, cause, session) = match (&seat, &result) {
             (Some(cur), Ok(o)) => match handover_cause(o) {
-                Some(c) => (cur.clone(), c, o.session.clone().or_else(|| prior.clone())),
+                Some(c) => (cur.clone(), c, last_good_session.clone().or_else(|| prior.clone())),
                 None => break,
             },
             _ => break,
         };
+        if let Ok(o) = &result {
+            remember_account_issues(&mut account_issues, [account_attempt_issue(
+                &cur.name, o.error.as_deref().unwrap_or("Account refused this turn"), o.limit.as_ref(),
+            )]);
+        }
         let (next, why) = match &cause {
             Handover::Limit(hit) => {
-                crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model.as_deref()).await
+                crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model.as_deref(), &seat_tried, attempted_credential.as_deref()).await
             }
-            Handover::SignedOut => crate::accounts::failover_signed_out(&cur.name, model.as_deref()).await,
+            Handover::SignedOut => crate::accounts::failover_signed_out(&cur.name, model.as_deref(), &seat_tried, attempted_credential.as_deref()).await,
         };
+        remember_account_issues(&mut account_issues, why.clone());
         let Some(next) = next else {
-            let line = why.iter().map(|(n, w)| format!("`{n}` {w}")).collect::<Vec<_>>().join("; ");
+            let line = why.iter().map(|i| format!("`{}` {}", i.account, i.detail)).collect::<Vec<_>>().join("; ");
             println!(
                 "⛔ account `{}` {} — no other login can take over{}",
                 cur.name,
                 cause.what(),
                 if line.is_empty() { String::new() } else { format!(" ({line})") }
             );
-            wall_why = why;
             walled = true;
             break;
         };
-        if seat_tried.contains(&next.name) {
-            break;
-        }
+        // The selector excludes every login already attempted this turn.
+        debug_assert!(!seat_tried.contains(&next.name));
         seat_tried.push(next.name.clone());
         let note = match &cause {
             Handover::Limit(hit) => {
@@ -9060,7 +9128,7 @@ async fn handle(
         println!("{note}");
         // The seam, in the reply itself: the reader sees where the account
         // changed, the way a steer shows where a correction landed.
-        let _ = ev_keep.send(AgentEvent::Text(format!("\n_{note}_\n\n")));
+        let _ = ev_keep.send(AgentEvent::Text(private_account_note(&note)));
         {
             let mut states = chat_states.lock().await;
             let st = states.entry(chat_id.to_string()).or_default();
@@ -9082,6 +9150,7 @@ async fn handle(
             );
         }
         env = next.env();
+        attempted_credential = crate::commands::credential_fingerprint(&env);
         let again = Turn {
             // Work already landed under the first login stays in the session;
             // say so, or the model re-answers a message it had half-answered.
@@ -9117,6 +9186,9 @@ async fn handle(
             proc: turn_proc.clone(),
         };
         result = harness.run(again, ev_keep.clone()).await;
+        if let Ok(o) = &result {
+            retain_attempt_session(&mut last_good_session, o);
+        }
         drop_turn(chat_states, chat_id, &cancel).await;
         seat_produced |= matches!(&result, Ok(o) if o.produced);
         seat = Some(next);
@@ -9207,48 +9279,27 @@ async fn handle(
                 proc: turn_proc.clone(),
             };
             result = harness.run(retry, ev_tx2).await;
+            if let Ok(o) = &result {
+                retain_attempt_session(&mut last_good_session, o);
+            }
             drop_turn(chat_states, chat_id, &cancel).await;
             let _ = renderer2.await;
         }
     }
 
-    // Stale-resume recovery: a RESUMED turn that ends in an error is the
-    // signature of a corrupt/expired Claude Code session — it fails IDENTICALLY
-    // on every resume, so `error_during_execution` (surfaced as Ok+error, which
-    // otherwise re-persists the same session below) would leave the bot broken
-    // on every future message until the session is cleared by hand. Drop the
-    // stale session NOW and retry ONCE on a FRESH one so THIS message is still
-    // answered; the fresh session then replaces the bad one.
-    //
-    // This also covers the harness process exiting NONZERO without ever emitting
-    // a terminal `result` — it just dies, often with nothing on stderr either
-    // (a `result` that says `is_error` is the OTHER shape, already handled since
-    // 1902051e). That silent death used to arrive as `Err`, which matches
-    // neither retry here, so the whole turn was spent on a reply card that lived
-    // a couple of seconds and the user had to notice and resend by hand.
-    // `claude_code` now reports it as Ok+error so it lands here instead.
-    //
-    // Gates: skip when we didn't resume (nothing to blame), when the user
-    // stopped it, and when the run already PRODUCED output (a retry would redo
-    // work that partly landed). A clean turn with no error and no output is the
-    // separate empty-turn path above, retried on the SAME session.
-    // (A usage wall or a refused sign-in is NOT a corrupt session — the seat
-    // logic above already did what can be done about it, and a fresh session
-    // on the same login would fail identically — so it never drops the
-    // session here.)
-    // Nor for a turn carrying on after a restart (`Resumed::continues`): the
-    // work it would redo is already on screen, from before the restart, and
-    // all it was told is to carry on — words a fresh session can do nothing
-    // with.
+    // A missing resumed transcript can be retried once from scratch. Every
+    // other failure keeps context, including an unknown new vendor error.
+    // Never redo work that already produced output or continues after restart.
     let continuing = resumed.as_ref().is_some_and(|r| r.continues);
     let resumed_errored = prior.is_some()
         && !continuing
         && refused.is_none()
-        && matches!(&result, Ok(o) if o.error.is_some() && !seat_trouble(o) && !o.stopped && !o.produced);
+        && matches!(&result, Ok(o) if broken_resume(o));
     if resumed_errored {
         let why = result.as_ref().ok().and_then(|o| o.error.clone()).unwrap_or_default();
         println!("↻ resumed session errored ({why}) — dropping it + retrying once on a FRESH session");
         drop_session(sessions, &skey, prior.as_deref()).await;
+        last_good_session = None;
         let (ev_tx3, ev_rx3) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         {
             let mut states = chat_states.lock().await;
@@ -9305,6 +9356,9 @@ async fn handle(
             proc: turn_proc.clone(),
         };
         result = harness.run(fresh, ev_tx3).await;
+        if let Ok(o) = &result {
+            retain_attempt_session(&mut last_good_session, o);
+        }
         drop_turn(chat_states, chat_id, &cancel).await;
         let _ = renderer3.await;
     }
@@ -9356,35 +9410,24 @@ async fn handle(
                     final_content = mafold_transcript::render::heal_open_code(&final_content);
                 }
                 final_content.push_str(sep);
-                final_content.push_str(&failure_card(bot, err, o.limit.as_ref()));
-                if o.limit.is_some() || walled {
-                    // Every login on this machine is out (or there is only
-                    // one). Say what would have helped, right here.
-                    final_content.push_str(&wall_footer(&wall_why, crate::accounts::load().accounts.len()));
+                if !account_issues.is_empty() && refused.is_none() {
+                    if let Some(a) = &seat {
+                        remember_account_issues(&mut account_issues, [account_attempt_issue(&a.name, err, o.limit.as_ref())]);
+                    }
                 }
+                final_content.push_str(&failure_card_with_accounts(bot, err, o.limit.as_ref(), &account_issues, walled));
             } else if !o.produced {
                 // Nothing said and nothing done: a turn that didn't answer —
                 // the same card as any other (it was a bare italic line).
                 final_content.push_str(&failure_card(bot, "the agent produced no output", None));
                 post_appended = true;
             }
-            // Persist the new session on a clean turn. But if the turn ERRORED on
-            // a session we RESUMED, DROP it instead of re-arming it — a corrupt/
-            // expired session fails identically on every resume, so persisting it
-            // is what leaves the bot stuck (the bug this fixes). Next message then
-            // starts fresh. (A fresh-session error keeps its sid: nothing to blame.)
-            //
-            // `!o.produced` is the same gate the retry above uses, for the same
-            // reason: a resume that has already streamed real work (tool calls,
-            // text) demonstrably loaded fine — a mid-turn ECONNRESET / stall is
-            // the network's fault, not the session's. Dropping it here threw
-            // away a 15-step turn's whole context over one connection blip, and
-            // the next message ("继续") started on a blank session. A broken
-            // session dies BEFORE producing anything; that is the only shape
-            // this drop is for.
-            if o.error.is_some() && !seat_trouble(&o) && prior.is_some() && !o.produced && refused.is_none() {
+            // Only a positively identified broken transcript can invalidate a
+            // saved session. A zero-output failed attempt cannot replace it
+            // with the id of a fork that never successfully loaded the context.
+            if broken_resume(&o) && prior.is_some() && refused.is_none() && !continuing {
                 drop_session(sessions, &skey, prior.as_deref()).await;
-            } else if let Some(sid) = o.session {
+            } else if let Some(sid) = last_good_session.take() {
                 let mut s = sessions.lock().await;
                 if s.get(&skey).map(String::as_str) != Some(sid.as_str()) {
                     s.insert(skey.clone(), sid);
@@ -9405,9 +9448,14 @@ async fn handle(
             // on PATH, a workdir that doesn't exist) — a nonzero exit from a run
             // that did start arrives as Ok+error and is retried above. Nothing
             // to retry for these: the next message would fail the same way. Still
-            // drop a resumed session, since we can't tell it apart from a bad one.
-            drop_session(sessions, &skey, prior.as_deref()).await;
-            final_content.push_str(&failure_card(bot, &format!("{e:#}"), None));
+            // keep the resumed session: a failure to launch says nothing about
+            // whether its transcript is intact.
+            if let Some(sid) = last_good_session.take() {
+                let mut s = sessions.lock().await;
+                s.insert(skey.clone(), sid);
+                save_sessions(&s);
+            }
+            final_content.push_str(&failure_card_with_accounts(bot, &format!("{e:#}"), None, &account_issues, false));
         }
     }
     // (The turn handle was already dropped above, before awaiting the renderer.)
@@ -15138,27 +15186,107 @@ mod failure_card_tests {
 
 #[cfg(test)]
 mod wall_footer_tests {
-    use super::wall_footer;
+    use super::{account_attempt_issue, failure_card_with_accounts, remember_account_issues};
+    use mafold_transcript::failure::{AccountIssue, FailureKind};
 
     /// 2026-09-27: the footer said "no other account could take over" while
     /// the other login had simply been skipped as "not logged in" — the one
     /// thing the user could have fixed, and the reply didn't say it.
     #[test]
     fn every_passed_over_login_is_named_with_its_reason() {
+        let hit = crate::harness::LimitHit { kind: "weekly_all".into(), resets_at: Some(1792200000) };
         let why = vec![
-            ("new5x".to_string(), "isn't logged in — `/login <name>` fixes that".to_string()),
-            ("work".to_string(), "is exhausted (weekly_all) — resets in 2d 03h".to_string()),
+            account_attempt_issue("default", "You've hit your weekly limit", Some(&hit)),
+            account_attempt_issue("work", "You've hit your weekly limit", Some(&hit)),
+            account_attempt_issue("personal", "Failed to authenticate: OAuth session expired and could not be refreshed", None),
         ];
-        let f = wall_footer(&why, 3);
-        assert!(f.contains("`new5x` isn't logged in — `/login <name>` fixes that"), "{f}");
-        assert!(f.contains("`work` is exhausted (weekly_all)"), "{f}");
+        let f = failure_card_with_accounts("opsdu:claude-code", "No available account", None, &why, true);
+        assert!(f.contains("kind=\"accounts_unavailable\""), "{f}");
+        for name in ["default", "work", "personal"] {
+            assert!(f.contains(name), "{f}");
+        }
+        assert_eq!(f.matches("account|").count(), 3, "{f}");
+        assert_eq!(why[0].kind, FailureKind::RateLimit);
+        assert_eq!(why[2].kind, FailureKind::Auth);
+        assert!(f.contains("1792200000"), "{f}");
     }
 
     #[test]
     fn a_single_login_machine_says_there_is_no_other() {
-        let f = wall_footer(&[], 1);
-        assert!(f.contains("only one Claude login"), "{f}");
-        assert!(f.contains("`/login <name>`"), "{f}");
+        let issue = AccountIssue::new("default", FailureKind::RateLimit, "weekly limit");
+        let f = failure_card_with_accounts("opsdu:claude-code", "No available account", None, &[issue], true);
+        assert!(f.contains("accounts_unavailable"), "{f}");
+        assert!(!f.contains("/login"), "a quota wall must not demand sign-in: {f}");
+    }
+
+    #[test]
+    fn an_unknown_last_error_keeps_prior_quota_evidence() {
+        let mut issues = vec![AccountIssue::new("work", FailureKind::RateLimit, "weekly limit")];
+        remember_account_issues(&mut issues, [AccountIssue::new("personal", FailureKind::Auth, "old refusal")]);
+        remember_account_issues(&mut issues, [AccountIssue::new("personal", FailureKind::Unknown, "new vendor error")]);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].kind, FailureKind::RateLimit);
+        assert_eq!(issues[1].kind, FailureKind::Unknown);
+        let card = failure_card_with_accounts("opsdu:claude-code", "new vendor error", None, &issues, false);
+        assert!(card.contains("kind=\"unknown\""));
+        assert!(card.contains("weekly limit"));
+        assert!(!card.contains("old refusal"));
+    }
+
+    #[test]
+    fn switch_notes_keep_storage_details_private_and_indivisible() {
+        let note = super::private_account_note("Keychain path {% /mafold/only %} must stay private");
+        assert!(note.contains("for=\"owner\""));
+        assert_eq!(note.matches("{% /mafold/only %}").count(), 1);
+        assert!(note.contains("{ % /mafold/only % }"));
+    }
+
+    #[test]
+    fn zero_output_account_and_network_failures_never_discard_context() {
+        for error in [
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+            "Failed to refresh OAuth token: another Claude Code process is refreshing it",
+            "Failed to refresh OAuth token: network request timed out",
+            "API Error: 529 overloaded",
+            "ECONNRESET",
+            "claude exited unsuccessfully: a new unknown provider failure",
+            "No Claude account could take this turn",
+        ] {
+            let out = crate::harness::TurnOutcome { error: Some(error.into()), produced: false, ..Default::default() };
+            assert!(!super::broken_resume(&out), "must preserve prior session for {error}");
+        }
+        let mut out = crate::harness::TurnOutcome {
+            error: Some("claude exited unsuccessfully: No conversation found with session ID: 29cbfee1".into()),
+            ..Default::default()
+        };
+        assert!(super::broken_resume(&out));
+        out.produced = true;
+        assert!(!super::broken_resume(&out));
+        out.produced = false;
+        out.stopped = true;
+        assert!(!super::broken_resume(&out));
+    }
+
+    #[test]
+    fn a_failed_later_account_cannot_replace_the_session_that_did_work() {
+        let mut saved = None;
+        let first = crate::harness::TurnOutcome {
+            produced: true,
+            session: Some("work-session".into()),
+            error: Some("You've hit your weekly limit".into()),
+            ..Default::default()
+        };
+        super::retain_attempt_session(&mut saved, &first);
+        let failed = crate::harness::TurnOutcome {
+            session: Some("empty-failed-fork".into()),
+            error: Some("Failed to authenticate: OAuth session expired and could not be refreshed".into()),
+            ..Default::default()
+        };
+        super::retain_attempt_session(&mut saved, &failed);
+        assert_eq!(saved.as_deref(), Some("work-session"));
+        let clean = crate::harness::TurnOutcome { session: Some("continued-session".into()), ..Default::default() };
+        super::retain_attempt_session(&mut saved, &clean);
+        assert_eq!(saved.as_deref(), Some("continued-session"));
     }
 
     fn ended_on(error: &str) -> crate::harness::TurnOutcome {

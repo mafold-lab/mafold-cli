@@ -192,14 +192,22 @@ fn submit_body(params: &Value) -> Result<Value, String> {
             if !matches!(role, "first_frame" | "last_frame" | "reference_image" | "reference_video" | "reference_audio") {
                 return Err(format!("refs: unknown role `{role}`"));
             }
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err("refs: url must be http(s) — a chat attachment's public link".into());
-            }
             let kind = match role {
                 "reference_video" => "video_url",
                 "reference_audio" => "audio_url",
                 _ => "image_url",
             };
+            // A link, or — for an image — the inline `data:image/…` a server
+            // without public storage resolves a chat file to: ModelArk reads
+            // base64 images, and the house path already sends it exactly that
+            // (2026-10-14: refusing it here made a reference image work on the
+            // wallet and fail on the owner's own key).
+            let link = url.starts_with("http://") || url.starts_with("https://");
+            if !link && !(kind == "image_url" && url.starts_with("data:image/")) {
+                return Err("refs: url must be http(s) — a chat attachment's public link \
+                            (an image may also be an inline data:image/… URL)"
+                    .into());
+            }
             content.push(json!({ "type": kind, kind: { "url": url }, "role": role }));
         }
     }
@@ -248,6 +256,25 @@ mod tests {
         let e = submit_body(&json!({ "model": "m", "prompt": "p",
             "refs": [{ "role": "hero", "url": "https://a/b.jpg" }] })).unwrap_err();
         assert!(e.contains("unknown role"));
+    }
+
+    /// An inline image is something ModelArk reads (the house path sends it);
+    /// inline video/audio, or any other scheme, is not.
+    #[test]
+    fn an_inline_image_ref_is_sent_but_inline_video_is_not() {
+        let png = "data:image/png;base64,iVBORw0KGgo=";
+        let b = submit_body(&json!({ "model": "m", "prompt": "p",
+            "refs": [{ "role": "reference_image", "url": png }] })).unwrap();
+        assert_eq!(b["content"][1]["image_url"]["url"], png);
+        for (role, url) in [
+            ("reference_video", "data:video/mp4;base64,AAAA"),
+            ("first_frame", "file:///C:/x.png"),
+            ("reference_image", "data:text/html;base64,PGI+"),
+        ] {
+            let e = submit_body(&json!({ "model": "m", "prompt": "p",
+                "refs": [{ "role": role, "url": url }] })).unwrap_err();
+            assert!(e.contains("http(s)"), "{role} {url}: {e}");
+        }
     }
 
     #[test]

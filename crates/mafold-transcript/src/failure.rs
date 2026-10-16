@@ -165,6 +165,9 @@ pub enum FailureKind {
     RateLimit,
     /// The credential was refused: a revoked key, an expired sign-in.
     Auth,
+    /// No configured account could take this turn. The reasons belong to
+    /// each account separately, so one refusal never hides the others.
+    AccountsUnavailable,
     /// The model chosen can't run (unknown, unpriced, retired).
     Model,
     /// The model runs, just not as a chat agent: its vendor refused a turn
@@ -212,6 +215,7 @@ impl FailureKind {
             Self::Credit => "credit",
             Self::RateLimit => "rate_limit",
             Self::Auth => "auth",
+            Self::AccountsUnavailable => "accounts_unavailable",
             Self::Model => "model",
             Self::NotChat => "not_chat",
             Self::Context => "context",
@@ -227,6 +231,23 @@ impl FailureKind {
             Self::Blocked => "blocked",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+/// Why one account could not take a turn. Account names, provider details and
+/// quota reset times stay inside the failure card's private audience block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountIssue {
+    pub account: String,
+    pub kind: FailureKind,
+    pub detail: String,
+    pub window: Option<String>,
+    pub resets_at: Option<i64>,
+}
+
+impl AccountIssue {
+    pub fn new(account: impl Into<String>, kind: FailureKind, detail: impl Into<String>) -> Self {
+        Self { account: account.into(), kind, detail: detail.into(), window: None, resets_at: None }
     }
 }
 
@@ -269,6 +290,8 @@ pub struct Failure {
     /// one-liner say «the picture» instead of «this turn». An id, not a
     /// sentence: the card words it in the reader's language.
     pub step: Option<String>,
+    /// All accounts that could not take this turn, not just the last error.
+    pub accounts: Vec<AccountIssue>,
 }
 
 impl Failure {
@@ -288,6 +311,7 @@ impl Failure {
             reader: None,
             detail: detail.into(),
             step: None,
+            accounts: Vec::new(),
         }
     }
 
@@ -296,6 +320,38 @@ impl Failure {
         self.step = Some(step.to_string());
         self
     }
+}
+
+/// A refused sign-in, shared by failure presentation and account selection.
+/// A refresh race or a failed network request does not invalidate credentials:
+/// only a provider's explicit authentication refusal may sign an account out.
+pub fn is_auth_refusal(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    if transient_refresh(&low).is_some() {
+        return false;
+    }
+    low.contains("please run /login")
+        || low.contains("authentication_error")
+        || (low.contains("401") && low.contains("invalid api key"))
+        || low.contains("not logged in")
+        || (low.contains("oauth session expired") && low.contains("could not be refreshed"))
+}
+
+/// Claude's refresh diagnostics may include `/login` as last-resort advice.
+/// That advice must never turn temporary contention or a timeout into Auth.
+fn transient_refresh(low: &str) -> Option<FailureKind> {
+    if low.contains("another claude code process is refreshing") {
+        return Some(FailureKind::Unavailable);
+    }
+    if low.contains("refresh") && [
+        "error sending request", "connection error", "connection reset",
+        "connection refused", "timed out", "timeout", "dns error",
+        "econnreset", "econnrefused", "enotfound", "fetch failed",
+        "network error", "network request failed",
+    ].iter().any(|s| low.contains(s)) {
+        return Some(FailureKind::Network);
+    }
+    None
 }
 
 /// Read a raw error string into a [`Failure`]. Never fails: what it can't
@@ -400,7 +456,10 @@ pub fn classify(err: &str) -> Failure {
         || (low.contains("hit your") && low.contains("limit"))
     {
         FailureKind::RateLimit
-    } else if matches!(status, Some(401 | 403))
+    } else if let Some(kind) = transient_refresh(&low) {
+        kind
+    } else if is_auth_refusal(&detail)
+        || matches!(status, Some(401 | 403))
         || has(&[
             "invalid_api_key",
             "invalid api key",
@@ -568,6 +627,46 @@ fn status_of(s: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fatal_oauth_session_refusal_is_shared_by_selection_and_presentation() {
+        let refused = "OAuth session expired and could not be refreshed";
+        for raw in [
+            refused.to_string(),
+            format!("Error: {refused}. Please log in again."),
+            format!("Error: {refused}: Please log in again."),
+            format!("Failed to authenticate: {refused}. Please log in again."),
+            format!("Failed to authenticate. {refused}. Please log in again."),
+            serde_json::json!({"type": "result", "is_error": true, "result": refused}).to_string(),
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": refused}]}}).to_string(),
+            "API Error: 401 Invalid API key · Please run /login".to_string(),
+            "Not logged in · Please run /login".to_string(),
+            r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}"#.to_string(),
+        ] {
+            assert!(is_auth_refusal(&raw), "selection must recognize {raw}");
+            let f = classify(&raw);
+            assert_eq!(f.kind, FailureKind::Auth, "presentation must agree for {raw}");
+            assert_eq!(f.detail, raw);
+            assert!(f.accounts.is_empty());
+        }
+    }
+
+    #[test]
+    fn refresh_contention_or_network_failure_never_signs_an_account_out() {
+        for (raw, kind) in [
+            ("Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists please run /login", FailureKind::Unavailable),
+            ("authentication_error: another Claude Code process is refreshing it; retry in a minute", FailureKind::Unavailable),
+            ("Failed to refresh OAuth token: request timed out. Please run /login", FailureKind::Network),
+            ("Failed to refresh OAuth token: network error", FailureKind::Network),
+            ("API Error: 401: failed to refresh OAuth token: fetch failed", FailureKind::Network),
+            ("something nobody mapped", FailureKind::Unknown),
+            ("Failed to refresh OAuth token: something nobody mapped", FailureKind::Unknown),
+            ("You've hit your session limit · resets 3am", FailureKind::RateLimit),
+        ] {
+            assert!(!is_auth_refusal(raw), "must preserve credentials: {raw}");
+            assert_eq!(classify(raw).kind, kind, "{raw}");
+        }
+    }
 
     /// 2026-10-09 本人截图那一条:托管 agent 的钱包不够,router 的 402 里裹着 api
     /// 自己那句话。要读成「钱包」,并且把需要多少、还剩多少原样读出来。

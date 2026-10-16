@@ -1428,15 +1428,25 @@ fn child_env(client: &Client, me: &str, journal: &Path, seen: &Path, dry: bool) 
 /// The login a turn starts on — see [`Ctx::seat_pref`]. When it is not the
 /// preferred one, the loop's log says which and why each login before it was
 /// passed over.
-async fn pick_seat(ctx: &Ctx) -> Option<crate::accounts::Account> {
+async fn pick_seat(ctx: &Ctx) -> (Option<crate::accounts::Account>, Vec<mafold_transcript::failure::AccountIssue>) {
     if !ctx.seats {
-        return None;
+        return (None, Vec::new());
     }
     let choice = crate::accounts::choose(ctx.seat_pref.as_deref(), ctx.opts.model.as_deref()).await;
     if let Some(note) = choice.note() {
         println!("inbox: {note}");
     }
-    Some(choice.account)
+    (choice.account, choice.skipped)
+}
+
+/// Keep the final session id, with an event fallback for event-only harnesses.
+fn retain_attempt_session(last: &mut Option<String>, outcome: &harness::TurnOutcome, event: Option<&str>) {
+    crate::agent::retain_attempt_session(last, outcome);
+    // A final id can be newer than the init event after a fork or compaction.
+    // Event-only harnesses still get a fallback, subject to the same trust rule.
+    if outcome.session.is_none() && (outcome.produced || (!outcome.stopped && outcome.error.is_none())) {
+        if let Some(sid) = event { *last = Some(sid.to_owned()); }
+    }
 }
 
 /// A finished attempt that ended on its login (full window, refused sign-in):
@@ -1449,27 +1459,33 @@ async fn next_seat(
     attempt: &Result<crate::harness::TurnOutcome>,
     tried: &[String],
     model: Option<&str>,
-) -> Option<(crate::accounts::Account, String)> {
+    issues: &mut Vec<mafold_transcript::failure::AccountIssue>,
+    attempted_credential: Option<&str>,
+) -> (Option<(crate::accounts::Account, String)>, bool) {
     use crate::agent::Handover;
-    let (cur, Ok(o)) = (cur?, attempt) else { return None };
-    let cause = crate::agent::handover_cause(o)?;
+    let (Some(cur), Ok(o)) = (cur, attempt) else { return (None, false) };
+    let Some(cause) = crate::agent::handover_cause(o) else { return (None, false) };
+    crate::agent::remember_account_issues(issues, [crate::agent::account_attempt_issue(
+        &cur.name, o.error.as_deref().unwrap_or("Account refused this turn"), o.limit.as_ref(),
+    )]);
     let (next, why) = match &cause {
-        Handover::Limit(hit) => crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model).await,
-        Handover::SignedOut => crate::accounts::failover_signed_out(&cur.name, model).await,
+        Handover::Limit(hit) => crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model, tried, attempted_credential).await,
+        Handover::SignedOut => crate::accounts::failover_signed_out(&cur.name, model, tried, attempted_credential).await,
     };
-    let Some(next) = next.filter(|n| !tried.contains(&n.name)) else {
-        let line = why.iter().map(|(n, w)| format!("`{n}` {w}")).collect::<Vec<_>>().join("; ");
+    crate::agent::remember_account_issues(issues, why.clone());
+    let Some(next) = next else {
+        let line = why.iter().map(|i| format!("`{}` {}", i.account, i.detail)).collect::<Vec<_>>().join("; ");
         println!(
             "inbox: ⛔ login `{}` {} — no other login can take over{}",
             cur.name,
             cause.what(),
             if line.is_empty() { String::new() } else { format!(" ({line})") }
         );
-        return None;
+        return (None, true);
     };
     let note = format!("↻ login `{}` {} — continuing on `{}`", cur.name, cause.what(), next.name);
     println!("inbox: {note}");
-    Some((next, note))
+    (Some((next, note)), false)
 }
 
 /// The turn's environment: the loop's own plus its login's
@@ -1891,7 +1907,8 @@ async fn look(
     }
     save_seen(&ctx.seen, &seen_ledger);
     let cancel = Arc::new(Notify::new());
-    let mut seat = pick_seat(ctx).await;
+    let (mut seat, mut account_issues) = pick_seat(ctx).await;
+    let mut accounts_unavailable = ctx.seats && seat.is_none();
     for f in &due {
         state.fired.insert(f.key());
     }
@@ -1912,6 +1929,7 @@ async fn look(
     let turn_keys: HashSet<String> = batches.iter().map(|b| b.tl.key()).collect();
     let mut steered: Vec<(String, HashSet<String>)> = Vec::new();
     let mut session_seen: Option<String> = None;
+    let mut last_good_session = None;
     let mut seats_tried: Vec<String> = seat.iter().map(|a| a.name.clone()).collect();
     // One attempt per login. A run that ended on its SEAT — a full window, a
     // refused sign-in — says nothing about the conversation: the transcript
@@ -1920,10 +1938,17 @@ async fn look(
     // the window (a pinned loop once sat out three hours of one this way while
     // another login on the machine was free). Each login is tried at most once.
     let outcome = loop {
+        if accounts_unavailable {
+            break Ok(harness::TurnOutcome {
+                error: Some("No Claude account could take this turn".into()),
+                ..Default::default()
+            });
+        }
         // The tier, held to what this machine's binary says the model takes —
         // the same door a bot's turn goes through (`harness::effort_for_turn`):
         // run as picked, or not at all and the log says why.
         let env = with_seat(&ctx.env, seat.as_ref());
+        let attempted_credential = seat.as_ref().and_then(|_| crate::commands::credential_fingerprint(&env));
         let effort = match harness::effort_for_turn(
             ctx.harness.as_ref(),
             &env,
@@ -1948,7 +1973,7 @@ async fn look(
             surface: format!("inbox____{}", ctx.me_lc.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '-'), "_")),
             draft: String::new(),
             workdir: ctx.workdir.clone(),
-            session: session_seen.clone().or_else(|| if dry { None } else { state.session.clone() }),
+            session: last_good_session.clone().or_else(|| if dry { None } else { state.session.clone() }),
             model: ctx.opts.model.clone(),
             effort,
             thinking: None,
@@ -2010,14 +2035,15 @@ async fn look(
             write(event_json(&ev));
             tx_log.push(&ev);
         }
-        let Some((next, note)) = next_seat(seat.as_ref(), &attempt, &seats_tried, ctx.opts.model.as_deref()).await else {
+        if let Ok(o) = &attempt {
+            retain_attempt_session(&mut last_good_session, o, session_seen.as_deref());
+        }
+        let (next, unavailable) = next_seat(seat.as_ref(), &attempt, &seats_tried, ctx.opts.model.as_deref(), &mut account_issues, attempted_credential.as_deref()).await;
+        accounts_unavailable = unavailable;
+        let Some((next, note)) = next else {
             break attempt;
         };
-        if let Ok(o) = &attempt {
-            if let Some(s) = &o.session {
-                session_seen = Some(s.clone());
-            }
-        }
+        session_seen = None;
         write(Some(json!({ "t": "seat", "v": note })));
         seats_tried.push(next.name.clone());
         seat = Some(next);
@@ -2037,10 +2063,8 @@ async fn look(
         Ok(o) => (o.error.is_none(), o.stopped, o.error.clone()),
         Err(e) => (false, false, Some(format!("{e:#}"))),
     };
-    if let (Ok(o), false) = (&outcome, dry) {
-        if let Some(s) = o.session.clone().or(session_seen) {
-            state.session = Some(s);
-        }
+    if !dry {
+        if let Some(s) = last_good_session { state.session = Some(s); }
     }
     let (spoke, sends) = spoke_to(&ctx.journal);
 
@@ -2115,7 +2139,12 @@ async fn look(
     // is what stopped it.
     let failed = err.as_deref().map(|e| {
         let limit = outcome.as_ref().ok().and_then(|o| o.limit.as_ref());
-        format!("\n\n{}", crate::agent::failure_card(&ctx.me, e, limit))
+        if !account_issues.is_empty() {
+            if let Some(a) = &seat {
+                crate::agent::remember_account_issues(&mut account_issues, [crate::agent::account_attempt_issue(&a.name, e, limit)]);
+            }
+        }
+        format!("\n\n{}", crate::agent::failure_card_with_accounts(&ctx.me, e, limit, &account_issues, accounts_unavailable))
     });
     if dry {
         // Nothing leaves the machine: the trace and what it WOULD have sent.
@@ -2404,6 +2433,23 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_final_session_outranks_the_init_event_and_failed_events_are_ignored() {
+        let mut saved = Some("prior".into());
+        let mut outcome = crate::harness::TurnOutcome {
+            produced: true, session: Some("after-compaction".into()), ..Default::default()
+        };
+        super::retain_attempt_session(&mut saved, &outcome, Some("init-session"));
+        assert_eq!(saved.as_deref(), Some("after-compaction"));
+        outcome.session = None;
+        super::retain_attempt_session(&mut saved, &outcome, Some("event-only"));
+        assert_eq!(saved.as_deref(), Some("event-only"));
+        outcome.produced = false;
+        outcome.error = Some("authentication failed".into());
+        super::retain_attempt_session(&mut saved, &outcome, Some("failed-fork"));
+        assert_eq!(saved.as_deref(), Some("event-only"));
+    }
+
     use super::*;
 
     fn msg(id: &str, who: &str, kind: &str, at: &str, text: &str) -> Value {
