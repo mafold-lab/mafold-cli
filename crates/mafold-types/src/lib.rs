@@ -788,12 +788,35 @@ pub struct Sidecar {
     /// Page URL → what the page says about itself.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub pages: std::collections::BTreeMap<String, PageSlot>,
+    /// Controlled state (`.docs/card-state-v1.md`): key → item. The server has
+    /// already left out every item this reader may not read.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub state: std::collections::BTreeMap<String, StateItem>,
 }
 
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
-        self.media.is_empty() && self.pages.is_empty()
+        self.media.is_empty() && self.pages.is_empty() && self.state.is_empty()
     }
+}
+
+/// One controlled-state item beside a message (`.docs/card-state-v1.md` §3.1).
+/// A reader never gets `read` / `write` of an item they may not read — the item
+/// is not sent at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateItem {
+    #[serde(default)]
+    pub v: serde_json::Value,
+    #[serde(default)]
+    pub read: Vec<String>,
+    #[serde(default)]
+    pub write: Vec<String>,
+    /// Who wrote it last; `@server` for the server's own writes.
+    #[serde(default)]
+    pub by: String,
+    /// Unix seconds of the last write.
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// One picture: re-hosted on our CDN, still being fetched, or not to be had.

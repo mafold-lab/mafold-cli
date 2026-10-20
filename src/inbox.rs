@@ -1015,17 +1015,16 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
     if who != me_lc && aliases().iter().any(|a| *a != who && mafold_transcript::mention::summons(raw, a, is_bot(m))) {
         line.push_str(" [找本人的]");
     }
-    // An agent's reply is mostly its working trail (cards) with the answer at
-    // the END — 80–130 KB where the conclusion is the last paragraph. Read it
-    // as prose, and when it's long keep its tail: clipping from the front is
-    // exactly how this loop read "no answer yet" into replies that had one.
+    // Folded like every other history view (`agent::model_view`): an agent's
+    // 80–130 KB working trail becomes one line per card, and its answer — the
+    // prose, usually the last paragraph — is what's left. An agent's reply
+    // keeps head AND tail when long: clipping from the front is exactly how
+    // this loop read "no answer yet" into replies that had one.
+    let mid = m["id"].as_str().unwrap_or("");
     let body = if is_bot(m) {
-        // A failed turn still reads as one: its card becomes a line before the
-        // cards go, or the reply is «—» and a half answer looks whole.
-        let prose = mafold_transcript::render::strip_cards(&mafold_transcript::render::failure_cards_as_text(raw));
-        head_tail(&collapse_blank(&prose), BOT_HEAD, BOT_TAIL)
+        head_tail(&collapse_blank(&crate::agent::model_view(raw, mid)), BOT_HEAD, BOT_TAIL)
     } else {
-        clip(&crate::chat::readable_body(raw), BODY_MAX)
+        clip(&crate::chat::readable_body(raw, mid), BODY_MAX)
     };
     line.push_str(": ");
     line.push_str(if body.trim().is_empty() { "—" } else { &body });
@@ -1246,7 +1245,8 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
          \u{20} · 点卡片上的按钮(跟人手点一样):`mafold tap <消息id> <action> [内容]` —— 回答问题卡 `ask:answer <答案>`、\
          权限卡 `perm:answer Allow`;叫停一个正在写的回复:`mafold tap <「⏳」那行的 #id> stop`,它会告诉你停没停下。\
          只停你自己叫起来、却重复了或跑偏了的回复,或者本人让你停的;别人的(尤其 linsky 和他的 bot)不碰。\n\
-         \u{20} · 要更多上下文:`mafold read <chat_id> [--channel <channel_id>] --ids --limit 30`;所有会话:`mafold chats`。\n\
+         \u{20} · 要更多上下文:`mafold read <chat_id> [--channel <channel_id>] --limit 30`;所有会话:`mafold chats`。\
+         卡片在这里都是折叠的(标签+属性,内容换成一行 [folded: …]),要看哪条的原文:`mafold msg <消息id>`。\n\
          \u{20} · 分派工作 = 一件事一个频道:群是论坛(有频道)时,先 `mafold channels list <chat_id>` 找对应这件事的频道;没有就 `mafold channels create <chat_id> <名字>` 开一个(名字就写这件事,短),再用 `--channel` 在里面说、@ 人。别把不相干的事堆进私聊或主时间线。开不了(只有管理员能开)就用最接近的现有频道,并说明一句。事情结了,`mafold channels close <chat_id> <频道>` 关掉你自己开的那个。\n\
          - 闲聊、别人之间的事,看完不说话完全正常。但**有人在等你**的时候必须接:问了你(或「找本人的」)的问题、\
          找你拍板、交了活等你验收(看它的结论和证据,不够就要)、答应的事到点没动静 —— 回答、验收、拍板或追,别只在日志里记一笔。\n\
@@ -2137,6 +2137,9 @@ async fn look(
     // The card, at the end of what the run did — the same one a reply that
     // dies ends on (`agent::failure_card`), with the seat's limit when that
     // is what stopped it.
+    // What only some readers of the log may read — a compaction's summary, the
+    // failure's raw error — as state on the log message once it is posted.
+    let mut private = tx_log.take_private();
     let failed = err.as_deref().map(|e| {
         let limit = outcome.as_ref().ok().and_then(|o| o.limit.as_ref());
         if !account_issues.is_empty() {
@@ -2144,7 +2147,9 @@ async fn look(
                 crate::agent::remember_account_issues(&mut account_issues, [crate::agent::account_attempt_issue(&a.name, e, limit)]);
             }
         }
-        format!("\n\n{}", crate::agent::failure_card_with_accounts(&ctx.me, e, limit, &account_issues, accounts_unavailable))
+        let (card, item) = crate::agent::failure_card_with_accounts(&ctx.me, e, limit, &account_issues, accounts_unavailable);
+        private.extend(item);
+        format!("\n\n{card}")
     });
     if dry {
         // Nothing leaves the machine: the trace and what it WOULD have sent.
@@ -2160,6 +2165,9 @@ async fn look(
             Ok(m) => {
                 if let Some(id) = m["id"].as_str() {
                     state.remember_log(id);
+                    if !private.is_empty() {
+                        crate::agent::write_private(&ctx.client, id, private).await;
+                    }
                 }
             }
             Err(e) => eprintln!("inbox: posting the log failed: {e:#}"),

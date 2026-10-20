@@ -135,6 +135,23 @@ pub fn marker(audience: &str) -> String {
     format!("{{% {TAG} for=\"{}\" hidden=\"true\" /%}}", spelled(audience))
 }
 
+/// A note only `audience` may read, the way a message now carries one: the
+/// card `{% mafold/only for="…" sid="…" /%}` in the body, the text as the
+/// controlled-state item `mafold/only/<sid>.text` read by `audience`
+/// (`.docs/card-state-v1.md`). The body is the same for every reader; the
+/// item is what only some get. Whoever posts the card writes the item.
+pub fn private_note(audience: &str, text: &str) -> (String, crate::render::PrivateItem) {
+    let who = spelled(audience);
+    let v = serde_json::Value::String(text.trim().to_string());
+    let sid = crate::render::sid_of(&v);
+    let item = crate::render::PrivateItem {
+        key: format!("{TAG}/{sid}.text"),
+        read: crate::render::read_list(&who),
+        v,
+    };
+    (format!("{{% {TAG} for=\"{who}\" sid=\"{sid}\" /%}}"), item)
+}
+
 /// `audience` in a closed alphabet (names, `@`, commas, spaces).
 fn spelled(audience: &str) -> String {
     let clean: String = audience

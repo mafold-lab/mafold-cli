@@ -143,6 +143,9 @@ pub struct Transcript {
     /// summary has to stop counting it, and the whole-turn `totals` can't say
     /// which share to drop.
     last_group: (HashMap<&'static str, usize>, usize),
+    /// Parts of cards this turn rendered that only some readers may read —
+    /// state for whoever posts the reply to write ([`Transcript::take_private`]).
+    private: Vec<crate::render::PrivateItem>,
 }
 
 impl Default for Transcript {
@@ -224,6 +227,7 @@ impl Transcript {
             steps: 0,
             groups: 0,
             last_group: (HashMap::new(), 0),
+            private: Vec::new(),
         }
     }
 
@@ -323,6 +327,14 @@ impl Transcript {
         self.close_group();
     }
 
+    /// The private parts of cards rendered since the last call: controlled
+    /// state the poster of this reply writes onto it, as its sender, once the
+    /// message is there (`render::PrivateItem`). Drained — each is handed out
+    /// once.
+    pub fn take_private(&mut self) -> Vec<crate::render::PrivateItem> {
+        std::mem::take(&mut self.private)
+    }
+
     /// Append markdoc the caller assembled itself — the daemon's
     /// `{% mafold/bgtasks %}` notice, or a one-line apology for something that
     /// failed out-of-band. Pending narration and the open group are committed
@@ -378,7 +390,15 @@ impl Transcript {
                 self.first_text_ms = Some(self.stats_started.elapsed().as_millis() as u64);
             }
             AgentEvent::ToolCall { id, .. } => { self.stat_calls.insert(id.clone()); }
-            AgentEvent::Compacted { .. } => { self.compactions += 1; }
+            AgentEvent::Compacted { pre_tokens, post_tokens, summary, flagged } => {
+                self.compactions += 1;
+                // The card `render` draws for this event names its private part
+                // by the same `sid`; this is the part.
+                if let Some(s) = summary {
+                    let (_, item) = crate::render::compact_card(*pre_tokens, *post_tokens, true, s, flagged);
+                    self.private.extend(item);
+                }
+            }
             _ => {}
         }
         match ev {

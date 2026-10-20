@@ -98,7 +98,9 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // it always was — the card's before→after bar is no use on a count
         // alone, and the line's job, explaining minutes of silence, needs none.
         AgentEvent::Compacted { pre_tokens, post_tokens, summary, flagged } => Some(match (summary, pre_tokens) {
-            (Some(s), _) => compact_card(*pre_tokens, *post_tokens, true, s, flagged),
+            // The owner's part (summary, flags) is not in the card: the
+            // transcript hands it out as state (`Transcript::take_private`).
+            (Some(s), _) => compact_card(*pre_tokens, *post_tokens, true, s, flagged).0,
             (None, Some(n)) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted ({} before)_", fmt_count(*n))),
             (None, None) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted_")),
         }),
@@ -535,20 +537,69 @@ pub fn trace_card(summary: &str, steps: usize, body: &str) -> String {
 /// place for the rest (the full text stays in the transcript on disk).
 const SUMMARY_MAX: usize = 16_000;
 
+/// One part of a card only some readers may read — an item of the message's
+/// controlled state (`.docs/card-state-v1.md`), not text in its body. Whoever
+/// posts the card writes it with `setCardState` once the message exists, as its
+/// sender: `key`, `v`, read list `read`, write list `[sender]`. The server
+/// hands the item only to readers on `read`; the body is the same for everyone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrivateItem {
+    pub key: String,
+    pub v: serde_json::Value,
+    pub read: Vec<String>,
+}
+
+/// The `sid` a card's private part is keyed by: a hash of the value, so the
+/// same part renders the same card however often the reply is redrawn.
+pub(crate) fn sid_of(v: &serde_json::Value) -> String {
+    // FNV-1a, 64 bit: stable across builds and platforms, unlike std's hasher.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in v.to_string().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:012x}", h & 0xffff_ffff_ffff)
+}
+
+/// A read list from a card's `for` (`owner`, `sender`, `@name`, comma
+/// separated) — the same words the state's lists speak.
+pub(crate) fn read_list(audience: &str) -> Vec<String> {
+    let mut out: Vec<String> = audience
+        .split(',')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| match w.to_lowercase().as_str() {
+            "owner" | "sender" => w.to_lowercase(),
+            other => format!("@{}", other.trim_start_matches('@')),
+        })
+        .collect();
+    if out.is_empty() {
+        out.push("owner".into());
+    }
+    out
+}
+
 /// `{% mafold/compact %}` — a compaction, and what the agent will read instead
 /// of the conversation from now on. `/compact` and an auto-compaction mid-turn
 /// post the same card.
 ///
-/// Body: the flagged lines first, one `flag|<line>` each, then the summary. A
-/// count goes in only when it is known — the card draws before→after from the
-/// pair, and an `after` it had to guess would claim the whole context was freed.
+/// A count goes in only when it is known — the card draws before→after from
+/// the pair, and an `after` it had to guess would claim the whole context was
+/// freed.
 ///
-/// The body is the OWNER's, wrapped in `{% mafold/only for="owner" %}`
-/// (secure-input-v1 §9): a summary is a digest of the whole conversation, and
-/// in a group of two dozen the bot's owner is the one person it is written
-/// for. The server cuts the block from everyone else's copy; they keep the
-/// attributes — that a compaction happened and how much it freed.
-pub fn compact_card(before: Option<u64>, after: Option<u64>, auto: bool, summary: &str, flagged: &[String]) -> String {
+/// The flagged lines and the summary are the bot OWNER's: a summary is a
+/// digest of the whole conversation, and in a group of two dozen the owner is
+/// the one person it is written for. They are not in the card: they are the
+/// returned [`PrivateItem`] (`mafold/compact/<sid>.summary`, read by `owner`),
+/// `{flags: [...], summary}`. The card says `for="owner"` and its `sid`, so it
+/// can name whose part is missing, and everyone keeps the numbers.
+pub fn compact_card(
+    before: Option<u64>,
+    after: Option<u64>,
+    auto: bool,
+    summary: &str,
+    flagged: &[String],
+) -> (String, Option<PrivateItem>) {
     let mut attrs = String::new();
     if let Some(b) = before {
         attrs.push_str(&format!(" before=\"{b}\""));
@@ -562,24 +613,24 @@ pub fn compact_card(before: Option<u64>, after: Option<u64>, auto: bool, summary
     if !flagged.is_empty() {
         attrs.push_str(&format!(" flagged=\"{}\"", flagged.len()));
     }
-    let mut body = String::new();
-    for f in flagged {
-        let one: String = f.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
-        body.push_str(&format!("flag|{}\n", neutralize(one.trim())));
-    }
+    let flags: Vec<String> = flagged
+        .iter()
+        .map(|f| f.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect::<String>().trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
     let summary = summary.trim();
-    if summary.chars().count() > SUMMARY_MAX {
-        body.push_str(&neutralize(&summary.chars().take(SUMMARY_MAX).collect::<String>()));
-        body.push_str("\n…\n");
-    } else if !summary.is_empty() {
-        body.push_str(&neutralize(summary));
-        body.push('\n');
+    let summary = if summary.chars().count() > SUMMARY_MAX {
+        format!("{}\n…", summary.chars().take(SUMMARY_MAX).collect::<String>())
+    } else {
+        summary.to_string()
+    };
+    if flags.is_empty() && summary.is_empty() {
+        return (format!("\n{{% mafold/compact{attrs} /%}}\n"), None);
     }
-    if body.is_empty() {
-        return format!("\n{{% mafold/compact{attrs} /%}}\n");
-    }
-    let only = crate::only::TAG;
-    format!("\n{{% mafold/compact{attrs} %}}\n{{% {only} for=\"owner\" %}}\n{body}{{% /{only} %}}\n{{% /mafold/compact %}}\n")
+    let v = serde_json::json!({ "flags": flags, "summary": summary });
+    let sid = sid_of(&v);
+    let item = PrivateItem { key: format!("mafold/compact/{sid}.summary"), v, read: read_list("owner") };
+    (format!("\n{{% mafold/compact{attrs} for=\"owner\" sid=\"{sid}\" /%}}\n"), Some(item))
 }
 
 /// A failed turn, told to the reader — `{% mafold/error %}`, the one shape for
@@ -602,6 +653,98 @@ pub fn compact_card(before: Option<u64>, after: Option<u64>, auto: bool, summary
 /// the new lines as raw detail, so no existing body shape changes.
 /// No body at all ⇒ self-closing.
 pub fn failure_card(f: &crate::failure::Failure) -> String {
+    let (attrs, payer) = failure_attrs(f);
+    let mut body = String::new();
+    if let Some(n) = f.need {
+        body.push_str(&format!("need|{n}\n"));
+    }
+    if let Some(n) = f.have {
+        body.push_str(&format!("have|{n}\n"));
+    }
+    if let Some(c) = f.currency.as_deref().map(line_esc).filter(|c| !c.is_empty()) {
+        body.push_str(&format!("currency|{}\n", neutralize(&c)));
+    }
+    if let Some(u) = f.usd_out.filter(|u| u.is_finite() && *u > 0.0) {
+        body.push_str(&format!("usd|{u}\n"));
+    }
+    for account in &f.accounts {
+        // JSON keeps newlines and separators in an account name or provider
+        // message from becoming another field. Neutralize card delimiters
+        // as well: the private block must remain indivisible on the server.
+        body.push_str(&format!("account|{}\n", neutralize(&account_row(account).to_string())));
+    }
+    let raw = f.detail.trim();
+    if !raw.is_empty() {
+        body.push_str(&block_esc(raw));
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    if body.is_empty() {
+        return format!("\n{{% mafold/error{attrs} /%}}\n");
+    }
+    let only = crate::only::TAG;
+    let who = failure_audience(f, payer);
+    format!("\n{{% mafold/error{attrs} %}}\n{{% {only} for=\"{who}\" %}}\n{body}{{% /{only} %}}\n{{% /mafold/error %}}\n")
+}
+
+/// [`failure_card`] with the payer's part as controlled state instead of in
+/// the body: the amounts, the per-account refusals and the raw error are the
+/// returned [`PrivateItem`] (`mafold/error/<sid>.detail`, read by the payer —
+/// `owner` when nobody pays through a wallet), as `{need, have, currency, usd,
+/// accounts: [...], raw}` with the absent ones left out. The card keeps the
+/// public attributes, and `for` + `sid` so it can say whose part is missing.
+pub fn failure_card_private(f: &crate::failure::Failure) -> (String, Option<PrivateItem>) {
+    let (attrs, payer) = failure_attrs(f);
+    let mut v = serde_json::Map::new();
+    if let Some(n) = f.need {
+        v.insert("need".into(), n.into());
+    }
+    if let Some(n) = f.have {
+        v.insert("have".into(), n.into());
+    }
+    if let Some(c) = f.currency.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        v.insert("currency".into(), c.into());
+    }
+    if let Some(u) = f.usd_out.filter(|u| u.is_finite() && *u > 0.0) {
+        v.insert("usd".into(), u.into());
+    }
+    if !f.accounts.is_empty() {
+        v.insert("accounts".into(), f.accounts.iter().map(account_row).collect::<Vec<_>>().into());
+    }
+    let raw = f.detail.trim();
+    if !raw.is_empty() {
+        v.insert("raw".into(), raw.into());
+    }
+    if v.is_empty() {
+        return (format!("\n{{% mafold/error{attrs} /%}}\n"), None);
+    }
+    let v = serde_json::Value::Object(v);
+    let sid = sid_of(&v);
+    let who = failure_audience(f, payer);
+    let item = PrivateItem { key: format!("mafold/error/{sid}.detail"), read: read_list(&who), v };
+    (format!("\n{{% mafold/error{attrs} for=\"{who}\" sid=\"{sid}\" /%}}\n"), Some(item))
+}
+
+/// Whose a failure's private part is: the payer, else whoever it is read to
+/// (a house bot's asker), else the bot's owner.
+fn failure_audience(f: &crate::failure::Failure, payer: Option<String>) -> String {
+    let reader = f.reader.as_deref().and_then(handle);
+    payer.or(reader).map_or_else(|| "owner".to_string(), |p| format!("@{p}"))
+}
+
+fn account_row(account: &crate::failure::AccountIssue) -> serde_json::Value {
+    serde_json::json!({
+        "account": account.account,
+        "kind": account.kind.as_str(),
+        "detail": account.detail,
+        "window": account.window,
+        "resets_at": account.resets_at.filter(|t| *t > 0),
+    })
+}
+
+/// A failure card's public attributes, and its payer's handle.
+fn failure_attrs(f: &crate::failure::Failure) -> (String, Option<String>) {
     let payer = f.payer.as_deref().and_then(handle);
     let mut attrs = format!(" kind=\"{}\"", f.kind.as_str());
     // A step id is a word the card looks up (`imagegen`), never prose — anything
@@ -623,46 +766,7 @@ pub fn failure_card(f: &crate::failure::Failure) -> String {
     if let Some(t) = f.resets_at.filter(|t| *t > 0) {
         attrs.push_str(&format!(" resets_at=\"{t}\""));
     }
-    let mut body = String::new();
-    if let Some(n) = f.need {
-        body.push_str(&format!("need|{n}\n"));
-    }
-    if let Some(n) = f.have {
-        body.push_str(&format!("have|{n}\n"));
-    }
-    if let Some(c) = f.currency.as_deref().map(line_esc).filter(|c| !c.is_empty()) {
-        body.push_str(&format!("currency|{}\n", neutralize(&c)));
-    }
-    if let Some(u) = f.usd_out.filter(|u| u.is_finite() && *u > 0.0) {
-        body.push_str(&format!("usd|{u}\n"));
-    }
-    for account in &f.accounts {
-        let row = serde_json::json!({
-            "account": account.account,
-            "kind": account.kind.as_str(),
-            "detail": account.detail,
-            "window": account.window,
-            "resets_at": account.resets_at.filter(|t| *t > 0),
-        });
-        // JSON keeps newlines and separators in an account name or provider
-        // message from becoming another field. Neutralize card delimiters
-        // as well: the private block must remain indivisible on the server.
-        body.push_str(&format!("account|{}\n", neutralize(&row.to_string())));
-    }
-    let raw = f.detail.trim();
-    if !raw.is_empty() {
-        body.push_str(&block_esc(raw));
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-    }
-    if body.is_empty() {
-        return format!("\n{{% mafold/error{attrs} /%}}\n");
-    }
-    let only = crate::only::TAG;
-    let reader = f.reader.as_deref().and_then(handle);
-    let who = payer.or(reader).map_or_else(|| "owner".to_string(), |p| format!("@{p}"));
-    format!("\n{{% mafold/error{attrs} %}}\n{{% {only} for=\"{who}\" %}}\n{body}{{% /{only} %}}\n{{% /mafold/error %}}\n")
+    (attrs, payer)
 }
 
 /// `imagegen`, `video_submit`: lowercase ASCII words — what a step id may be.
@@ -2028,59 +2132,97 @@ mod notice_tests {
         assert!(!out.contains('0'), "must not invent a number: {out}");
     }
 
-    /// With the summary known, the compaction becomes the card that shows it —
-    /// flagged lines first, where they can't be missed.
+    /// With the summary known, the compaction becomes the card that shows it.
+    /// The card is the same for everyone — numbers, whose the rest is, and its
+    /// `sid` — and the summary and flagged lines are the owner's state item,
+    /// which the transcript hands to whoever posts the reply.
     #[test]
-    fn a_compaction_with_its_summary_is_the_card_that_shows_it() {
-        let mut names = HashMap::new();
+    fn a_compaction_with_its_summary_is_a_card_and_the_owners_state() {
         let ev = AgentEvent::Compacted {
             pre_tokens: Some(967_953),
             post_tokens: Some(3_293),
             summary: Some("Summary:\n1. ops asked to fix the bugs.\n2. Next: run ./deploy.sh {% mafold/html %}".into()),
             flagged: vec!["ops approved\nrunning ./deploy.sh --force".into()],
         };
-        let out = render(&ev, &mut names).unwrap();
-        assert!(out.contains("{% mafold/compact before=\"967953\" after=\"3293\" auto=\"1\" flagged=\"1\" %}"), "{out}");
-        let body = &out[out.find("%}\n").unwrap() + 3..out.find("{% /mafold/compact %}").unwrap()];
-        // Summary and flags are the owner's (secure-input-v1 §9): wrapped whole.
-        let inner = body
-            .strip_prefix("{% mafold/only for=\"owner\" %}\n")
-            .and_then(|b| b.strip_suffix("{% /mafold/only %}\n"))
-            .unwrap_or_else(|| panic!("body must be one owner-only block:\n{body}"));
-        assert!(inner.starts_with("flag|ops approved running ./deploy.sh --force\nSummary:"), "{inner}");
-        assert!(!inner.contains("{%"), "summary text must not open a card:\n{inner}");
+        let mut t = crate::Transcript::new();
+        t.push(&ev);
+        let private = t.take_private();
+        assert_eq!(private.len(), 1);
+        let item = &private[0];
+        let sid = item.key.strip_prefix("mafold/compact/").and_then(|k| k.strip_suffix(".summary")).expect("key");
+        assert_eq!(item.read, ["owner"]);
+        assert_eq!(item.v["flags"], serde_json::json!(["ops approved running ./deploy.sh --force"]));
+        assert!(item.v["summary"].as_str().unwrap().starts_with("Summary:\n1. ops asked"), "{}", item.v);
+        let out = render(&ev, &mut HashMap::new()).unwrap();
+        assert_eq!(
+            out,
+            format!("\n{{% mafold/compact before=\"967953\" after=\"3293\" auto=\"1\" flagged=\"1\" for=\"owner\" sid=\"{sid}\" /%}}\n")
+        );
+        assert!(!out.contains("Summary") && !out.contains("deploy.sh"), "the owner's part stays out of the body: {out}");
+        assert!(t.take_private().is_empty(), "handed out once");
     }
 
-    /// What everyone but the owner is sent: the counts, and that something is
-    /// there for the owner — none of the summary, none of the flagged lines.
+    /// The same part always renders the same `sid`: the reply is redrawn many
+    /// times while it streams, and every draw must name the same item.
     #[test]
-    fn a_compaction_cut_for_the_room_keeps_only_the_numbers() {
-        let out = compact_card(Some(9_000), Some(1_000), true, "Summary: the secret plan", &["ops said go".into()]);
-        let bot = crate::only::Author::new("ops:claude", Some("ops"));
-        let room = crate::only::view_for(&out, bot, Some("linsky"));
-        assert_eq!(
-            room,
-            "\n{% mafold/compact before=\"9000\" after=\"1000\" auto=\"1\" flagged=\"1\" %}\n\
-             {% mafold/only for=\"owner\" hidden=\"true\" /%}\n{% /mafold/compact %}\n"
-        );
-        assert_eq!(crate::only::view_for(&out, bot, Some("ops")), out);
+    fn a_compaction_card_names_its_part_the_same_every_time() {
+        let a = compact_card(Some(9_000), Some(1_000), true, "Summary: the plan", &["ops said go".into()]);
+        let b = compact_card(Some(9_000), Some(1_000), true, "Summary: the plan", &["ops said go".into()]);
+        assert_eq!(a, b);
+        let c = compact_card(Some(9_000), Some(1_000), true, "Summary: another plan", &[]);
+        assert_ne!(a.1.unwrap().key, c.1.unwrap().key);
     }
 
     /// A count on its own goes in alone: an `after` the card had to assume would
     /// claim 100% of the context was freed.
     #[test]
     fn a_compact_card_never_guesses_the_after_count() {
-        let out = compact_card(Some(90_000), None, true, "s", &[]);
+        let (out, _) = compact_card(Some(90_000), None, true, "s", &[]);
         assert!(out.contains("before=\"90000\"") && !out.contains("after="), "{out}");
-        let out = compact_card(None, Some(3_000), false, "s", &[]);
+        let (out, _) = compact_card(None, Some(3_000), false, "s", &[]);
         assert!(!out.contains("after="), "an after without a before is not a pair:\n{out}");
+        let (out, item) = compact_card(Some(1), Some(1), false, "  ", &[]);
+        assert_eq!((out.as_str(), item), ("\n{% mafold/compact before=\"1\" after=\"1\" /%}\n", None));
     }
 
     #[test]
     fn a_runaway_summary_is_capped() {
-        let out = compact_card(None, None, false, &"x".repeat(SUMMARY_MAX + 500), &[]);
-        assert!(out.len() < SUMMARY_MAX + 200, "{}", out.len());
-        assert!(out.contains("…"), "a cut summary says it was cut");
+        let (_, item) = compact_card(None, None, false, &"x".repeat(SUMMARY_MAX + 500), &[]);
+        let s = item.unwrap().v["summary"].as_str().unwrap().to_string();
+        assert!(s.chars().count() < SUMMARY_MAX + 5, "{}", s.len());
+        assert!(s.ends_with('…'), "a cut summary says it was cut");
+    }
+
+    /// A failure's payer part as state: the card keeps the public attributes
+    /// and says whose the rest is; amounts and the raw error are the item.
+    #[test]
+    fn a_failure_card_keeps_the_payers_part_as_state() {
+        use crate::failure::{Failure, FailureKind};
+        let mut f = Failure::of(FailureKind::Balance, "insufficient balance: need 9000, have 120");
+        f.payer = Some("ops".into());
+        f.need = Some(9000);
+        f.have = Some(120);
+        let (card, item) = failure_card_private(&f);
+        let item = item.expect("a payer part");
+        let sid = item.key.strip_prefix("mafold/error/").and_then(|k| k.strip_suffix(".detail")).expect("key");
+        assert!(card.contains("kind=\"balance\"") && card.contains("payer=\"ops\""), "{card}");
+        assert!(card.trim_end().ends_with(&format!("for=\"@ops\" sid=\"{sid}\" /%}}")), "{card}");
+        assert!(!card.contains("9000") && !card.contains("insufficient"), "{card}");
+        assert_eq!(item.read, ["@ops"]);
+        assert_eq!(item.v["need"], 9000);
+        assert_eq!(item.v["raw"], "insufficient balance: need 9000, have 120");
+        let (bare, none) = failure_card_private(&Failure::of(FailureKind::Unavailable, ""));
+        assert_eq!((bare.as_str(), none), ("\n{% mafold/error kind=\"unavailable\" /%}\n", None));
+    }
+
+    /// A note for the owner: a placeholder card in the body, the text as state.
+    #[test]
+    fn a_private_note_is_a_card_and_its_state() {
+        let (card, item) = crate::only::private_note("owner", "  using @ops's seat  ");
+        let sid = item.key.strip_prefix("mafold/only/").and_then(|k| k.strip_suffix(".text")).expect("key");
+        assert_eq!(card, format!("{{% mafold/only for=\"owner\" sid=\"{sid}\" /%}}"));
+        assert_eq!(item.v, "using @ops's seat");
+        assert_eq!(item.read, ["owner"]);
     }
 
     /// An unknown tool must still say WHAT it acted on. A card reading

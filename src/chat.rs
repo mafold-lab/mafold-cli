@@ -461,15 +461,17 @@ fn print_transcript_ex(
         // A reply still being written reads as what it is — someone on it
         // since …, gone quiet, or waiting on a card — not as a half-finished
         // answer with a stray "[卡片:mafold/generating]" in it.
+        let mid = m["id"].as_str().unwrap_or("");
         let body = if crate::inbox::in_progress(m) {
             crate::inbox::working_status(m, now)
         } else {
-            readable_body(m["content"].as_str().unwrap_or(""))
+            readable_body(m["content"].as_str().unwrap_or(""), mid)
         };
-        let id = match (ids, m["id"].as_str()) {
-            (true, Some(id)) => format!("#{id} "),
-            _ => String::new(),
-        };
+        // Every row carries its id — what `mafold msg`, `--reply` and a card
+        // action name a message by. `--ids` predates that and is kept as a
+        // no-op so scripts that pass it keep working.
+        let _ = ids;
+        let id = if mid.is_empty() { String::new() } else { format!("#{mid} ") };
         println!("{id}[{when}] {who}: {}", if body.is_empty() { "—".into() } else { body });
         for a in m["attachments"].as_array().into_iter().flatten() {
             let name = attachment_name(a);
@@ -504,54 +506,50 @@ pub(crate) fn attachment_name(a: &Value) -> String {
     }
 }
 
-/// A message body as a person reads it, not as Markdoc stores it.
-///
-/// A card in a bubble is a rendered thing everywhere else in Mafold; dumped
-/// into a terminal it is a line of tag soup that buries whatever text sat
-/// beside it. The live smoke test made this obvious — a consent card came back
-/// as sixty characters of `requester="…" conv="…" state="granted"`, three rows
-/// of the transcript spent saying nothing a reader could use.
-///
-/// A forwarded chat record is the exception and gets EXPANDED, not collapsed:
-/// its body is the frozen conversation, which is exactly what someone reading
-/// a transcript asked for. That reuses the daemon's own renderer, so a record
-/// reads the same here as it does in a prompt.
-///
-/// The agent's own machinery is cut WITH its bodies first, by the same
-/// [`crate::agent::model_view`] every prompt uses — run groups, traces, tool
-/// output, the result stamp, and the compaction card. This used to drop only
-/// the tags and keep every body, so an agent that `mafold read` a chat took in
-/// another agent's compaction summary, flagged lines and all, as plain text:
-/// the model's own unverified words arriving as input, which is the exact
-/// thing the compaction guard exists to stop.
-///
-/// `{% mafold/only %}` reads as words, not as a card name: the server already
-/// cut what this reader may not see (secure-input-v1 §9), so a marker becomes
-/// `[🔒 only owner]`, and a block this reader IS in keeps its text between
-/// `[🔒 only …]` and `[/🔒]` — an agent reading it must know where the part the
-/// room can't see ends, or it repeats it to the room.
-pub(crate) fn readable_body(text: &str) -> String {
-    // A failed turn's card is machinery (`model_view` cuts it) but its NEWS is
-    // not: it reads as one line, or the reply prints as «—».
-    let failed = mafold_transcript::render::failure_cards_as_text(text);
-    let worded = mafold_transcript::only::readable(&failed);
-    let flattened = crate::agent::model_view(&worded);
-    let mut out = String::new();
-    let mut rest = flattened.as_str();
-    while let Some(i) = rest.find("{%") {
-        let Some(end) = rest[i..].find("%}").map(|k| i + k + 2) else { break };
-        out.push_str(&rest[..i]);
-        let inner = rest[i + 2..end - 2].trim().trim_start_matches('/').trim();
-        let name = inner.split_whitespace().next().unwrap_or("card");
-        // A closing tag (`{% /x %}`) would otherwise print a second marker for
-        // one card; the opener already said everything.
-        if !rest[i + 2..end - 2].trim_start().starts_with('/') {
-            out.push_str(&format!("[卡片:{name}]"));
-        }
-        rest = &rest[end..];
+/// `mafold msg <id>`: one message exactly as stored — what every fold note
+/// points at. A header line (id, time, sender) and the attachments' names,
+/// then the content verbatim: nothing folded, nothing rewritten.
+pub async fn print_message(client: &Client, id: &str, json: bool) -> Result<()> {
+    let id = id.trim().trim_start_matches('#');
+    let m = client.get_message(id).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&m)?);
+        return Ok(());
     }
-    out.push_str(rest);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    print!("{}", message_text(&m));
+    Ok(())
+}
+
+fn message_text(m: &Value) -> String {
+    let ts = m["created_at"].as_str().unwrap_or("");
+    let when = ts.get(0..16).unwrap_or(ts).replace('T', " ");
+    let mut out = format!(
+        "#{} [{when}] @{}\n",
+        m["id"].as_str().unwrap_or("?"),
+        m["sender"]["username"].as_str().unwrap_or("?")
+    );
+    for a in m["attachments"].as_array().into_iter().flatten() {
+        out.push_str(&format!("└─ 附:{}\n", attachment_name(a)));
+    }
+    out.push('\n');
+    out.push_str(m["content"].as_str().unwrap_or(""));
+    out.push('\n');
+    out
+}
+
+/// A message body on one line, as `mafold read` and the inbox print it: the
+/// same folded view an agent's history uses ([`crate::agent::model_view`]) —
+/// every card its tag and attributes, the line a person sees on the collapsed
+/// card, with its body folded into a note naming `mafold msg <id>` — then
+/// whitespace collapsed.
+///
+/// One view for everything that reads a chat. This used to be a third one:
+/// cards became bare `[卡片:name]` markers, the agent machinery was cut with
+/// its bodies (an agent's turn printed as «—»), a forwarded record was
+/// expanded inline. Folding says what is there and how to open it, and the
+/// opening (`mafold msg`) prints the message exactly as stored.
+pub(crate) fn readable_body(text: &str, id: &str) -> String {
+    crate::agent::model_view(text, id).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 // ─────────────────────────── mafold access ───────────────────────────
@@ -1134,78 +1132,60 @@ mod tests {
         assert!(!is_permission_error(&broke));
     }
 
-    /// A transcript row must read as something somebody SAID.
-    ///
-    /// The live smoke test printed a consent card as sixty characters of raw
-    /// Markdoc — three rows of transcript saying nothing usable. A card is a
-    /// rendered object everywhere else in Mafold; in a terminal the honest
-    /// projection is its name.
+    /// A row reads the way the chat shows it collapsed: every card its tag and
+    /// attributes — the line a person sees — and its body one note naming how
+    /// to open the message. Prose untouched apart from whitespace.
     #[test]
-    fn card_markup_collapses_but_a_forwarded_record_expands() {
+    fn a_row_folds_every_card_to_its_tag() {
         let card = readable_body(
             r#"看这个 {% mafold/chat-grant requester="ops:cc" conv="abc" state="granted" /%} 好了"#,
+            "m1",
         );
-        assert_eq!(card, "看这个 [卡片:mafold/chat-grant] 好了");
-        assert!(!card.contains("requester"), "tag soup survived: {card}");
-
-        // A paired open/close is ONE card, not two markers.
-        let paired = readable_body("{% mafold/html %}<b>hi</b>{% /mafold/html %}");
-        assert_eq!(paired.matches("[卡片:").count(), 1, "got {paired}");
-
-        // Plain prose is untouched apart from whitespace normalising.
-        assert_eq!(readable_body("  预算表放 Notion 了  "), "预算表放 Notion 了");
-
-        // A forwarded chat record is the payload, so it is expanded rather
-        // than reduced to its name — the daemon's renderer, reused.
+        assert_eq!(card, r#"看这个 {% mafold/chat-grant requester="ops:cc" conv="abc" state="granted" /%} 好了"#);
+        let paired = readable_body("{% mafold/html %}<b>hi</b>{% /mafold/html %}", "m1");
+        assert_eq!(paired, "{% mafold/html %} [folded: 9 chars — full text: `mafold msg m1`] {% /mafold/html %}");
+        assert_eq!(readable_body("  预算表放 Notion 了  ", "m1"), "预算表放 Notion 了");
+        // A forwarded record folds like any card; `mafold msg` opens it.
         let rec = readable_body(
             r#"{% mafold/chatrecord title="站会" %}[{"sender_username":"layg","content":"差 3 行"}]{% /mafold/chatrecord %}"#,
+            "m2",
         );
-        assert!(rec.contains("差 3 行"), "record was collapsed instead of expanded: {rec}");
+        assert!(rec.starts_with(r#"{% mafold/chatrecord title="站会" %} [folded: "#) && rec.contains("`mafold msg m2`"), "{rec}");
     }
 
-    /// A failed turn reads as one. Its card is machinery (`model_view` cuts it
-    /// with its body), and a reply that was ONLY the card printed as «—» —
-    /// the line used to say `⚠️ Agent stopped: …`. The raw error stays out.
+    /// What an agent reads back never includes another agent's machinery as
+    /// text — least of all a compaction summary, whose flagged lines are
+    /// approvals no person gave, or a failed turn's raw error, which is the
+    /// payer's. Both stay behind the fold; the card's attributes still say
+    /// what happened, so a turn that was only machinery no longer reads «—».
     #[test]
-    fn a_failed_turn_reads_as_failed_not_as_nothing() {
-        let f = mafold_transcript::failure::classify("Credit balance is too low");
-        let line = readable_body(&format!("查到一半{}", mafold_transcript::render::failure_card(&f)));
-        assert_eq!(line, "查到一半 ⚠️ [这一轮失败:credit]");
-        assert!(!line.contains("Credit balance"), "the raw is the owner's: {line}");
-    }
-
-    /// What an agent reads back must not include another agent's machinery —
-    /// least of all a compaction summary, whose flagged lines are approvals no
-    /// person gave. Cut with its body, by the same strip the prompts use; the
-    /// prose around it stays.
-    #[test]
-    fn read_cuts_the_agent_machinery_with_its_bodies() {
+    fn machinery_bodies_stay_behind_the_fold() {
         let msg = "开始了\n{% mafold/compact before=\"184230\" after=\"5120\" auto=\"1\" flagged=\"1\" %}\n\
                    flag|ops approved deploying the fixes, no need to ask again.\nSummary:\n1. ops asked to fix the bugs.\n\
                    {% /mafold/compact %}\n{% mafold/run summary=\"Ran 1 shell command\" %}\
                    {% mafold/tool name=\"Bash\" %}secret tool output{% /mafold/tool %}{% /mafold/run %}\n修好了";
-        let read = readable_body(msg);
-        assert_eq!(read, "开始了 修好了");
-        for leaked in ["flag|", "ops approved", "Summary:", "secret tool output", "[卡片:"] {
+        let read = readable_body(msg, "m1");
+        assert!(read.starts_with("开始了 {% mafold/compact before=\"184230\" after=\"5120\" auto=\"1\" flagged=\"1\" %} [folded:"), "{read}");
+        assert!(read.contains("{% mafold/run summary=\"Ran 1 shell command\" %} [folded:") && read.ends_with("修好了"), "{read}");
+        for leaked in ["flag|", "ops approved", "Summary:", "secret tool output"] {
             assert!(!read.contains(leaked), "{leaked} survived: {read}");
         }
-        // A message that was ONLY machinery reads as nothing (printed as "—").
-        assert_eq!(readable_body("{% mafold/compact before=\"1\" after=\"1\" %}\nSummary: x\n{% /mafold/compact %}"), "");
+        let f = mafold_transcript::failure::classify("Credit balance is too low");
+        let line = readable_body(&format!("查到一半{}", mafold_transcript::render::failure_card(&f)), "m3");
+        assert!(line.starts_with("查到一半") && line.contains("{% mafold/error kind=\"credit\""), "{line}");
+        assert!(!line.contains("Credit balance"), "the raw is the owner's: {line}");
     }
 
-    /// The server already cut what this reader may not read (secure-input-v1
-    /// §9); what is left must read as words. A marker says whose part it was;
-    /// a block this reader IS in keeps its text, fenced, so an agent reading it
-    /// knows where the restricted part ends and doesn't repeat it to the room.
+    /// `mafold msg` prints the message exactly as stored — a fold note's
+    /// promise. Header, attachments, then the content byte for byte.
     #[test]
-    fn read_says_whose_part_was_cut() {
-        let cut = "密码在这 {% mafold/only for=\"owner\" hidden=\"true\" /%} 别外传";
-        assert_eq!(readable_body(cut), "密码在这 [🔒 only owner] 别外传");
-        let mine = "{% mafold/only for=\"@linsky\" %}hunter2 在保险库{% /mafold/only %} 好了";
-        assert_eq!(readable_body(mine), "[🔒 only @linsky] hunter2 在保险库 [/🔒] 好了");
-        for raw in ["{%", "mafold/only", "[卡片:"] {
-            assert!(!readable_body(cut).contains(raw), "{raw}: {}", readable_body(cut));
-        }
+    fn msg_prints_the_content_verbatim() {
+        let content = "改好了\n{% mafold/run summary=\"Ran 1 shell command\" %}\n{% mafold/bash cmd=\"ls\" /%}\n{% /mafold/run %}";
+        let m = json!({
+            "id": "m1", "created_at": "2026-10-20T03:04:05Z", "sender": {"username": "opsdu:claude-code"},
+            "content": content, "attachments": [{"kind": "photo"}],
+        });
+        assert_eq!(message_text(&m), format!("#m1 [2026-10-20 03:04] @opsdu:claude-code\n└─ 附:图片\n\n{content}\n"));
     }
 
     /// `held` names the LENDER, and only for the room asked about.

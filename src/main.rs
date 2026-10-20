@@ -42,6 +42,7 @@ mod permission_mcp;
 mod platform;
 mod room;
 mod session;
+mod session_life;
 mod sites;
 mod steer_hook;
 mod supervisor;
@@ -178,9 +179,18 @@ enum Cmd {
         /// capped by --limit), then mark it read — what opening a chat does.
         #[arg(long)]
         unread: bool,
-        /// Print each message's id, for `send --reply <id>` / `react <id>`.
-        #[arg(long)]
+        /// Accepted for old scripts; every row now shows its id.
+        #[arg(long, hide = true)]
         ids: bool,
+    },
+    /// Print one message exactly as it was sent — every card whole, nothing
+    /// folded or rewritten. What a `[folded: …]` note in a history points at.
+    Msg {
+        /// The message id (`mafold read` shows it on every row).
+        id: String,
+        /// The message as the API returns it, for code rather than for a model.
+        #[arg(long)]
+        json: bool,
     },
     /// Chat-history tickets: ask for one, see what you hold, revoke one you gave.
     Access {
@@ -782,6 +792,7 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Cmd::Msg { id, json } => chat::print_message(&Client::new(cli.base, token?), &id, json).await?,
         Cmd::Access { cmd } => chat::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Send {
             chat,
@@ -1458,7 +1469,7 @@ fn after_tap(before: &serde_json::Value, after: &serde_json::Value, now_ms: u64)
     if let Some(a) = answered_of(content) {
         return format!("卡片已回答:「{a}」");
     }
-    let body = chat::readable_body(content);
+    let body = chat::readable_body(content, after["id"].as_str().unwrap_or(""));
     let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let n = body.chars().count();
     if n > 200 { format!("{}…", body.chars().take(200).collect::<String>()) } else { body }

@@ -359,7 +359,7 @@ pub(crate) fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
 }
 
 /// [`find_close`] with where the close tag starts: `(start, end)`.
-fn close_at(text: &str, from: usize, name: &str) -> Option<(usize, usize)> {
+pub(crate) fn close_at(text: &str, from: usize, name: &str) -> Option<(usize, usize)> {
     let b = text.as_bytes();
     let mut i = from;
     while let Some(rel) = text[i..].find("{%") {

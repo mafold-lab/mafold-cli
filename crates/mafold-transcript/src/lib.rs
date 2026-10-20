@@ -21,6 +21,7 @@
 
 pub mod event;
 pub mod failure;
+pub mod fold;
 pub mod lint;
 pub mod mention;
 pub mod only;

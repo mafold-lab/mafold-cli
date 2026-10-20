@@ -17,6 +17,31 @@ const RETRY_ATTEMPTS: u32 = 5;
 /// replaced.
 const MEDIA_ATTEMPTS: u32 = 5;
 
+/// What ONE connection must keep delivering while a media attachment comes
+/// down: at least `min_bytes` in every `window`, waiting for the response head
+/// included. Below that the connection is abandoned and the download resumes
+/// on a fresh one (see `download`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StallFloor {
+    pub(crate) window: std::time::Duration,
+    pub(crate) min_bytes: u64,
+}
+
+/// 64 KiB per 15 s (~4 KB/s). 2026-10-19: a pooled connection to the CDN sank
+/// to ~1 KB/s mid-photo while a fresh one ran at ~68 KB/s; nothing ever gave up
+/// on it, so four phone photos held a reply for over an hour.
+pub(crate) const MEDIA_STALL: StallFloor =
+    StallFloor { window: std::time::Duration::from_secs(15), min_bytes: 64 * 1024 };
+
+/// Why one try at an attachment ended without the whole body.
+enum Tear {
+    /// The transport said so: a reset, a TLS shutdown, a 5xx.
+    Http(reqwest::Error),
+    /// The connection fell under the [`StallFloor`]: `got` bytes in the last
+    /// `window` (0 while still waiting on the response head).
+    Stalled { got: u64, window: std::time::Duration },
+}
+
 /// Outcome of `me_probed`: the identity, or a definitive auth rejection.
 pub enum MeProbe {
     Me(Value),
@@ -477,6 +502,25 @@ impl Client {
         self.post("getMessage", json!({ "message_id": message_id })).await
     }
 
+    /// Write one item of a message's controlled state (`.docs/card-state-v1.md`
+    /// §3.4). The first write fixes `read`/`write`; the server decides who may
+    /// create or change it. Idempotent for the same value and lists, so it is
+    /// retried.
+    pub async fn set_card_state(
+        &self,
+        message_id: &str,
+        key: &str,
+        v: &Value,
+        read: &[String],
+        write: &[String],
+    ) -> Result<Value> {
+        self.post_idempotent(
+            "setCardState",
+            json!({ "message_id": message_id, "key": key, "v": v, "read": read, "write": write }),
+        )
+        .await
+    }
+
     pub async fn get_thread_messages(
         &self,
         chat_id: &str,
@@ -767,7 +811,18 @@ impl Client {
     /// And the result is LENGTH-CHECKED: a body that ends short without raising
     /// an error is retried rather than handed back, since a truncated screenshot
     /// the model treats as whole is worse than a missing one.
+    ///
+    /// And FLOORED ([`MEDIA_STALL`]): a connection that slows to a crawl never
+    /// errors, so the resume above never ran — on 2026-10-19 one sank to ~1 KB/s
+    /// mid-photo and held a reply for over an hour while fresh connections ran
+    /// at ~68 KB/s. Now each try has to keep up the floor, head included; under
+    /// it the try is cut and the rest asked for on a fresh connection.
     pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
+        self.download_with(path, MEDIA_STALL).await
+    }
+
+    /// `download`, held to `floor` instead of [`MEDIA_STALL`].
+    pub(crate) async fn download_with(&self, path: &str, floor: StallFloor) -> Result<Vec<u8>> {
         let url = if path.starts_with("http://") || path.starts_with("https://") {
             if !self.media_origin_allowed(path) {
                 anyhow::bail!("refusing to fetch attachment from a non-Mafold origin: {path}");
@@ -790,12 +845,20 @@ impl Client {
         let mut delay = std::time::Duration::from_millis(600);
         let mut attempt = 1;
         loop {
+            // Where this try starts. One that gets further was cut short, not
+            // refused — see `progressed` below.
+            let had = buf.len();
             let got = async {
                 let mut req = self.http.get(&url);
                 if !buf.is_empty() {
                     req = req.header(reqwest::header::RANGE, format!("bytes={}-", buf.len()));
                 }
-                let mut resp = req.send().await?.error_for_status()?;
+                // The head is held to the floor too: a request the far end took
+                // and never answers is the same dead connection.
+                let mut resp = match tokio::time::timeout(floor.window, req.send()).await {
+                    Ok(sent) => sent.and_then(|r| r.error_for_status()).map_err(Tear::Http)?,
+                    Err(_) => return Err(Tear::Stalled { got: 0, window: floor.window }),
+                };
                 // 206 means the range was honoured and the body continues where
                 // we stopped. ANY other success is the whole object again, so the
                 // prefix in hand has to go — appending would duplicate its head.
@@ -807,11 +870,33 @@ impl Client {
                 }
                 // Chunk by chunk rather than `bytes()`, so a body that tears
                 // half-way leaves what it already delivered in `buf` instead of
-                // discarding it with the error.
-                while let Some(chunk) = resp.chunk().await? {
-                    buf.extend_from_slice(&chunk);
+                // discarding it with the error — and so every `floor.window` can
+                // be checked for `floor.min_bytes`. Dropping `resp` short of its
+                // end takes its connection with it (this client speaks HTTP/1.1
+                // only: reqwest without `http2`), so the next try is on a fresh
+                // one rather than back on the crawl.
+                let mut since = tokio::time::Instant::now();
+                let mut got: u64 = 0;
+                loop {
+                    let left = floor.window.saturating_sub(since.elapsed());
+                    match tokio::time::timeout(left, resp.chunk()).await {
+                        Ok(Ok(Some(chunk))) => {
+                            got += chunk.len() as u64;
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => return Err(Tear::Http(e)),
+                        Err(_) => {}
+                    }
+                    if since.elapsed() >= floor.window {
+                        if got < floor.min_bytes {
+                            return Err(Tear::Stalled { got, window: floor.window });
+                        }
+                        since = tokio::time::Instant::now();
+                        got = 0;
+                    }
                 }
-                Ok::<bool, reqwest::Error>(total.is_none_or(|t| buf.len() as u64 >= t))
+                Ok::<bool, Tear>(total.is_none_or(|t| buf.len() as u64 >= t))
             }
             .await;
             let err = match got {
@@ -820,18 +905,50 @@ impl Client {
                 // not be mistaken for success.
                 Ok(false) => None,
                 // A 4xx is the server saying the thing is really gone.
-                Err(e) if e.status().is_some_and(|s| s.is_client_error()) => {
+                Err(Tear::Http(e)) if e.status().is_some_and(|s| s.is_client_error()) => {
                     return Err(anyhow::Error::new(e))
                 }
-                Err(e) => Some(e),
+                Err(t) => Some(t),
             };
+            // `{e}` alone prints only the OUTERMOST layer — which is how every
+            // one of those tears logged as a bare "error decoding response body"
+            // with the reason (connection reset? incomplete message?) dropped on
+            // the floor. Walk the chain.
+            let why = match &err {
+                Some(Tear::Http(e)) => cause_chain(e),
+                Some(Tear::Stalled { got, window }) => format!(
+                    "connection stalled: {got} bytes in {window:?}, under the {} floor",
+                    floor.min_bytes
+                ),
+                None => "body ended short".to_string(),
+            };
+            // A try that brought new bytes goes again at once, on a fresh
+            // connection, without spending the budget: on a link that is slow
+            // everywhere every try gets a stretch further, and five of them
+            // used to throw the photo away half-delivered. Only tries that
+            // bring nothing count — a dead link still gives up.
+            if buf.len() > had {
+                eprintln!(
+                    "attachment fetch cut short ({why}) — {} of {} bytes in hand, resuming on a fresh connection…",
+                    buf.len(),
+                    total.map_or_else(|| "?".to_string(), |t| t.to_string()),
+                );
+                attempt = 1;
+                delay = std::time::Duration::from_millis(600);
+                continue;
+            }
             if attempt >= MEDIA_ATTEMPTS {
                 return match err {
-                    Some(e) => Err(anyhow::Error::new(e).context(format!(
+                    Some(Tear::Http(e)) => Err(anyhow::Error::new(e).context(format!(
                         "attachment download gave up after {attempt} tries with {} of {} bytes",
                         buf.len(),
                         total.map_or_else(|| "?".to_string(), |t| t.to_string())
                     ))),
+                    Some(Tear::Stalled { .. }) => anyhow::bail!(
+                        "attachment download gave up after {attempt} tries with {} of {} bytes ({why})",
+                        buf.len(),
+                        total.map_or_else(|| "?".to_string(), |t| t.to_string())
+                    ),
                     None => anyhow::bail!(
                         "attachment body ended short: {} of {} bytes after {attempt} tries",
                         buf.len(),
@@ -839,14 +956,6 @@ impl Client {
                     ),
                 };
             }
-            // `{e}` alone prints only the OUTERMOST layer — which is how every
-            // one of those tears logged as a bare "error decoding response body"
-            // with the reason (connection reset? incomplete message?) dropped on
-            // the floor. Walk the chain.
-            let why = match &err {
-                Some(e) => cause_chain(e),
-                None => "body ended short".to_string(),
-            };
             eprintln!(
                 "attachment fetch failed ({why}) — {} of {} bytes in hand, resuming; \
 retry {attempt}/{} in {delay:?}…",
@@ -2584,6 +2693,176 @@ content-range: bytes {}-{}/{}\r\ncontent-length: {}\r\n\r\n",
         let got = c.download("/media/shot.png").await.unwrap();
         assert_eq!(got, payload(), "a 200 on the retry must REPLACE the partial prefix");
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// How the stub below misbehaves. Every connection it does not single out
+    /// is answered in full from where its `Range` starts.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        /// The first connection delivers the head and 120 bytes, then goes
+        /// silent with the socket still open — no error, no data, forever.
+        Silent,
+        /// The first connection delivers 120 bytes, then one byte per 100 ms:
+        /// alive, and far too slow to ever finish (2026-10-19: ~1 KB/s).
+        Trickle,
+        /// EVERY connection delivers 20 bytes and goes silent — a link that is
+        /// slow everywhere, not on one connection. Ten connections to finish:
+        /// more than `MEDIA_ATTEMPTS`, each of them making progress.
+        TwentyAtATime,
+        /// One connection, the whole body at ~330 B/s: slow, but above the
+        /// test floor. The positive control — it must NOT be abandoned.
+        SlowButSteady,
+    }
+
+    /// The floor the tests hold downloads to: 32 bytes per 300 ms.
+    const TEST_FLOOR: StallFloor =
+        StallFloor { window: std::time::Duration::from_millis(300), min_bytes: 32 };
+
+    /// Serves `payload()` misbehaving as `how`; records every request's
+    /// `Range:` header. Each connection gets its own task, so one held open
+    /// does not keep the next from being answered.
+    async fn stalling_stub(how: Stall) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut nth = 0u32;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                nth += 1;
+                let first = nth == 1;
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let Some(head) = read_head(&mut sock).await else { return };
+                    let range = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    log.lock().unwrap().push(range.clone());
+                    let body = payload();
+                    let from: usize = range
+                        .split('=')
+                        .nth(1)
+                        .and_then(|v| v.trim().trim_end_matches('-').parse().ok())
+                        .unwrap_or(0)
+                        .min(body.len());
+                    let rest = &body[from..];
+                    let h = if from > 0 {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\ncontent-type: image/jpeg\r\n\
+content-range: bytes {}-{}/{}\r\ncontent-length: {}\r\n\r\n",
+                            from,
+                            body.len() - 1,
+                            body.len(),
+                            rest.len()
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: image/jpeg\r\ncontent-length: {}\r\n\r\n",
+                            body.len()
+                        )
+                    };
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let hold = || tokio::time::sleep(Duration::from_secs(60));
+                    match how {
+                        Stall::Silent if first => {
+                            let _ = sock.write_all(&rest[..120]).await;
+                            hold().await;
+                        }
+                        Stall::Trickle if first => {
+                            let _ = sock.write_all(&rest[..120]).await;
+                            for b in &rest[120..] {
+                                if sock.write_all(std::slice::from_ref(b)).await.is_err() {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                        Stall::TwentyAtATime if rest.len() > 20 => {
+                            let _ = sock.write_all(&rest[..20]).await;
+                            hold().await;
+                        }
+                        Stall::SlowButSteady => {
+                            for piece in rest.chunks(10) {
+                                if sock.write_all(piece).await.is_err() {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(30)).await;
+                            }
+                        }
+                        _ => {
+                            let _ = sock.write_all(rest).await;
+                        }
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Downloads against `how`, bounded so a hang fails the test instead of
+    /// wedging the suite. Returns the bytes, the `Range:` headers seen, and the
+    /// time it took.
+    async fn fetch_through(how: Stall) -> (Vec<u8>, Vec<String>, std::time::Duration) {
+        let (base, seen) = stalling_stub(how).await;
+        let c = Client::new(base, "t".into());
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            c.download_with("/media/photo.jpg", TEST_FLOOR),
+        )
+        .await
+        .expect("the download hung: a stalled connection was never given up on")
+        .unwrap();
+        let calls = seen.lock().unwrap().clone();
+        (got, calls, t0.elapsed())
+    }
+
+    /// The connection goes quiet mid-photo without erroring. Nothing used to
+    /// give up on it: no read timeout, and the resume only ran on an error.
+    #[tokio::test]
+    async fn a_connection_that_goes_silent_is_dropped_and_the_rest_fetched_fresh() {
+        let (got, calls, _) = fetch_through(Stall::Silent).await;
+        assert_eq!(got, payload(), "the resumed file must be byte-identical");
+        assert_eq!(calls.len(), 2, "one stalled connection, one fresh one — got {calls:?}");
+        assert!(
+            calls[1].to_ascii_lowercase().contains("bytes=120-"),
+            "the fresh connection must ask only for the remainder, got {:?}",
+            calls[1]
+        );
+    }
+
+    /// Alive but crawling — 2026-10-19's actual shape. Left alone it would
+    /// finish in 8 s on the one connection; it must be dropped long before.
+    #[tokio::test]
+    async fn a_connection_that_trickles_below_the_floor_is_dropped() {
+        let (got, calls, took) = fetch_through(Stall::Trickle).await;
+        assert_eq!(got, payload());
+        assert_eq!(calls.len(), 2, "the crawling connection must be replaced — got {calls:?}");
+        assert!(took < std::time::Duration::from_secs(4), "took {took:?}: it sat on the crawl");
+    }
+
+    /// Slow on EVERY connection, but each one gets somewhere. A retry budget
+    /// spent on connections that made progress would throw the photo away
+    /// after five of them, half-delivered.
+    #[tokio::test]
+    async fn retries_that_make_progress_do_not_use_up_the_budget() {
+        let (got, calls, _) = fetch_through(Stall::TwentyAtATime).await;
+        assert_eq!(got, payload());
+        assert_eq!(calls.len(), 10, "20 bytes a connection, 200 bytes — got {calls:?}");
+    }
+
+    /// Positive control: slow but above the floor is left alone — one
+    /// connection, no reconnect churn.
+    #[tokio::test]
+    async fn a_slow_but_steady_connection_is_not_dropped() {
+        let (got, calls, _) = fetch_through(Stall::SlowButSteady).await;
+        assert_eq!(got, payload());
+        assert_eq!(calls.len(), 1, "a steady connection must not be replaced — got {calls:?}");
     }
 
     /// `{e}` prints only the outermost layer — the log needs the one that names
