@@ -1,9 +1,9 @@
 //! Feature-flag engine — the ONE client-side implementation (.docs/feature-flags.md).
 //!
-//! A flag is born HERE: `KNOWN_FLAGS` is the single home of the key, the
-//! compile-time default and the metadata (invariant ① — the server record is a
-//! rollout override only, never a second default). Resolution precedence:
-//! `local override > server value > compile default (dev or prod)`.
+//! A flag is born in `mafold_types::flags::KNOWN_FLAGS`: the single home of the
+//! key, the compile-time default and the metadata (invariant ① — the server
+//! record is a rollout override only, never a second default). Resolution
+//! precedence: `local override > server value > compile default (dev or prod)`.
 //!
 //! Server values arrive as a `mafold_types::FlagState` (bootstrap `getFlags` +
 //! WS `flagsChanged`) and are persisted to the core KV, so a cold offline start
@@ -20,257 +20,20 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
-
 use crate::storage::Storage;
 use crate::store::Store;
 
-/// Compile-time flag registry — key + default + metadata. One entry per flag;
-/// delete the entry together with its gate code when the feature hits 100%.
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct FlagMeta {
-    pub key: &'static str,
-    /// Production default (when neither an override nor a server value exists).
-    pub default: bool,
-    /// Default in dev/internal builds (`set_flags_dev(true)`) — preserves the
-    /// old devmode.ts behavior of dev-only tabs without magic overrides.
-    pub dev_default: bool,
-    pub label: &'static str,
-    pub description: &'static str,
-    /// Who owns the flag's lifecycle (flags are temporary — see the doc §6).
-    pub owner: &'static str,
-    /// yyyy-mm added — lets a periodic check surface stale flags.
-    pub added: &'static str,
+/// The registry lives in the wire crate (`mafold_types::flags`) because the
+/// api reads it too; the core resolves the flags a client reads — an api-only
+/// flag (`clients` empty) has no client default and stays out of the snapshot.
+pub use mafold_types::flags::{FlagMeta, KNOWN_FLAGS};
+
+fn client_flags() -> impl Iterator<Item = &'static FlagMeta> {
+    KNOWN_FLAGS.iter().filter(|m| !m.clients.is_empty())
 }
 
-/// The registry. Keys must match the server's control-plane records and the
-/// gate code on every client.
-pub static KNOWN_FLAGS: &[FlagMeta] = &[
-    // `provider:<id>` holds a connection provider back for a cohort: "add a
-    // connection" offers it only where the flag resolves on (web's
-    // `providerOffered`). Google's app is in Testing — Google lets only listed
-    // test accounts consent — so its rollout is an account list, not a percent.
-    FlagMeta {
-        key: "provider:google",
-        default: false,
-        dev_default: true,
-        label: "Google connection",
-        description: "Offers Google (Gmail + Calendar) under Add connection. Its Google app is in \
-                      Testing: only invited test accounts can consent.",
-        owner: "ops",
-        added: "2026-09",
-    },
-    // ModelArk (a user's OWN Seedance key) is held back until the video line's
-    // e2e passes on devapi (@realopsdu 2026-10-06). Registered BEFORE the
-    // provider lands: the connection pack goes live within 15 minutes of the
-    // merge that adds a provider, while this gate reaches the web only with
-    // its next release — so the gate has to be out there first.
-    FlagMeta {
-        key: "provider:modelark",
-        default: false,
-        dev_default: true,
-        label: "ModelArk connection",
-        description: "Offers BytePlus ModelArk (Seedance video, on your own key) under Add \
-                      connection. Held back until the video line launches.",
-        owner: "linsky",
-        added: "2026-10",
-    },
-    // `modelBot:<handle>` is an official model bot's LAUNCH: the server keeps
-    // the bot coming-soon (off the roster, silent in its DMs) for everyone the
-    // flag is not on for, and a key with no record is CLOSED there — a launch
-    // is opened on purpose (`Store::model_bot_live_for`). Named by the bot's
-    // own profile (`templates/official/<handle>.json` `launch_flag`); clients
-    // read nothing from it, the roster they fetch already reflects it.
-    FlagMeta {
-        key: "modelBot:gemini",
-        default: false,
-        dev_default: false,
-        label: "Gemini official bot",
-        description: "Opens @gemini (Gemini on the router's Google seat, paid from the reader's \
-                      google wallet). Until it is on for you, @gemini stays coming soon.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    FlagMeta {
-        key: "starterTutorial",
-        default: false,
-        dev_default: true,
-        label: "Starter tutorial",
-        description: "Three guided starter quests in Activity Center.",
-        owner: "ops",
-        added: "2026-09",
-    },
-    FlagMeta {
-        key: "showIds",
-        default: false,
-        dev_default: false,
-        label: "Show chat & message IDs",
-        description: "Profiles show a copyable chat id; message menus show the message id.",
-        owner: "ops",
-        added: "2026-07",
-    },
-    FlagMeta {
-        key: "gardenApps",
-        default: false,
-        dev_default: true,
-        label: "Moments & Garden",
-        description: "Reveals the bottom tab switcher (Moments / Chats / Garden) under the chat list.",
-        owner: "ops",
-        added: "2026-07",
-    },
-    FlagMeta {
-        key: "gardenOnePath",
-        default: false,
-        dev_default: false,
-        label: "New garden (mafold/garden)",
-        description: "The garden button opens mafold/garden and 收进园地 writes its pins, on web and phone \
-                      alike. Off = the pre-switch path (web: opsdu/garden-beta + the old garden room; \
-                      phone: the garden DM). Turn on for everyone once garden.mafold.app is switched, \
-                      then delete the old path with this flag.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    FlagMeta {
-        key: "gardenWorksV2",
-        default: false,
-        dev_default: false,
-        label: "Garden activity v2",
-        description: "动态 also shows other people's agents when they answer you, marked with whose they \
-                      are, and the ones writing to you right now; card type definitions are no longer works. \
-                      (Its work series were never shipped — gardenWorksV3 replaced them, linsky 10-08.) \
-                      Read by getAppViewerProfile for the viewer.",
-        owner: "linsky",
-        added: "2026-10",
-    },
-    // linsky 10-08: 「生成的东西忠实地全部放进来,不让 agent 判断」.
-    FlagMeta {
-        key: "gardenWorksV3",
-        default: false,
-        dev_default: false,
-        label: "Garden works v3 (every output)",
-        description: "The garden's 作品 are everything the person's own agents produced, judged by nobody: \
-                      every HTML card and every file on every finished message they sent, wherever the \
-                      person can still read it (getAppViewerProfile `outputs`, listViewerOutputs, \
-                      getViewerOutput). Card type definitions are no longer works.",
-        owner: "linsky",
-        added: "2026-10",
-    },
-    // Owner 10-06, after seeing it live: "样式还行但不能这样直接上,要隐藏".
-    // Off until he turns it on. A phone binary built before this entry doesn't
-    // know the key and resolves it off too; turning it ON for phones therefore
-    // needs the next app@ binary.
-    FlagMeta {
-        key: "premiumRing",
-        default: false,
-        dev_default: false,
-        label: "Premium avatar ring",
-        description: "The blue → pink ring around a Premium member's avatar (heartbeat ripples while \
-                      they are online, still while offline, opened where the online dot sits), on web \
-                      and phone alike. Off = no ring; the crown by the name is unaffected.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    // Read by the daemon (`mafold-cli`), not a UI: a bot evaluates as its own
-    // handle, and an allowlist entry naming a person covers their bots too —
-    // so it is switched on per person, from the server, with nothing to set on
-    // the Windows machine itself.
-    FlagMeta {
-        key: "windowsBackground",
-        default: false,
-        dev_default: false,
-        label: "Windows background tasks",
-        description: "On Windows, an agent's background Bash is started by the daemon with no \
-                      console window, outlives the turn and is reported back in a new turn — \
-                      as on macOS/Linux. Off = background Bash stays turn-scoped, as before.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    // Owner 10-09: the left rail is fine as the wide-screen default, but it
-    // goes out behind this flag, off, with its own line on the release card —
-    // on only once he has clicked it there.
-    FlagMeta {
-        key: "folderRail",
-        default: false,
-        dev_default: false,
-        label: "Folder tabs on the left",
-        description: "On a wide screen the chat-list folder tabs become a rail down the column's left \
-                      edge (mafold-mac's sidebar rail; the desktop shell's window lights at its head), \
-                      and Settings > Chat Folders offers left / top. Off = the strip across the top, \
-                      no choice offered.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    // realopsdu 10-11: people convert by hand because nothing says payments
-    // already convert. The wallet's head says it now; off until verified on
-    // dev and released.
-    FlagMeta {
-        key: "walletAutoFirst",
-        default: false,
-        dev_default: false,
-        label: "Wallet: auto convert first",
-        description: "The wallet states auto convert in its head (the switch, the funding pocket) and \
-                      Convert drops from the action pills to one row under it; the Settings tab goes, \
-                      the starter tutorial's convert scene teaches auto convert, and the Premium card \
-                      moves from the wallet to Settings. Off = the old layout. (Activity names auto \
-                      converts either way — that reads the server's `auto` field, not this flag.)",
-        owner: "ops",
-        added: "2026-10",
-    },
-    // The re-laid profile page (RN + web Profile). Its tab bar asks the api
-    // `getProfileTabs`; an api without the route just means no tab is left out.
-    FlagMeta {
-        key: "profileV2",
-        default: false,
-        dev_default: false,
-        label: "Profile: re-laid page",
-        description: "One header layout with or without a banner (avatar + actions, name, @handle · \
-                      presence, bio, who runs a bot), clear-history in ⋯, and a tab bar that keeps \
-                      only the tabs with something in them. Off = the old layout.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    // Sending pictures as `.docs/thumbnail-v1.md` Phase 2: the ≤2560 view and
-    // the inline strip go up, the original only when "Original" is ticked. Off =
-    // the picked file goes up as it is. Irreversible per send (an original not
-    // uploaded is never on the server), hence a flag tried by the owner first.
-    FlagMeta {
-        key: "thumbSend",
-        default: false,
-        dev_default: false,
-        label: "Pictures: send view + strip",
-        description: "A picture is sent as its view (fitted into 2560, screenshots lossless, photos q85) \
-                      with a 40px inline strip; the composer offers \"Original\" (off, not remembered) \
-                      to send the untouched file beside it. Off = the picked file is uploaded as is.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    // Inline media in replies (`.docs` design: 回复嵌图方案稿 v4): open_url lists
-    // a page's pictures, `unfurlUrl` answers, and the media/cite cards are
-    // offered to agents. Server-read with an explicit `unwrap_or(false)` — no
-    // record means OFF, not the usual open gate.
-    FlagMeta {
-        key: "inlineMedia",
-        default: false,
-        dev_default: false,
-        label: "Inline media in replies",
-        description: "Agents can put a page's real pictures in a reply: open_url lists them, unfurlUrl \
-                      answers, and the media / cite cards are offered. Off = none of it.",
-        owner: "ops",
-        added: "2026-10",
-    },
-    FlagMeta {
-        key: "moments",
-        default: false,
-        dev_default: true,
-        label: "Moments",
-        description: "The Moments tab (author feed + composer). WIP — gated separately from gardenApps so Garden can ship without exposing unfinished Moments.",
-        owner: "ops",
-        added: "2026-07",
-    },
-];
-
 fn meta(key: &str) -> Option<&'static FlagMeta> {
-    KNOWN_FLAGS.iter().find(|m| m.key == key)
+    client_flags().find(|m| m.key == key)
 }
 
 /// A flag's production default — for a client that holds the server's values
@@ -358,7 +121,7 @@ impl<S: Storage> Store<S> {
         let dev = self.flags_is_dev();
 
         let mut out: BTreeMap<String, bool> = BTreeMap::new();
-        for m in KNOWN_FLAGS {
+        for m in client_flags() {
             out.insert(
                 m.key.to_string(),
                 if dev { m.dev_default } else { m.default },
@@ -395,9 +158,10 @@ impl<S: Storage> Store<S> {
     }
 }
 
-/// The registry as JSON (for clients to render the toggle list from).
+/// The registry as JSON (for clients to render the toggle list from) — the
+/// flags a client reads; an api-only one has nothing to toggle on a device.
 pub fn registry_json() -> String {
-    serde_json::to_string(KNOWN_FLAGS).unwrap_or_else(|_| "[]".into())
+    serde_json::to_string(&client_flags().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into())
 }
 
 // ─────────────────────────────── tests ───────────────────────────────

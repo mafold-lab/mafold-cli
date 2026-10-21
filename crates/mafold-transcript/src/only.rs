@@ -288,6 +288,42 @@ pub fn hide_all(text: &str) -> Cow<'_, str> {
     view_for(text, Author::new("", None), None)
 }
 
+/// The one-time move of `only` blocks out of a message's text (owner
+/// 2026-10-20, `.docs/card-state-v1.md` §7.1 「A1」): every block that holds
+/// text becomes the card `{% mafold/only for="…" sid="…" /%}` — the same
+/// placeholder [`private_note`] writes — and what it held becomes the returned
+/// state items (`mafold/only/<sid>.text`, read by its audience). Once every
+/// stored message has been through this, nothing private is left in any
+/// message's text and the per-reader cut of the text can go.
+///
+/// Top-level blocks only: a block nested inside one moves with its outer
+/// block's text. Leaves (already a marker) and blocks inside a JSON string (a
+/// forwarded record's frozen body) are left as they are. `None` when there is
+/// nothing to move — so running it twice changes nothing.
+pub fn move_to_state(text: &str) -> Option<(String, Vec<crate::render::PrivateItem>)> {
+    if !mentions(text) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut items = Vec::new();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while let Some(b) = next_block(text, i) {
+        i = b.end;
+        let Some((from, to)) = b.body.filter(|_| !b.escaped) else { continue };
+        let (card, item) = private_note(&b.audience, &text[from..to]);
+        out.push_str(&text[copied..b.start]);
+        out.push_str(&card);
+        copied = b.end;
+        items.push(item);
+    }
+    if items.is_empty() {
+        return None;
+    }
+    out.push_str(&text[copied..]);
+    Some((out, items))
+}
+
 /// The block in words, for plain-text readers (`mafold read`): a hidden marker
 /// becomes `[🔒 only owner]`, a block the reader may see keeps its text between
 /// `[🔒 only owner]` and `[/🔒]` — so an agent reading it knows where the
@@ -459,5 +495,37 @@ mod tests {
             "[🔒 only @alice,@bob] pw [/🔒]"
         );
         assert!(matches!(readable("nothing here"), Cow::Borrowed(_)));
+    }
+
+    /// A1: each block that holds text becomes the placeholder card, and its
+    /// text the state item for its audience; markers, text outside blocks and
+    /// a forwarded record's frozen JSON are left alone; a second run finds
+    /// nothing.
+    #[test]
+    fn moving_blocks_to_state() {
+        let text = "前面 {% mafold/only for=\"owner\" %}\n摘要 秘密\n{% /mafold/only %} 中间 \
+                    {% mafold/only for=\"@ops, @eons\" %}need|9{% /mafold/only %} \
+                    {% mafold/only for=\"owner\" hidden=\"true\" /%} 后面";
+        let (out, items) = move_to_state(text).expect("moved");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].v, "摘要 秘密");
+        assert_eq!(items[0].read, ["owner"]);
+        assert_eq!(items[1].v, "need|9");
+        assert_eq!(items[1].read, ["@ops", "@eons"]);
+        let sid = |i: usize| items[i].key.strip_prefix("mafold/only/").unwrap().strip_suffix(".text").unwrap().to_string();
+        assert_eq!(
+            out,
+            format!(
+                "前面 {{% mafold/only for=\"owner\" sid=\"{}\" /%}} 中间 {{% mafold/only for=\"@ops, @eons\" sid=\"{}\" /%}} \
+                 {{% mafold/only for=\"owner\" hidden=\"true\" /%}} 后面",
+                sid(0),
+                sid(1)
+            )
+        );
+        assert!(!out.contains("秘密") && !out.contains("need|9"));
+        assert!(move_to_state(&out).is_none(), "a second run finds nothing");
+        assert!(move_to_state("no blocks here").is_none());
+        let frozen = r#"{"content":"{% mafold/only for=\"owner\" %}x{% /mafold/only %}"}"#;
+        assert!(move_to_state(frozen).is_none(), "a forwarded record's JSON is not a block");
     }
 }

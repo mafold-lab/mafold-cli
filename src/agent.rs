@@ -7510,7 +7510,8 @@ their next message and you continue. Example:\n\
 {% mafold/ask %}\nq|Deploy|0|Ship to prod now?\no|Yes|blue-green, ~2 min\no|Hold|I'll review first\n{% /mafold/ask %}\n\
 \n• {% mafold/html %} — a sandboxed mini-UI (charts, demos, small games, rich layouts, dashboards). Put \
 your HTML between the tags and CLOSE with {% /mafold/html %} (NOT a second {% mafold/html %} — a common mistake \
-that breaks the card). Scripts run; there is no network / same-origin. Reach for it whenever \
+that breaks the card). Scripts run in an isolated origin — no access to the app, its cookies or storage — \
+but the network is reachable, so a chart library from a CDN or a picture by URL loads. Reach for it whenever \
 something visual communicates better than text.\n\
   COLOURS: the frame hands you the READER'S OWN theme as CSS variables. Use them and your card is \
 correct in light and dark without a single media query:\n\
@@ -7552,7 +7553,11 @@ renders live in the bubble, scripts and all. Best for something small and intera
 demo, a layout, a mini-game.\n\
   • **the file itself** — `mafold attach <path>` (one or more paths) hangs a real file on THIS \
 reply. An image lands as a photo, a clip as a player, and anything else (.html, .pdf, .md, .csv, …) \
-as a file card the user can open, download and keep. `mafold attach --sticker [--emoji 😂] <picture>` \
+as a file card the user can open, download and keep. A .md, .html or plain-text file OPENS INSIDE \
+Mafold, as a full page on every client: Markdown typeset as a document, HTML running sandboxed \
+exactly as you wrote it (its own styles — no --mf-* variables there; its links ask the reader \
+first). So a long report or a whole page is better sent as a file than squeezed into a bubble. \
+`mafold attach --sticker [--emoji 😂] <picture>` \
 sends a picture as a STICKER instead — bare and sticker-sized, no bubble, the way a person sends one.\n\
   • **a screenshot** — `mafold attach shot.png`. Only when the PICTURE is the content: proof of a \
 bug, what the app actually looks like right now, a rendering you cannot hand over any other way.\n\
@@ -12541,6 +12546,19 @@ mod inbound_file_tests {
         assert!(p.contains("a screenshot"), "screenshot route missing");
         // …and that the user's own words are what choose between them.
         assert!(p.contains("NEVER a screenshot of it"), "{p}");
+    }
+
+    /// What a file and a card actually do on the reader's side. The preamble
+    /// said html cards had "no network" — they always had it — and said nothing
+    /// about .md/.html files opening in Mafold, so agents squeezed whole reports
+    /// into a bubble rather than sending the file.
+    #[test]
+    fn the_preamble_tells_the_truth_about_html_network_and_opened_files() {
+        let p = mafold_preamble("ops:claude", "ops", &[]);
+        assert!(!p.contains("no network"), "{p}");
+        assert!(p.contains("the network is reachable"), "{p}");
+        assert!(p.contains("OPENS INSIDE"), "{p}");
+        assert!(p.contains("better sent as a file"), "{p}");
     }
 
     /// A client that renders live components should not be answered with an

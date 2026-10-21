@@ -216,7 +216,13 @@ enum Cmd {
         /// it as written regardless.
         #[arg(long)]
         anyway: bool,
-        #[arg(trailing_var_arg = true, required = true)]
+        /// Read the text from a file instead.
+        #[arg(long, conflicts_with = "text")]
+        file: Option<String>,
+        /// The text (words are joined with spaces), or `-` to read it from
+        /// stdin. Options go before it: from its first word on, everything is
+        /// the text.
+        #[arg(trailing_var_arg = true, required_unless_present = "file")]
         text: Vec<String>,
     },
     /// React to a message with an emoji (`--remove` takes it back).
@@ -800,14 +806,16 @@ async fn main() -> Result<()> {
             main,
             reply,
             anyway,
+            file,
             text,
         } => {
+            let text = send_body(&text, file.as_deref(), std::io::stdin())?;
             send(
                 &Client::new(cli.base, token?),
                 &chat,
                 Target::of(channel.as_deref(), main),
                 reply.as_deref(),
-                &text.join(" "),
+                &text,
                 anyway,
             )
             .await?
@@ -1357,6 +1365,14 @@ impl<'a> Target<'a> {
     }
 }
 
+/// What `mafold send` posts: its words joined with spaces, or — read exactly
+/// as `mafold edit` reads its text ([`msgops::body_from`]) — stdin for a lone
+/// `-`, or `--file`.
+fn send_body(text: &[String], file: Option<&str>, stdin: impl std::io::Read) -> Result<String> {
+    let text = (!text.is_empty()).then(|| text.join(" "));
+    msgops::body_from(text.as_deref(), file, stdin)
+}
+
 async fn send(
     client: &Client,
     chat: &str,
@@ -1419,7 +1435,8 @@ async fn send(
         "reply_to": reply,
         "text": text,
     }));
-    println!("✓ sent to {label}");
+    let id = sent["id"].as_str().map(|id| format!(" · #{id}")).unwrap_or_default();
+    println!("✓ sent to {label}{id} · {}", msgops::receipt(text));
     Ok(())
 }
 
@@ -1574,6 +1591,55 @@ mod send_target_tests {
         assert!(send_target(&["--main", "--channel", "#发版"]).is_err());
         assert!(Cli::try_parse_from(["mafold", "read", "--main", "--channel", "x"]).is_err());
         assert!(Cli::try_parse_from(["mafold", "read", "--main"]).is_ok());
+    }
+
+    /// What `mafold send <chat> <args…>` posts when `stdin` is piped in.
+    fn sends(args: &[&str], stdin: &str) -> Result<String> {
+        let argv = ["mafold", "send", "72355ef4-c43f-44ba-a0d5-b2c061026cd6"].iter().chain(args);
+        match Cli::try_parse_from(argv)?.cmd {
+            Cmd::Send { text, file, .. } => send_body(&text, file.as_deref(), stdin.as_bytes()),
+            _ => unreachable!(),
+        }
+    }
+
+    /// 2026-10-19/20, linsky's Rei: `… | mafold send <chat> -` — the way
+    /// `mafold edit` documents — posted a bubble reading just "-", six times,
+    /// each acknowledged "✓ sent". `-` is stdin for `send` exactly as for `edit`.
+    #[test]
+    fn a_dash_reads_the_text_from_stdin_as_edit_does() {
+        let piped = "617.42 的安装脚本好了，现在可以开始：\n1. Win+R → 输入 cmd\n";
+        assert_eq!(sends(&["-"], piped).unwrap(), piped.trim_end());
+        assert_eq!(
+            sends(&["-"], piped).unwrap(),
+            msgops::body_from(Some("-"), None, piped.as_bytes()).unwrap(),
+            "send and edit read a text the same way"
+        );
+        // Only a lone `-` means stdin; among words it is a word.
+        assert_eq!(sends(&["a", "-", "b"], piped).unwrap(), "a - b");
+        assert_eq!(sends(&["没问题", "-", "就这样"], "").unwrap(), "没问题 - 就这样");
+    }
+
+    /// Nothing to say is refused before anything is sent: an empty pipe, a
+    /// blank argument, a text of nothing but whitespace.
+    #[test]
+    fn an_empty_text_is_refused_not_sent() {
+        assert!(sends(&["-"], "").is_err(), "nothing was piped in");
+        assert!(sends(&["-"], " \n\n").is_err());
+        assert!(sends(&[""], "").is_err());
+        assert!(sends(&["  ", "\t"], "").is_err());
+    }
+
+    /// `--file` like `edit`'s, and never together with a text.
+    #[test]
+    fn send_reads_a_file_as_edit_does() {
+        let path = std::env::temp_dir().join(format!("mafold-send-body-{}.txt", std::process::id()));
+        std::fs::write(&path, "第一行\n第二行\n").unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(sends(&["--file", p], "").unwrap(), "第一行\n第二行");
+        assert!(sends(&["--file", p, "hi"], "").is_err(), "a text OR a file");
+        std::fs::write(&path, "\n").unwrap();
+        assert!(sends(&["--file", p], "").is_err(), "an empty file is an empty text");
+        std::fs::remove_file(&path).ok();
     }
 
     /// A tap carries what the card's own button carries: most send a string

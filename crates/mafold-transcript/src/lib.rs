@@ -28,6 +28,7 @@ pub mod only;
 pub mod prose;
 pub mod preview;
 pub mod render;
+pub mod scopes;
 pub mod transcript;
 pub mod stats;
 

@@ -335,6 +335,13 @@ impl Transcript {
         std::mem::take(&mut self.private)
     }
 
+    /// Hand the transcript a private part of a card the CALLER drew (a hosted
+    /// brain's failure card, appended after the answer): it goes out with the
+    /// rest through [`Transcript::take_private`].
+    pub fn keep_private(&mut self, item: crate::render::PrivateItem) {
+        self.private.push(item);
+    }
+
     /// Append markdoc the caller assembled itself — the daemon's
     /// `{% mafold/bgtasks %}` notice, or a one-line apology for something that
     /// failed out-of-band. Pending narration and the open group are committed
