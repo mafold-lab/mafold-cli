@@ -867,7 +867,7 @@ mod tests {
         let group = md.find("{% mafold/run").expect("group");
         let res = md.find("{% mafold/result").expect("result");
         assert!(group < res, "the result stamp goes last: {md}");
-        assert!(md.contains("duration=\"18.3s\"") && md.contains("tokens=\"4.2k\""), "{md}");
+        assert!(md.contains("duration=\"18.3s\"") && md.contains("tokens=\"4.2K\""), "{md}");
     }
 
     /// Spliced markdoc lands after everything already said — and, at

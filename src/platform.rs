@@ -22,6 +22,77 @@ mod imp {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 
+    /// Is `pid` still running — alive and NOT a zombie? For asking about a
+    /// process that is somebody else's child: a daemon the supervisor started
+    /// stays a zombie from the moment it exits until the supervisor's next
+    /// tick reaps it, and a zombie answers `kill(pid, 0)` — so `mafold down`,
+    /// run from outside, would take a daemon that already stopped for one that
+    /// won't.
+    pub fn pid_running(pid: u32) -> bool {
+        pid_alive(pid) && !zombie(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn zombie(pid: u32) -> bool {
+        // `pid (comm) state …` — comm may itself hold spaces and parentheses,
+        // so the state is the first field after the LAST `)`.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(')').map(|(_, rest)| rest.trim_start().starts_with('Z')))
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn zombie(pid: u32) -> bool {
+        // What `ps` reads: `kinfo_proc.kp_proc.p_stat`, from sysctl
+        // KERN_PROC_PID. libc doesn't define the struct, but its 64-bit layout
+        // is fixed: 648 bytes, `p_stat` at offset 36, near the head of
+        // `kp_proc` (so a struct that ever grew at the tail reads the same).
+        // `proc_pidinfo` won't say: it answers ESRCH for a zombie — measured
+        // on macOS 26.
+        const SIZE: usize = 648;
+        const P_STAT: usize = 36;
+        let mut buf = [0u8; SIZE];
+        let mut len = SIZE;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
+        // SAFETY: the kernel writes at most `len` bytes into `buf` and sets
+        // `len` to what it wrote (0 when there's no such process).
+        let r = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        r == 0 && len > P_STAT && u32::from(buf[P_STAT]) == libc::SZOMB
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn zombie(_pid: u32) -> bool {
+        false
+    }
+
+    /// When this machine last booted, epoch seconds.
+    #[cfg(target_os = "linux")]
+    pub fn boot_time() -> Option<i64> {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        stat.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()
+    }
+
+    /// When this machine last booted, epoch seconds.
+    #[cfg(target_os = "macos")]
+    pub fn boot_time() -> Option<i64> {
+        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::timeval>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        // SAFETY: the kernel writes at most `len` bytes — one `timeval`.
+        let r = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint, (&mut tv as *mut libc::timeval).cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        (r == 0 && tv.tv_sec > 0).then_some(tv.tv_sec as i64)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn boot_time() -> Option<i64> {
+        None
+    }
+
     /// Is `pid` — a CHILD of this process — still running?
     ///
     /// Not [`pid_alive`]: a child that exited but that nobody has reaped yet is
@@ -135,6 +206,11 @@ mod imp {
         child_running(pid)
     }
 
+    /// No zombies on Windows: alive is running.
+    pub fn pid_running(pid: u32) -> bool {
+        pid_alive(pid)
+    }
+
     /// Is `pid` — a CHILD of this process — still running?
     ///
     /// Not [`pid_alive`]: the `Child` that spawned it holds a handle, and an
@@ -178,6 +254,15 @@ mod imp {
     /// No zombies on Windows — nothing to reap.
     pub fn reap_children() {}
 
+    /// When this machine last booted, epoch seconds: now less the uptime
+    /// (a second or so either way).
+    pub fn boot_time() -> Option<i64> {
+        use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+        let up = unsafe { GetTickCount64() } / 1000;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        now.checked_sub(up).map(|t| t as i64)
+    }
+
     /// Is this process attached to a console at all — visible, windowless or
     /// headless alike? `GetConsoleWindow` can't say: it is NULL both for "no
     /// console" and for a console that simply has no window. The process list
@@ -218,6 +303,28 @@ mod imp {
 }
 
 pub use imp::*;
+
+/// Ask `pid` to stop and wait up to `max` until it has; true once it's gone.
+/// What a command that stops something waits on before it says it did — a
+/// "✓ stopped" printed right after the signal was a guess.
+pub fn stop_and_wait(pid: u32, max: std::time::Duration) -> bool {
+    terminate(pid);
+    wait_until(max, || !pid_running(pid))
+}
+
+/// Check `done` every 100 ms for up to `max`; true as soon as it holds.
+pub fn wait_until(max: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        if start.elapsed() >= max {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
 
 /// Hide the console window this process owns (Windows). A supervisor launched
 /// by the Task Scheduler logon task is a console binary, so Windows hands it a
@@ -454,6 +561,39 @@ pub fn idle_child() -> std::process::Child {
         .expect("spawn an idle child")
 }
 
+/// A child that ignores SIGTERM — what "asked to stop, still running" looks
+/// like — returned once its trap is in place. Killed (SIGKILL) and reaped when
+/// dropped, so a failing assertion can't leave it looping forever.
+#[cfg(all(test, unix))]
+pub fn stubborn_child() -> KilledOnDrop {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    let mut child = std_command("sh")
+        .args(["-c", "trap '' TERM; echo ready; while :; do sleep 1; done"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a shell that ignores SIGTERM");
+    let mut line = String::new();
+    let stdout = child.stdout.take().expect("piped");
+    let guard = KilledOnDrop(child);
+    std::io::BufReader::new(stdout).read_line(&mut line).expect("its trap is set");
+    guard
+}
+
+/// See [`stubborn_child`].
+#[cfg(all(test, unix))]
+pub struct KilledOnDrop(pub std::process::Child);
+
+#[cfg(all(test, unix))]
+impl Drop for KilledOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// A program started the way every spawn site started one before this module
 /// owned spawning: no flags at all. The console-window tests' positive
 /// control — what a child of a console-less process looks like when nothing
@@ -638,5 +778,52 @@ mod tests {
         assert!(!child_running(pid), "reaped");
         assert!(!child_running(std::process::id()), "not our child: ourselves");
         assert!(!child_running(1), "not our child: init");
+    }
+
+    /// What `mafold down` asks about a daemon the supervisor started: exited
+    /// but not yet reaped by its parent is NOT running, though `kill(pid, 0)`
+    /// still answers for it (activity center C3). Asked here about our own
+    /// child; nothing in `pid_running` depends on being the parent.
+    #[test]
+    fn a_dead_unreaped_process_is_not_running() {
+        let mut child = idle_child();
+        let pid = child.id();
+        assert!(pid_running(pid), "a live process");
+        child.kill().expect("kill it");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || !pid_running(pid)),
+            "dead, not yet reaped: not running"
+        );
+        #[cfg(unix)]
+        assert!(pid_alive(pid), "positive control: kill(pid, 0) still answers for the zombie");
+        child.wait().expect("reap it");
+        assert!(!pid_running(pid));
+    }
+
+    /// `stop_and_wait` says a process is gone only once it is.
+    #[test]
+    fn stop_and_wait_sees_a_process_that_stops() {
+        let mut child = idle_child();
+        let pid = child.id();
+        assert!(
+            !wait_until(std::time::Duration::from_millis(300), || !pid_running(pid)),
+            "positive control: a live process doesn't read as gone by itself"
+        );
+        assert!(stop_and_wait(pid, std::time::Duration::from_secs(5)), "asked to stop, it stops");
+        child.wait().expect("reap it");
+    }
+
+    /// …and says so when it isn't: a process that ignores SIGTERM is still
+    /// running when the wait runs out. (Windows has no such process:
+    /// `terminate` is `TerminateProcess` there.)
+    #[cfg(unix)]
+    #[test]
+    fn stop_and_wait_says_no_for_a_process_that_keeps_running() {
+        let child = stubborn_child();
+        let pid = child.0.id();
+        let t = std::time::Instant::now();
+        assert!(!stop_and_wait(pid, std::time::Duration::from_secs(1)), "still running when the wait runs out");
+        assert!(t.elapsed() >= std::time::Duration::from_secs(1), "it waited the whole time");
+        assert!(pid_running(pid));
     }
 }

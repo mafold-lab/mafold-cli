@@ -85,10 +85,14 @@ pub fn start_detached(
 
 pub fn stop() -> Result<()> {
     match read_pid() {
-        Some(pid) if alive(pid) => {
+        Some(pid) if platform::pid_running(pid) => {
             // Plain SIGTERM — the daemon's shutdown handler kills its in-flight
-            // claude children precisely; background tasks survive.
-            platform::terminate(pid);
+            // claude children precisely; background tasks survive. "Stopped"
+            // is said once it's gone, not when the signal went out.
+            let wait = std::time::Duration::from_secs(10);
+            if !platform::stop_and_wait(pid, wait) {
+                anyhow::bail!("the agent (pid {pid}) is still running {}s after being asked to stop", wait.as_secs());
+            }
             let _ = fs::remove_file(pid_path()?);
             println!("✓ stopped agent (pid {pid})");
         }

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::client::Client;
+use mafold_core::mafold_types::units::{self, EN};
 
 #[derive(Subcommand)]
 pub enum SitesCmd {
@@ -71,10 +72,11 @@ pub enum SitesCmd {
         rows_read: Option<i64>,
         #[arg(long)]
         rows_written: Option<i64>,
+        /// Database storage in MB, 1000 to the KB (the default is 200).
         #[arg(long)]
-        storage_mib: Option<i64>,
+        storage_mb: Option<i64>,
         /// Back to the default lines.
-        #[arg(long, conflicts_with_all = ["requests", "cpu_ms", "rows_read", "rows_written", "storage_mib"])]
+        #[arg(long, conflicts_with_all = ["requests", "cpu_ms", "rows_read", "rows_written", "storage_mb"])]
         reset: bool,
     },
     /// Call a webview app's backend as yourself: mints your launch token for
@@ -159,7 +161,7 @@ pub enum KeyCmd {
     Revoke { site: String },
 }
 
-const MIB: i64 = 1024 * 1024;
+const MB: i64 = 1_000_000;
 
 fn utc_time(t: i64) -> String {
     chrono::DateTime::from_timestamp(t, 0)
@@ -168,21 +170,16 @@ fn utc_time(t: i64) -> String {
 }
 
 fn grouped(n: i64) -> String {
-    let s = n.abs().to_string();
-    let mut out = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    if n < 0 { format!("-{out}") } else { out }
+    units::grouped(n as f64)
 }
 
+/// One metric on the shared ruler (`mafold_types::units`): cpu milliseconds
+/// as a duration ("1h 1m 43s"), storage as a size ("12.9 MB"), the rest as a
+/// grouped count.
 fn amount(metric: &str, n: i64) -> String {
     match metric {
-        "cpu" => format!("{:.1} s", n as f64 / 1000.0),
-        "storage" => format!("{:.1} MiB", n as f64 / MIB as f64),
+        "cpu" => EN.duration(n as f64),
+        "storage" => EN.bytes(n as f64),
         _ => grouped(n),
     }
 }
@@ -475,7 +472,7 @@ pub async fn run(cmd: SitesCmd, client: &Client) -> Result<()> {
                 print_usage(&out);
             }
         }
-        SitesCmd::Allowance { user, requests, cpu_ms, rows_read, rows_written, storage_mib, reset } => {
+        SitesCmd::Allowance { user, requests, cpu_ms, rows_read, rows_written, storage_mb, reset } => {
             let allowance = if reset {
                 Value::Null
             } else {
@@ -487,7 +484,7 @@ pub async fn run(cmd: SitesCmd, client: &Client) -> Result<()> {
                     ("cpu_ms", cpu_ms),
                     ("rows_read", rows_read),
                     ("rows_written", rows_written),
-                    ("storage_bytes", storage_mib.map(|m| m.saturating_mul(MIB))),
+                    ("storage_bytes", storage_mb.map(|m| m.saturating_mul(MB))),
                 ] {
                     if let Some(v) = v {
                         a[k] = json!(v);

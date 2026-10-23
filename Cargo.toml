@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.148"
+version = "0.9.149"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -68,6 +68,9 @@ windows-sys = { version = "0.59", features = [
     # (computer::Tree). CreateJobObjectW's signature needs the Security types.
     "Win32_System_JobObjects",
     "Win32_Security",
+    # GetTickCount64: when the machine booted (platform::boot_time), so a
+    # supervisor that went down with it doesn't read as a crash.
+    "Win32_System_SystemInformation",
 ] }
 
 # Test-only: `#[tokio::test(start_paused = true)]`. A failed attachment fetch

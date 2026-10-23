@@ -716,25 +716,23 @@ impl Harness for ClaudeCode {
     /// The seat `env` selects, asked the same quota-free question Claude Code
     /// asks itself (`/api/oauth/usage`), with the failure taxonomy kept apart
     /// — 401 wants a login, 403 does not, unreachable wants patience.
+    ///
+    /// The heartbeat asks this every 30 seconds for every login on the
+    /// machine, so an answer is reused for [`SEAT_HEALTH_FRESH`] while it is
+    /// still about the same login ([`SeenSeat::reusable`]).
     async fn seat_health(&self, env: &[(String, String)]) -> SeatHealth {
-        use crate::commands::UtilizationProbe as P;
-        match crate::commands::probe_utilization(env).await {
-            P::Ok(v) => {
-                // Shared usage semantics: a model-only wall or paid overage
-                // must not advertise the entire subscription as exhausted.
-                let tier = if crate::accounts::Account::from_env(env).is_default() {
-                    crate::commands::plan_tier()
-                } else {
-                    None
-                };
-                seat_health_from_usage(&v, tier, crate::accounts::now())
-            }
-            P::NoCredential => SeatHealth::unauthenticated(),
-            // Signed in, renewed on its next run — we didn't get to look.
-            P::Stale => SeatHealth::unknown(),
-            P::Http(s) => SeatHealth::from_status(s),
-            P::Unreachable | P::Unreadable(_) => SeatHealth::unreachable(),
+        let seat = self.seat_key(env);
+        let login = crate::commands::credential_fingerprint(env);
+        let seen = seen_seats().lock().unwrap_or_else(|p| p.into_inner()).get(&seat).cloned();
+        if let Some(s) = seen.filter(|s| s.reusable(login.as_deref(), std::time::Instant::now(), crate::accounts::now())) {
+            return s.health;
         }
+        let health = probe_seat_health(env).await;
+        seen_seats().lock().unwrap_or_else(|p| p.into_inner()).insert(
+            seat,
+            SeenSeat { at: std::time::Instant::now(), login, health: health.clone() },
+        );
+        health
     }
 
     async fn cli_version(&self) -> String {
@@ -788,6 +786,65 @@ impl Harness for ClaudeCode {
             }
         }
         (!probe.is_empty()).then_some(probe)
+    }
+}
+
+/// How long [`ClaudeCode::seat_health`] reuses an answer. A window doesn't
+/// move much in five minutes, and the cards that show it say when it was
+/// measured (`SeatHealth::checked_at`).
+const SEAT_HEALTH_FRESH: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What a seat last answered, and for which login.
+#[derive(Clone)]
+struct SeenSeat {
+    at: std::time::Instant,
+    /// [`crate::commands::credential_fingerprint`] when it was asked; never
+    /// sent anywhere.
+    login: Option<String>,
+    health: SeatHealth,
+}
+
+impl SeenSeat {
+    /// Whether this answer may stand in for asking again: the same login
+    /// (signing in, out or as somebody else is a new question), younger than
+    /// [`SEAT_HEALTH_FRESH`], not a failure to get through (that one is worth
+    /// retrying at the next heartbeat), and — for a full window — not past the
+    /// moment a window said it would roll over.
+    fn reusable(&self, login: Option<&str>, at: std::time::Instant, now: i64) -> bool {
+        self.login.as_deref() == login
+            && at.saturating_duration_since(self.at) < SEAT_HEALTH_FRESH
+            && self.health.state != "unreachable"
+            && (self.health.state != "exhausted"
+                || self.health.limits.iter().all(|l| l.resets_at.is_none_or(|r| r > now)))
+    }
+}
+
+/// Last answer per seat ([`Harness::seat_key`]), for this process.
+fn seen_seats() -> &'static std::sync::Mutex<std::collections::HashMap<String, SeenSeat>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, SeenSeat>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// Ask `/api/oauth/usage` for the seat `env` selects (no cache).
+async fn probe_seat_health(env: &[(String, String)]) -> SeatHealth {
+    use crate::commands::UtilizationProbe as P;
+    match crate::commands::probe_utilization(env).await {
+        P::Ok(v) => {
+            // Shared usage semantics: a model-only wall or paid overage
+            // must not advertise the entire subscription as exhausted.
+            let tier = if crate::accounts::Account::from_env(env).is_default() {
+                crate::commands::plan_tier()
+            } else {
+                None
+            };
+            seat_health_from_usage(&v, tier, crate::accounts::now())
+        }
+        P::NoCredential => SeatHealth::unauthenticated(),
+        // Signed in, renewed on its next run — we didn't get to look.
+        P::Stale => SeatHealth::unknown(),
+        P::Http(s) => SeatHealth::from_status(s),
+        P::Unreachable | P::Unreadable(_) => SeatHealth::unreachable(),
     }
 }
 
@@ -2097,6 +2154,40 @@ mod tests {
         assert_eq!(seat_limit_label("weekly_all", &Value::Null), "Week (all models)");
         assert_eq!(seat_limit_label("weekly_scoped", &scoped), "Week (Fable)");
         assert_eq!(seat_limit_label("some_new_window", &Value::Null), "Some new window");
+    }
+
+    /// The heartbeat asks every 30 seconds; the seat is asked again only when
+    /// the answer is old, about another login, a failure, or a full window
+    /// whose reset has come (activity center C1).
+    #[test]
+    fn a_seat_answer_is_reused_until_it_could_have_changed() {
+        let t0 = std::time::Instant::now();
+        let now = 1_788_000_000;
+        let seen = |state: &str, resets_at: Option<i64>| SeenSeat {
+            at: t0,
+            login: Some("login-a".into()),
+            health: SeatHealth {
+                state: state.into(),
+                status: Some(200),
+                tier: None,
+                limits: vec![SeatLimit { kind: "session".into(), label: "Session".into(), percent: 100.0, resets_at }],
+                checked_at: now,
+            },
+        };
+        let ok = seen("ok", Some(now + 60));
+        let later = |secs| t0 + std::time::Duration::from_secs(secs);
+        assert!(ok.reusable(Some("login-a"), later(30), now), "the next heartbeat: no new probe");
+        assert!(ok.reusable(Some("login-a"), later(299), now));
+        assert!(!ok.reusable(Some("login-a"), later(SEAT_HEALTH_FRESH.as_secs()), now), "five minutes: ask again");
+        assert!(!ok.reusable(Some("login-b"), later(30), now), "signed in as somebody else");
+        assert!(!ok.reusable(None, later(30), now), "signed out");
+        let out = SeenSeat { login: None, ..seen("unauthenticated", None) };
+        assert!(out.reusable(None, later(30), now), "still signed out: nothing new to ask");
+        assert!(!out.reusable(Some("login-a"), later(30), now), "signed in since: ask at once");
+        assert!(!seen("unreachable", None).reusable(Some("login-a"), later(30), now), "a failure is retried");
+        let full = seen("exhausted", Some(now + 60));
+        assert!(full.reusable(Some("login-a"), later(30), now));
+        assert!(!full.reusable(Some("login-a"), later(30), now + 60), "the window rolled over");
     }
 
     #[test]

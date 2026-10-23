@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::cards::{bundle_args_with, ensure_esbuild, title_case, write};
 use crate::client::Client;
+use mafold_core::mafold_types::units::EN;
 
 /// Imports the apps pipeline externalizes ON TOP of the card externals — the
 /// interactive SDK profile the host injects at load time.
@@ -416,11 +417,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
             let bytes =
                 std::fs::read(&path).with_context(|| format!("reading icon {}", path.display()))?;
             let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("logo");
-            println!(
-                "→ uploading logo {} ({:.1} KB) …",
-                icon,
-                bytes.len() as f64 / 1024.0
-            );
+            println!("→ uploading logo {} ({}) …", icon, EN.bytes(bytes.len() as f64));
             let r = client.upload_media(bytes, fname, mime_for(fname)).await?;
             let url = r["url"]
                 .as_str()
@@ -449,11 +446,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         anyhow::bail!("esbuild exited with {status}");
     }
     let bundle = std::fs::read(&out).with_context(|| format!("reading {}", out.display()))?;
-    println!(
-        "  bundle: {} ({:.1} KB)",
-        out.display(),
-        bundle.len() as f64 / 1024.0
-    );
+    println!("  bundle: {} ({})", out.display(), EN.bytes(bundle.len() as f64));
 
     // The server stores the manifest verbatim, so send the FULL manifest JSON
     // (not a hand-picked subset) — reconstruct it from the parsed fields + the
@@ -637,7 +630,7 @@ async fn upload_screenshots(client: &Client, args: &[String]) -> Result<Option<V
         }
         let bytes = std::fs::read(path).with_context(|| format!("reading {arg}"))?;
         let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("screenshot.png");
-        println!("→ uploading {} ({:.1} KB) …", fname, bytes.len() as f64 / 1024.0);
+        println!("→ uploading {} ({}) …", fname, EN.bytes(bytes.len() as f64));
         let r = client.upload_media(bytes, fname, mime_for(fname)).await?;
         let file_id = r["id"]
             .as_str()

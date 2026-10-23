@@ -457,14 +457,10 @@ not be loaded and ask them to paste it.",
 }
 
 /// Bytes as a person reads them — for the one line the agent sees about a file
-/// it hasn't opened yet.
+/// it hasn't opened yet. The shared ruler: the size the sender's own device
+/// showed them (1000 to the KB).
 fn human_size(n: u64) -> String {
-    match n {
-        n if n >= 1024 * 1024 * 1024 => format!("{:.1} GB", n as f64 / 1024.0 / 1024.0 / 1024.0),
-        n if n >= 1024 * 1024 => format!("{:.1} MB", n as f64 / 1024.0 / 1024.0),
-        n if n >= 1024 => format!("{:.1} KB", n as f64 / 1024.0),
-        n => format!("{n} B"),
-    }
+    mafold_core::mafold_types::units::EN.bytes(n as f64)
 }
 
 /// Flatten a forwarded chat record (WeChat 合并转发) into readable transcript
@@ -1029,13 +1025,25 @@ struct ExecCoord {
     /// File the in-flight-turn count is published to, so the supervisor can DRAIN
     /// (wait a turn out) before a cliUpdate restart instead of killing it.
     busy_file: Option<std::path::PathBuf>,
+    /// When each turn in flight began (epoch seconds), by guard — the oldest
+    /// is what `mafold status` says this bot has been replying since. Kept
+    /// beside `busy` in `turns.json`, so the count stays the bare number an
+    /// older supervisor's drain reads.
+    starts: std::sync::Mutex<std::collections::BTreeMap<u64, i64>>,
+    next_guard: std::sync::atomic::AtomicU64,
+    /// The runtime this daemon runs (as Mafold told it), said in `turns.json`
+    /// so `mafold status` doesn't go by the local config's hint.
+    runtime: Option<String>,
 }
 
 impl ExecCoord {
-    fn new(busy_file: Option<std::path::PathBuf>) -> Arc<Self> {
+    fn new(busy_file: Option<std::path::PathBuf>, runtime: Option<String>) -> Arc<Self> {
         let c = Arc::new(Self {
             active: std::sync::atomic::AtomicUsize::new(0),
             busy_file,
+            starts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            next_guard: std::sync::atomic::AtomicU64::new(0),
+            runtime,
         });
         c.publish_busy(); // clear any stale marker from a prior (killed) process
         c
@@ -1044,26 +1052,42 @@ impl ExecCoord {
     fn idle(&self) -> bool {
         self.active.load(std::sync::atomic::Ordering::SeqCst) == 0
     }
-    /// Write the current in-flight-turn count for the supervisor's drain check.
+    /// Write the current in-flight-turn count for the supervisor's drain check,
+    /// and the turns themselves for `mafold status`.
     fn publish_busy(&self) {
         if let Some(p) = &self.busy_file {
             let n = self.active.load(std::sync::atomic::Ordering::SeqCst);
             let _ = std::fs::write(p, n.to_string());
+            let starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            crate::lifecycle::write_turns(
+                &p.with_file_name("turns.json"),
+                &crate::lifecycle::Turns {
+                    pid: std::process::id(),
+                    active: starts.len(),
+                    since: starts.values().copied().min(),
+                    runtime: self.runtime.clone(),
+                },
+            );
         }
     }
 }
 
 /// RAII: a turn is in flight while this lives (bumps/decrements `ExecCoord::active`).
-struct TurnGuard(Arc<ExecCoord>);
+struct TurnGuard(Arc<ExecCoord>, u64);
 impl TurnGuard {
-    fn new(c: &Arc<ExecCoord>) -> Self {
+    /// `started_at`: when the turn began, epoch seconds — a picked-up turn's
+    /// is the one its generating card already shows.
+    fn new(c: &Arc<ExecCoord>, started_at: i64) -> Self {
+        let id = c.next_guard.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        c.starts.lock().unwrap_or_else(|e| e.into_inner()).insert(id, started_at);
         c.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         c.publish_busy();
-        Self(c.clone())
+        Self(c.clone(), id)
     }
 }
 impl Drop for TurnGuard {
     fn drop(&mut self) {
+        self.0.starts.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1);
         self.0.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         self.0.publish_busy();
     }
@@ -2462,7 +2486,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
         Some(p)
     };
-    let coord = ExecCoord::new(busy_file);
+    let coord = ExecCoord::new(busy_file, Some(harness.id().to_string()));
 
     // Auto-update: poll every 10 minutes; if a newer release exists, apply +
     // re-exec — but only when IDLE (try_lock → no claude running/queued) so an
@@ -9060,7 +9084,7 @@ async fn handle(
     // Mark a turn in-flight (gates the self-updater). NO conversation lock:
     // turns run CONCURRENTLY — each gets its own draft, claude session, and
     // renderer, so the bot can serve several tasks/chats at once.
-    let _turn = TurnGuard::new(coord);
+    let _turn = TurnGuard::new(coord, (turn_started_ms / 1000) as i64);
     // Snapshot the session to resume from (context so far) — keyed per
     // (conversation, channel) so forum channels have isolated contexts. Truly
     // concurrent turns fork from this same parent; the chat-history re-injection
@@ -12499,8 +12523,9 @@ mod inbound_file_tests {
     #[test]
     fn sizes_read_the_way_a_person_would_say_them() {
         assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(2048), "2.0 KB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(5_000_000), "5 MB");
+        assert_eq!(human_size(136_913_102), "136.9 MB");
     }
 
     /// The three delivery routes are the whole point of that section: an agent
@@ -15712,7 +15737,7 @@ mod windows_background_tests {
         arm_bg_wakeup(
             Client::new("http://127.0.0.1:1".into(), "local-test".into()), home.clone(), false,
             "test".into(), "ci".into(), None, Some("windows".into()),
-            Default::default(), ExecCoord::new(None), states,
+            Default::default(), ExecCoord::new(None, None), states,
             Arc::new(crate::harness::claude_code::ClaudeCode),
             None, None, None, None, None, GATE_OWNER.into(), false, 1, None,
         );

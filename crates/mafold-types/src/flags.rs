@@ -416,6 +416,46 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // The update pill and its loading screen (owner 10-22, demo upd-demo v4:
+    // copy 「A 说清楚」, loading screen 「A 回到徽章」). Two flags, not one: the
+    // loading screen is seen on every open and may go out on its own, ahead
+    // of the pill or without it. The desktop app loads the web, so it reads
+    // the Web entry. A phone binary built before these entries has no default
+    // for them, but the server's record for an account still reaches it (the
+    // core carries server-only keys), so opening one for an account needs no
+    // app@. Rolling out = the record set on; deleting it turns the flag off.
+    FlagMeta {
+        key: "updatePill",
+        default: false,
+        dev_default: true,
+        label: "Update pill",
+        description: "When a newer build is ready (the web page, the phone's JS bundle, an App Store or \
+                      APK version, the desktop app), the activity center's badge in the bottom tab bar \
+                      stretches into a pill over the tab switcher that says what it is and offers to \
+                      update; Settings > Updates shows the same state. Off = as before: the web reloads \
+                      quietly at the next page switch, a phone bundle takes over at the next cold start, \
+                      Android checks only from Settings, the desktop app only notifies from the system \
+                      and the tray.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    FlagMeta {
+        key: "bootCurtain",
+        default: false,
+        dev_default: true,
+        label: "Loading screen: back to the badge",
+        description: "From the first frame the app opens on its own ground colour with the Mafold icon \
+                      in the middle (a spinner joins below it only when loading is slow); once the first \
+                      screen is ready the icon flies down into the activity center's badge. Off = as \
+                      before: web shows nothing, then a spinner after 400 ms; the phone shows a plain \
+                      background until the first screen.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -481,6 +521,21 @@ mod tests {
             assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
             assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
             assert_eq!(m.server, NotRead, "{k}: gates the panel only");
+            assert!(!server_default(k), "{k}: nothing server-side opens without a record");
+        }
+    }
+
+    #[test]
+    fn update_pill_and_boot_curtain_ship_dark_and_separately() {
+        // Two keys, so the loading screen (seen on every open) can go out
+        // without the pill and the pill without it; off in production until
+        // the owner opens them, on in dev; read by web (which the desktop app
+        // loads) and phone. Nothing on the server waits on either.
+        for k in ["updatePill", "bootCurtain"] {
+            let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+            assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+            assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+            assert_eq!(m.server, NotRead, "{k}: read by the clients only");
             assert!(!server_default(k), "{k}: nothing server-side opens without a record");
         }
     }

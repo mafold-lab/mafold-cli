@@ -721,7 +721,8 @@ pub trait Harness: Send + Sync {
     /// allowed, and how full is my window" must say so rather than imply health.
     /// Implementations MUST be cheap and quota-free: this runs on every
     /// `reportHarnesses` heartbeat, so a probe that starts a session or burns
-    /// tokens would measure the thing by consuming it.
+    /// tokens would measure the thing by consuming it. One that goes over the
+    /// network reuses its answer for a while (Claude Code: 5 minutes per login).
     ///
     /// Implemented for Claude Code (a plain HTTP call to the same utilization
     /// endpoint Claude Code itself polls). **Codex is deliberately still
@@ -819,8 +820,8 @@ pub fn probe_with_versions() -> Vec<(&'static str, bool, Option<String>)> {
 
 /// The `reportHarnesses` rows for this machine — availability, CLI version and
 /// seat health — built in ONE place so `mafold login` / `mafold report` and the
-/// supervisor heartbeat can never drift apart (§0). Both call sites hand this
-/// straight to the `harnesses` field.
+/// supervisor heartbeat can never drift apart (§0). All of them send it through
+/// [`report_body`]; `mafold status` shows the same rows.
 ///
 /// Seat health is probed only for harnesses actually installed (asking a missing
 /// CLI about its subscription is noise). A harness with several logins on this
@@ -874,6 +875,20 @@ pub async fn report_rows() -> Vec<Value> {
         }));
     }
     rows
+}
+
+/// The whole `reportHarnesses` body for this machine as `sess` — what
+/// `mafold login` / `mafold report` send and what the supervisor sends as its
+/// 30-second heartbeat. One body for both: a heartbeat that carried less than
+/// a full report used to overwrite the logins the full report had just written
+/// (activity center K2/C1).
+pub async fn report_body(sess: &crate::session::Session) -> Value {
+    serde_json::json!({
+        "device_id": sess.device_id,
+        "device_name": sess.device_name,
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "harnesses": report_rows().await,
+    })
 }
 
 /// Drop the version cache (next `probe_with_versions` re-probes) — call after

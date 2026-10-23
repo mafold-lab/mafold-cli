@@ -24,6 +24,7 @@
 //! Lost or stale entries are harmless: no record means "keep resuming" and
 //! "tell it again".
 
+use mafold_core::mafold_types::units::EN;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -68,8 +69,8 @@ pub enum Why {
 impl std::fmt::Display for Why {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Why::Context(n) => write!(f, "context {n} tokens ≥ {CONTEXT_LIMIT}"),
-            Why::Idle(s) => write!(f, "idle {}m", s / 60),
+            Why::Context(n) => write!(f, "context {} tokens ≥ {}", EN.compact(*n as f64), EN.compact(CONTEXT_LIMIT as f64)),
+            Why::Idle(s) => write!(f, "idle {}", EN.seconds(*s as f64)),
         }
     }
 }

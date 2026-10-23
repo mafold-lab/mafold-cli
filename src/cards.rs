@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::client::Client;
+use mafold_core::mafold_types::units::EN;
 
 /// Pinned esbuild version fetched on demand.
 const ESBUILD_VERSION: &str = "0.24.2";
@@ -244,11 +245,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         anyhow::bail!("esbuild exited with {status}");
     }
     let bundle = std::fs::read(&out).with_context(|| format!("reading {}", out.display()))?;
-    println!(
-        "  bundle: {} ({:.1} KB)",
-        out.display(),
-        bundle.len() as f64 / 1024.0
-    );
+    println!("  bundle: {} ({})", out.display(), EN.bytes(bundle.len() as f64));
 
     let client = Client::new(base, token);
     let meta = json!({

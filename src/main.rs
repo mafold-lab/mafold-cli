@@ -6,6 +6,7 @@
 //!
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
+mod account_health;
 mod accounts;
 mod agent;
 mod apps;
@@ -29,11 +30,14 @@ mod daemon;
 mod discover;
 mod drafts;
 mod drive;
+mod flagcmd;
 mod flags;
 mod harness;
 mod inbox;
 mod install;
 mod langpack;
+mod lifecycle;
+mod machine;
 mod mcp_link;
 mod msgops;
 mod pair;
@@ -80,7 +84,7 @@ struct Cli {
     /// `report`, and the control plane.
     #[arg(long, env = "MAFOLD_ACCOUNT", global = true)]
     account: Option<String>,
-    /// Disable the agent's hourly auto-update.
+    /// Turn off automatic updates (otherwise checked every 10 minutes).
     #[arg(long, env = "MAFOLD_NO_AUTO_UPDATE", global = true)]
     no_auto_update: bool,
     #[command(subcommand)]
@@ -363,6 +367,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: video::VideoCmd,
     },
+    /// Feature flags, with this identity's own token: list / show / add /
+    /// remove / set / delete / check. The server decides who may
+    /// (`flags.read` / `flags.write` — an agent holds them through its
+    /// owner's agents' grant); every change is audited, and undone on the
+    /// admin portal's Flags page.
+    Flags {
+        #[command(subcommand)]
+        cmd: Option<flagcmd::FlagsCmd>,
+    },
     /// Token wallet: balances / transfer / convert / rates / history / grants.
     Wallet {
         #[command(subcommand)]
@@ -412,9 +425,12 @@ enum Cmd {
     },
     /// Remove a bot daemon from the local config (stops it too).
     Rm { name: String },
-    /// Start the supervisor — keeps all configured daemons running + owns updates.
+    /// Start the supervisor, now and on every login — keeps all configured
+    /// daemons running + owns updates. Succeeds only once it is running.
     Up,
-    /// Stop the supervisor + all daemons (or one daemon by name).
+    /// Stop the supervisor + all daemons, until `mafold up`. With a name, stop
+    /// just that daemon — while the supervisor runs, it starts it again within
+    /// ~10s (a restart). Waits for each to exit; fails if one doesn't.
     Down { name: Option<String> },
     /// Show the last lines of a bot daemon's log.
     Logs { name: String },
@@ -634,6 +650,11 @@ async fn main() -> Result<()> {
         };
         let http = reqwest::Client::new();
         match update::update_to_latest(&http, &cli.base, channel).await {
+            // `mafold stop` only knows the old `agent --detach` — on a machine
+            // the supervisor runs, that hint stopped nothing.
+            Ok(Some(v)) if supervisor::supervisor_running() => {
+                println!("✓ updated to v{v} — {}", supervisor::update_pickup_note())
+            }
             Ok(Some(v)) => println!("✓ updated to v{v} — restart a running agent with: mafold stop && mafold agent --detach …"),
             Ok(None) => println!(
                 "already up to date (v{}, {} channel)",
@@ -856,6 +877,7 @@ async fn main() -> Result<()> {
             msgops::edit(&Client::new(cli.base, token?), &message, text.as_deref(), file.as_deref()).await?
         }
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Flags { cmd } => flagcmd::run(cmd.unwrap_or(flagcmd::FlagsCmd::List), &Client::new(cli.base, token?)).await?,
         Cmd::Stop | Cmd::Status { .. } | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }
@@ -1143,24 +1165,27 @@ async fn report_harnesses(base: &str) -> Result<()> {
 }
 
 async fn report_with(base: &str, sess: &session::Session) -> Result<()> {
-    let harnesses = harness::report_rows().await;
-    let avail: Vec<&str> = harnesses
-        .iter()
+    let body = harness::report_body(sess).await;
+    let avail: Vec<&str> = body["harnesses"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter(|h| h["available"].as_bool() == Some(true))
         .filter_map(|h| h["id"].as_str())
         .collect();
-    Client::new(base.to_string(), sess.token.clone())
-        .call(
-            "reportHarnesses",
-            serde_json::json!({
-                "device_id": sess.device_id,
-                "device_name": sess.device_name,
-                "cli_version": env!("CARGO_PKG_VERSION"),
-                "harnesses": harnesses,
-            }),
-        )
-        .await
-        .context("reportHarnesses failed")?;
+    let res = Client::new(base.to_string(), sess.token.clone()).call("reportHarnesses", body.clone()).await;
+    let outcome = match &res {
+        Ok(_) => account_health::Outcome::Accepted,
+        Err(e) => account_health::Outcome::of_error(e),
+    };
+    account_health::record(&sess.username, &sess.token, outcome);
+    if outcome == account_health::Outcome::SignedOut {
+        anyhow::bail!(
+            "Mafold has signed @{u} out on this machine (sign-in expired or revoked) — `mafold login` as @{u} signs it back in",
+            u = sess.username
+        );
+    }
+    res.context("reportHarnesses failed")?;
     println!(
         "✓ reported harnesses on {} — available: {}",
         sess.device_name,

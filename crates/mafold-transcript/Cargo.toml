@@ -8,6 +8,9 @@ license = "MIT"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The one way a number reads (`mafold_types::units`) — the result card's
+# attributes and the compacted line go through the same ruler as every client.
+mafold-types = { path = "../mafold-types" }
 
 [dev-dependencies]
 # A CommonMark reader for the tests: how a client (react-markdown / remark,

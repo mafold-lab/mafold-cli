@@ -120,9 +120,10 @@ pub struct DeviceHarnesses {
 impl DeviceHarnesses {
     /// Keep what the last report knew that this one doesn't say.
     ///
-    /// A cli reports in two sizes: a full report with each harness's seat
-    /// health and logins, and the 30-second heartbeat that carries only
-    /// id / installed / version (mafold-cli `supervisor.rs`). Storing the
+    /// A cli before C1 reported in two sizes: a full report with each
+    /// harness's seat health and logins, and the 30-second heartbeat that
+    /// carried only id / installed / version (mafold-cli `supervisor.rs`;
+    /// from C1 the heartbeat is the full report). Storing the
     /// heartbeat as the whole row wiped the health a full report had just
     /// written, so «Claude Code needs signing in again» lived half a minute
     /// (activity center K2). Per harness: a report that says nothing about
@@ -198,6 +199,10 @@ pub struct ViewerAgent {
     /// The machine its daemon last reported from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+    /// That machine's `device_id` — the key of its row in `listHarnessHosts`,
+    /// so a computer card can put the agent under the computer it runs on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     /// The viewer's direct conversation with it, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dm: Option<Uuid>,
@@ -206,6 +211,10 @@ pub struct ViewerAgent {
     /// Where, when it is a conversation the person is in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_in: Option<ViewerConv>,
+    /// When the turn it is writing began (RFC 3339) — the one in `working_in`
+    /// when there is one, else its newest; a steer doesn't restart it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_since: Option<String>,
     /// When it last finished a reply, anywhere (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_at: Option<String>,
@@ -224,6 +233,24 @@ pub struct ViewerConv {
     /// None for a direct conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+// ───────────────── the computer card (`computers|list`) ─────────────────
+
+/// What the activity center's computer card (`mafold/computers`) is told when
+/// it asks — about the person who opened it, wherever it is open: their own
+/// computers as `listHarnessHosts` lists them, and their own agents as
+/// `getAppViewerProfile` describes them. The agents' history (`last_active_at`,
+/// `replied_at`) is left empty: it costs a pass over every message, and this
+/// card asks each time it opens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputersView {
+    /// The server's clock (unix seconds), so «3 分钟没上报» is measured
+    /// against the same clock as `reported_at`, not the device's.
+    pub now: i64,
+    /// Online first, then most recently seen.
+    pub computers: Vec<HarnessHost>,
+    pub agents: Vec<ViewerAgent>,
 }
 
 #[cfg(test)]
@@ -346,18 +373,36 @@ mod tests {
     fn agent_bytes_unchanged() {
         let a = ViewerAgent {
             username: "ops:bot".into(), display_name: "Bot".into(), bio: Some("hi".into()), avatar_url: Some("u".into()), online: true,
-            harness: Some("claude-code".into()), model: Some("Opus".into()), machine: Some("MacBook".into()),
+            harness: Some("claude-code".into()), model: Some("Opus".into()), machine: Some("MacBook".into()), device_id: None,
             dm: Some(Uuid::from_u128(1)), working: true,
-            working_in: Some(ViewerConv { id: Uuid::from_u128(2), title: Some("#dev".into()) }),
+            working_in: Some(ViewerConv { id: Uuid::from_u128(2), title: Some("#dev".into()) }), working_since: None,
             last_active_at: Some("2026-10-21T00:00:00Z".into()), replied_at: vec![3, 2],
         };
         let b = ViewerAgent {
             username: "ops:b2".into(), display_name: "B2".into(), bio: None, avatar_url: None, online: false, harness: None, model: None,
-            machine: None, dm: None, working: false, working_in: Some(ViewerConv { id: Uuid::from_u128(3), title: None }), last_active_at: None, replied_at: vec![],
+            machine: None, device_id: None, dm: None, working: false, working_in: Some(ViewerConv { id: Uuid::from_u128(3), title: None }),
+            working_since: None, last_active_at: None, replied_at: vec![],
         };
         assert_eq!(
             serde_json::to_string(&vec![a, b]).unwrap(),
             r##"[{"username":"ops:bot","display_name":"Bot","bio":"hi","avatar_url":"u","online":true,"harness":"claude-code","model":"Opus","machine":"MacBook","dm":"00000000-0000-0000-0000-000000000001","working":true,"working_in":{"id":"00000000-0000-0000-0000-000000000002","title":"#dev"},"last_active_at":"2026-10-21T00:00:00Z","replied_at":[3,2]},{"username":"ops:b2","display_name":"B2","online":false,"working":false,"working_in":{"id":"00000000-0000-0000-0000-000000000003"},"replied_at":[]}]"##
         );
+    }
+
+    /// K8's two fields are additions only: absent, the bytes above stand;
+    /// present, each sits beside what it qualifies.
+    #[test]
+    fn agent_where_and_since() {
+        let a = ViewerAgent {
+            username: "ops:bot".into(), display_name: "Bot".into(), bio: None, avatar_url: None, online: true, harness: None, model: None,
+            machine: Some("MacBook".into()), device_id: Some("dev-1".into()), dm: None, working: true, working_in: None,
+            working_since: Some("2026-10-21T00:00:00+00:00".into()), last_active_at: None, replied_at: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"username":"ops:bot","display_name":"Bot","online":true,"machine":"MacBook","device_id":"dev-1","working":true,"working_since":"2026-10-21T00:00:00+00:00","replied_at":[]}"#
+        );
+        let old: ViewerAgent = serde_json::from_str(r#"{"username":"x","display_name":"X","online":false,"working":false}"#).unwrap();
+        assert!(old.device_id.is_none() && old.working_since.is_none());
     }
 }

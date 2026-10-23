@@ -224,6 +224,7 @@ pub fn remove(username: &str) -> Result<bool> {
     if !d.forget(username) {
         return Ok(false);
     }
+    crate::account_health::forget(username);
     if d.accounts.is_empty() {
         std::fs::remove_file(path()).context("remove session.json")?;
     } else {
@@ -293,6 +294,16 @@ pub fn machine() -> (String, String) {
         Some(s) if !s.device_id.is_empty() => (s.device_id, s.device_name),
         _ => (device_id(None), device_name()),
     }
+}
+
+/// [`machine`]'s id when this machine already has one — never minting one
+/// and never asking `hostname`: for `mafold status`, which only reads.
+pub fn known_device_id() -> Option<String> {
+    read()
+        .map(|d| d.device_id)
+        .filter(|id| !id.is_empty())
+        .or_else(|| std::fs::read_to_string(device_id_path()).ok().map(|s| s.trim().to_string()))
+        .filter(|id| !id.is_empty())
 }
 
 #[cfg(test)]

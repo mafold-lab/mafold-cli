@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use mafold_core::mafold_types::units::{self, EN};
+
 pub enum Outcome {
     /// Handled locally — send this markdown reply.
     Reply(String),
@@ -567,13 +569,9 @@ fn bucket_cost(short: &str, b: &Buckets) -> f64 {
         / 1e6
 }
 
-/// "$4.20" / "$59.2k" — compact once the cents stop mattering.
+/// "$4.20" / "$59,234" / "$0.0042" — the shared ruler (`mafold_types::units`).
 fn fmt_usd(v: f64) -> String {
-    if v >= 1000.0 {
-        format!("${:.1}k", v / 1000.0)
-    } else {
-        format!("${v:.2}")
-    }
+    units::usd(v)
 }
 
 /// Everything the usage card needs, from either data source.
@@ -1048,10 +1046,10 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
         trivia.push(format!("longest session {}", fmt_dur(agg.longest_sess)));
     }
     if cur_streak > 0 {
-        trivia.push(format!("streak {cur_streak}d"));
+        trivia.push(format!("streak {}", fmt_dur(cur_streak as i64 * 86_400)));
     }
     if best_streak > cur_streak {
-        trivia.push(format!("best {best_streak}d"));
+        trivia.push(format!("best {}", fmt_dur(best_streak as i64 * 86_400)));
     }
     if let Some(d) = busiest_day {
         trivia.push(format!("most active {d}"));
@@ -1756,18 +1754,10 @@ fn streaks(days: &[i64], today: i64) -> (u64, u64) {
     (current, best)
 }
 
-/// Seconds → "35d 0h" / "9h 24m" / "42m".
+/// Whole seconds → "35d 0h 25m" / "9h 24m" / "42m 7s" / "30s" / "0s" — the
+/// shared ruler, as a clock: whole seconds, so nothing reads "0ms".
 pub(crate) fn fmt_dur(secs: i64) -> String {
-    let d = secs / 86400;
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{}m", m.max(1))
-    }
+    EN.elapsed(secs as f64 * 1000.0)
 }
 
 /// Uppercase the first ASCII letter ("week (all models)" → "Week (all models)").
@@ -2028,17 +2018,9 @@ pub(crate) fn preview_from_head(head: &str) -> String {
     String::new()
 }
 
-/// Seconds → "just now" / "5m ago" / "3h ago" / "2d ago".
+/// Seconds → "just now" / "5m ago" / "3h ago" / "2d ago" — the shared ruler.
 pub(crate) fn fmt_age(secs: i64) -> String {
-    if secs < 60 {
-        "just now".into()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
+    EN.ago(secs as f64)
 }
 
 /// An interactive `claude` session someone else is holding right now — a
@@ -2166,21 +2148,9 @@ pub(crate) fn resolve_session<'a>(metas: &'a [SessionMeta], arg: &str) -> Resolv
     }
 }
 
-/// 1_234_567 → "1.2M" (K/M/B, trailing `.0` stripped).
+/// 1_234_567 → "1.2M" — the shared ruler.
 pub(crate) fn humanize(n: u64) -> String {
-    let f = n as f64;
-    let s = if f >= 1e9 {
-        format!("{:.1}B", f / 1e9)
-    } else if f >= 1e6 {
-        format!("{:.1}M", f / 1e6)
-    } else if f >= 1e3 {
-        format!("{:.1}K", f / 1e3)
-    } else {
-        return n.to_string();
-    };
-    s.replace(".0B", "B")
-        .replace(".0M", "M")
-        .replace(".0K", "K")
+    EN.compact(n as f64)
 }
 
 /// "claude-opus-4-5-20251101" → "opus-4-5".
@@ -2490,9 +2460,15 @@ Last 7d · 7983 requests · 30 sessions
 
     #[test]
     fn durations() {
-        assert_eq!(fmt_dur(3_025_524), "35d 0h");
+        // The shared ruler (client-shared/units.cases.json): at most three
+        // units, trailing zeros dropped, never "1m" for thirty seconds.
+        assert_eq!(fmt_dur(3_025_524), "35d 0h 25m");
         assert_eq!(fmt_dur(33_840), "9h 24m");
-        assert_eq!(fmt_dur(30), "1m");
+        assert_eq!(fmt_dur(30), "30s");
+        assert_eq!(fmt_dur(0), "0s", "a one-turn session, a daemon that just started");
+        assert_eq!(humanize(25_488_300), "25.5M");
+        assert_eq!(fmt_usd(59_234.0), "$59,234");
+        assert_eq!(fmt_usd(0.0042), "$0.0042");
     }
 
     #[test]

@@ -22,11 +22,18 @@ pub mod drive;
 /// The feature-flag registry — keys, defaults, who reads each, and what the
 /// server decides without a record (`flags.rs`, `.docs/feature-flags.md`).
 pub mod flags;
+/// What agents did for a person, one row per reply — the activity center's
+/// receipts card (`receipts.rs`).
+pub mod receipts;
 /// A mafold.app site's own Worker (`sites.rs`, `.docs/site-workers-v1.md`).
 pub mod sites;
 /// Mid-turn words: which running turn takes them, and how they are framed —
 /// one rule for the daemon and the hosted brains (`steer.rs`).
 pub mod steer;
+/// How a number reads — durations, counts, dollars, sizes, "how long ago" —
+/// the Rust half of `client-shared/units.ts`, tested against the same table
+/// (`units.rs`).
+pub mod units;
 pub use connections::{
     provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
     PROVIDERS,

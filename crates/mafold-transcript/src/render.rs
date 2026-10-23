@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::event::AgentEvent;
+use mafold_types::units::{self, EN};
 
 /// The prefixes of the one-line notices this renderer writes on a producer's or
 /// the driver's behalf — a usage limit, a compaction, a steer seam. Named so the
@@ -101,7 +102,7 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
             // The owner's part (summary, flags) is not in the card: the
             // transcript hands it out as state (`Transcript::take_private`).
             (Some(s), _) => compact_card(*pre_tokens, *post_tokens, true, s, flagged).0,
-            (None, Some(n)) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted ({} before)_", fmt_count(*n))),
+            (None, Some(n)) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted ({} before)_", EN.compact(*n as f64))),
             (None, None) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted_")),
         }),
         // Only a REFUSAL is news. The `allowed_*` states are threshold
@@ -1269,10 +1270,16 @@ fn result_tag(dur: Option<f64>, cost: Option<f64>, tokens: Option<u64>) -> Optio
     if dur.is_none() && cost.is_none() && tokens.is_none() {
         return None;
     }
+    // The attributes are for a card too old to read the JSON body: it shows
+    // them as they are. So they're written the way any reader would want them
+    // ("1h 1m 43s", "25.5M", "$13.44"), in English — one message, every reader;
+    // a current card formats the body's raw numbers in each reader's own
+    // language, and reads these back (client-shared/units parse*) only when a
+    // body is missing.
     let mut attrs = String::new();
-    if let Some(d) = dur { attrs.push_str(&format!(" duration=\"{:.1}s\"", d / 1000.0)); }
-    if let Some(t) = tokens { attrs.push_str(&format!(" tokens=\"{}\"", fmt_count(t))); }
-    if let Some(c) = cost { attrs.push_str(&format!(" cost=\"${c:.4}\"")); }
+    if let Some(d) = dur { attrs.push_str(&format!(" duration=\"{}\"", EN.duration(d))); }
+    if let Some(t) = tokens { attrs.push_str(&format!(" tokens=\"{}\"", EN.compact(t as f64))); }
+    if let Some(c) = cost { attrs.push_str(&format!(" cost=\"{}\"", units::usd(c))); }
     Some(format!("\n{{% mafold/result{attrs} /%}}\n"))
 }
 
@@ -1431,6 +1438,31 @@ fn strip_cards_where(md: &str, cut: impl Fn(&str) -> bool) -> String {
 }
 
 #[cfg(test)]
+mod result_attr_tests {
+    use super::*;
+
+    /// The screenshot that started the shared ruler (2026-10-22): an hour-long
+    /// reply's result bar read "3702.9s · 25488.3k tok · $13.4366".
+    #[test]
+    fn the_result_attributes_read_like_every_other_number() {
+        let tag = result_tag(Some(3_702_900.0), Some(13.4366), Some(25_488_300)).unwrap();
+        assert!(tag.contains(r#"duration="1h 1m 43s""#), "{tag}");
+        assert!(tag.contains(r#"tokens="25.5M""#), "{tag}");
+        assert!(tag.contains(r#"cost="$13.44""#), "{tag}");
+        let small = result_tag(Some(4_200.0), Some(0.0042), Some(812)).unwrap();
+        assert!(small.contains(r#"duration="4.2s" tokens="812" cost="$0.0042""#), "{small}");
+        assert_eq!(result_tag(None, Some(0.0), None), None, "a zero cost alone is nothing to stamp");
+    }
+
+    #[test]
+    fn the_compacted_line_counts_on_the_same_ruler() {
+        let ev = AgentEvent::Compacted { pre_tokens: Some(90_000), post_tokens: None, summary: None, flagged: Vec::new() };
+        let line = render(&ev, &mut HashMap::new()).expect("a line");
+        assert!(line.contains("Context auto-compacted (90K before)"), "{line}");
+    }
+}
+
+#[cfg(test)]
 mod strip_transcript_tests {
     use super::*;
 
@@ -1462,10 +1494,6 @@ mod strip_transcript_tests {
         let out = strip_transcript_cards(md);
         assert_eq!(out, "{% mafold/quote %}said:\n\nthat{% /mafold/quote %}");
     }
-}
-
-fn fmt_count(n: u64) -> String {
-    if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
 }
 
 
@@ -2118,7 +2146,7 @@ mod notice_tests {
     fn a_compaction_renders_with_the_size_it_compacted() {
         let mut names = HashMap::new();
         let out = render(&compacted(Some(302_336)), &mut names).unwrap();
-        assert!(out.contains("302.3k"), "{out}");
+        assert!(out.contains("302.3K before"), "{out}");
         assert!(out.contains("compacted"), "{out}");
     }
 

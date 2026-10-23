@@ -21,6 +21,7 @@
 
 use crate::client::{Client, Dest};
 use crate::harness::{self, AgentEvent, Turn};
+use mafold_core::mafold_types::units::Units;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -568,15 +569,10 @@ const STALL_MS: u64 = 10 * 60 * 1000;
 /// How much of what a reply in progress has written so far is shown.
 const WORKING_TAIL: usize = 120;
 
-/// "3 分钟" / "1 小时 20 分钟" — how long something has been going on.
+/// 「45 秒」「3 分 12 秒」「1 小时 20 分」 — how long something has been going
+/// on, on the shared ruler (`mafold_types::units`), whole seconds.
 fn span_zh(ms: u64) -> String {
-    let mins = ms / 60_000;
-    match mins {
-        0 => "不到 1 分钟".into(),
-        1..=59 => format!("{mins} 分钟"),
-        _ if mins % 60 == 0 => format!("{} 小时", mins / 60),
-        _ => format!("{} 小时 {} 分钟", mins / 60, mins % 60),
-    }
+    Units::new("zh-Hans").elapsed(ms as f64)
 }
 
 /// What a reply still being written ([`in_progress`]) is doing, in one line:
@@ -589,17 +585,20 @@ pub(crate) fn working_status(m: &Value, now_ms: u64) -> String {
     let mut s = match progress_of(raw) {
         Some(p) => {
             let started = p.started_ms.or_else(|| secs_of(Some(created(m))).map(|s| s as u64 * 1000));
-            let elapsed = started.map(|t| span_zh(now_ms.saturating_sub(t))).unwrap_or_else(|| "?".into());
+            let elapsed_ms = started.map(|t| now_ms.saturating_sub(t));
+            let elapsed = elapsed_ms.map(span_zh).unwrap_or_else(|| "?".into());
+            let ago = |ms: u64| Units::new("zh-Hans").ago(ms as f64 / 1000.0);
             let quiet = p.beat_at_ms.map(|b| now_ms.saturating_sub(b));
             if let Some(who) = &p.awaiting {
                 format!("⏸ 在等 @{} 回答卡片(已写 {elapsed})", who.trim_start_matches('@'))
             } else if let Some(q) = quiet.filter(|q| *q >= STALL_MS) {
-                format!("⚠️ {}没动静了(开写 {elapsed}前) —— 可能卡住了", span_zh(q))
+                let began = elapsed_ms.map(ago).unwrap_or_else(|| "?".into());
+                format!("⚠️ {}没动静了(开写 {began}) —— 可能卡住了", span_zh(q))
             } else {
                 let mut s = format!("⏳ 正在回复 · 已写 {elapsed}");
                 match quiet {
                     Some(q) if q < 60_000 => s.push_str(" · 刚有动静"),
-                    Some(q) => s.push_str(&format!(" · 最后动静 {}前", span_zh(q))),
+                    Some(q) => s.push_str(&format!(" · 最后动静 {}", ago(q))),
                     None => {}
                 }
                 if p.shells > 0 {
@@ -2908,11 +2907,11 @@ mod tests {
         };
         let alive = draft("d", "2026-09-25T02:00:00Z", &format!("先查日志,再看游标{}", tag(T0 - 9 * 60_000, T0 - 60_000, 2, None)));
         let s = working_status(&alive, T0);
-        assert!(s.starts_with("⏳ 正在回复 · 已写 9 分钟 · 最后动静 1 分钟前 · 2 个后台任务"), "{s}");
+        assert!(s.starts_with("⏳ 正在回复 · 已写 9 分 · 最后动静 1 分钟前 · 2 个后台任务"), "{s}");
         assert!(s.contains("已写到:「先查日志,再看游标」"), "{s}");
 
         let quiet = draft("d", "", &tag(T0 - 40 * 60_000, T0 - 25 * 60_000, 0, None));
-        assert!(working_status(&quiet, T0).starts_with("⚠️ 25 分钟没动静了"), "{}", working_status(&quiet, T0));
+        assert!(working_status(&quiet, T0).starts_with("⚠️ 25 分没动静了(开写 40 分钟前)"), "{}", working_status(&quiet, T0));
 
         let parked = draft("d", "", &tag(T0 - 5 * 60_000, T0 - 20 * 60_000, 0, Some("opsdu")));
         assert!(working_status(&parked, T0).starts_with("⏸ 在等 @opsdu 回答卡片"), "parked beats quiet: {}", working_status(&parked, T0));

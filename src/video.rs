@@ -1076,7 +1076,7 @@ where
                     return Ok(v);
                 }
                 if waited > std::time::Duration::ZERO {
-                    eprintln!("  {status} … {}s", waited.as_secs());
+                    eprintln!("  {status} … {}", mafold_core::mafold_types::units::EN.seconds(waited.as_secs() as f64));
                 }
                 WAIT_TICK
             }

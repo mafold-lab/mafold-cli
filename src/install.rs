@@ -76,6 +76,13 @@ fn find(tool: &str) -> Option<&'static Tool> {
 }
 
 pub fn run(tool: &str, yes: bool) -> Result<()> {
+    run_within(tool, yes, None)
+}
+
+/// [`run`], with the official installer stopped (it and everything it
+/// started) once it has run for `limit`. The supervisor installs with a limit:
+/// an installer stuck on a download used to keep the machine busy for good.
+pub fn run_within(tool: &str, yes: bool, limit: Option<std::time::Duration>) -> Result<()> {
     if tool.trim().is_empty() || tool == "list" {
         return list();
     }
@@ -85,7 +92,7 @@ pub fn run(tool: &str, yes: bool) -> Result<()> {
             TOOLS.iter().map(|t| t.id).collect::<Vec<_>>().join(", ")
         );
     };
-    install(t, yes)
+    install(t, yes, limit)
 }
 
 /// `mafold install` with no argument: the four runtimes + their install state.
@@ -107,7 +114,7 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn install(t: &Tool, yes: bool) -> Result<()> {
+fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()> {
     if cfg!(windows) {
         bail!(
             "automatic install isn't supported on Windows yet — {}",
@@ -143,12 +150,13 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
     // stock Windows box) the manual route in `fallback` IS the answer. Bailing
     // with a bare "failed to run bash" left the user with no next step on the one
     // platform that had no other way in.
-    let status = match crate::platform::console_std_command("bash")
-        .arg("-c")
-        .arg(t.install_cmd)
-        .status()
-    {
-        Ok(s) => s,
+    let status = match run_installer(t.install_cmd, limit) {
+        Ok(Some(s)) => s,
+        Ok(None) => bail!(
+            "the installer was still running after {} minutes — stopped it; {}",
+            limit.unwrap_or_default().as_secs() / 60,
+            t.fallback
+        ),
         Err(e) => bail!("couldn't run the installer ({e}) — {}", t.fallback),
     };
     if !status.success() {
@@ -177,6 +185,45 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Run `cmd` under `bash -c`. With a `limit` it runs in its own process
+/// group, and when the limit passes the whole group is killed — an installer
+/// is a pipeline (`curl … | bash`), so killing `bash` alone would leave the
+/// download running. `Ok(None)` = it was stopped. Without a limit it stays in
+/// the caller's group: `mafold install` in a terminal may ask its questions.
+fn run_installer(
+    cmd: &str,
+    limit: Option<std::time::Duration>,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut c = crate::platform::console_std_command("bash");
+    c.arg("-c").arg(cmd);
+    let Some(limit) = limit else {
+        return c.status().map(Some);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
+    let mut child = c.spawn()?;
+    let end = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= end {
+            #[cfg(unix)]
+            // SAFETY: plain kill(2) on the group this child leads.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn version_of(bin: &str) -> Option<String> {
     let out = crate::platform::std_command(crate::harness::program(bin))
         .arg("--version")
@@ -197,4 +244,39 @@ fn next_steps(t: &Tool) {
         "  2. in Mafold: pencil icon → New Bot → Runtime: {}",
         t.name
     );
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::run_installer;
+    use std::time::{Duration, Instant};
+
+    /// A stuck installer is stopped at its limit — and so is what it started
+    /// (`curl … | bash` is a pipeline; the download is a grandchild).
+    #[test]
+    fn a_stuck_installer_is_stopped_with_everything_it_started() {
+        let dir = std::env::temp_dir().join(format!("mafold-install-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("grandchild.pid");
+        let cmd = format!("sleep 60 & echo $! > '{}'; wait", pidfile.display());
+        let t = Instant::now();
+        let ran = run_installer(&cmd, Some(Duration::from_secs(1))).unwrap();
+        assert!(ran.is_none(), "reported as stopped, not as an exit");
+        assert!(t.elapsed() < Duration::from_secs(10), "stopped at the limit: {:?}", t.elapsed());
+        let grandchild: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // SAFETY: signal 0 only probes.
+        let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+        assert!(!alive, "the grandchild went with it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_installer_that_finishes_in_time_reports_its_exit() {
+        let ok = run_installer("exit 0", Some(Duration::from_secs(30))).unwrap().unwrap();
+        assert!(ok.success());
+        let failed = run_installer("exit 3", Some(Duration::from_secs(30))).unwrap().unwrap();
+        assert_eq!(failed.code(), Some(3));
+        assert!(run_installer("exit 0", None).unwrap().unwrap().success(), "no limit: as before");
+    }
 }

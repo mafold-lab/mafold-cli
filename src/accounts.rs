@@ -2158,9 +2158,9 @@ mod tests {
             Some("stored credential deadline in 27d 3h (not an authentication check)")
         );
         let soon = login_expiry_note("work", Some(now + 2 * 86400), now).unwrap();
-        assert!(soon.starts_with("⚠️ stored credential deadline in 2d 0h") && soon.contains("/login work renews it"), "{soon}");
+        assert!(soon.starts_with("⚠️ stored credential deadline in 2d —") && soon.contains("/login work renews it"), "{soon}");
         let gone = login_expiry_note("work", Some(now - 5 * 3600), now).unwrap();
-        assert!(gone.starts_with("⚠️ stored credential deadline passed 5h 0m ago") && gone.contains("/login work"), "{gone}");
+        assert!(gone.starts_with("⚠️ stored credential deadline passed 5h ago") && gone.contains("/login work"), "{gone}");
         // The default login is signed in again by a bare `/login`.
         assert!(login_expiry_note(DEFAULT, Some(now + 3600), now).unwrap().ends_with("— /login renews it"));
     }

@@ -11,6 +11,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use mafold_core::mafold_types::d1::validate_name;
+use mafold_core::mafold_types::units::{self, EN};
 use serde_json::{json, Value};
 
 use crate::client::Client;
@@ -84,8 +85,9 @@ pub enum D1Cmd {
     Undelete { database: String },
 }
 
+/// A database's size on the shared ruler: "12.9 MB" (1000 to the KB).
 fn mb(bytes: i64) -> String {
-    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    EN.bytes(bytes as f64)
 }
 
 fn when(ts: i64) -> String {
@@ -134,12 +136,12 @@ fn print_results(out: &Value) {
         }
         let m = &s["meta"];
         println!(
-            "({} row{} · read {} · written {} · {} ms)",
+            "({} row{} · read {} · written {} · {})",
             rows.len(),
             if rows.len() == 1 { "" } else { "s" },
-            m["rows_read"].as_i64().unwrap_or(0),
-            m["rows_written"].as_i64().unwrap_or(0),
-            m["duration"].as_f64().map(|d| format!("{d:.1}")).unwrap_or_else(|| "?".into()),
+            units::grouped(m["rows_read"].as_f64().unwrap_or(0.0)),
+            units::grouped(m["rows_written"].as_f64().unwrap_or(0.0)),
+            m["duration"].as_f64().map(|d| EN.duration(d)).unwrap_or_else(|| "?".into()),
         );
     }
 }

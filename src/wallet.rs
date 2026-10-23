@@ -12,6 +12,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::client::Client;
+use mafold_core::mafold_types::units::{self, EN};
 
 #[derive(Subcommand)]
 pub enum WalletCmd {
@@ -56,41 +57,65 @@ pub enum WalletCmd {
     },
 }
 
-/// "1M" / "2.5B" / "1000" → raw tokens.
+/// "1M" / "2.5B" / "1000" → raw tokens. Read as decimal digits, not a float:
+/// 4.1 × 1e6 is 4099999.9999999995 in floating point, and flooring that sent
+/// one token less than the "4.1M" the wallet itself prints. A fraction finer
+/// than one token is dropped.
 fn parse_amount(s: &str) -> Result<i64> {
     let s = s.trim();
-    let (num, mult) = match s.chars().last().map(|c| c.to_ascii_lowercase()) {
-        Some('k') => (&s[..s.len() - 1], 1e3),
-        Some('m') => (&s[..s.len() - 1], 1e6),
-        Some('b') => (&s[..s.len() - 1], 1e9),
-        _ => (s, 1.0),
+    let bad = || anyhow::anyhow!("bad amount `{s}` — try 1M / 2.5B / 1000");
+    let (num, zeros) = match s.chars().last().map(|c| c.to_ascii_lowercase()) {
+        Some('k') => (&s[..s.len() - 1], 3),
+        Some('m') => (&s[..s.len() - 1], 6),
+        Some('b') => (&s[..s.len() - 1], 9),
+        _ => (s, 0),
     };
-    let v: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad amount `{s}` — try 1M / 2.5B / 1000"))?;
-    let raw = (v * mult).floor() as i64;
+    let (whole, frac) = num.trim().split_once('.').unwrap_or((num.trim(), ""));
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || !(frac.is_empty() || digits(frac)) {
+        return Err(bad());
+    }
+    let frac: String = frac.chars().chain(std::iter::repeat('0')).take(zeros).collect();
+    let raw = whole
+        .parse::<i64>()
+        .ok()
+        .and_then(|w| w.checked_mul(10i64.pow(zeros as u32)))
+        .and_then(|w| w.checked_add(if frac.is_empty() { 0 } else { frac.parse::<i64>().ok()? }))
+        .ok_or_else(bad)?;
     if raw <= 0 {
         bail!("amount must be positive");
     }
     Ok(raw)
 }
 
+/// A wallet amount on the shared ruler: "2.5M" / "1B" / "999" — one decimal,
+/// the same as every client's wallet (owner, 2026-10-22: no exception).
 fn fmt(n: i64) -> String {
-    let a = n.abs() as f64;
-    if a >= 1e9 {
-        format!("{:.2}B", n as f64 / 1e9)
-    } else if a >= 1e6 {
-        format!("{:.2}M", n as f64 / 1e6)
-    } else if a >= 1e3 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
+    EN.compact(n as f64)
 }
 
 fn items(v: &Value) -> Vec<Value> {
     v["items"].as_array().cloned().unwrap_or_default()
+}
+
+/// Each currency's own unit ("token", "second"), from `walletRates`. A failed
+/// call is no units, and every amount then reads as tokens.
+async fn units_of(client: &Client) -> std::collections::HashMap<String, String> {
+    let Ok(r) = client.call("walletRates", json!({})).await else { return Default::default() };
+    items(&r)
+        .iter()
+        .filter_map(|row| {
+            let cur = row["currency"].as_str()?;
+            Some((cur.to_string(), row["unit"].as_str().unwrap_or("token").to_string()))
+        })
+        .collect()
+}
+
+/// An amount with its unit — "500K gpt-5.6-terra tokens": a bare "500K
+/// gpt-5.6-terra" left the reader asking 500K of what (owner, 2026-10-22).
+/// The id stays: it is what the reader types back.
+fn amount_of(n: i64, cur: &str, units: &std::collections::HashMap<String, String>) -> String {
+    EN.amount(n as f64, cur, units.get(cur).map(String::as_str), false)
 }
 
 /// A unit as a plural noun: "token" → "tokens", "second" → "seconds".
@@ -135,7 +160,7 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                     json!({ "to": to, "currency": currency, "amount": amt, "memo": memo }),
                 )
                 .await?;
-            println!("✓ sent {} {currency} → {to}", fmt(amt));
+            println!("✓ sent {} → {to}", amount_of(amt, &currency, &units_of(client).await));
         }
         WalletCmd::Convert { amount, from, to } => {
             let amt = parse_amount(&amount)?;
@@ -145,10 +170,11 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                     json!({ "currency": from, "to_currency": to, "amount": amt }),
                 )
                 .await?;
+            let units = units_of(client).await;
             println!(
-                "✓ {} {from} → {} {to}  (rate {:.4})",
-                fmt(amt),
-                fmt(r["to_amount"].as_i64().unwrap_or(0)),
+                "✓ {} → {}  (rate {:.4})",
+                amount_of(amt, &from, &units),
+                amount_of(r["to_amount"].as_i64().unwrap_or(0), &to, &units),
                 r["rate"].as_f64().unwrap_or(0.0)
             );
         }
@@ -163,10 +189,10 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
             for row in items(&r) {
                 let unit = row["unit"].as_str().unwrap_or("token");
                 println!(
-                    "  {:<22} in ${:<7} out ${:<9} per 1M {}",
+                    "  {:<22} in {:<8} out {:<10} per 1M {}",
                     row["currency"].as_str().unwrap_or("?"),
-                    row["usd_in"].as_f64().unwrap_or(0.0),
-                    row["usd_out"].as_f64().unwrap_or(0.0),
+                    units::usd(row["usd_in"].as_f64().unwrap_or(0.0)),
+                    units::usd(row["usd_out"].as_f64().unwrap_or(0.0)),
                     plural(unit)
                 );
             }
@@ -180,6 +206,7 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                 println!("(no transactions)");
                 return Ok(());
             }
+            let units = units_of(client).await;
             for tx in rows {
                 let kind = tx["kind"].as_str().unwrap_or("?");
                 // The SERVER stamps direction (`credit`). Keeping our own list
@@ -204,14 +231,13 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                     (false, None) => String::new(),
                 };
                 let conv = match (tx["to_amount"].as_i64(), tx["to_currency"].as_str()) {
-                    (Some(a), Some(c)) => format!(" → +{} {c}", fmt(a)),
+                    (Some(a), Some(c)) => format!(" → +{}", amount_of(a, c, &units)),
                     _ => String::new(),
                 };
                 println!(
-                    "  {:<10} {sign}{} {}{conv}{peer}{memo}",
+                    "  {:<10} {sign}{}{conv}{peer}{memo}",
                     kind,
-                    fmt(tx["amount"].as_i64().unwrap_or(0)),
-                    tx["currency"].as_str().unwrap_or("?")
+                    amount_of(tx["amount"].as_i64().unwrap_or(0), tx["currency"].as_str().unwrap_or("?"), &units),
                 );
             }
         }
@@ -234,14 +260,15 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                 return Ok(());
             }
             for g in rows {
+                // A grant's cap belongs to no one currency: "1M tokens".
                 let cap = g["monthly_cap"]
                     .as_i64()
-                    .map(fmt)
+                    .map(|n| EN.tokens(n as f64))
                     .unwrap_or_else(|| "uncapped".into());
                 println!(
-                    "  @{:<20} cap {cap:<10} used this month {}",
+                    "  @{:<20} cap {cap:<12} used this month {}",
                     g["spender"].as_str().unwrap_or("?"),
-                    fmt(g["used_month"].as_i64().unwrap_or(0))
+                    EN.tokens(g["used_month"].as_i64().unwrap_or(0) as f64)
                 );
             }
         }
@@ -258,8 +285,43 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                     json!({ "to": to, "currency": currency, "amount": amt, "memo": memo }),
                 )
                 .await?;
-            println!("✓ minted {} {currency} → {to}", fmt(amt));
+            println!("✓ minted {} → {to}", amount_of(amt, &currency, &units_of(client).await));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amounts_read_exactly_what_the_wallet_prints() {
+        assert_eq!(parse_amount("4.1M").unwrap(), 4_100_000, "not 4,099,999");
+        assert_eq!(parse_amount("8.2m").unwrap(), 8_200_000);
+        assert_eq!(parse_amount("2.5B").unwrap(), 2_500_000_000);
+        assert_eq!(parse_amount("64K").unwrap(), 64_000);
+        assert_eq!(parse_amount(" 1000 ").unwrap(), 1000);
+        assert_eq!(parse_amount("1.5").unwrap(), 1, "a fraction of a token is dropped");
+        assert_eq!(parse_amount("1.23456M").unwrap(), 1_234_560);
+        for bad in ["abc", "1,000", "-5", "0", "0.4", "1e3", "M", "1.2.3K"] {
+            assert!(parse_amount(bad).is_err(), "{bad}");
+        }
+        assert_eq!(fmt(4_100_000), "4.1M", "and the wallet prints it back the same");
+    }
+
+    #[test]
+    fn amounts_say_their_unit() {
+        let units: std::collections::HashMap<String, String> =
+            [("seedance-2".to_string(), "second".to_string())].into();
+        assert_eq!(amount_of(500_000, "gpt-5.6-terra", &units), "500K gpt-5.6-terra tokens");
+        assert_eq!(amount_of(1, "opus-5.5", &units), "1 opus-5.5 token");
+        assert_eq!(amount_of(30, "seedance-2", &units), "30 seedance-2 seconds");
+        assert_eq!(
+            amount_of(4_100_000, "opus-5.5", &Default::default()),
+            "4.1M opus-5.5 tokens",
+            "no price list ⇒ token"
+        );
+        assert_eq!(EN.tokens(2_000_000.0), "2M tokens", "a grant's cap owns no currency");
+    }
 }

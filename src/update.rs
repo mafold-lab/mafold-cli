@@ -20,6 +20,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use mafold_core::mafold_types::units::EN;
 
 const REPO: &str = "mafold-lab/mafold-cli";
 
@@ -607,6 +608,127 @@ pub fn mark_failed(version: &str, error: &anyhow::Error) -> std::time::Duration 
     backoff_for(streak)
 }
 
+// ── what the update checks found, for `mafold status` ──
+
+/// What the supervisor's update checks last found — `~/.mafold/update.json`,
+/// for `mafold status` (a separate process) to say. The cooldown itself stays
+/// in [`LAST_FAILED`]; this is only what a person is shown.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct Seen {
+    /// When a check last got an answer, epoch seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    /// The release that answer offered; none when this machine was current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered: Option<String>,
+    /// The last failed install, until one succeeds or there's nothing left to
+    /// install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<Failed>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Failed {
+    pub version: String,
+    /// The first of the failures in a row, epoch seconds.
+    pub since: i64,
+    /// The latest one.
+    pub at: i64,
+    /// Failed installs of this version in a row.
+    pub streak: usize,
+    pub error: String,
+}
+
+fn seen_path() -> PathBuf {
+    mafold_dir().join("update.json")
+}
+
+pub fn seen() -> Seen {
+    seen_at(&seen_path())
+}
+
+fn seen_at(path: &Path) -> Seen {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn note_seen(change: impl FnOnce(&mut Seen)) {
+    note_seen_at(&seen_path(), change)
+}
+
+/// Read, change, write back whole (aside, then renamed over it). The
+/// supervisor is the one writer that matters; a standalone agent's own
+/// update failure lands here too, and is as true of this machine.
+fn note_seen_at(path: &Path, change: impl FnOnce(&mut Seen)) {
+    let mut s = seen_at(path);
+    change(&mut s);
+    let Ok(json) = serde_json::to_string(&s) else { return };
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let aside = path.with_extension(format!("json.{}", std::process::id()));
+    if std::fs::write(&aside, json).is_ok() && std::fs::rename(&aside, path).is_err() {
+        let _ = std::fs::remove_file(&aside);
+    }
+}
+
+/// A check got an answer: `offered` is the release it offered, none when this
+/// machine is current — and with nothing to install, no install is failing.
+pub fn note_checked(offered: Option<&str>) {
+    let now = crate::accounts::now();
+    note_seen(|s| checked(s, offered, now));
+}
+
+fn checked(s: &mut Seen, offered: Option<&str>, now: i64) {
+    s.checked_at = Some(now);
+    s.offered = offered.map(str::to_string);
+    if offered.is_none() {
+        s.failed = None;
+    }
+}
+
+/// An install went through.
+pub fn note_installed() {
+    note_seen(|s| s.failed = None);
+}
+
+/// The supervisor's install of `version` failed. Counted here, not from the
+/// cooldown's in-memory streak: a restart in between doesn't make a version
+/// that has failed for days look like it failed once.
+pub fn note_failed(version: &str, error: &anyhow::Error) {
+    let now = crate::accounts::now();
+    note_seen(|s| failed(s, version, &format!("{error:#}"), now));
+}
+
+fn failed(s: &mut Seen, version: &str, error: &str, now: i64) {
+    let before = s.failed.take().filter(|f| f.version == version);
+    s.failed = Some(Failed {
+        version: version.to_string(),
+        since: before.as_ref().map_or(now, |f| f.since),
+        at: now,
+        streak: before.map_or(1, |f| f.streak + 1),
+        error: error.chars().take(300).collect(),
+    });
+}
+
+/// The release on offer that is newer than `running`, if the last check saw
+/// one.
+pub fn available(s: &Seen, running: &str) -> Option<String> {
+    s.offered.clone().filter(|v| is_newer(v, running))
+}
+
+/// An update worth a person's attention: installing a version newer than
+/// `running` failed twice or more in a row (once is usually a network blip
+/// the next attempt gets past), on a machine that updates itself.
+pub fn failing<'a>(s: &'a Seen, running: &str, auto_update: bool) -> Option<&'a Failed> {
+    unresolved(s, running).filter(|f| auto_update && f.streak >= 2)
+}
+
+/// The last failed install, while it is still of a version newer than
+/// `running` — an install that went through since makes it history.
+pub fn unresolved<'a>(s: &'a Seen, running: &str) -> Option<&'a Failed> {
+    s.failed.as_ref().filter(|f| is_newer(&f.version, running))
+}
+
 /// Should the auto-updater try `version` now? When it shouldn't, it SAYS SO:
 /// a cooldown that skips without a word is indistinguishable from an updater
 /// that has stopped working, which is exactly what this looked like on
@@ -627,14 +749,10 @@ pub fn should_attempt(version: &str) -> bool {
     false
 }
 
-/// `90s` / `7m` / `1h05m` — for log lines a person reads.
+/// `10s` / `1m 30s` / `1h 5m` — for log lines a person reads, on the shared
+/// ruler (`mafold_types::units`).
 pub fn human(d: std::time::Duration) -> String {
-    let s = d.as_secs();
-    match s {
-        0..=99 => format!("{s}s"),
-        100..=3599 => format!("{}m", (s + 30) / 60),
-        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
-    }
+    EN.elapsed(d.as_secs() as f64 * 1000.0)
 }
 
 /// Wall-clock time since `t`. A clock that went backwards reads as "forever",
@@ -1143,8 +1261,10 @@ mod tests {
     #[test]
     fn durations_read_like_a_person_wrote_them() {
         assert_eq!(human(Duration::from_secs(10)), "10s");
+        assert_eq!(human(Duration::from_millis(400)), "0s");
+        assert_eq!(human(Duration::from_secs(90)), "1m 30s");
         assert_eq!(human(Duration::from_secs(5 * 60)), "5m");
-        assert_eq!(human(Duration::from_secs(65 * 60)), "1h05m");
+        assert_eq!(human(Duration::from_secs(65 * 60)), "1h 5m");
     }
 
     /// A blip mid-download is retried in place: two failures then a success is
@@ -1193,5 +1313,65 @@ mod tests {
         assert_eq!(Channel::parse("nightly"), None);
         assert_eq!(Channel::parse(""), None);
         assert_eq!(Channel::default(), Channel::Stable);
+    }
+}
+
+#[cfg(test)]
+mod seen_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mafold-seen-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("update.json")
+    }
+
+    fn failed(version: &str, streak: usize) -> Seen {
+        Seen {
+            failed: Some(Failed { version: version.into(), since: 1, at: 2, streak, error: "x".into() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_check_says_what_is_on_offer_until_it_is_installed() {
+        let p = tmp("offer");
+        assert_eq!(seen_at(&p), Seen::default(), "nothing checked yet");
+        note_seen_at(&p, |s| checked(s, Some("0.9.151"), 10));
+        let s = seen_at(&p);
+        assert_eq!(s.checked_at, Some(10));
+        assert_eq!(available(&s, "0.9.150").as_deref(), Some("0.9.151"));
+        assert_eq!(available(&s, "0.9.151"), None, "running it already: nothing on offer");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn failures_of_one_version_add_up_across_restarts_and_another_starts_over() {
+        let mut s = Seen::default();
+        super::failed(&mut s, "0.9.151", "reset", 100);
+        super::failed(&mut s, "0.9.151", "reset again", 400);
+        let f = s.failed.clone().unwrap();
+        assert_eq!((f.streak, f.since, f.at, f.error.as_str()), (2, 100, 400, "reset again"));
+        // The release moved on: a new run of failures.
+        super::failed(&mut s, "0.9.152", "x", 900);
+        let f = s.failed.unwrap();
+        assert_eq!((f.version.as_str(), f.streak, f.since), ("0.9.152", 1, 900));
+    }
+
+    #[test]
+    fn being_current_clears_a_failure() {
+        let mut s = failed("0.9.151", 3);
+        checked(&mut s, Some("0.9.151"), 10);
+        assert!(s.failed.is_some(), "still on offer, still failing");
+        checked(&mut s, None, 20);
+        assert_eq!((s.failed, s.offered, s.checked_at), (None, None, Some(20)));
+    }
+
+    #[test]
+    fn a_failing_update_is_two_in_a_row_of_a_newer_version_on_a_machine_that_updates_itself() {
+        assert!(failing(&failed("0.9.151", 2), "0.9.150", true).is_some());
+        assert!(failing(&failed("0.9.151", 1), "0.9.150", true).is_none(), "once is a blip");
+        assert!(failing(&failed("0.9.151", 3), "0.9.151", true).is_none(), "installed after all");
+        assert!(failing(&failed("0.9.151", 3), "0.9.150", false).is_none(), "it isn't trying to");
     }
 }
