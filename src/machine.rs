@@ -288,7 +288,7 @@ mod tests {
 
     fn up(started_at: i64) -> Service {
         Service {
-            run: Some(Run { pid: 7, started_at, version: "0.9.150".into(), auto_update: true, crashes: vec![] }),
+            run: Some(Run { pid: 7, started_at, version: "0.9.150".into(), auto_update: true, crashes: vec![], control: 1, update_setting: true }),
             last_exit: None,
             crashes: vec![],
         }

@@ -320,7 +320,9 @@ impl std::error::Error for NoStoredLogin {}
 
 /// This machine's login Keychain, when Claude Code keeps logins in one
 /// (macOS), for readers that ask over and over — the credential sweep, the
-/// usage readout: an item that just failed is left alone for a while.
+/// usage readout, the seat a turn runs on: an item that just failed is left
+/// alone for a while, and an item the Keychain merely didn't answer for
+/// reads as what it said last ([`Unanswered`]).
 pub fn keychain() -> Option<Keychain<'static>> {
     cfg!(target_os = "macos").then_some(&remembered_keychain_password as Keychain<'static>)
 }
@@ -334,50 +336,116 @@ pub fn keychain_now() -> Option<Keychain<'static>> {
 /// How long a Keychain item that couldn't be read is left alone.
 const KEYCHAIN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Keychain items that recently couldn't be read, and what was said.
+/// How long an item's last answer may stand in for one the Keychain didn't
+/// give. Longer than that, a Keychain that won't answer is a problem of its
+/// own, and saying so is the right answer.
+const KEYCHAIN_STAND_IN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Why a Keychain item couldn't be read — and whether the Keychain said so.
+#[derive(Debug, Clone, PartialEq)]
+enum Unread {
+    /// It answered no: it is locked, or `security` refused the item. Claude
+    /// Code gets the same answer, so it stands.
+    Said(String),
+    /// It never answered: `security` hung past [`KEYCHAIN_TIMEOUT`] or
+    /// wouldn't start. That says nothing about the item — a busy Mac does it
+    /// for a second or two.
+    Silent(String),
+}
+
+impl Unread {
+    fn why(self) -> String {
+        match self {
+            Unread::Said(why) | Unread::Silent(why) => why,
+        }
+    }
+}
+
+/// What each Keychain item said last, and the ones that recently couldn't be
+/// read.
+///
+/// A Keychain that goes silent for a moment must not read as every login on
+/// the machine going bad at once. 10-24, twice in an afternoon on a busy Mac:
+/// the lock probe hung past its 2 s, `default` and `work` became «credential
+/// unreadable» for the next minute, and a turn ended on «no Claude account
+/// could take this turn» — once after first running on `personal`, a seat
+/// that wasn't signed in, because its read flipped between "not there" and
+/// "unreadable" mid-check and looked like a new login (`check_seat`). Claude
+/// Code itself read the same items fine moments later. So while the Keychain
+/// is silent, each item reads as what it said last, for
+/// [`KEYCHAIN_STAND_IN`]. A real "no" — locked — is believed, and drops the
+/// last answer with it.
 #[derive(Default)]
-struct Unanswered(HashMap<String, (Instant, String)>);
+struct Unanswered {
+    /// A recent failure, repeated instead of asking for [`KEYCHAIN_BACKOFF`].
+    failed: HashMap<String, (Instant, Unread)>,
+    /// Each item's last real answer — "not there" included — and when.
+    said: HashMap<String, (Instant, Option<String>)>,
+}
 
 impl Unanswered {
-    /// The failure to repeat instead of asking again, if one is recent.
-    fn recent(&self, service: &str, now: Instant) -> Option<String> {
-        self.0
-            .get(service)
-            .filter(|(at, _)| now.saturating_duration_since(*at) < KEYCHAIN_BACKOFF)
-            .map(|(_, why)| why.clone())
+    /// What to hand back instead of asking, while a failure is recent.
+    fn recent(&self, service: &str, now: Instant) -> Option<Result<Option<String>, String>> {
+        let (at, unread) = self.failed.get(service)?;
+        (now.saturating_duration_since(*at) < KEYCHAIN_BACKOFF).then(|| self.answer(service, now, unread.clone()))
     }
 
-    /// Remember how asking about `service` went: only a failure is kept —
-    /// an answer, even "not there", is asked again next time.
-    fn record(&mut self, service: &str, now: Instant, got: &Result<Option<String>, String>) {
+    /// Remember how asking about `service` went, and say what to hand back.
+    /// An answer, even "not there", is asked again next time.
+    fn record(&mut self, service: &str, now: Instant, got: Result<Option<String>, Unread>) -> Result<Option<String>, String> {
         match got {
-            Err(why) => {
-                self.0.insert(service.to_string(), (now, why.clone()));
+            Ok(item) => {
+                self.failed.remove(service);
+                self.said.insert(service.to_string(), (now, item.clone()));
+                Ok(item)
             }
-            Ok(_) => {
-                self.0.remove(service);
+            Err(unread) => {
+                if matches!(unread, Unread::Said(_)) {
+                    self.said.remove(service);
+                }
+                self.failed.insert(service.to_string(), (now, unread.clone()));
+                self.answer(service, now, unread)
             }
+        }
+    }
+
+    /// A failure as handed back: a silent Keychain repeats what the item said
+    /// last, while that is recent; anything else is the failure itself.
+    fn answer(&self, service: &str, now: Instant, unread: Unread) -> Result<Option<String>, String> {
+        match (unread, self.said.get(service)) {
+            (Unread::Silent(_), Some((at, item))) if now.saturating_duration_since(*at) < KEYCHAIN_STAND_IN => {
+                Ok(item.clone())
+            }
+            (unread, _) => Err(unread.why()),
         }
     }
 }
 
 static UNANSWERED: OnceLock<Mutex<Unanswered>> = OnceLock::new();
 
-/// [`keychain_password`], minus the waits a Keychain that won't answer costs.
+/// [`read_keychain_item`], minus the waits a Keychain that won't answer costs
+/// and the false alarms one that went quiet for a moment raises.
 fn remembered_keychain_password(service: &str) -> Result<Option<String>, String> {
     let memo = UNANSWERED.get_or_init(Default::default);
-    if let Some(why) = memo.lock().unwrap_or_else(|p| p.into_inner()).recent(service, Instant::now()) {
-        return Err(why);
+    if let Some(got) = memo.lock().unwrap_or_else(|p| p.into_inner()).recent(service, Instant::now()) {
+        return got;
     }
-    let got = keychain_password(service);
-    memo.lock().unwrap_or_else(|p| p.into_inner()).record(service, Instant::now(), &got);
-    got
+    let got = read_keychain_item(service, false);
+    let silent = match &got {
+        Err(Unread::Silent(why)) => Some(why.clone()),
+        _ => None,
+    };
+    let answer = memo.lock().unwrap_or_else(|p| p.into_inner()).record(service, Instant::now(), got);
+    if let (Some(why), Ok(_)) = (silent, &answer) {
+        eprintln!("keychain: `{service}` didn't answer ({why}) — going on what it said last");
+    }
+    answer
 }
 
 /// How long `security` may take — Claude Code's own bound on the same read.
 /// Something that still waits on a person (a dialog) must not hold the
-/// daemon's link handler or a write; a login Claude Code couldn't read in
-/// that time is one it won't run on.
+/// daemon's link handler or a write. Running out of it is silence, not an
+/// answer ([`Unread::Silent`]): a moment later the same read usually lands.
 const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// `security`'s exit status for "no such item" (errSecItemNotFound) — the one
@@ -424,36 +492,35 @@ fn keychain_lock(fresh: bool) -> Lock {
     lock
 }
 
+/// [`read_keychain_item`], probing the lock afresh.
+fn keychain_password_now(service: &str) -> Result<Option<String>, String> {
+    read_keychain_item(service, true).map_err(Unread::why)
+}
+
 /// One generic password out of the login Keychain, through `security` — the
 /// tool Claude Code itself writes the item with, which is why a daemon reads
-/// it without a prompt. `None` when there is no such item; otherwise any
-/// failure is what `security` said, or that the Keychain is locked.
-fn keychain_password(service: &str) -> Result<Option<String>, String> {
-    read_keychain_item(service, false)
-}
-
-/// [`keychain_password`], probing the lock afresh.
-fn keychain_password_now(service: &str) -> Result<Option<String>, String> {
-    read_keychain_item(service, true)
-}
-
-fn read_keychain_item(service: &str, fresh: bool) -> Result<Option<String>, String> {
+/// it without a prompt. `None` when there is no such item; otherwise what
+/// `security` said, that the Keychain is locked, or that it didn't answer.
+/// `fresh` probes the lock afresh.
+fn read_keychain_item(service: &str, fresh: bool) -> Result<Option<String>, Unread> {
     match keychain_lock(fresh) {
         Lock::Unlocked => {}
-        Lock::Locked => return Err("the login Keychain is locked — unlock it and try again".to_string()),
-        Lock::Unknown(why) => return Err(format!("couldn't tell whether the login Keychain is locked ({why})")),
+        Lock::Locked => return Err(Unread::Said("the login Keychain is locked — unlock it and try again".to_string())),
+        Lock::Unknown(why) => {
+            return Err(Unread::Silent(format!("couldn't tell whether the login Keychain is locked ({why})")))
+        }
     }
-    let (status, stdout, stderr) = run_security(&["find-generic-password", "-s", service, "-w"])?;
+    let (status, stdout, stderr) = run_security(&["find-generic-password", "-s", service, "-w"]).map_err(Unread::Silent)?;
     if status.code() == Some(SECURITY_NOT_FOUND) {
         return Ok(None);
     }
     if !status.success() {
         let said = String::from_utf8_lossy(&stderr).trim().to_string();
-        return Err(if said.is_empty() { format!("security {status}") } else { said });
+        return Err(Unread::Said(if said.is_empty() { format!("security {status}") } else { said }));
     }
     String::from_utf8(stdout)
         .map(|s| Some(unhex(s.trim_end())))
-        .map_err(|_| "the item is not UTF-8".to_string())
+        .map_err(|_| Unread::Said("the item is not UTF-8".to_string()))
 }
 
 /// `security <args>`, bounded by [`KEYCHAIN_TIMEOUT`]: how it exited, and
@@ -1279,8 +1346,20 @@ impl Choice {
     pub fn note(&self) -> Option<String> {
         if !self.switched() { return None; }
         let account = self.account.as_ref()?;
-        let why = self.skipped.iter().map(|i| format!("`{}` {}", i.account, i.detail)).collect::<Vec<_>>().join("; ");
-        Some(format!("↻ Using account `{}` — {why}", account.name))
+        Some(format!("↻ Using account `{}` — {}", account.name, self.why()))
+    }
+
+    /// No login can take the turn: each one and what stopped it, for the
+    /// log. The reply's card tells the owner; a log that says nothing leaves
+    /// nothing to look back at (10-24 14:35, a turn that ended on «no Claude
+    /// account could take this turn» without a line).
+    pub fn none_note(&self) -> Option<String> {
+        if self.account.is_some() { return None; }
+        Some(format!("⛔ No Claude account can take this turn — {}", self.why()))
+    }
+
+    fn why(&self) -> String {
+        self.skipped.iter().map(|i| format!("`{}` {}", i.account, i.detail)).collect::<Vec<_>>().join("; ")
     }
 }
 
@@ -1554,7 +1633,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn an_absent_keychain_item_reads_as_not_there() {
-        let got = keychain_password(&format!("mafold-test-absent-{}", std::process::id()));
+        let got = read_keychain_item(&format!("mafold-test-absent-{}", std::process::id()), false);
         println!("absent item → {got:?}");
         assert!(!matches!(got, Ok(Some(_))), "{got:?}");
     }
@@ -1666,42 +1745,121 @@ mod tests {
         }
     }
 
-    /// The readers that ask over and over — the sweep, the usage readout —
-    /// go through the memory; the one a person is waiting on does not.
+    /// The readers that ask over and over — the sweep, the usage readout, a
+    /// turn's seat — go through the memory; the one a person is waiting on
+    /// does not.
     #[cfg(target_os = "macos")]
     #[test]
     fn repeat_readers_go_through_the_memory_and_a_person_does_not() {
         let service = format!("mafold-test-remembered-{}", std::process::id());
-        UNANSWERED
+        let _ = UNANSWERED
             .get_or_init(Default::default)
             .lock()
             .unwrap()
-            .record(&service, Instant::now(), &Err("remembered".into()));
+            .record(&service, Instant::now(), Err(Unread::Said("remembered".into())));
         assert_eq!(keychain().unwrap()(&service), Err("remembered".to_string()));
         assert!(!matches!(keychain_now().unwrap()(&service), Err(why) if why == "remembered"));
     }
 
-    /// A Keychain that won't answer (locked: every ask is a 2s wait for a
-    /// dialog nobody is looking at) is not asked again for a while — the
-    /// usage readout and the credential sweep ask on every turn and every few
-    /// seconds. "Not there" and a real answer are never remembered: a fresh
-    /// `/login` must be seen on the next read.
+    /// A Keychain that won't answer is not asked again for a while — every
+    /// ask is a 2s wait, and the usage readout and the credential sweep ask
+    /// on every turn and every few seconds. An answer, "not there" included,
+    /// is never repeated in place of asking: a fresh `/login` must be seen on
+    /// the next read.
     #[test]
     fn a_keychain_that_wont_answer_is_not_asked_again_for_a_while() {
+        let secs = std::time::Duration::from_secs;
         let t0 = Instant::now();
         let mut memo = Unanswered::default();
-        let locked: Result<Option<String>, String> = Err("no answer from the Keychain in 2s — is it locked?".into());
-        memo.record("svc", t0, &locked);
-        assert_eq!(memo.recent("svc", t0 + std::time::Duration::from_secs(30)).as_deref(), locked.as_ref().err().map(String::as_str));
-        assert_eq!(memo.recent("other", t0 + std::time::Duration::from_secs(30)), None);
-        assert_eq!(memo.recent("svc", t0 + KEYCHAIN_BACKOFF + std::time::Duration::from_secs(1)), None);
+        let silent = || -> Result<Option<String>, Unread> {
+            Err(Unread::Silent("no answer from the Keychain in 2s — is it locked?".into()))
+        };
+        let why: Result<Option<String>, String> = Err("no answer from the Keychain in 2s — is it locked?".into());
+        assert_eq!(memo.record("svc", t0, silent()), why);
+        assert_eq!(memo.recent("svc", t0 + secs(30)), Some(why.clone()));
+        assert_eq!(memo.recent("other", t0 + secs(30)), None);
+        assert_eq!(memo.recent("svc", t0 + KEYCHAIN_BACKOFF + secs(1)), None);
 
-        memo.record("svc", t0, &locked);
-        memo.record("svc", t0 + std::time::Duration::from_secs(1), &Ok(None));
-        assert_eq!(memo.recent("svc", t0 + std::time::Duration::from_secs(2)), None);
-        memo.record("svc", t0, &locked);
-        memo.record("svc", t0 + std::time::Duration::from_secs(1), &Ok(Some("blob".into())));
-        assert_eq!(memo.recent("svc", t0 + std::time::Duration::from_secs(2)), None);
+        let _ = memo.record("svc", t0 + secs(1), Ok(None));
+        assert_eq!(memo.recent("svc", t0 + secs(2)), None);
+        let _ = memo.record("svc", t0 + secs(3), silent());
+        let _ = memo.record("svc", t0 + secs(4), Ok(Some("blob".into())));
+        assert_eq!(memo.recent("svc", t0 + secs(5)), None);
+    }
+
+    /// 10-24: the Keychain went quiet for a moment and every login on the
+    /// machine read as «credential unreadable». While it is silent, an item
+    /// reads as what it said last — a login stays a login, "not there" stays
+    /// not there — for [`KEYCHAIN_STAND_IN`]; the next real answer replaces it.
+    #[test]
+    fn a_silent_keychain_repeats_what_each_item_said_last() {
+        let secs = std::time::Duration::from_secs;
+        let t0 = Instant::now();
+        let mut memo = Unanswered::default();
+        let silent = || -> Result<Option<String>, Unread> {
+            Err(Unread::Silent(
+                "couldn't tell whether the login Keychain is locked (no answer from the Keychain in 2s — is it locked?)".into(),
+            ))
+        };
+        assert_eq!(memo.record("signed-in", t0, Ok(Some("blob".into()))), Ok(Some("blob".to_string())));
+        assert_eq!(memo.record("signed-out", t0, Ok(None)), Ok(None));
+
+        assert_eq!(memo.record("signed-in", t0 + secs(20), silent()), Ok(Some("blob".to_string())));
+        assert_eq!(memo.record("signed-out", t0 + secs(20), silent()), Ok(None));
+        // ...and so for the minute it is left alone.
+        assert_eq!(memo.recent("signed-in", t0 + secs(50)), Some(Ok(Some("blob".to_string()))));
+        assert_eq!(memo.recent("signed-out", t0 + secs(50)), Some(Ok(None)));
+
+        // An item it never answered for has nothing to stand in for it…
+        assert!(memo.record("never", t0 + secs(20), silent()).is_err());
+        // …nor one whose last answer is too old to vouch for.
+        assert!(memo.record("signed-in", t0 + KEYCHAIN_STAND_IN + secs(1), silent()).is_err());
+
+        // It answers again: that answer counts from then on.
+        assert_eq!(memo.record("signed-out", t0 + secs(90), Ok(Some("new login".into()))), Ok(Some("new login".to_string())));
+        assert_eq!(memo.recent("signed-out", t0 + secs(91)), None);
+    }
+
+    /// A Keychain that answers "locked" is believed: Claude Code can't read
+    /// the item either. The last answer goes with it — the Keychain is no
+    /// longer as it was — so a silence after the lock vouches for nothing.
+    #[test]
+    fn a_locked_keychain_is_believed() {
+        let secs = std::time::Duration::from_secs;
+        let t0 = Instant::now();
+        let mut memo = Unanswered::default();
+        let _ = memo.record("svc", t0, Ok(Some("blob".into())));
+        let locked: Result<Option<String>, String> = Err("the login Keychain is locked — unlock it and try again".into());
+        assert_eq!(
+            memo.record("svc", t0 + secs(1), Err(Unread::Said("the login Keychain is locked — unlock it and try again".into()))),
+            locked
+        );
+        assert_eq!(memo.recent("svc", t0 + secs(30)), Some(locked));
+        let silent = Err(Unread::Silent("no answer from the Keychain in 2s — is it locked?".into()));
+        assert!(memo.record("svc", t0 + KEYCHAIN_BACKOFF + secs(2), silent).is_err());
+    }
+
+    /// Through the reader every seat check goes through: with the Keychain
+    /// hung, the signed-in login is still read — not «unreadable», which
+    /// passed over every good seat — and the one that was never signed in
+    /// still reads as signed out, not as a changed login to give a try.
+    #[test]
+    fn a_hung_keychain_leaves_each_login_as_it_was() {
+        let secs = std::time::Duration::from_secs;
+        let dir = std::env::temp_dir().join(format!("mafold-hung-keychain-{}", std::process::id()));
+        let signed_in = LoginStore { file: dir.join("in/.credentials.json"), keychain_service: "Claude Code-credentials".into() };
+        let signed_out = LoginStore { file: dir.join("out/.credentials.json"), keychain_service: "Claude Code-credentials-0badc0de".into() };
+        let t0 = Instant::now();
+        let memo = Mutex::new(Unanswered::default());
+        let _ = memo.lock().unwrap().record(&signed_in.keychain_service, t0, Ok(Some("from-keychain".into())));
+        let _ = memo.lock().unwrap().record(&signed_out.keychain_service, t0, Ok(None));
+        let hung = |service: &str| {
+            let silent = Err(Unread::Silent("no answer from the Keychain in 2s — is it locked?".into()));
+            memo.lock().unwrap().record(service, t0 + secs(30), silent)
+        };
+        assert_eq!(signed_in.read_with(Some(&hung)).unwrap(), "from-keychain");
+        let out = signed_out.read_with(Some(&hung)).unwrap_err();
+        assert!(out.signed_out(), "{out}");
     }
 
     /// The whole premise: a seat moves the CREDENTIAL and nothing else. The
@@ -2193,8 +2351,27 @@ mod tests {
         assert!(c.switched());
         let n = c.note().unwrap();
         assert!(n.contains("`b`") && n.contains("`default` is exhausted"), "{n}");
+        assert_eq!(c.none_note(), None);
         let same = Choice { preferred: "b".into(), ..c };
         assert_eq!(same.note(), None);
+    }
+
+    /// With no login at all, the log line names every one and why — the
+    /// line 10-24 14:35 never got.
+    #[test]
+    fn a_choice_with_no_login_says_why_each_was_passed_over() {
+        let c = Choice {
+            account: None,
+            preferred: "personal".into(),
+            skipped: vec![
+                AccountIssue::new("personal", FailureKind::Auth, "isn't logged in — `/login personal` fixes that"),
+                AccountIssue::new("default", FailureKind::Connection, "credential unreadable — no answer from the Keychain in 2s"),
+            ],
+        };
+        let n = c.none_note().unwrap();
+        assert!(n.starts_with("⛔ No Claude account can take this turn"), "{n}");
+        assert!(n.contains("`personal` isn't logged in") && n.contains("`default` credential unreadable"), "{n}");
+        assert_eq!(c.note(), None);
     }
 
     /// An Idle seat (lapsed access token + refresh token) on disk, whose

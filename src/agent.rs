@@ -2230,6 +2230,17 @@ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new
 
 pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String, auto_update: bool) -> Result<()> {
     let _ = START.set(std::time::Instant::now());
+    // A daemon the supervisor runs writes its own log from here on, and keeps
+    // it under 10 MB (C6) — the log the supervisor names, taken out of the
+    // environment before anything is started: a turn that runs `mafold agent`
+    // itself must not take this one's log over.
+    if let Some(log) = std::env::var_os(crate::logfile::LOG_ENV) {
+        std::env::remove_var(crate::logfile::LOG_ENV);
+        let log = std::path::PathBuf::from(log);
+        if let Err(e) = crate::logfile::keep(&log) {
+            eprintln!("⚠️  couldn't write {} ({e}) — output stays where the supervisor pointed it", log.display());
+        }
+    }
     // The flags this bot runs under (`windowsBackground` among them) — before
     // the first prompt is built, since the prompt states what they allow.
     crate::flags::refresh(&client).await;
@@ -2244,15 +2255,17 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // always current; if it updates, re-exec into the new binary. A failure is
     // printed and remembered (cooldown), never silently swallowed — on networks
     // where the release download is blocked, every restart used to announce
-    // "updating…" and then do nothing, with no clue why.
-    if auto_update {
+    // "updating…" and then do nothing, with no clue why. The machine setting
+    // (`mafold update --auto-update off`) is read here and before every later
+    // check (`maybe_update`), like the supervisor does.
+    if auto_update && crate::update::auto_update_on() {
         if let Ok(Some(r)) =
             crate::update::check(&client.http, &client.base, crate::update::Channel::current()).await
         {
             if crate::update::should_attempt(&r.version) {
                 println!("{}…", r.action_line());
                 match crate::update::apply(&client.http, &r.url, &r.version, r.sha256.as_deref()).await {
-                    Ok(()) => crate::update::reexec_or_warn(&r.version), // replaces this process (loud if not)
+                    Ok(()) => crate::update::reexec_or_warn(Some(&r.version)), // replaces this process (loud if not)
                     Err(e) => {
                         let wait = crate::update::mark_failed(&r.version, &e);
                         eprintln!(
@@ -2551,8 +2564,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         let mut tags: HashMap<String, u64> = HashMap::new();
         let mut others = 0usize;
         let mut orphans: Vec<String> = vec![];
-        if let Ok(home) = std::env::var("HOME") {
-            let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
+        if let Some(dir) = crate::bgtasks::registry_dir() {
             for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 match classify_registration(&name, &me) {
@@ -2700,7 +2712,11 @@ fn deprovision_and_exit(my_username: &str, token: &str, reason: &str) -> ! {
 /// flight → coord is idle), safely apply it and re-exec into the new
 /// binary. Idle-gated so a self-update never interrupts a reply; never returns
 /// on a successful re-exec. Shared by the periodic poll + the reconnect check.
+/// Nothing while this computer's automatic updates are off (the setting).
 async fn maybe_update(http: &reqwest::Client, base: &str, coord: &Arc<ExecCoord>) {
+    if !crate::update::auto_update_on() {
+        return;
+    }
     match crate::update::check(http, base, crate::update::Channel::current()).await {
         // This version already failed to apply recently (e.g. the download is
         // blocked on this network) — cooldown, so a cliUpdate nudge storm can't
@@ -2711,7 +2727,7 @@ async fn maybe_update(http: &reqwest::Client, base: &str, coord: &Arc<ExecCoord>
             if coord.idle() {
                 println!("↻ updating to v{} — restarting…", r.version);
                 match crate::update::apply(http, &r.url, &r.version, r.sha256.as_deref()).await {
-                    Ok(()) => crate::update::reexec_or_warn(&r.version),
+                    Ok(()) => crate::update::reexec_or_warn(Some(&r.version)),
                     Err(e) => {
                         let wait = crate::update::mark_failed(&r.version, &e);
                         eprintln!(
@@ -3422,6 +3438,7 @@ async fn intro_turn(
         false,
         None,
         settles,
+        None,
     )
     .await
     // A first-contact intro has no user waiting on it to interrupt — whatever
@@ -4196,9 +4213,19 @@ async fn connect_and_run(
             };
             let tap = Answer::Verdict { code, prompt };
             match deliver_ask_answer(chat_states, &conv_id, &msg_id, &from, standing, is_bot_handle(&from), tap).await {
-                Delivery::Delivered => println!("← permission {answer} from @{from} on {msg_id}"),
+                // The tap is whatever the client sent: quoted, not trusted to
+                // be a verdict code.
+                Delivery::Delivered => {
+                    println!("{}", crate::logfile::quoting(&format!("← permission from @{from} on {msg_id}"), &answer))
+                }
                 Delivery::NotTheirs { starter } => {
-                    println!("← permission {answer} from @{from} on {msg_id} (not theirs to answer → alert)");
+                    println!(
+                        "{}",
+                        crate::logfile::quoting(
+                            &format!("← permission from @{from} on {msg_id} (not theirs to answer → alert)"),
+                            &answer
+                        )
+                    );
                     let client = client.clone();
                     tokio::spawn(async move {
                         let lang = intro_lang_for(&client, &from).await;
@@ -4604,7 +4631,7 @@ async fn connect_and_run(
         if redact {
             println!("← @{}: [redacted, {} chars]", m.sender.username, m.content.trim().chars().count());
         } else {
-            println!("← @{}: {}", m.sender.username, m.content);
+            println!("{}", crate::logfile::said(&m.sender.username, &m.content));
         }
 
         let trimmed = m.content.trim();
@@ -5232,6 +5259,7 @@ async fn connect_and_run(
                     sender_pays,
                     None,
                     None,
+                    None,
                 ).await {
                     Ok(t) if round < 3 => next = t.leftover,
                     Ok(_) => {}
@@ -5244,7 +5272,9 @@ async fn connect_and_run(
                         if e.downcast_ref::<crate::pending::NoticeOwed>().is_some() {
                             pending.keep();
                         }
-                        eprintln!("handle error: {e:#}")
+                        // One line: the chain can carry what a runtime printed
+                        // (`logfile::EXITED`), line breaks and all.
+                        eprintln!("handle error: {}", crate::logfile::one_line(&format!("{e:#}")))
                     }
                 }
             }
@@ -5354,7 +5384,14 @@ async fn deliver_ask_answer(
     let (to, record, said) = match (&t.perm, answer) {
         (Some(p), Answer::Verdict { code, prompt }) => {
             if prompt.is_some_and(|id| id != p.prompt) {
-                eprintln!("permission: @{from}'s {code} names prompt {prompt:?}, not the one open — not delivered");
+                // Both halves are whatever the client sent: quoted.
+                eprintln!(
+                    "{}",
+                    crate::logfile::quoting(
+                        &format!("permission: @{from}'s tap names a prompt that isn't the one open — not delivered"),
+                        &format!("{code}|{}", prompt.unwrap_or_default())
+                    )
+                );
                 return Delivery::NotParked;
             }
             let record = crate::permission_mcp::verdict_record(&p.prompt, true, code);
@@ -5521,7 +5558,7 @@ async fn deliver_intro_decision(
             "dropped"
         }
         other => {
-            eprintln!("intro: unknown verdict {other:?} — ignored");
+            eprintln!("{}", crate::logfile::quoting("intro: unknown verdict, ignored", other));
             return;
         }
     };
@@ -7643,7 +7680,21 @@ ask.",
     // no code path could ever deliver (the user then had to poke it). Keep this
     // in lockstep with `bash_hook::bg_detach_supported` and the `{% mafold/bgtasks %}`
     // emit gate — all three describe the same guarantee.
-    s.push_str(if crate::bash_hook::bg_detach_supported() {
+    s.push_str(if crate::bash_hook::bg_detach_supported() && crate::bgtasks::events_on() {
+        // The per-task watcher (`arm_task_watch`): what happens to a task is
+        // the agent's to report, and nothing gives up on it at two hours.
+        "\n\nBACKGROUND WORK — WHAT SURVIVES A TURN: only a **Bash tool call with \
+run_in_background** does. A hook detaches it into its own session, and the daemon watches each \
+such task until it exits — however long that takes; nothing gives up on it. What happens to it \
+comes back to YOU as an update in this chat's session: when it ends (with its exit code and log), \
+if the `timeout` you gave it kills it, if its log goes quiet for a long while, and once if it runs \
+very long. The daemon posts nothing about it in the chat itself: whether to tell the people here, \
+and what, is your call when the update arrives. So \"I'll report back when it finishes\" is a \
+promise you will be in a position to keep. NOTHING ELSE survives: Monitor watches, background \
+Agent/Task runs and background Workflows all die when this turn ends, and no completion \
+notification will ever arrive. Never promise to report back on one of those — run the work to \
+completion in the foreground instead, or hand it to a background Bash."
+    } else if crate::bash_hook::bg_detach_supported() {
         "\n\nBACKGROUND WORK — WHAT SURVIVES A TURN: only a **Bash tool call with \
 run_in_background** does. A hook detaches it into its own session and the daemon re-opens the chat \
 with its results once it exits, so \"I'll report back when it finishes\" is a promise the system \
@@ -8552,13 +8603,15 @@ fn resume_turns(
                     j.channel.as_deref(), &prompt, &[], &sessions, &coord, &chat_states, &harness,
                     j.model.clone(), j.effort.clone(), j.thinking, j.system.clone(), j.account.clone(),
                     &j.sender, j.relayed_for.as_deref(), None, &[], None, j.pays, r, j.settles.as_deref(),
+                    None,
                 )
                 .await
                 {
                     Ok(Turned { leftover: Some(more), .. }) if round < 3 => prompt = more,
                     Ok(_) => break,
                     Err(e) => {
-                        eprintln!("picked-up turn in chat {} failed: {e:#}", j.chat);
+                        // One line, like `handle error:` (`logfile::EXITED`).
+                        eprintln!("picked-up turn in chat {} failed: {}", j.chat, crate::logfile::one_line(&format!("{e:#}")));
                         // Whatever it managed stays, finalized as it stands.
                         if round == 1 {
                             outbox.give_up(&draft);
@@ -8683,9 +8736,15 @@ struct Turned {
     /// Whatever the user said too late for the turn to act on — the next
     /// turn's prompt (`steering::mailbox::followup`).
     leftover: Option<String>,
+    /// An update turn whose update went nowhere: it failed (a stopped one was
+    /// someone's call, and counts as heard), or it came to have something to
+    /// show and no bubble could be opened for it. `deliver_update` keeps the
+    /// task's registration and tries again later.
+    lost: bool,
     /// The message the reply was finalized into: the draft the turn opened, or
     /// the one a steer moved it to. Empty when no draft was ever opened (the
-    /// server refused the turn). A caller that acts on "the reply" uses this —
+    /// server refused the turn, or an update turn had nothing to say). A
+    /// caller that acts on "the reply" uses this —
     /// "the bot's newest message in the chat" is a different message the moment
     /// two turns share a chat (two group introductions drafting at once in the
     /// owner's DM, 2026-10-06).
@@ -8747,7 +8806,16 @@ async fn handle(
     // first-boot report says `boot`. Journaled with the draft, so whichever
     // daemon process delivers the reply records it as said.
     settles: Option<&str>,
+    // A background-task update nobody is waiting on (`deliver_update`): the
+    // agent may judge there is nothing to say, so the bubble is held back
+    // until there is something to show (`Quiet`) — and a turn that showed
+    // nothing leaves nothing in the chat. It is still in the session.
+    update: Option<UpdateTurn>,
 ) -> Result<Turned> {
+    let quiet = update.is_some();
+    // An update turn is told how its bubble works — and how to say nothing.
+    let with_note = quiet.then(|| format!("{prompt}\n\n{QUIET_NOTE}"));
+    let prompt: &str = with_note.as_deref().unwrap_or(prompt);
     let pays = match &resumed {
         Some(r) => r.journal.pays,
         None => sender_pays && trigger_id.is_some(),
@@ -8820,6 +8888,9 @@ async fn handle(
         None
     };
     let seat_note = choice.as_ref().and_then(|c| c.note());
+    if let Some(line) = choice.as_ref().and_then(|c| c.none_note()) {
+        println!("{line} (chat {chat_id})");
+    }
     let (mut seat, mut account_issues) = match choice {
         Some(c) => (c.account, c.skipped),
         None => (None, Vec::new()),
@@ -8878,6 +8949,9 @@ async fn handle(
     let steer_file = std::env::temp_dir()
         .join(format!("mafold-steer-{safe_chat}-{nanos}.txt"))
         .to_string_lossy().into_owned();
+    // Whatever is put in it is this turn's until its end-of-turn drain, below
+    // — which comes after its handle is gone (`mailbox_open`).
+    let _draining = OpenMailbox::hold(&steer_file);
 
     // Open the draft FIRST — before the context round trips and photo downloads
     // below. Register it keyed by its draft id, so `/stop`, the Stop button, and
@@ -8891,6 +8965,9 @@ async fn handle(
     let created = match &resumed {
         // Already open, already billed, already journaled as ours (`drafts`).
         Some(r) => Ok(r.draft.clone()),
+        // No bubble yet: the renderer opens one if the turn comes to have
+        // something to show. Until then the turn goes by an id of its own.
+        None if quiet => Ok(held_draft_id()),
         None => client.create_draft(chat_id, thread_root, channel_id, trigger_id).await,
     };
     let msg_id = match created {
@@ -8902,7 +8979,7 @@ async fn handle(
             // to run, nothing lost: one log line and a clean end.
             if let Some(refused) = e.downcast_ref::<crate::client::DraftRefused>() {
                 eprintln!("{refused}");
-                return Ok(Turned { leftover: None, draft: String::new() });
+                return Ok(Turned { leftover: None, lost: false, draft: String::new() });
             }
             // There is no draft yet to write this into, so without a word here
             // the turn evaporates: the chat shows a bot that read the message
@@ -8972,23 +9049,38 @@ async fn handle(
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
     };
     let said: String = resumed.as_ref().map(|r| r.prefix.clone()).unwrap_or_default();
-    let _ = client
-        .edit_draft(
-            &msg_id,
-            &format!(
-                "{said}{}",
-                mafold_transcript::render::generating_tag(turn_started_ms, 0, turn_started_ms, 0, 0)
-            ),
-        )
-        .await;
+    // (A held bubble has no draft to say it in — and nothing to say yet.)
+    if !quiet {
+        let _ = client
+            .edit_draft(
+                &msg_id,
+                &format!(
+                    "{said}{}",
+                    mafold_transcript::render::generating_tag(turn_started_ms, 0, turn_started_ms, 0, 0)
+                ),
+            )
+            .await;
+    }
     // From here a killed daemon hands this turn to the next one instead of
     // leaving the reply frozen where it stopped (`drafts::Journal`). A picked-up
     // turn keeps the journal it came with: its prompt, what it has shown, and
     // how many times it has been picked up already.
+    //
+    // A held one's journal waits for its bubble (`Quiet::journal`): until
+    // then there is nothing to pick up in, and a daemon killed under it
+    // leaves the task's registration on disk for the restart's watcher to
+    // hand over again.
+    let mut held_journal: Option<crate::drafts::Journal> = None;
     if resumed.is_none() {
         if let Some(outbox) = &client.drafts {
-            outbox.journal(
-                &msg_id,
+            let mut journal = |turn: crate::drafts::Journal| {
+                if quiet {
+                    held_journal = Some(turn);
+                } else {
+                    outbox.journal(&msg_id, turn);
+                }
+            };
+            journal(
                 crate::drafts::Journal {
                     chat: chat_id.to_string(),
                     channel: channel_id.map(str::to_string),
@@ -9076,6 +9168,9 @@ async fn handle(
         if let Some(outbox) = &client.drafts {
             outbox.note(&msg_id, |t| t.as_mut().map(|t| t.prompt = Some(full_prompt.clone())).is_some());
         }
+        if let Some(j) = held_journal.as_mut() {
+            j.prompt = Some(full_prompt.clone());
+        }
     }
     if let Some(t) = trigger_id {
         crate::pending::clear(bot, t);
@@ -9091,6 +9186,16 @@ async fn handle(
     // above keeps continuity, and whichever turn finishes last advances the
     // canonical session id (below).
 
+    // The daemon's own notes in the reply (the seat, the effort tier, a seat
+    // failover): what a held bubble's renderer must not take for the agent
+    // speaking (`Quiet::notes`). Written down before each is sent.
+    let quiet_notes: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let daemon_note = |tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>, text: String| {
+        if quiet {
+            quiet_notes.lock().unwrap().push(text.clone());
+        }
+        let _ = tx.send(AgentEvent::Text(text));
+    };
     // The seat this turn runs on. Only Claude Code keys logins by directory
     // (`crate::accounts`); every other harness has one login — its own env —
     // and gets no seat at all. The choice can differ from the preference (a
@@ -9100,15 +9205,24 @@ async fn handle(
         println!("{note}");
         // A picked-up turn's bubble already said this when it began.
         if resumed.is_none() {
-            let _ = ev_tx.send(AgentEvent::Text(private_account_note(note, &private)));
+            daemon_note(&ev_tx, private_account_note(note, &private));
         }
     }
     // A tier the model has no dial for is said up top, like the seat — the
     // owner set something this turn can't honour, and the reply is where they
     // find out.
     if let (Some(note), None) = (&effort_note, &resumed) {
-        let _ = ev_tx.send(AgentEvent::Text(format!("_{note}_\n\n")));
+        daemon_note(&ev_tx, format!("_{note}_\n\n"));
     }
+    let quiet_wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let quiet_for = || {
+        update.as_ref().map(|_| Quiet {
+            held: msg_id.clone(),
+            notes: quiet_notes.clone(),
+            wanted: quiet_wanted.clone(),
+            journal: held_journal.clone(),
+        })
+    };
 
     // Which process is running this turn, for the generating card's heartbeat
     // (`Heartbeat::keepalive`). One for the whole turn: every attempt below —
@@ -9173,7 +9287,7 @@ async fn handle(
         let channel_owned = channel_id.map(str::to_string);
         let live_draft = live_draft.clone();
         let proc = turn_proc.clone();
-        tokio::spawn(render_loop(ev_rx, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc, said.clone(), context_seen.clone(), private.clone()))
+        tokio::spawn(render_loop(ev_rx, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc, said.clone(), context_seen.clone(), private.clone(), quiet_for()))
     };
 
     // A spare sender keeps the renderer alive across a seat failover (below):
@@ -9288,12 +9402,14 @@ async fn handle(
         println!("{note}");
         // The seam, in the reply itself: the reader sees where the account
         // changed, the way a steer shows where a correction landed.
-        let _ = ev_keep.send(AgentEvent::Text(private_account_note(&note, &private)));
+        daemon_note(&ev_keep, private_account_note(&note, &private));
         {
             let mut states = chat_states.lock().await;
             let st = states.entry(chat_id.to_string()).or_default();
+            // Under the draft the reply is in NOW (a steer, an update turn's
+            // bubble opening), where Stop and ask answers will look for it.
             st.turns.insert(
-                msg_id.clone(),
+                live_draft.lock().unwrap().clone(),
                 TurnHandle {
                     cancel: cancel.clone(),
                     ask_file: None,
@@ -9378,8 +9494,9 @@ async fn handle(
             {
                 let mut states = chat_states.lock().await;
                 let st = states.entry(chat_id.to_string()).or_default();
+                // Where the reply is NOW (as at the failover above).
                 st.turns.insert(
-                    msg_id.clone(),
+                    live_draft.lock().unwrap().clone(),
                     TurnHandle {
                         cancel: cancel.clone(),
                         ask_file: None,
@@ -9408,7 +9525,7 @@ async fn handle(
                 let channel_owned = channel_id.map(str::to_string);
                 let live_draft = live_draft.clone();
                 let proc = turn_proc.clone();
-                tokio::spawn(render_loop(ev_rx2, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc, said.clone(), context_seen.clone(), private.clone()))
+                tokio::spawn(render_loop(ev_rx2, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc, said.clone(), context_seen.clone(), private.clone(), quiet_for()))
             };
             let retry = Turn {
                 // Re-carry the user's message VERBATIM: the first attempt's
@@ -9457,15 +9574,20 @@ async fn handle(
         && matches!(&result, Ok(o) if broken_resume(o));
     if resumed_errored {
         let why = result.as_ref().ok().and_then(|o| o.error.clone()).unwrap_or_default();
-        println!("↻ resumed session errored ({why}) — dropping it + retrying once on a FRESH session");
+        // `why` is the runtime's own words: claude's stderr, or what kimi printed.
+        println!(
+            "{}",
+            crate::logfile::quoting("↻ resumed session errored — dropping it + retrying once on a FRESH session", &why)
+        );
         drop_session(sessions, &skey, prior.as_deref()).await;
         last_good_session = None;
         let (ev_tx3, ev_rx3) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         {
             let mut states = chat_states.lock().await;
             let st = states.entry(chat_id.to_string()).or_default();
+            // Where the reply is NOW (as at the failover above).
             st.turns.insert(
-                msg_id.clone(),
+                live_draft.lock().unwrap().clone(),
                 TurnHandle {
                     cancel: cancel.clone(),
                     ask_file: None,
@@ -9494,7 +9616,7 @@ async fn handle(
             let channel_owned = channel_id.map(str::to_string);
             let live_draft = live_draft.clone();
             let proc = turn_proc.clone();
-            tokio::spawn(render_loop(ev_rx3, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc, said.clone(), context_seen.clone(), private.clone()))
+            tokio::spawn(render_loop(ev_rx3, client, msg_id, thread_root_owned, channel_owned, live_draft, chat_states, chat_id, surface, ask_file, bg_shells, final_md, turn_started_ms, proc, said.clone(), context_seen.clone(), private.clone(), quiet_for()))
         };
         let fresh = Turn {
             prompt: full_prompt.clone(),
@@ -9607,7 +9729,7 @@ async fn handle(
             // lookup says "couldn't start `claude` (…\claude.exe)" and keeps the
             // `io::Error` naming the syscall's actual refusal one link down. Two
             // Windows rounds were spent on that missing suffix.
-            eprintln!("harness run failed: {e:#}");
+            eprintln!("harness run failed: {}", crate::logfile::one_line(&format!("{e:#}")));
             // Reaching here means the harness could not RUN at all (no `claude`
             // on PATH, a workdir that doesn't exist) — a nonzero exit from a run
             // that did start arrives as Ok+error and is retried above. Nothing
@@ -9634,8 +9756,12 @@ async fn handle(
     // (The turn handle was already dropped above, before awaiting the renderer.)
     let _ = std::fs::remove_file(&ask_file);
     // The forwarding address only meant anything while the harness child was
-    // alive to follow it.
-    let _ = std::fs::remove_file(draft_ptr_path(&origin_draft));
+    // alive to follow it — except an update turn's: its own id names no
+    // message at all, so a background task it started (which keeps that id
+    // in its env) finds the bubble it opened only by this.
+    if !(quiet && *live_draft.lock().unwrap() != origin_draft) {
+        let _ = std::fs::remove_file(draft_ptr_path(&origin_draft));
+    }
     // Anything still in the mailbox was said too late for this turn to act on —
     // the model made no further tool call after it arrived, so the hook never
     // ran. It is a message the user sent and has not been answered, so it
@@ -9643,21 +9769,64 @@ async fn handle(
     // Claimed by the same atomic rename the hook uses: exactly one of the two
     // ever gets a given message. The room's background alone is not a message
     // anyone sent it, and goes with the temp file (`steer_hook::followup`).
-    let leftover = crate::steer_hook::take(&steer_file).and_then(|raw| steering::mailbox::followup(&raw));
-    let _ = std::fs::remove_file(&steer_file);
-    // A picked-up turn answers the message the killed one was opened for.
-    let answered = trigger_id.or(resumed.as_ref().and_then(|r| r.journal.trigger.as_deref()));
-    match client.finish_draft(&msg_id, &final_content, if clean_end { answered } else { None }, outcome).await {
-        Ok(true) => println!("→ finalized reply for chat {chat_id}"),
-        Ok(false) => println!("→ reply {msg_id} completion delivery in progress"),
-        Err(e) => eprintln!("reply {msg_id} completion queued for retry: {e:#}"),
+    let raw_left = crate::steer_hook::take(&steer_file);
+    // Nothing in it but background-task updates the turn never got to: back
+    // to the watcher (`bgtasks::unhand`), which hands them over again — as an
+    // update turn of their own when nothing runs here, journaled once it
+    // opens and tried again if it goes nowhere — not as a follow-up of this
+    // turn's that a restart before it showed anything would lose. That turn
+    // is free to say nothing: the agent may well have reported the task by
+    // hand already, in this very turn (10-22 03:38–03:39). Done before the
+    // mailbox counts as closed (`OpenMailbox`), so the watcher never takes
+    // the drain for the agent having read them.
+    let only_updates = raw_left.as_deref().is_some_and(crate::bgtasks::only_updates);
+    if only_updates {
+        crate::bgtasks::unhand(&surface, &steer_file);
     }
-    // The parts of its cards only some readers may read, as the reply's state —
-    // the draft exists whether or not its completion has landed yet. A steered
-    // reply moved into this draft with everything it said (`msg_id` above).
-    let items = std::mem::take(&mut *private.lock().unwrap());
-    if !items.is_empty() {
-        write_private(client, &msg_id, items).await;
+    let leftover = raw_left.as_deref().filter(|_| !only_updates).and_then(steering::mailbox::followup);
+    let _ = std::fs::remove_file(&steer_file);
+    let _ = std::fs::remove_file(draft_open_path(&origin_draft));
+    let mut msg_id = msg_id;
+    // (A picked-up update turn too: its prompt is the one that taught it the
+    // marker.)
+    if quiet || resumed.as_ref().is_some_and(|r| r.journal.prompt.as_deref().is_some_and(|p| p.contains(QUIET_NOTE))) {
+        final_content = strip_silence(&final_content);
+    }
+    // A held bubble (`quiet`) the turn never opened. Ended cleanly, that is the
+    // agent's call that there was nothing to say: nothing goes in the chat. A
+    // turn that failed or was stopped says so, in a bubble opened for it now —
+    // an update that went nowhere must not look like one that was judged —
+    // unless the same update's failure was shown already (`hush_failure`).
+    // (A turn that came to have something to show and couldn't get a bubble
+    // for it — the link down when the renderer asked — gets one here.)
+    let hush_failure = update.as_ref().is_some_and(|u| u.hush_failure);
+    let silent = quiet
+        && is_held_draft(&msg_id)
+        && (outcome.is_none() || (hush_failure && outcome == Some(crate::client::TurnEnd::Failed)))
+        && !quiet_wanted.load(std::sync::atomic::Ordering::Relaxed);
+    if quiet && is_held_draft(&msg_id) && !silent {
+        match client.create_draft(chat_id, thread_root, channel_id, None).await {
+            Ok(id) => msg_id = id,
+            Err(e) => eprintln!("could not open a bubble for the failed update turn in chat {chat_id}: {e:#}"),
+        }
+    }
+    if silent {
+        println!("· the update turn in chat {chat_id} had nothing to say — no message");
+    } else if !is_held_draft(&msg_id) {
+        // A picked-up turn answers the message the killed one was opened for.
+        let answered = trigger_id.or(resumed.as_ref().and_then(|r| r.journal.trigger.as_deref()));
+        match client.finish_draft(&msg_id, &final_content, if clean_end { answered } else { None }, outcome).await {
+            Ok(true) => println!("→ finalized reply for chat {chat_id}"),
+            Ok(false) => println!("→ reply {msg_id} completion delivery in progress"),
+            Err(e) => eprintln!("reply {msg_id} completion queued for retry: {e:#}"),
+        }
+        // The parts of its cards only some readers may read, as the reply's state —
+        // the draft exists whether or not its completion has landed yet. A steered
+        // reply moved into this draft with everything it said (`msg_id` above).
+        let items = std::mem::take(&mut *private.lock().unwrap());
+        if !items.is_empty() {
+            write_private(client, &msg_id, items).await;
+        }
     }
 
     // Completion wakeup: the turn ended cleanly but left DETACHED tasks running.
@@ -9671,11 +9840,12 @@ async fn handle(
     // older claude that ignores `updatedInput`, hook not installed) still showed
     // the card and then silently stood down — a promise with nobody to keep it.
     if clean_end {
-        let shells = bgtasks_snapshot(&surface).len() as u64;
+        let shells = registered(&surface);
         if shells > 0 {
             // The reply that carries the `{% mafold/bgtasks %}` card, for live edits.
+            // (None for a turn that left no message.)
             let snapshot = final_md.lock().unwrap().clone();
-            let live_msg = (!post_appended && snapshot.contains("{% mafold/bgtasks"))
+            let live_msg = (!post_appended && !is_held_draft(&msg_id) && snapshot.contains("{% mafold/bgtasks"))
                 .then(|| (msg_id.clone(), snapshot));
             arm_bg_wakeup(
                 client.clone(),
@@ -9701,7 +9871,22 @@ async fn handle(
             );
         }
     }
-    Ok(Turned { leftover, draft: msg_id })
+    let lost = quiet && (outcome == Some(crate::client::TurnEnd::Failed) || (!silent && is_held_draft(&msg_id)));
+    Ok(Turned { leftover, lost, draft: if is_held_draft(&msg_id) { String::new() } else { msg_id } })
+}
+
+/// How many background tasks are registered on a surface — what a clean turn
+/// end (and a restart) arms a watcher on. Every registration counts, ended
+/// ones too: an ended task nobody has been told about yet is exactly what a
+/// watcher is for. (Under the `bgtasks` flag the watcher it arms knows what
+/// was already told; the old one did not, which is how a turn ending cleanly
+/// after a task was reported by hand reported it again — 10-22 03:39.)
+fn registered(surface: &str) -> u64 {
+    if crate::bgtasks::events_on() {
+        crate::bgtasks::list(surface).len() as u64
+    } else {
+        bgtasks_snapshot(surface).len() as u64
+    }
 }
 
 /// Forwarding address for a draft that MOVED mid-turn.
@@ -9717,6 +9902,121 @@ pub fn draft_ptr_path(origin_id: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("mafold-draft-{safe}.txt"))
 }
 
+/// What the agent writes, alone, when a background-task update leaves it
+/// nothing worth telling the people here (`bgtasks::prompt`). A turn that says
+/// only this, and was not at work for long, leaves no message (`Quiet`).
+pub const SILENCE: &str = "[[silent]]";
+
+/// What an update turn's agent is told about its held bubble (`Quiet`),
+/// after the update itself.
+const QUIET_NOTE: &str = "(Nothing you do in this turn shows in the chat unless you write \
+something, or work at it for a while. If you told someone you'd report back, this is when. If \
+there is nothing worth anyone's attention — they already have the result, you would only repeat \
+what was said, or a long task is simply still going fine — reply with exactly `[[silent]]` and \
+nothing else, and no message is posted. The turn stays in your session either way.)";
+
+/// The reply minus the silence marker — said alongside real words, or by a
+/// turn whose bubble opened anyway (it was at work a while), it is not for
+/// the reader.
+fn strip_silence(s: &str) -> String {
+    if s.contains(SILENCE) {
+        s.replace(SILENCE, "").trim_end().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Does the agent's text say anything beyond the silence marker? One still
+/// arriving (`[[sil`) is not speech yet.
+fn speaks(text: &str) -> bool {
+    let rest = text.replace(SILENCE, "");
+    let t = rest.trim();
+    !t.is_empty() && !SILENCE.starts_with(t)
+}
+
+/// An update turn's bubble, held back until it has something to show.
+///
+/// The turn runs under [`Quiet::held`], an id no draft has, and the renderer
+/// opens a real draft — re-keying the turn to it, leaving `mafold attach` a
+/// forwarding address, as a steer's move does — the moment the agent says
+/// something that isn't [`SILENCE`], asks something, is spoken to, sends a
+/// file, or has been at work for [`QUIET_WORK`]. A turn that ends without any
+/// of that leaves nothing in the chat (`handle`).
+struct Quiet {
+    held: String,
+    /// The daemon's own notes in the reply (the seat, the effort tier, a seat
+    /// failover), by their text: not the agent speaking. Each is written here
+    /// before it is sent, so the renderer always knows it by the time it
+    /// arrives.
+    notes: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Set once the turn has something to show, whether or not a draft could
+    /// be opened for it then — `handle` opens one at the end if not.
+    wanted: Arc<std::sync::atomic::AtomicBool>,
+    /// The turn's journal (`drafts::Journal`), kept back with the bubble: it
+    /// goes in when the bubble opens, so a daemon killed after that point
+    /// leaves a bubble the next one finalizes as it stands (a turn nobody's
+    /// message started is never picked back up: `drafts::verdict`) — not one
+    /// generating forever. Either way the task's registration is still on
+    /// disk, and the restart's watcher hands the update over again.
+    journal: Option<crate::drafts::Journal>,
+}
+
+/// What makes a turn an update turn (`handle`'s `update`).
+#[derive(Clone)]
+struct UpdateTurn {
+    /// A retry of an update whose turn already failed once (`Retry`): that
+    /// failure was shown, so another one leaves nothing in the chat — not one
+    /// failure card per try.
+    hush_failure: bool,
+}
+
+/// How long an update turn may be at work (tool calls) before its bubble
+/// shows, said or not: what it is doing is worth seeing by then.
+const QUIET_WORK: Duration = if cfg!(test) { Duration::from_millis(1500) } else { Duration::from_secs(30) };
+
+fn held_draft_id() -> String {
+    format!("held-{}", uuid::Uuid::new_v4())
+}
+
+pub fn is_held_draft(id: &str) -> bool {
+    id.starts_with("held-")
+}
+
+/// Where `mafold attach` (and its kin) asks a held bubble to open: a file the
+/// turn's renderer looks for, keyed like the forwarding address it answers in.
+pub fn draft_open_path(origin_id: &str) -> std::path::PathBuf {
+    draft_ptr_path(origin_id).with_extension("open")
+}
+
+/// The turn's reply as it stands now: `env_id` (what the turn's child was
+/// spawned with), or where it moved to (`draft_ptr_path`). None while an
+/// update turn's bubble is still held — no message exists to name.
+pub fn reply_now(env_id: &str) -> Option<String> {
+    std::fs::read_to_string(draft_ptr_path(env_id))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!is_held_draft(env_id)).then(|| env_id.to_string()))
+}
+
+/// The reply a turn's own tools should act on ([`reply_now`]) — and when the
+/// turn's bubble is still held, asking for it to open first and waiting for
+/// the address (up to 20s): a file sent is something to show.
+pub async fn current_draft(env_id: String) -> anyhow::Result<String> {
+    if let Some(id) = reply_now(&env_id) {
+        return Ok(id);
+    }
+    let _ = std::fs::write(draft_open_path(&env_id), b"");
+    let began = std::time::Instant::now();
+    while began.elapsed() < Duration::from_secs(20) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(id) = reply_now(&env_id) {
+            return Ok(id);
+        }
+    }
+    anyhow::bail!("this turn's reply bubble didn't open in time — try again, or pass --message <id>")
+}
+
 /// NON-DESTRUCTIVE scan of `~/.mafold/bgtasks` for this conversation's
 /// detached-task pid files (written by `mafold bash-hook`, keyed by the
 /// sanitized conversation id). Returns (live count, finished tasks as
@@ -9728,8 +10028,7 @@ pub fn draft_ptr_path(origin_id: &str) -> std::path::PathBuf {
 fn bgtasks_scan(tag: &str) -> (usize, Vec<(PathBuf, String)>) {
     let mut live = 0usize;
     let mut finished: Vec<(PathBuf, String)> = vec![];
-    let Ok(home) = std::env::var("HOME") else { return (0, finished) };
-    let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
+    let Some(dir) = crate::bgtasks::registry_dir() else { return (0, finished) };
     let prefix = format!("{tag}.");
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -9757,16 +10056,9 @@ fn bgtasks_scan(tag: &str) -> (usize, Vec<(PathBuf, String)>) {
 /// Called ONLY after the wrap-up reply is confirmed sent, so an undelivered
 /// promise stays on disk for the next restart's re-arm.
 fn bgtasks_cleanup(pid_paths: &[PathBuf]) {
-    for p in pid_paths {
-        let _ = std::fs::remove_file(p);
-        let _ = std::fs::remove_file(p.with_extension("log"));
-        let _ = std::fs::remove_file(p.with_extension("sh"));
-        let _ = std::fs::remove_file(p.with_extension("exit"));
-        // `.meta` too — it was missing here, so every reported task left one
-        // behind and the registry silted up with orphans that only the 7-day
-        // sweep ever collected.
-        let _ = std::fs::remove_file(p.with_extension("meta"));
-    }
+    // Everything beside it — `.meta` and the newer `.state` too, or the
+    // registry silts up with orphans only the 7-day sweep ever collects.
+    crate::bgtasks::cleanup(pid_paths);
 }
 
 /// The in-chat "still running" beat for long background tasks: what is still
@@ -9977,8 +10269,7 @@ fn card_line(s: &str, max: usize) -> String {
 fn bgtasks_snapshot(tag: &str) -> Vec<BgTask> {
     const MAX_TASKS: usize = 8;
     const MAX_TAIL: usize = 6;
-    let Ok(home) = std::env::var("HOME") else { return vec![] };
-    let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
+    let Some(dir) = crate::bgtasks::registry_dir() else { return vec![] };
     let prefix = format!("{tag}.");
     let mut tasks: Vec<BgTask> = vec![];
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -10134,6 +10425,16 @@ fn wrapup_claimed(mailbox: &str, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Does the old watcher run on a test's clock? Only in a test that picked it
+/// (`bgtasks::TEST_EVENTS` = off): every other test — the Windows report test
+/// among them — gets the real one.
+fn old_watcher_fast() -> bool {
+    #[cfg(test)]
+    return *crate::bgtasks::TEST_EVENTS.lock().unwrap() == Some(false);
+    #[cfg(not(test))]
+    false
+}
+
 fn arm_bg_wakeup(
     client: Client,
     workdir: String,
@@ -10159,22 +10460,30 @@ fn arm_bg_wakeup(
     shells: u64,
     live_msg: Option<(String, String)>,
 ) {
+    // Registry tag — the surface this turn ran on (conv + forum channel), the
+    // same key `bash_hook` registered its detached tasks under.
+    let tag = guest_tag(surface_tag(&bot, &chat_id, channel_id.as_deref()), guest);
+    // ONE watcher per surface, of whichever kind is already there: the flag
+    // read differently from one arm to the next (switched on the server, or
+    // not yet fetched when a restart re-armed) must not leave both watching —
+    // and reporting — the same tasks.
+    let old_here = old_watchers().lock().unwrap().iter().any(|k| k.strip_prefix(tag.as_str()).is_some_and(|r| r.starts_with('@')));
+    let new_here = watching().lock().unwrap().contains_key(&tag);
+    if new_here || (!old_here && crate::bgtasks::events_on()) {
+        let wake = WakeTurn {
+            client, workdir, workdir_ns, bot, chat_id, thread_root, channel_id, sessions, coord,
+            chat_states, harness, model, effort, thinking, system, account, turn_sender, guest,
+        };
+        return arm_task_watch(wake, shells, live_msg);
+    }
     use std::collections::{HashMap, HashSet};
     use std::sync::{Mutex as StdMutex, OnceLock};
-    // One monitor per (conv, channel, workdir): a later turn that starts more
-    // shells while one is armed rides the existing monitor's wrap-up. Disarmed
-    // BEFORE the wrap-up turn runs, so shells started by the wrap-up itself
-    // can arm a fresh monitor.
-    static ARMED: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
     // key → the `{% mafold/bgtasks %}`-carrying replies this monitor live-edits, as
     // (msg_id, current content). A riding turn APPENDS its reply here, so every
     // card for the conversation stays fresh, not just the first one's.
     static LIVE: OnceLock<StdMutex<HashMap<String, Vec<(String, String)>>>> = OnceLock::new();
-    let armed = || ARMED.get_or_init(|| StdMutex::new(HashSet::new()));
+    let armed = old_watchers;
     let live_slot = || LIVE.get_or_init(|| StdMutex::new(HashMap::new()));
-    // Registry tag — the surface this turn ran on (conv + forum channel), the
-    // same key `bash_hook` registered its detached tasks under.
-    let tag = guest_tag(surface_tag(&bot, &chat_id, channel_id.as_deref()), guest);
     // The monitor key IS the registry key (plus the workdir, which can differ
     // per chat): one monitor per registry, so two monitors can never race for
     // the same registrations.
@@ -10188,14 +10497,16 @@ fn arm_bg_wakeup(
     println!("⏳ {shells} background task(s) outlive the turn in {tag} — wakeup armed");
     tokio::spawn(async move {
         // Poll cadence, when the silence starts costing a beat, and the point
-        // where we stop waiting at all.
-        const TICK: Duration = Duration::from_secs(10);
-        const BEAT_FIRST: Duration = Duration::from_secs(15 * 60);
-        const BEAT_EVERY: Duration = Duration::from_secs(30 * 60);
-        const GIVE_UP_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+        // where we stop waiting at all. (In a test that chose this watcher —
+        // `bgtask_watch_tests` — minutes are milliseconds; every other test
+        // gets the real ones.)
+        let fast = old_watcher_fast();
+        let ms = |test: u64, real: u64| Duration::from_millis(if fast { test } else { real });
+        let (tick, beat_first, beat_every, give_up_after) =
+            (ms(50, 10_000), ms(500, 15 * 60_000), ms(1000, 30 * 60_000), ms(4000, 2 * 60 * 60_000));
 
         let started = std::time::Instant::now();
-        let mut next_beat = BEAT_FIRST;
+        let mut next_beat = beat_first;
         let mut last_block = String::new();
         // Registrations this monitor has already dispatched a wrap-up for.
         // An UNDELIVERED one keeps its files on disk (for the restart re-arm),
@@ -10214,7 +10525,7 @@ fn arm_bg_wakeup(
         let mut in_flight: Vec<(Vec<PathBuf>, String, String)> = Vec::new();
         let mut ticks: u64 = 0;
         loop {
-            tokio::time::sleep(TICK).await;
+            tokio::time::sleep(tick).await;
             ticks += 1;
             // Did the running turn actually take what we handed it? The mailbox
             // is claimed by ONE atomic rename — the PostToolUse hook mid-turn, or
@@ -10345,7 +10656,7 @@ fn arm_bg_wakeup(
                         prompt.trim().to_string(),
                     ));
                     // A report IS a sign of life — no beat on top of it.
-                    next_beat = started.elapsed() + BEAT_EVERY;
+                    next_beat = started.elapsed() + beat_every;
                     continue;
                 }
 
@@ -10374,6 +10685,7 @@ fn arm_bg_wakeup(
                         false,
                         None,
                         None,
+                        None,
                     )
                     .await
                     {
@@ -10382,7 +10694,11 @@ fn arm_bg_wakeup(
                         // the ordinary dispatch path, not this retry loop.
                         Ok(_) => { delivered = true; break; }
                         Err(e) => {
-                            eprintln!("bg wakeup turn failed for chat {chat_id} (attempt {}/3): {e:#}", attempt + 1);
+                            eprintln!(
+                                "bg wakeup turn failed for chat {chat_id} (attempt {}/3): {}",
+                                attempt + 1,
+                                crate::logfile::one_line(&format!("{e:#}"))
+                            );
                             tokio::time::sleep(Duration::from_secs(30 * (attempt as u64 + 1))).await;
                         }
                     }
@@ -10397,7 +10713,7 @@ fn arm_bg_wakeup(
                     println!("⏳ wrap-up for chat {chat_id} undelivered after 3 tries — kept for restart re-arm");
                 }
                 // A report IS a sign of life — no beat on top of it.
-                next_beat = started.elapsed() + BEAT_EVERY;
+                next_beat = started.elapsed() + beat_every;
                 continue;
             }
 
@@ -10434,7 +10750,7 @@ fn arm_bg_wakeup(
             // result and the wrap-up that delivers it there used to be NOTHING
             // for up to two hours, which reads exactly like a dead session.
             if started.elapsed() >= next_beat {
-                next_beat = started.elapsed() + BEAT_EVERY;
+                next_beat = started.elapsed() + beat_every;
                 if let Some(note) = bgtasks_beat_note(&tag) {
                     if let Err(e) = client
                         .send_to(Dest::chat(&chat_id).channel(channel_id.as_deref()), &note)
@@ -10445,7 +10761,7 @@ fn arm_bg_wakeup(
                 }
             }
 
-            if started.elapsed() >= GIVE_UP_AFTER {
+            if started.elapsed() >= give_up_after {
                 // Still running after 2h: stop editing (the card truthfully says
                 // "running"), keep the registrations for the restart re-arm.
                 armed().lock().unwrap().remove(&key);
@@ -10471,6 +10787,500 @@ fn arm_bg_wakeup(
             }
         }
     });
+}
+
+/// How a background-task update runs, when it runs as a turn of its own: as
+/// the latest turn on that surface did — the one that armed the watcher, or
+/// the last one to ride it. (The restart re-arm knows nothing of the chat's
+/// settings; the next turn there brings them.)
+#[derive(Clone)]
+struct WakeTurn {
+    client: Client,
+    workdir: String,
+    workdir_ns: bool,
+    bot: String,
+    chat_id: String,
+    thread_root: Option<String>,
+    channel_id: Option<String>,
+    sessions: Sessions,
+    coord: Arc<ExecCoord>,
+    chat_states: ChatStates,
+    harness: Arc<dyn Harness>,
+    model: Option<String>,
+    effort: Option<String>,
+    thinking: Option<u32>,
+    system: Option<String>,
+    account: Option<String>,
+    turn_sender: String,
+    guest: bool,
+}
+
+/// The old watchers running in this process, as `<tag>@<workdir>`: one per
+/// (conv, channel, workdir) — a later turn that starts more shells while one
+/// is armed rides the existing monitor's wrap-up. Disarmed BEFORE the wrap-up
+/// turn runs, so shells started by the wrap-up itself can arm a fresh monitor.
+fn old_watchers() -> &'static std::sync::Mutex<HashSet<String>> {
+    static ARMED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    ARMED.get_or_init(Default::default)
+}
+
+/// The watchers running in this process, by registry key, each with the turn
+/// settings its next update runs on (`Ride`); and the replies whose
+/// `{% mafold/bgtasks %}` card each one keeps fresh.
+type Watching = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<Ride>>>>;
+
+/// What a watcher runs its next update as — the latest turn on its surface —
+/// and whether a turn has ended there since it last looked: the «next turn
+/// here» an update given up on (`Retry::spent`) waits for.
+struct Ride {
+    wake: WakeTurn,
+    fresh: bool,
+}
+fn watching() -> &'static Watching {
+    static W: std::sync::OnceLock<Watching> = std::sync::OnceLock::new();
+    W.get_or_init(Default::default)
+}
+fn watched_cards() -> &'static std::sync::Mutex<HashMap<String, Vec<String>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// Watch a surface's background tasks, EACH ON ITS OWN CLOCK, until every one
+/// has exited — and hand what happens to them to the agent (`bgtasks` flag).
+///
+/// What the watcher before it (`arm_bg_wakeup`'s body) got wrong, 10-22:
+/// - its clock was the CHANNEL's: started by the first task, ridden by every
+///   later one, and at two hours it said «超过 2 小时» about tasks minutes old
+///   and stopped watching. Here a task's age is its own, «running long» is
+///   said once, and nothing stops watching a task that is still running.
+/// - it posted «⏳ 后台还在跑» / «超过 2 小时» into the chat itself, as the
+///   bot, without the agent knowing. Here the daemon posts nothing: an exit,
+///   a timeout, a log gone quiet or a task running long goes to the agent —
+///   into the turn running here if there is one, else a turn of its own — and
+///   what to say about it is the agent's call.
+/// - what it had reported lived in its memory, and the files of anything it
+///   had not finished with stayed on disk for the next watcher to report
+///   again. Here what the agent was told is written beside each task
+///   (`bgtasks::Ledger`), so neither a later watcher nor a restart repeats it.
+/// - its key carried the workdir, so a restart (default workdir) and a chat's
+///   turn (its own) could both watch one registry. One watcher per surface.
+fn arm_task_watch(wake: WakeTurn, shells: u64, live_msg: Option<(String, String)>) {
+    let tag = guest_tag(surface_tag(&wake.bot, &wake.chat_id, wake.channel_id.as_deref()), wake.guest);
+    if let Some((mid, _)) = live_msg {
+        watched_cards().lock().unwrap().entry(tag.clone()).or_default().push(mid);
+    }
+    let slot = {
+        let mut w = watching().lock().unwrap();
+        if let Some(slot) = w.get(&tag) {
+            // Rides the watcher already here; its next update runs as THIS turn did.
+            *slot.lock().unwrap() = Ride { wake, fresh: true };
+            return;
+        }
+        let slot = Arc::new(std::sync::Mutex::new(Ride { wake, fresh: false }));
+        w.insert(tag.clone(), slot.clone());
+        slot
+    };
+    println!("⏳ {shells} background task(s) registered in {tag} — watching each until it exits");
+    tokio::spawn(async move {
+        const TICK: Duration = crate::bgtasks::TICK;
+        // Exits whose update went nowhere (`Retry`): tried again later, and
+        // after the last try left on disk for the next watcher.
+        let mut retry: HashMap<PathBuf, Retry> = HashMap::new();
+        // Each card's block as it last LANDED: a card whose read or edit
+        // failed is tried again on the next tick, never left on «running».
+        let mut applied: HashMap<String, String> = HashMap::new();
+        // Ticks spent with nothing left to watch but a card that won't take
+        // its last edit (deleted, say): a minute's worth, then let it be.
+        let mut card_only = 0u32;
+        // Tasks seen to have ended, as their card rows read then (the log
+        // complete). Once the agent has an exit, its registration goes — and
+        // the card keeps saying how it ended instead of dropping the line.
+        let mut ended: HashMap<PathBuf, CardRow> = HashMap::new();
+        loop {
+            tokio::time::sleep(TICK).await;
+            let (w, fresh) = {
+                let mut ride = slot.lock().unwrap();
+                (ride.wake.clone(), std::mem::take(&mut ride.fresh))
+            };
+            // A turn has ended here since: updates given up on get their next try.
+            if fresh {
+                retry.retain(|_, r| !r.spent());
+            }
+            // An exit handed to a running turn: the turn's until it has ended.
+            // Then, taken (by its hook, or by its last drain into a reply
+            // someone is owed), the task is done with (its log stays); not
+            // taken — the daemon died under it — it is handed on again. (A
+            // last drain that found nothing but updates gave them back
+            // already: `bgtasks::unhand`.)
+            for t in crate::bgtasks::list(&tag) {
+                let Some(h) = &t.ledger.handed else { continue };
+                if mailbox_open(&w.chat_states, &w.chat_id, &h.mailbox).await {
+                    continue;
+                }
+                if wrapup_claimed(&h.mailbox, &h.needle) {
+                    println!("✓ the turn in {tag} took the update — registration cleared");
+                    crate::bgtasks::retire(std::slice::from_ref(&t.pid_path));
+                } else {
+                    let mut l = t.ledger.clone();
+                    l.handed = None;
+                    crate::bgtasks::write_ledger(&t.pid_path, &l);
+                }
+            }
+            let tasks = crate::bgtasks::list(&tag);
+            // The card(s) promising these tasks, kept current — only when it
+            // changed, spliced into the message as it is NOW (see the old
+            // watcher for why never into a cached copy).
+            let mut rows: Vec<CardRow> = tasks
+                .iter()
+                .map(|t| match ended.get(&t.pid_path) {
+                    Some(r) => r.clone(),
+                    None => card_row(t),
+                })
+                .collect();
+            for (t, r) in tasks.iter().zip(&rows) {
+                if !t.running() {
+                    ended.entry(t.pid_path.clone()).or_insert_with(|| r.clone());
+                }
+            }
+            rows.extend(
+                ended
+                    .iter()
+                    .filter(|(p, _)| !tasks.iter().any(|t| &t.pid_path == *p))
+                    .map(|(_, r)| r.clone()),
+            );
+            rows.sort_by_key(|r| r.started_ms);
+            let block = card_block(&rows);
+            let targets = watched_cards().lock().unwrap().get(&tag).cloned().unwrap_or_default();
+            let mut cards_behind = false;
+            if !block.is_empty() {
+                let at = Dest::chat(&w.chat_id).channel(w.channel_id.as_deref()).thread(w.thread_root.as_deref());
+                for mid in targets {
+                    if applied.get(&mid) == Some(&block) {
+                        continue;
+                    }
+                    let landed = match own_message(&w.client, at, &mid, &w.bot).await {
+                        None => false,
+                        Some(current) => match live_card_update(&current, &block) {
+                            Some(next) => w.client.edit_draft(&mid, &next).await.is_ok(),
+                            None => true, // it already says this, or carries no card to keep
+                        },
+                    };
+                    if landed {
+                        applied.insert(mid, block.clone());
+                    } else {
+                        cards_behind = true;
+                    }
+                }
+            }
+            let now = crate::bgtasks::now_ms();
+            let (quiet, long) = (crate::bgtasks::quiet_after(), crate::bgtasks::long_after());
+            let events: Vec<(crate::bgtasks::Task, crate::bgtasks::Kind)> = tasks
+                .iter()
+                .filter(|t| retry.get(&t.pid_path).is_none_or(Retry::due))
+                .filter_map(|t| crate::bgtasks::due(t, now, quiet, long).map(|k| (t.clone(), k)))
+                .collect();
+            if !events.is_empty() {
+                deliver_update(&w, &tag, events, &tasks, &mut retry).await;
+                continue;
+            }
+            // Still to come: a task's end, a handed exit's taking, an update
+            // that went nowhere and is to be tried again.
+            let waiting = |t: &crate::bgtasks::Task| {
+                t.running() || t.ledger.handed.is_some() || retry.get(&t.pid_path).is_some_and(|r| !r.spent())
+            };
+            if tasks.iter().any(waiting) {
+                card_only = 0;
+                continue;
+            }
+            if cards_behind && card_only < 6 {
+                card_only += 1;
+                continue;
+            }
+            // Nothing left to watch. Step down — and look once more: an update
+            // turn that just ran may have started a task, and its arm found
+            // this watcher still here and rode it.
+            watching().lock().unwrap().remove(&tag);
+            // (An ended task this watcher has given up on waits for the next.)
+            let left = crate::bgtasks::list(&tag)
+                .into_iter()
+                .any(|t| waiting(&t) || (!retry.contains_key(&t.pid_path) && crate::bgtasks::due(&t, now, quiet, long).is_some()));
+            if left {
+                let mut w = watching().lock().unwrap();
+                if !w.contains_key(&tag) {
+                    w.insert(tag.clone(), slot.clone());
+                    println!("↻ a background task registered during the update in {tag} — still watching");
+                    continue;
+                }
+                return; // a fresh watcher took over, cards and all
+            }
+            if !watching().lock().unwrap().contains_key(&tag) {
+                watched_cards().lock().unwrap().remove(&tag);
+            }
+            return;
+        }
+    });
+}
+
+/// Is a turn still running with this mailbox — one that may yet take what was
+/// put in it? Its handle says so until `drop_turn`; after that, until its
+/// end-of-turn drain, only `OpenMailbox` does — and an update read as «nobody
+/// took it» in that gap is handed over a second time, while the drain turns
+/// the first copy into a follow-up.
+async fn mailbox_open(chat_states: &ChatStates, chat_id: &str, mailbox: &str) -> bool {
+    open_mailboxes().lock().unwrap().contains(mailbox)
+        || chat_states
+            .lock()
+            .await
+            .get(chat_id)
+            .is_some_and(|st| st.turns.values().any(|t| t.steer_file == mailbox))
+}
+
+/// The mailboxes of turns in this process that have yet to drain them.
+fn open_mailboxes() -> &'static std::sync::Mutex<HashSet<String>> {
+    static OPEN: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    OPEN.get_or_init(Default::default)
+}
+
+/// A turn's mailbox, open for as long as the turn (`handle`) runs — however
+/// it ends.
+struct OpenMailbox(String);
+
+impl OpenMailbox {
+    fn hold(path: &str) -> OpenMailbox {
+        open_mailboxes().lock().unwrap().insert(path.to_string());
+        OpenMailbox(path.to_string())
+    }
+}
+
+impl Drop for OpenMailbox {
+    fn drop(&mut self) {
+        open_mailboxes().lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Hand a batch of task updates to the agent: into the turn running on that
+/// surface if there is one (the same door a person's mid-turn words take, so
+/// no second copy of the agent forks its session), else as a turn of its own.
+/// Then write down what it was told, so nothing tells it again.
+async fn deliver_update(
+    w: &WakeTurn,
+    tag: &str,
+    events: Vec<(crate::bgtasks::Task, crate::bgtasks::Kind)>,
+    tasks: &[crate::bgtasks::Task],
+    retry: &mut HashMap<PathBuf, Retry>,
+) {
+    use crate::bgtasks::{Handed, Kind};
+    let now = crate::bgtasks::now_ms();
+    let still: Vec<&crate::bgtasks::Task> = tasks.iter().filter(|t| t.running()).collect();
+    let prompt = crate::bgtasks::prompt(&events, &still, now);
+    println!(
+        "✓ {} background-task update(s) in {tag} ({}) — to the agent",
+        events.len(),
+        events.iter().map(|(_, k)| match k { Kind::Exited(_) => "ended", Kind::Quiet => "log quiet", Kind::Long => "running long" }).collect::<Vec<_>>().join(", ")
+    );
+    let told = |t: &crate::bgtasks::Task, k: &Kind, handed: Option<&Handed>| {
+        let mut l = crate::bgtasks::ledger(&t.pid_path);
+        match k {
+            Kind::Exited(_) => l.handed = handed.cloned(),
+            Kind::Quiet => l.quiet = true,
+            Kind::Long => l.long = true,
+        }
+        crate::bgtasks::write_ledger(&t.pid_path, &l);
+    };
+    if let Some(outcome) = inject_into_live_turn(
+        &w.chat_states, &w.chat_id, w.channel_id.as_deref(), w.thread_root.as_deref(),
+        // Free, like a wrap-up always was: it may land in whichever unbilled
+        // turn is running here — of its own kind: a guest's work only into a
+        // guest's turn.
+        Speaker::person(&w.turn_sender), Some(w.guest), None, &prompt, Seam::Notice(crate::bgtasks::notice(&events)),
+        |t| async move { t },
+    )
+    .await
+    {
+        println!("↩︎ handed to the RUNNING turn in {tag} — no turn of its own");
+        let handed = Handed { mailbox: outcome.mailbox().to_string(), needle: prompt.trim().to_string() };
+        for (t, k) in &events {
+            told(t, k, Some(&handed));
+        }
+        return;
+    }
+    // Nobody running here: a turn of its own. «Quiet» and «long» are said
+    // once whatever becomes of it: retried until they land, they would be
+    // the very noise this replaces.
+    let mut exits: Vec<PathBuf> = vec![];
+    for (t, k) in &events {
+        match k {
+            Kind::Exited(_) => exits.push(t.pid_path.clone()),
+            _ => told(t, k, None),
+        }
+    }
+    // The update, then whatever someone said into it too late for it to act
+    // on (`Turned::leftover`) — answered, as `connect_and_run` answers it.
+    let mut next = Some(prompt);
+    let hush_failure = exits.iter().any(|p| retry.get(p).is_some_and(|r| r.tries > 0));
+    let mut update = Some(UpdateTurn { hush_failure });
+    let mut landed = false;
+    for round in 1..=3 {
+        let Some(p) = next.take() else { break };
+        let attempt = handle(
+            &w.client, &w.workdir, w.workdir_ns, &w.bot, &w.chat_id,
+            w.thread_root.as_deref(), w.channel_id.as_deref(), &p, &[],
+            &w.sessions, &w.coord, &w.chat_states, &w.harness,
+            w.model.clone(), w.effort.clone(), w.thinking, w.system.clone(), w.account.clone(),
+            // Nobody's message: no trigger, nothing to bill. A guest's tasks
+            // wake as a guest's, whoever's turn armed the watcher.
+            &w.turn_sender, w.guest.then_some(""), None, &[],
+            None,
+            false,
+            None,
+            None,
+            // Its bubble is held: the agent may judge there is nothing to say.
+            update.take(),
+        )
+        .await;
+        match attempt {
+            // (A follow-up answers someone: a turn like any other.)
+            Ok(t) => {
+                landed |= round == 1 && !t.lost;
+                next = t.leftover;
+            }
+            Err(e) => {
+                eprintln!("background-task update turn failed in {tag}: {e:#}");
+                break;
+            }
+        }
+    }
+    for p in &exits {
+        if landed {
+            crate::bgtasks::retire(std::slice::from_ref(p));
+            retry.remove(p);
+            continue;
+        }
+        // Went nowhere — the link down, the turn failed. Not every ten
+        // seconds: in a minute, then ten; then it waits on disk for the next
+        // watcher (the next turn here, a restart). An exit nobody hears about
+        // is the silence this whole watcher exists to end.
+        let r = retry.entry(p.clone()).or_default();
+        r.failed();
+        if r.spent() {
+            println!("⏳ update for {} went nowhere {} times — kept for the next watcher", p.display(), Retry::TRIES);
+        } else {
+            println!("⏳ update for {} went nowhere — trying again in {:?}", p.display(), r.at.saturating_duration_since(std::time::Instant::now()));
+        }
+    }
+}
+
+/// An exit whose update went nowhere, and when to try it again.
+struct Retry {
+    tries: u32,
+    at: std::time::Instant,
+}
+
+impl Default for Retry {
+    fn default() -> Retry {
+        Retry { tries: 0, at: std::time::Instant::now() }
+    }
+}
+
+impl Retry {
+    const TRIES: u32 = 3;
+
+    fn failed(&mut self) {
+        self.tries += 1;
+        let wait = match (self.tries, cfg!(test)) {
+            (1, false) => Duration::from_secs(60),
+            (_, false) => Duration::from_secs(10 * 60),
+            (n, true) => Duration::from_millis(200 * n as u64),
+        };
+        self.at = std::time::Instant::now() + wait;
+    }
+
+    fn spent(&self) -> bool {
+        self.tries >= Self::TRIES
+    }
+
+    fn due(&self) -> bool {
+        !self.spent() && std::time::Instant::now() >= self.at
+    }
+}
+
+/// The last lines of a task's log, for its card: the final few KB only.
+fn log_tail(path: &std::path::Path, max: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return vec![] };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let back = len.min(4096);
+    let mut buf = Vec::with_capacity(back as usize);
+    if f.seek(SeekFrom::Start(len - back)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return vec![];
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<&str> = text.lines().collect();
+    // Started mid-line: that first line is a fragment.
+    let start = usize::from(back == 4096 && len > 4096 && lines.len() > 1);
+    let mut tail: Vec<String> = lines[start..].iter().map(|l| card_line(l, 160)).filter(|l| !l.is_empty()).collect();
+    if tail.len() > max {
+        tail.drain(..tail.len() - max);
+    }
+    tail
+}
+
+/// One task on a `{% mafold/bgtasks %}` card, as it last read.
+#[derive(Clone)]
+struct CardRow {
+    started_ms: u64,
+    running: bool,
+    /// Its `t|…`, `x|…` and `o|…` lines.
+    lines: String,
+}
+
+fn card_row(t: &crate::bgtasks::Task) -> CardRow {
+    use crate::bgtasks::{Exit, Life};
+    const MAX_TAIL: usize = 6;
+    let mut s = format!(
+        "t|{}|{}|{}\n",
+        t.started_ms,
+        if t.running() { "running" } else { "done" },
+        card_line(&t.meta.cmd, 160)
+    );
+    if let Life::Exited(Exit { code, timed_out }) = &t.life {
+        s.push_str(&format!(
+            "x|{}|{}\n",
+            code.map(|c| c.to_string()).unwrap_or_default(),
+            if *timed_out { "timeout" } else { "" }
+        ));
+    }
+    for l in log_tail(&t.log(), MAX_TAIL) {
+        s.push_str("o|");
+        s.push_str(&l);
+        s.push('\n');
+    }
+    CardRow { started_ms: t.started_ms, running: t.running(), lines: s }
+}
+
+/// The `{% mafold/bgtasks %}` block for a surface's tasks, as this watcher
+/// keeps it: the NEWEST eight (the old snapshot kept the oldest, so leftovers
+/// pushed the turn's own tasks out of its card), shown oldest first. An ended
+/// task carries how it ended on an `x|<code>|<timeout>` line — cards that
+/// predate it skip lines they don't know.
+fn tasks_block(tasks: &[crate::bgtasks::Task]) -> String {
+    card_block(&tasks.iter().map(card_row).collect::<Vec<_>>())
+}
+
+fn card_block(rows: &[CardRow]) -> String {
+    const MAX_TASKS: usize = 8;
+    if rows.is_empty() {
+        return String::new();
+    }
+    let shown = &rows[rows.len().saturating_sub(MAX_TASKS)..];
+    let live = shown.iter().filter(|r| r.running).count();
+    let n = if live > 0 { live } else { shown.len() };
+    let mut s = format!("{{% mafold/bgtasks n={n} %}}\n");
+    for r in shown {
+        s.push_str(&r.lines);
+    }
+    s.push_str("{% /mafold/bgtasks %}");
+    s
 }
 
 /// Drains a harness's `AgentEvent` stream → ordered markdoc deltas, with
@@ -10809,6 +11619,8 @@ async fn render_loop(
     // Out-param: the parts of cards drawn this turn that only some readers may
     // read — controlled state `handle()` writes onto the reply at the end.
     private: Private,
+    // An update turn's held bubble (`Quiet`); None for every other turn.
+    quiet: Option<Quiet>,
 ) {
     // Telegram `sendMessageDraft` model: keep the running FULL markdoc content
     // locally and push the whole snapshot (throttled ~300ms) via editDraft, with
@@ -10899,9 +11711,28 @@ async fn render_loop(
     // this original id — see `draft_ptr_path`.
     let origin_id = msg_id.clone();
 
+    // An update turn's bubble, held until there is something to show (`Quiet`)
+    // — no draft exists for `msg_id` while `held`. A retry's renderer finds
+    // the one an earlier attempt opened.
+    let mut held = false;
+    if let Some(q) = &quiet {
+        let live = live_draft.lock().unwrap().clone();
+        held = live == q.held;
+        msg_id = live;
+    }
+    // What the agent has said so far, and whether it has been at work.
+    let mut spoken = String::new();
+    let mut worked = false;
+    let mut open_retry_at = std::time::Instant::now();
+    // The session the work is going into, for the journal a held bubble
+    // brings in with it when it opens (`Quiet::journal`).
+    let mut session_now: Option<String> = None;
+
     // Show the generating card immediately (covers the model's initial latency)
     // — under whatever the bubble already says.
-    let _ = client.edit_draft(&msg_id, &format!("{}{}", tx.snapshot(), generating_tag!())).await;
+    if !held {
+        let _ = client.edit_draft(&msg_id, &format!("{}{}", tx.snapshot(), generating_tag!())).await;
+    }
 
     // Push the running snapshot, throttled. `$force` bypasses the throttle
     // (interactive ask; every tool event — first paint must not lag). The
@@ -10913,11 +11744,70 @@ async fn render_loop(
     // committing it later produces identical text — visually seamless.
     macro_rules! push_running {
         ($force:expr) => {
-            if $force || last_push.elapsed() >= THROTTLE {
+            if !held && ($force || last_push.elapsed() >= THROTTLE) {
                 let _ = client
                     .edit_draft(&msg_id, &format!("{}{}", tx.snapshot(), generating_tag!()))
                     .await;
                 last_push = std::time::Instant::now();
+            }
+        };
+    }
+
+    // Open a held bubble once the turn has something to show (`Quiet`) — or
+    // `$now`: a person's words reached the turn, a file is on its way. Opened
+    // like a steer moves a reply: a fresh draft, the turn's handle and the
+    // attach forwarding address follow it. A failed open is tried again in a
+    // few seconds; `handle` makes a last attempt at the end.
+    macro_rules! open_if_due {
+        ($now:expr) => {
+            if held {
+                let at_work = worked
+                    && mafold_transcript::stats::now_ms().saturating_sub(started_ms)
+                        >= QUIET_WORK.as_millis() as u64;
+                let due = $now
+                    || speaks(&spoken)
+                    || awaiting.is_some()
+                    || at_work
+                    || draft_open_path(&origin_id).exists();
+                if due {
+                    if let Some(q) = &quiet {
+                        q.wanted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                if due && ($now || std::time::Instant::now() >= open_retry_at) {
+                    match client.create_draft(&chat_id, thread_root.as_deref(), channel_id.as_deref(), None).await {
+                        Ok(fresh) => {
+                            held = false;
+                            let old = std::mem::replace(&mut msg_id, fresh.clone());
+                            *live_draft.lock().unwrap() = fresh.clone();
+                            let _ = std::fs::write(draft_ptr_path(&origin_id), &fresh);
+                            {
+                                let mut states = chat_states.lock().await;
+                                if let Some(st) = states.get_mut(&chat_id) {
+                                    if let Some(h) = st.turns.remove(&old) {
+                                        st.turns.insert(fresh.clone(), h);
+                                    }
+                                }
+                            }
+                            // From here a killed daemon leaves a bubble the
+                            // next one finalizes (`Quiet::journal`).
+                            if let (Some(outbox), Some(j)) = (&client.drafts, quiet.as_ref().and_then(|q| q.journal.as_ref())) {
+                                let mut j = j.clone();
+                                j.session = session_now.clone().or(j.session);
+                                j.child = journaled_child.or(j.child);
+                                j.produced = session_named;
+                                j.shown = !session_named;
+                                outbox.journal(&fresh, j);
+                            }
+                            println!("💬 the update turn in chat {chat_id} has something to show — its bubble opens");
+                            push_running!(true);
+                        }
+                        Err(e) => {
+                            eprintln!("update turn: couldn't open its bubble yet: {e:#}");
+                            open_retry_at = std::time::Instant::now() + Duration::from_secs(5);
+                        }
+                    }
+                }
             }
         };
     }
@@ -10929,6 +11819,9 @@ async fn render_loop(
         if hb.keepalive(mafold_transcript::stats::now_ms(), || proc.running()) {
             push_running!(true);
         }
+        // A held bubble whose turn has been at work a while, or whose
+        // `mafold attach` is waiting on it.
+        open_if_due!(false);
         // Which process is doing the work, the moment one is: a restart must
         // not run the turn again while it lives on — least of all a turn that
         // has shown nothing yet, which is the one a restart runs over again.
@@ -10999,11 +11892,31 @@ async fn render_loop(
                 // replaces the last — a seat failover or a retry runs on.
                 if let AgentEvent::Session(sid) = &ev {
                     session_named = true;
+                    session_now = Some(sid.clone());
                     journal_progress(&client, &msg_id, Some(sid), None, None);
                 }
                 if let AgentEvent::Stats(s) = &ev {
                     if let Some(n) = s.context_used_tokens {
                         context_seen.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                // What a held bubble waits on: the agent's own words (the
+                // daemon's notes ahead of them are not), and its work.
+                if let Some(q) = &quiet {
+                    match &ev {
+                        AgentEvent::Text(t) => {
+                            let mut notes = q.notes.lock().unwrap();
+                            match notes.iter().position(|n| n == t) {
+                                Some(i) => drop(notes.remove(i)),
+                                None => spoken.push_str(t),
+                            }
+                        }
+                        // An attempt abandoned mid-stream is un-said.
+                        AgentEvent::TextRewind(t) if spoken.ends_with(t.as_str()) => {
+                            spoken.truncate(spoken.len() - t.len())
+                        }
+                        AgentEvent::ToolCall { .. } => worked = true,
+                        _ => {}
                     }
                 }
                 match &ev {
@@ -11045,7 +11958,12 @@ async fn render_loop(
                 // "已生成" and nothing ever shows up. If it fails, say so in the
                 // transcript rather than leaving the claim standing.
                 if let AgentEvent::Image { path } = &ev {
-                    if let Err(e) = client.attach_media(&msg_id, path).await {
+                    // A held bubble opens for it — right now, backoff or not;
+                    // one that still can't has no message to hang it on.
+                    open_if_due!(true);
+                    if held {
+                        tx.push_raw("\n_(couldn't send the image: its message couldn't be opened)_\n");
+                    } else if let Err(e) = client.attach_media(&msg_id, path).await {
                         tx.push_raw(&format!("\n_(couldn't send the image: {e})_\n"));
                     }
                     push_running!(true);
@@ -11070,9 +11988,13 @@ async fn render_loop(
                 // `{% mafold/result %}` card and that goes last.
                 if matches!(ev, AgentEvent::Done { .. }) && shells > 0 {
                     tx.seal();
-                    let snap = bgtasks_snapshot(&surface);
-                    if !snap.is_empty() {
-                        tx.push_raw(&format!("\n{}\n", bgtasks_block(&snap)));
+                    let block = if crate::bgtasks::events_on() {
+                        tasks_block(&crate::bgtasks::list(&surface))
+                    } else {
+                        bgtasks_block(&bgtasks_snapshot(&surface))
+                    };
+                    if !block.is_empty() {
+                        tx.push_raw(&format!("\n{block}\n"));
                     }
                 }
 
@@ -11096,6 +12018,14 @@ async fn render_loop(
                 // The timing the whole thing rests on is free: we only hear
                 // about a steer AFTER the server stored their message, so a
                 // draft created now can only be newer.
+                if matches!(ev, AgentEvent::Steered(_)) && held {
+                    // Spoken to while holding its bubble: it opens now — below
+                    // their message already, so there is nothing to move.
+                    tx.push(&ev);
+                    open_if_due!(true);
+                    push_running!(true);
+                    continue;
+                }
                 if matches!(ev, AgentEvent::Steered(_)) {
                     tx.push(&ev); // the seam goes in first, so it travels along
                     // No trigger on the replacement: the server bills one
@@ -11164,6 +12094,7 @@ async fn render_loop(
                 // only (a compaction's summary): that part is state the turn
                 // writes onto its reply once it is finished (`write_private`).
                 private.lock().unwrap().extend(tx.take_private());
+                open_if_due!(false);
                 // Something reached the bubble: the journal learns whether it
                 // was the agent's own work, in a session a restart can continue,
                 // or only narration so far (`drafts::Journal::produced`/`shown`).
@@ -11240,7 +12171,9 @@ async fn render_loop(
                     // `editDraft` is.
                     Advance::Done => {
                         let out = tx.finish_folded();
-                        let _ = client.edit_draft(&msg_id, &out).await;
+                        if !held {
+                            let _ = client.edit_draft(&msg_id, &out).await;
+                        }
                         *final_md.lock().unwrap() = out;
                         return;
                     }
@@ -11258,7 +12191,9 @@ async fn render_loop(
     // path: a turn that died mid-way is exactly the one whose trail is worth
     // keeping and worth keeping out of the way.
     let out = tx.finish_folded();
-    let _ = client.edit_draft(&msg_id, &out).await;
+    if !held {
+        let _ = client.edit_draft(&msg_id, &out).await;
+    }
     *final_md.lock().unwrap() = out;
 }
 
@@ -15936,5 +16871,787 @@ mod stop_during_setup_tests {
             tokio::time::timeout(Duration::from_millis(500), cancel.notified()).await.is_ok(),
             "the run never saw the Stop"
         );
+    }
+}
+
+/// The background-task watcher, replayed from 10-22's channels against a
+/// stand-in api, a real `bash` per task and a turn already running (so every
+/// update lands in a mailbox the test can read). Each scenario runs against
+/// BOTH watchers: the new one must get it right, and the old one must still
+/// get it wrong the way the channels saw — that is what proves the scenario
+/// reaches the code it is about (a «nothing happened» on a harness that never
+/// fired would prove nothing). A test's minutes are milliseconds
+/// (`bgtasks::TICK`, `quiet_after`, `long_after`, the old watcher's beat and
+/// give-up: 0.5s first beat, 1s apart, 3s give-up).
+#[cfg(all(test, unix))]
+mod bgtask_watch_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const BOT: &str = "watch-bot";
+
+    /// One watcher at a time: `bgtasks::TEST_EVENTS` picks which.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Every call the daemon made, and the messages it holds, by id.
+    #[derive(Default)]
+    struct Api {
+        calls: Vec<(String, Value)>,
+        messages: HashMap<String, String>,
+    }
+
+    impl Api {
+        /// What the daemon posted into the chat on its own.
+        fn posts(&self) -> Vec<String> {
+            self.calls
+                .iter()
+                .filter(|(m, _)| m == "sendMessage")
+                .map(|(_, b)| b["text"].as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+    }
+
+    async fn fake_api() -> (String, Arc<StdMutex<Api>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let api = Arc::new(StdMutex::new(Api::default()));
+        let shared = api.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let api = shared.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let (path, body) = loop {
+                        let mut chunk = [0; 8192];
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                        let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                        let header = String::from_utf8_lossy(&bytes[..end]).to_string();
+                        let len: usize = header
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() < end + 4 + len {
+                            continue;
+                        }
+                        break (header.split_whitespace().nth(1).unwrap_or("").to_string(), bytes[end + 4..end + 4 + len].to_vec());
+                    };
+                    let method = path.trim_start_matches("/api/").to_string();
+                    let req: Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let result = {
+                        let mut api = api.lock().unwrap();
+                        api.calls.push((method.clone(), req.clone()));
+                        match method.as_str() {
+                            "botCreateDraft" => {
+                                let id = uuid::Uuid::new_v4().to_string();
+                                api.messages.insert(id.clone(), String::new());
+                                serde_json::json!({
+                                    "id": id, "conversation_id": req["chat_id"], "content": "",
+                                    "sender": { "username": BOT, "display_name": BOT, "kind": "bot" },
+                                    "created_at": "2026-10-23T00:00:00Z", "finalized_at": null,
+                                    "reactions": [], "client_msg_id": null, "attachments": [],
+                                })
+                            }
+                            "botEditDraft" => {
+                                if let (Some(id), Some(c)) = (req["message_id"].as_str(), req["content"].as_str()) {
+                                    api.messages.insert(id.to_string(), c.to_string());
+                                }
+                                serde_json::json!({})
+                            }
+                            "getMessage" => match req["message_id"].as_str().and_then(|id| api.messages.get(id).map(|c| (id, c))) {
+                                Some((id, c)) => serde_json::json!({
+                                    "id": id, "content": c, "sender": { "username": BOT, "kind": "bot" },
+                                }),
+                                None => serde_json::json!({}),
+                            },
+                            _ => serde_json::json!({}),
+                        }
+                    };
+                    let reply = serde_json::json!({ "ok": true, "result": result }).to_string();
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                                reply.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (base, api)
+    }
+
+    fn registry() -> PathBuf {
+        crate::bgtasks::TEST_REGISTRY
+            .get_or_init(|| {
+                let d = std::env::temp_dir().join(format!("mf-bgwatch-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .clone()
+    }
+
+    /// A channel with a turn already running in it — `@realopsdu`'s, say — so
+    /// whatever the watcher hands over lands in that turn's mailbox.
+    struct Room {
+        client: Client,
+        api: Arc<StdMutex<Api>>,
+        states: ChatStates,
+        conv: String,
+        tag: String,
+        mailbox: String,
+        _notices: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+        /// Everything the running turn has taken from its mailbox so far.
+        taken: Vec<String>,
+        pgids: Vec<u32>,
+    }
+
+    impl Room {
+        async fn new(name: &str) -> Room {
+            gate_access();
+            let (base, api) = fake_api().await;
+            let conv = format!("{name}-{}", uuid::Uuid::new_v4().simple());
+            let tag = surface_tag(BOT, &conv, Some("ch"));
+            let mailbox = registry().join(format!("{conv}.mailbox")).to_string_lossy().into_owned();
+            let (events, notices) = tokio::sync::mpsc::unbounded_channel();
+            let states: ChatStates = Default::default();
+            states.lock().await.entry(conv.clone()).or_default().turns.insert(
+                "running-turn".into(),
+                TurnHandle {
+                    cancel: Arc::new(Notify::new()), ask_file: None, perm: None, owner: GATE_OWNER.into(),
+                    channel: Some("ch".into()), thread: None, events, steer_file: mailbox.clone(),
+                    can_steer: true, pays: false, guest: false,
+                },
+            );
+            Room {
+                client: Client::new(base, "test".into()),
+                api, states, conv, tag, mailbox, _notices: notices, taken: vec![], pgids: vec![],
+            }
+        }
+
+        /// What `bash-hook` does for a background Bash: script, meta, a new
+        /// session, pid. Reaped here, as launchd reaps the real ones.
+        fn start(&mut self, cmd: &str) -> PathBuf {
+            use std::os::unix::process::CommandExt;
+            let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let at = |ext: &str| registry().join(format!("{}.{ns}.{ext}", self.tag));
+            // A receipt only where the hook would leave one: under the flag.
+            let receipt = at("exit");
+            let receipt = crate::bgtasks::events_on().then_some(receipt.as_path());
+            std::fs::write(at("sh"), crate::bash_hook::script_body(cmd, None, receipt)).unwrap();
+            let log = std::fs::File::create(at("log")).unwrap();
+            let mut c = crate::platform::std_command("bash");
+            c.arg(at("sh")).stdin(std::process::Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log);
+            unsafe {
+                c.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            let mut child = c.spawn().unwrap();
+            let pid = child.id();
+            std::thread::spawn(move || child.wait());
+            self.pgids.push(pid);
+            std::fs::write(at("pid"), pid.to_string()).unwrap();
+            let meta = serde_json::json!({ "cmd": cmd, "pid_start": crate::platform::pid_start(pid) });
+            std::fs::write(at("meta"), meta.to_string()).unwrap();
+            at("pid")
+        }
+
+        /// What a clean turn end — or a restart — does: arm on what is registered.
+        fn arm(&self, card: Option<&str>) {
+            let n = registered(&self.tag);
+            if n == 0 {
+                return;
+            }
+            arm_bg_wakeup(
+                self.client.clone(), "/tmp".into(), false, BOT.into(), self.conv.clone(), None, Some("ch".into()),
+                Default::default(), ExecCoord::new(None, None), self.states.clone(),
+                Arc::new(crate::harness::claude_code::ClaudeCode),
+                None, None, None, None, None, GATE_OWNER.into(), false, n,
+                card.map(|id| (id.to_string(), String::new())),
+            );
+        }
+
+        /// The running turn reaches a tool-result boundary and reads its
+        /// mailbox; for `for_ms`, as often as a turn would.
+        async fn take_for(&mut self, for_ms: u64) {
+            let until = tokio::time::Instant::now() + Duration::from_millis(for_ms);
+            while tokio::time::Instant::now() < until {
+                if let Some(t) = crate::steer_hook::take(&self.mailbox) {
+                    self.taken.push(t);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// The running turn ends; the next one here is already running, with a
+        /// mailbox of its own — where anything handed over from now on lands.
+        async fn next_turn(&mut self) {
+            let (events, notices) = tokio::sync::mpsc::unbounded_channel();
+            self.mailbox = registry().join(format!("{}.{}.mailbox", self.conv, uuid::Uuid::new_v4().simple())).to_string_lossy().into_owned();
+            self._notices = notices;
+            let mut states = self.states.lock().await;
+            let st = states.get_mut(&self.conv).unwrap();
+            st.turns.clear();
+            st.turns.insert(
+                "next-turn".into(),
+                TurnHandle {
+                    cancel: Arc::new(Notify::new()), ask_file: None, perm: None, owner: GATE_OWNER.into(),
+                    channel: Some("ch".into()), thread: None, events, steer_file: self.mailbox.clone(),
+                    can_steer: true, pays: false, guest: false,
+                },
+            );
+        }
+
+        /// How many updates the agent has been handed about this task.
+        fn told(&self, task: &std::path::Path) -> usize {
+            let log = task.with_extension("log").display().to_string();
+            self.taken.iter().filter(|t| t.contains(&log)).count()
+        }
+
+        /// …about its END. (The old watcher's wrap-up names the log only; the
+        /// new one's line for an end says «exited».)
+        fn told_end(&self, task: &std::path::Path) -> usize {
+            let log = task.with_extension("log").display().to_string();
+            self.taken
+                .iter()
+                .filter(|t| t.lines().any(|l| l.contains(&log) && !l.contains("still running")))
+                .count()
+        }
+
+        fn posts(&self) -> Vec<String> {
+            self.api.lock().unwrap().posts()
+        }
+    }
+
+    impl Drop for Room {
+        fn drop(&mut self) {
+            for p in &self.pgids {
+                unsafe { libc::kill(-(*p as i32), libc::SIGKILL) };
+            }
+            // Back to the server's word for every test after this one.
+            *crate::bgtasks::TEST_EVENTS.lock().unwrap() = None;
+        }
+    }
+
+    fn watcher(on: bool) {
+        *crate::bgtasks::TEST_EVENTS.lock().unwrap() = Some(on);
+    }
+
+    /// #desktop优化, 10-22 02:42–03:04: the channel's watcher had been running
+    /// since 00:58; the wait-for-#1065 task rode it, was told «超过 2 小时»
+    /// sixteen minutes in, and when it exited at 03:04 nobody said a word. Its
+    /// card stayed on «running».
+    async fn a_task_riding_an_old_watcher(on: bool) -> (Room, PathBuf) {
+        watcher(on);
+        let mut r = Room::new("ride").await;
+        // The old watcher gives up 4s after it was armed: the rider joins at
+        // 1s (seen within a tick), is still running at 4s, and ends at ~5s.
+        let _first = r.start("sleep 10");
+        r.api.lock().unwrap().messages.insert("card".into(), "{% mafold/bgtasks n=1 /%}".into());
+        r.arm(Some("card"));
+        r.take_for(1000).await;
+        let rider = r.start("sleep 4; echo merged");
+        r.arm(None);
+        r.take_for(5500).await;
+        (r, rider)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_that_rides_is_watched_on_its_own_clock_until_it_exits() {
+        let _one = SERIAL.lock().await;
+        let (r, rider) = a_task_riding_an_old_watcher(true).await;
+        assert_eq!(r.posts(), Vec::<String>::new(), "the daemon says nothing in the chat itself");
+        assert_eq!(r.told_end(&rider), 1, "its exit reached the agent, once: {:?}", r.taken);
+        let card = r.api.lock().unwrap().messages["card"].clone();
+        assert!(card.contains("|done|sleep 4; echo merged") && card.contains("x|0|"), "the card says it ended, and how: {card}");
+        assert!(!r.taken.iter().any(|t| t.contains("2 hours") || t.contains("2 小时")), "{:?}", r.taken);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_the_old_watcher_gives_a_rider_up_and_never_reports_it() {
+        let _one = SERIAL.lock().await;
+        let (r, rider) = a_task_riding_an_old_watcher(false).await;
+        let posts = r.posts();
+        assert!(posts.iter().any(|p| p.contains("⏳ 后台还在跑")), "{posts:?}");
+        assert!(posts.iter().any(|p| p.contains("超过 2 小时")), "{posts:?}");
+        assert_eq!(r.told_end(&rider), 0, "the rider's exit was never reported");
+        let card = r.api.lock().unwrap().messages["card"].clone();
+        assert!(card.contains("|running|sleep 4; echo merged"), "the card froze on running: {card}");
+    }
+
+    /// 09-27's «已 553 分钟»: a task that died without a receipt, its pid now a
+    /// stranger's. `kill(pid, 0)` alone called the stranger the task.
+    async fn a_dead_task_whose_pid_is_reused(on: bool) -> (Room, PathBuf, u32) {
+        watcher(on);
+        let mut r = Room::new("reuse").await;
+        let stranger = r.start("echo up; sleep 30");
+        // Up and into its script before that script goes: bash opens it only
+        // once it is running, and a script deleted before then is a stranger
+        // that dies at once — which proves nothing about pids.
+        let began = tokio::time::Instant::now();
+        while !std::fs::read_to_string(stranger.with_extension("log")).is_ok_and(|s| s.contains("up")) {
+            assert!(began.elapsed() < Duration::from_secs(5), "the stranger never came up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() - 60_000_000_000;
+        let task = registry().join(format!("{}.{ns}.pid", r.tag));
+        let pid: u32 = std::fs::read_to_string(&stranger).unwrap().trim().parse().unwrap();
+        let start = crate::platform::pid_start(pid).unwrap();
+        std::fs::write(&task, pid.to_string()).unwrap();
+        std::fs::write(
+            task.with_extension("meta"),
+            serde_json::json!({ "cmd": "make release", "pid_start": start - 1, "receipt": true }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(task.with_extension("log"), "built\n").unwrap();
+        // The stranger's own registration is not part of this story.
+        crate::bgtasks::cleanup(std::slice::from_ref(&stranger));
+        r.arm(None);
+        r.take_for(1800).await;
+        (r, task, pid)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reused_pid_does_not_keep_a_dead_task_running() {
+        let _one = SERIAL.lock().await;
+        let (r, task, stranger) = a_dead_task_whose_pid_is_reused(true).await;
+        assert!(crate::platform::pid_alive(stranger), "the stranger lives on — it is the start time that told them apart");
+        assert_eq!(r.told(&task), 1, "{:?}", r.taken);
+        assert!(r.taken.iter().any(|t| t.contains("without an exit code")), "{:?}", r.taken);
+        assert_eq!(r.posts(), Vec::<String>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_the_old_watcher_takes_the_stranger_for_the_task() {
+        let _one = SERIAL.lock().await;
+        let (r, task, stranger) = a_dead_task_whose_pid_is_reused(false).await;
+        assert!(crate::platform::pid_alive(stranger));
+        assert_eq!(r.told(&task), 0);
+        assert!(r.posts().iter().any(|p| p.contains("make release")), "beats about a dead task: {:?}", r.posts());
+    }
+
+    /// #desktop优化 03:38–03:39: the result had reached a running turn; the
+    /// watcher stepped down before that turn took it, so the files stayed —
+    /// and the next clean turn end armed on them and reported it all again
+    /// (222k tokens, $0.87).
+    async fn an_exit_handed_to_a_running_turn(on: bool) -> (Room, PathBuf) {
+        watcher(on);
+        let mut r = Room::new("handed").await;
+        let task = r.start("echo done");
+        r.arm(None);
+        // Handed over — but the turn is busy and doesn't read its mailbox yet.
+        // (Both watchers name the task's log; only the new one its command.)
+        let log = task.with_extension("log").display().to_string();
+        let began = tokio::time::Instant::now();
+        while !std::fs::read_to_string(&r.mailbox).is_ok_and(|s| s.contains(&log)) {
+            assert!(began.elapsed() < Duration::from_secs(5), "never handed over");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        r.take_for(100).await;
+        // That turn ends cleanly (the gate arms on what is left), and the
+        // next one here is running.
+        r.next_turn().await;
+        r.arm(None);
+        r.take_for(1000).await;
+        (r, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exit_a_running_turn_took_is_not_told_again() {
+        let _one = SERIAL.lock().await;
+        let (r, task) = an_exit_handed_to_a_running_turn(true).await;
+        assert_eq!(r.told(&task), 1, "{:?}", r.taken);
+        assert!(!task.exists(), "and once taken, its registration is gone");
+        assert!(task.with_extension("log").exists(), "— but not its log: the turn reads it after taking the update");
+    }
+
+    /// The gap the review found: a turn's handle is gone (`drop_turn`) a
+    /// while before its end-of-turn drain takes the mailbox. An update handed
+    /// to it must not read as «nobody took it» in that gap, or it is handed
+    /// over a second time while the drain makes a follow-up of the first.
+    /// A turn that ends without reading an update handed to it, its mailbox
+    /// holding nothing else. Its last drain gives the update back, and the
+    /// watcher gets it to the agent after all — not as a follow-up of that
+    /// turn's, which a restart before it showed anything would lose (the
+    /// review's case).
+    async fn a_turn_that_ended_before_reading_it(give_back: bool) -> (Room, PathBuf) {
+        watcher(true);
+        let mut r = Room::new("unread").await;
+        let task = r.start("echo done");
+        let draining = OpenMailbox::hold(&r.mailbox);
+        r.arm(None);
+        let log = task.with_extension("log").display().to_string();
+        let began = tokio::time::Instant::now();
+        while !std::fs::read_to_string(&r.mailbox).is_ok_and(|s| s.contains(&log)) {
+            assert!(began.elapsed() < Duration::from_secs(5), "never handed over");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The turn's last drain (`handle`): nothing in it but the update.
+        let raw = crate::steer_hook::take(&r.mailbox).unwrap();
+        assert!(crate::bgtasks::only_updates(&raw), "{raw}");
+        if give_back {
+            crate::bgtasks::unhand(&r.tag, &r.mailbox);
+        }
+        r.next_turn().await;
+        drop(draining);
+        r.take_for(800).await;
+        (r, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_a_turn_never_read_reaches_the_agent_after_all() {
+        let _one = SERIAL.lock().await;
+        let (r, task) = a_turn_that_ended_before_reading_it(true).await;
+        assert_eq!(r.told(&task), 1, "{:?}", r.taken);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_a_drained_update_not_given_back_is_lost() {
+        let _one = SERIAL.lock().await;
+        let (r, task) = a_turn_that_ended_before_reading_it(false).await;
+        assert_eq!(r.told(&task), 0, "{:?}", r.taken);
+        assert!(!task.exists());
+    }
+
+    async fn a_turn_in_its_last_stretch(guarded: bool) -> (Room, PathBuf, String) {
+        watcher(true);
+        let mut r = Room::new("drain").await;
+        let task = r.start("echo done");
+        // What `handle` holds from its mailbox's making to its last drain.
+        let draining = guarded.then(|| OpenMailbox::hold(&r.mailbox));
+        r.arm(None);
+        let log = task.with_extension("log").display().to_string();
+        let began = tokio::time::Instant::now();
+        while !std::fs::read_to_string(&r.mailbox).is_ok_and(|s| s.contains(&log)) {
+            assert!(began.elapsed() < Duration::from_secs(5), "never handed over");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The turn's last stretch: its handle gone, its mailbox not drained
+        // yet — and the next turn here already running, with a mailbox of its
+        // own (where a second handing-over would land).
+        let next = registry().join(format!("{}.next.mailbox", r.conv)).to_string_lossy().into_owned();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut states = r.states.lock().await;
+            let st = states.get_mut(&r.conv).unwrap();
+            st.turns.clear();
+            st.turns.insert(
+                "next-turn".into(),
+                TurnHandle {
+                    cancel: Arc::new(Notify::new()), ask_file: None, perm: None, owner: GATE_OWNER.into(),
+                    channel: Some("ch".into()), thread: None, events, steer_file: next.clone(),
+                    can_steer: true, pays: false, guest: false,
+                },
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // The drain.
+        r.take_for(100).await;
+        drop(draining);
+        r.take_for(400).await;
+        let second = std::fs::read_to_string(&next).unwrap_or_default();
+        let _ = std::fs::remove_file(&next);
+        (r, task, second)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handed_exit_waits_out_the_turns_last_drain() {
+        let _one = SERIAL.lock().await;
+        let (r, task, second) = a_turn_in_its_last_stretch(true).await;
+        assert_eq!(r.told(&task), 1, "{:?}", r.taken);
+        assert!(!second.contains(&task.with_extension("log").display().to_string()), "handed over again: {second}");
+    }
+
+    /// Without the mailbox held open to its drain, the gap hands it over twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_without_the_drain_guard_it_is_handed_twice() {
+        let _one = SERIAL.lock().await;
+        let (r, task, second) = a_turn_in_its_last_stretch(false).await;
+        assert_eq!(r.told(&task), 1, "{:?}", r.taken);
+        assert!(second.contains(&task.with_extension("log").display().to_string()), "{second}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_the_old_watcher_tells_it_twice() {
+        let _one = SERIAL.lock().await;
+        let (r, task) = an_exit_handed_to_a_running_turn(false).await;
+        assert_eq!(r.told(&task), 2, "{:?}", r.taken);
+    }
+
+    /// The daemon restarts after a running turn took a task's exit, before the
+    /// watcher cleared its files. The restart re-arm used to report it again.
+    async fn a_restart_after_the_turn_took_it(on: bool) -> (Room, PathBuf) {
+        watcher(on);
+        let r = Room::new("restart").await;
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let task = registry().join(format!("{}.{ns}.pid", r.tag));
+        std::fs::write(&task, "999999").unwrap();
+        std::fs::write(task.with_extension("exit"), "0\n").unwrap();
+        std::fs::write(task.with_extension("log"), "ok\n").unwrap();
+        std::fs::write(task.with_extension("meta"), serde_json::json!({ "cmd": "cargo test" }).to_string()).unwrap();
+        let gone = registry().join("taken-before-the-restart").to_string_lossy().into_owned();
+        crate::bgtasks::write_ledger(&task, &crate::bgtasks::Ledger {
+            handed: Some(crate::bgtasks::Handed { mailbox: gone, needle: "cargo test".into() }),
+            ..Default::default()
+        });
+        r.arm(None);
+        let mut r = r;
+        r.take_for(800).await;
+        (r, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_does_not_tell_what_was_already_taken() {
+        let _one = SERIAL.lock().await;
+        let (r, task) = a_restart_after_the_turn_took_it(true).await;
+        assert_eq!(r.told(&task), 0, "{:?}", r.taken);
+        assert!(!task.exists(), "its files are cleared instead");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_the_old_watcher_tells_it_again_after_a_restart() {
+        let _one = SERIAL.lock().await;
+        let (r, task) = a_restart_after_the_turn_took_it(false).await;
+        assert_eq!(r.told(&task), 1, "{:?}", r.taken);
+    }
+
+    /// Long and quiet are said once each, as updates to the agent — never as
+    /// a message of the daemon's — and the task is still watched to its end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_long_and_going_quiet_are_told_once_then_the_end() {
+        let _one = SERIAL.lock().await;
+        watcher(true);
+        let mut r = Room::new("long").await;
+        let task = r.start("sleep 4.2; echo finally");
+        r.arm(None);
+        r.take_for(6500).await;
+        let about: Vec<&String> = r.taken.iter().filter(|t| t.contains(&task.with_extension("log").display().to_string())).collect();
+        assert_eq!(about.iter().filter(|t| t.contains("hasn't changed in")).count(), 1, "{about:?}");
+        assert_eq!(about.iter().filter(|t| t.contains("so far")).count(), 1, "{about:?}");
+        assert_eq!(about.iter().filter(|t| t.contains("exited 0")).count(), 1, "{about:?}");
+        assert_eq!(r.posts(), Vec::<String>::new());
+    }
+
+    /// The card shows the NEWEST tasks — the old one kept the oldest eight, so
+    /// leftovers pushed a turn's own tasks out of its card.
+    #[test]
+    fn the_card_keeps_the_newest_and_says_how_each_ended() {
+        use crate::bgtasks::{Exit, Ledger, Life, Meta, Task};
+        let t = |i: u64, life: Life| Task {
+            pid_path: PathBuf::from(format!("/nowhere/c__ch__b.{i}.pid")),
+            started_ms: i,
+            life,
+            meta: Meta { cmd: format!("task {i}"), ..Default::default() },
+            quiet_ms: 0,
+            ledger: Ledger::default(),
+        };
+        let mut tasks: Vec<Task> = (1..=9).map(|i| t(i, Life::Running)).collect();
+        tasks.push(t(10, Life::Exited(Exit { code: Some(124), timed_out: true })));
+        let block = tasks_block(&tasks);
+        assert!(!block.contains("|task 1\n") && !block.contains("|task 2\n"), "{block}");
+        assert!(block.contains("t|10|done|task 10\nx|124|timeout\n"), "{block}");
+        assert!(block.starts_with("{% mafold/bgtasks n=7 %}"), "{block}");
+    }
+
+    /// An update turn's renderer (`Quiet`), fed `events` — each after its
+    /// pause in ms — against the stand-in api. What it came to: the api's
+    /// calls, the draft the turn ended in, the reply, and whether the turn
+    /// came to have something to show.
+    struct Held {
+        api: Arc<StdMutex<Api>>,
+        held: String,
+        ended_in: String,
+        reply: String,
+        wanted: bool,
+        handle_keys: Vec<String>,
+    }
+
+    impl Held {
+        fn calls(&self, method: &str) -> Vec<Value> {
+            self.api.lock().unwrap().calls.iter().filter(|(m, _)| m == method).map(|(_, b)| b.clone()).collect()
+        }
+    }
+
+    /// The forwarding address goes with the test, not with the renderer: a
+    /// `mafold attach` still polling for it must find it there.
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(draft_ptr_path(&self.held));
+            let _ = std::fs::remove_file(draft_open_path(&self.held));
+        }
+    }
+
+    async fn held_turn(notes: &[&str], events: Vec<(u64, AgentEvent)>, before: impl FnOnce(&str)) -> Held {
+        let (base, api) = fake_api().await;
+        let client = Client::new(base, "test".into());
+        let conv = uuid::Uuid::new_v4().to_string();
+        let held = held_draft_id();
+        let live = Arc::new(std::sync::Mutex::new(held.clone()));
+        let states: ChatStates = Default::default();
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        states.lock().await.entry(conv.clone()).or_default().turns.insert(
+            held.clone(),
+            TurnHandle {
+                cancel: Arc::new(Notify::new()), ask_file: None, perm: None, owner: GATE_OWNER.into(),
+                channel: None, thread: None, events: etx, steer_file: "/nonexistent-mailbox".into(),
+                can_steer: true, pays: false, guest: false,
+            },
+        );
+        let wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let final_md = Arc::new(std::sync::Mutex::new(String::new()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        before(&held);
+        let r = tokio::spawn(render_loop(
+            rx, client, held.clone(), None, None, live.clone(), states.clone(), conv.clone(),
+            "held-surface".into(), "/nonexistent-ask".into(), Default::default(), final_md.clone(),
+            crate::bgtasks::now_ms(), Default::default(), String::new(), Default::default(), Default::default(),
+            Some(Quiet {
+                held: held.clone(),
+                notes: Arc::new(StdMutex::new(notes.iter().map(|n| n.to_string()).collect())),
+                wanted: wanted.clone(),
+                journal: None,
+            }),
+        ));
+        for (pause, ev) in events {
+            tokio::time::sleep(Duration::from_millis(pause)).await;
+            tx.send(ev).unwrap();
+        }
+        drop(tx);
+        r.await.unwrap();
+        let ended_in = live.lock().unwrap().clone();
+        let handle_keys = states.lock().await.get(&conv).map(|s| s.turns.keys().cloned().collect()).unwrap_or_default();
+        let reply = final_md.lock().unwrap().clone();
+        Held { api, held, ended_in, reply, wanted: wanted.load(std::sync::atomic::Ordering::Relaxed), handle_keys }
+    }
+
+    fn done() -> AgentEvent {
+        AgentEvent::Done { duration_ms: None, cost_usd: None, tokens: None }
+    }
+
+    fn tool() -> AgentEvent {
+        AgentEvent::ToolCall { id: "t1".into(), name: "Read".into(), input: serde_json::json!({ "file_path": "/tmp/x.log" }) }
+    }
+
+    /// The agent reads the log and judges there is nothing to say: nothing
+    /// reaches the chat — not a bubble, not an edit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_turn_that_says_nothing_leaves_nothing() {
+        let t = held_turn(&[],vec![(0, tool()), (0, AgentEvent::Text(SILENCE.into())), (0, done())], |_| {}).await;
+        assert!(t.calls("botCreateDraft").is_empty() && t.calls("botEditDraft").is_empty(), "{:?}", t.api.lock().unwrap().calls);
+        assert_eq!(t.ended_in, t.held);
+        assert!(!t.wanted);
+        assert!(t.reply.contains(SILENCE), "the session still has it: {}", t.reply);
+    }
+
+    /// A marker that arrives in pieces is still the marker; the daemon's own
+    /// notes ahead of the agent's words are not the agent speaking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notes_and_a_marker_in_pieces_are_not_speech() {
+        let seat = "_Running on account `b` — `a` is at its limit._\n\n";
+        let events = vec![
+            (0, AgentEvent::Text(seat.into())),
+            (0, AgentEvent::Text("[[sil".into())),
+            (50, AgentEvent::Text("ent]]".into())),
+            (0, done()),
+        ];
+        let t = held_turn(&[seat], events, |_| {}).await;
+        assert!(t.calls("botCreateDraft").is_empty(), "{:?}", t.api.lock().unwrap().calls);
+        assert!(!t.wanted);
+    }
+
+    /// A seat failover's note comes mid-turn, after the agent has been at it
+    /// (the review's case): known by its text, it is still not speech.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_note_mid_turn_is_not_speech() {
+        let failover = "↻ Account `a` hit its 5-hour limit — continuing on `b`";
+        let events = vec![(0, tool()), (0, AgentEvent::Text(failover.into())), (0, AgentEvent::Text(SILENCE.into())), (0, done())];
+        let t = held_turn(&[failover], events, |_| {}).await;
+        assert!(t.calls("botCreateDraft").is_empty(), "{:?}", t.api.lock().unwrap().calls);
+        // …while the same words from the agent itself would be.
+        let t = held_turn(&[], vec![(0, AgentEvent::Text(failover.into())), (0, done())], |_| {}).await;
+        assert_eq!(t.calls("botCreateDraft").len(), 1);
+    }
+
+    /// Words of its own open the bubble: a fresh draft, the turn's handle
+    /// and the attach forwarding address follow it, and the reply lands there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_turn_that_speaks_opens_its_bubble() {
+        let events = vec![(0, tool()), (0, AgentEvent::Text("CI 挂在 rust-tests：".into())), (0, AgentEvent::Text("缺一个依赖。".into())), (0, done())];
+        let t = held_turn(&[],events, |_| {}).await;
+        assert_eq!(t.calls("botCreateDraft").len(), 1);
+        assert_ne!(t.ended_in, t.held);
+        assert!(t.wanted);
+        assert_eq!(t.handle_keys, vec![t.ended_in.clone()], "the handle follows the bubble");
+        let edits = t.calls("botEditDraft");
+        assert!(edits.iter().all(|e| e["message_id"] == t.ended_in.as_str()), "{edits:?}");
+        let last = edits.last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(last.contains("缺一个依赖"), "{last}");
+    }
+
+    /// At work past `QUIET_WORK` (1.5s in a test): the bubble shows what it is
+    /// doing, said or not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_turn_at_work_a_while_shows_it() {
+        let events = vec![(0, tool()), (2000, AgentEvent::Text(SILENCE.into())), (0, done())];
+        let t = held_turn(&[],events, |_| {}).await;
+        assert_eq!(t.calls("botCreateDraft").len(), 1);
+        assert!(t.wanted);
+    }
+
+    /// …but thinking a while without doing anything is not work to show.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thinking_a_while_is_not_work() {
+        let events = vec![(2000, AgentEvent::Text(SILENCE.into())), (0, done())];
+        let t = held_turn(&[],events, |_| {}).await;
+        assert!(t.calls("botCreateDraft").is_empty());
+    }
+
+    /// Someone's words reaching the turn open it — below their message
+    /// already, so nothing moves and nothing is discarded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spoken_to_it_opens() {
+        let events = vec![(0, AgentEvent::Steered("ops: 在吗".into())), (0, AgentEvent::Text(SILENCE.into())), (0, done())];
+        let t = held_turn(&[],events, |_| {}).await;
+        assert_eq!(t.calls("botCreateDraft").len(), 1);
+        assert!(t.calls("discardDraft").is_empty());
+    }
+
+    /// `mafold attach` in a held turn asks for the bubble (`current_draft`) and
+    /// gets the address of the one opened for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_on_its_way_opens_it() {
+        let asked = Arc::new(StdMutex::new(None::<tokio::task::JoinHandle<anyhow::Result<String>>>));
+        let a = asked.clone();
+        let t = held_turn(&[],vec![(600, done())], move |held| {
+            *a.lock().unwrap() = Some(tokio::spawn(current_draft(held.to_string())));
+        })
+        .await;
+        let got = asked.lock().unwrap().take().unwrap().await.unwrap().unwrap();
+        assert_eq!(got, t.ended_in);
+        assert_eq!(t.calls("botCreateDraft").len(), 1);
+    }
+
+    #[test]
+    fn speech_and_the_marker() {
+        assert!(!speaks(""));
+        assert!(!speaks(" [[silent]] \n"));
+        assert!(!speaks("[[sil"), "a marker still arriving");
+        assert!(speaks("[[silent]] actually, one thing:"));
+        assert!(speaks("CI is green."));
+        assert_eq!(strip_silence("done.\n\n[[silent]]"), "done.");
+        assert!(QUIET_NOTE.contains(SILENCE));
     }
 }

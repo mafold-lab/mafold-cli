@@ -22,6 +22,9 @@ pub mod drive;
 /// The feature-flag registry — keys, defaults, who reads each, and what the
 /// server decides without a record (`flags.rs`, `.docs/feature-flags.md`).
 pub mod flags;
+/// What a document's name says it is — the one extension → type table the cli
+/// declares from and the api guesses from (`mime.rs`).
+pub mod mime;
 /// What agents did for a person, one row per reply — the activity center's
 /// receipts card (`receipts.rs`).
 pub mod receipts;
@@ -1294,14 +1297,19 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-// MARK: - App update (in-app APK distribution for the RN Android client)
+// MARK: - App update(RN 壳本身:安卓 APK + iOS 商店版本)
 
 /// server → client answer to `appUpdateCheck`. The metadata fields are filled
 /// whenever ANY release is live (so the UI can say "you're on the latest,
-/// which is X"); `available` alone decides whether an update is offered. `abi`
-/// echoes which of the client's ABIs the server matched — pass it back to
-/// `appUpdateDownload`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// which is X"); `available` alone decides whether an update is offered.
+///
+/// 没有 `version` = 服务端还不知道,绝不是「已是最新」。
+///
+/// 安卓(我们自己发的 APK):`version_code`、`abi`、`size`、`sha256` —— `abi` 是服务端
+/// 从客户端的 ABI 里挑中的那个,下载时原样传回 `appUpdateDownload`。
+/// iPhone(App Store 上的版本):`version`、`size`、`notes`、`store_url`、`min_os`;
+/// 客户端报的 iOS 版本服务端已经算进 `available` 了,`min_os` 只给界面解释用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppUpdateInfo {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1316,6 +1324,12 @@ pub struct AppUpdateInfo {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// iPhone:去哪儿装(`itms-apps://apps.apple.com/app/id…`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_url: Option<String>,
+    /// iPhone:这一版最低要哪个 iOS。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_os: Option<String>,
 }
 
 // MARK: - CLI update (release metadata for mafold-cli's self-updater)
@@ -1354,6 +1368,144 @@ pub struct CliReleaseInfo {
     /// this must fall back rather than proceed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+}
+
+// MARK: - App bundle update (OTA for the RN client's JS bundle)
+
+/// server → client answer to `appBundleCheck`: what the client should do.
+/// `stale_binary` is always on the wire, `false` included — the client tells
+/// "nothing new" from "this binary is too old" by it alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppBundleInfo {
+    /// A bundle for THIS abi, newer than what the caller runs.
+    pub available: bool,
+    /// THE ANSWER THAT PREVENTS A SILENT DEAD END: nothing is published for the
+    /// caller's abi, but something is published for a newer one. The binary is
+    /// behind, not the JS — say so, because "no update" and "you can no longer
+    /// receive updates" look identical from the client and mean opposite things.
+    pub stale_binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub js_rev: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[cfg(test)]
+mod update_check_wire_tests {
+    use super::*;
+
+    /// The answer as this type alone writes it (declared field order — the
+    /// api's envelope re-sorts the keys, and its handler tests pin THOSE bytes),
+    /// and the same answer read back: a client decoding the wire gets what was sent.
+    fn pin<T: Serialize + serde::de::DeserializeOwned>(answer: &T, want: &str) {
+        assert_eq!(serde_json::to_string(answer).unwrap(), want);
+        let back: T = serde_json::from_str(want).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), want, "decodes back to the same answer");
+    }
+
+    #[test]
+    fn app_update_info_keeps_its_wire_shape() {
+        let none = AppUpdateInfo {
+            available: false,
+            version: None,
+            version_code: None,
+            abi: None,
+            size: None,
+            sha256: None,
+            notes: None,
+            store_url: None,
+            min_os: None,
+        };
+        pin(&none, r#"{"available":false}"#);
+        let offered = AppUpdateInfo {
+            available: true,
+            version: Some("1.1.13".into()),
+            version_code: Some(113),
+            abi: Some("arm64-v8a".into()),
+            size: Some(39_845_888),
+            sha256: Some("5e884898da28047151d0e56f8dc62927".into()),
+            notes: Some("Fixes the blank first frame.".into()),
+            store_url: None,
+            min_os: None,
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"version":"1.1.13","version_code":113,"abi":"arm64-v8a","size":39845888,"sha256":"5e884898da28047151d0e56f8dc62927","notes":"Fixes the blank first frame."}"#,
+        );
+    }
+
+    /// iPhone 收到的:App Store 上的版本、去哪儿装、要哪个 iOS —— APK 那几个字段一个都没有。
+    #[test]
+    fn app_update_info_from_the_app_store() {
+        let offered = AppUpdateInfo {
+            available: true,
+            version: Some("1.1.9".into()),
+            size: Some(42_971_136),
+            store_url: Some("itms-apps://apps.apple.com/app/id6778362401".into()),
+            min_os: Some("15.1".into()),
+            ..AppUpdateInfo::default()
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"version":"1.1.9","size":42971136,"store_url":"itms-apps://apps.apple.com/app/id6778362401","min_os":"15.1"}"#,
+        );
+        pin(&AppUpdateInfo::default(), r#"{"available":false}"#);
+    }
+
+    #[test]
+    fn cli_release_info_keeps_its_wire_shape() {
+        let unknown = CliReleaseInfo {
+            known: false,
+            channel: "stable".into(),
+            version: None,
+            url: None,
+            size: None,
+            sha256: None,
+        };
+        pin(&unknown, r#"{"known":false,"channel":"stable"}"#);
+        let known = CliReleaseInfo {
+            known: true,
+            channel: "stable".into(),
+            version: Some("0.9.148".into()),
+            url: Some("https://github.com/mafold-lab/mafold-cli/releases/download/v0.9.148/mafold-aarch64-apple-darwin".into()),
+            size: Some(12_345),
+            sha256: Some("2c26b46b68ffc68ff99b453c1d304134".into()),
+        };
+        pin(
+            &known,
+            r#"{"known":true,"channel":"stable","version":"0.9.148","url":"https://github.com/mafold-lab/mafold-cli/releases/download/v0.9.148/mafold-aarch64-apple-darwin","size":12345,"sha256":"2c26b46b68ffc68ff99b453c1d304134"}"#,
+        );
+    }
+
+    #[test]
+    fn app_bundle_info_keeps_its_wire_shape() {
+        let none = |stale_binary: bool| AppBundleInfo {
+            available: false,
+            stale_binary,
+            js_rev: None,
+            size: None,
+            sha256: None,
+            notes: None,
+        };
+        pin(&none(false), r#"{"available":false,"stale_binary":false}"#);
+        pin(&none(true), r#"{"available":false,"stale_binary":true}"#);
+        let offered = AppBundleInfo {
+            available: true,
+            stale_binary: false,
+            js_rev: Some(23),
+            size: Some(1_234_567),
+            sha256: Some("cafebabe".into()),
+            notes: Some("Input bar moves with the keyboard.".into()),
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"stale_binary":false,"js_rev":23,"size":1234567,"sha256":"cafebabe","notes":"Input bar moves with the keyboard."}"#,
+        );
+    }
 }
 
 #[cfg(test)]

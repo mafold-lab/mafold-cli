@@ -115,8 +115,14 @@ async fn drain_daemons(daemons: &[DaemonCfg], max: std::time::Duration) {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
-fn log_path(name: &str) -> PathBuf {
+/// Where a bot's daemon writes its output ([`crate::logfile::keep`]).
+pub(crate) fn bot_log(name: &str) -> PathBuf {
     daemons_dir().join(safe(name)).join("log")
+}
+
+/// Where the supervisor writes its own, on every OS ([`crate::logfile::keep`]).
+pub(crate) fn supervisor_log() -> PathBuf {
+    home().join(".mafold/supervisor.log")
 }
 
 /// When the daemon died without anyone stopping it (`lifecycle::note_death`).
@@ -145,6 +151,30 @@ fn died_by_itself(had: Option<u32>, seen: Option<u32>, stopping: &std::path::Pat
 fn turns_path(name: &str) -> PathBuf {
     busy_path(name).with_file_name("turns.json")
 }
+
+/// One at a time starts daemons — the loop keeping them up, a restart a
+/// command asked for (`control`), an update stopping them all — so none
+/// starts one another has just stopped, or a second of one just started.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spawning() -> std::sync::MutexGuard<'static, ()> {
+    SPAWNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The daemons this supervisor has seen running, by pid — the loop's and
+/// the ones a restart started. Only one of those vanishing is news: a pid
+/// file left from before it started (a reboot, a supervisor that took its
+/// daemons down with it — systemd stops the whole unit) says nothing about
+/// the daemon. Taken after [`SPAWNING`], never before.
+static SEEN: std::sync::Mutex<std::collections::BTreeMap<String, u32>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn seen() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, u32>> {
+    SEEN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the control thread takes requests: not once a re-exec is under
+/// way — on Windows the successor already runs and takes them.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 fn load() -> Config {
     fs::read_to_string(cfg_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
@@ -312,6 +342,29 @@ pub fn supervisor_running() -> bool {
     sup_running().is_some()
 }
 
+/// Was the supervisor here started to update itself — without
+/// `--no-auto-update`? From its own record, else from how its service is
+/// registered; `None` when neither says. Whether it does is this AND the
+/// machine setting ([`crate::update::auto_update_on`]).
+pub(crate) fn started_to_update() -> Option<bool> {
+    let service = crate::lifecycle::service(sup_running());
+    service.run.as_ref().map(|r| r.auto_update).or_else(|| registration().map(|r| !r.no_auto_update))
+}
+
+/// The version the supervisor here runs, from its own record.
+pub(crate) fn running_version() -> Option<String> {
+    crate::lifecycle::service(sup_running()).run.map(|r| r.version)
+}
+
+/// The supervisor's log line when the update setting is, or turns, `on`.
+fn setting_note(on: bool) -> &'static str {
+    if on {
+        "↻ automatic updates are on again on this computer"
+    } else {
+        "automatic updates are off on this computer — nothing is installed until they're on again (`mafold update --auto-update on`) or someone runs `mafold update`"
+    }
+}
+
 /// What happens to the running supervisor after `mafold update` swapped the
 /// binary under it. Its own 10-minute check compares the latest release with
 /// the version it RUNS, so it moves onto the new one by itself — draining
@@ -319,6 +372,11 @@ pub fn supervisor_running() -> bool {
 /// the caller to `mafold down && mafold up` instead was a trap: a bot that
 /// ran it from its own turn died at `down`, and `up` never ran.)
 pub fn update_pickup_note() -> &'static str {
+    // Only one that reads the setting is held back by it.
+    let reads = crate::lifecycle::service(sup_running()).run.is_some_and(|r| r.update_setting);
+    if reads && !crate::update::auto_update_on() {
+        return "automatic updates are off on this computer, so the supervisor here stays on the version it started with until it's restarted";
+    }
     match registration() {
         Some(r) if r.no_auto_update => {
             "the supervisor here runs with --no-auto-update, so it stays on the version it started with until it's restarted"
@@ -351,14 +409,16 @@ fn await_supervisor() -> Result<u32> {
     })
 }
 
-/// Where to look when the supervisor won't run, as said to a person.
+/// Where to look when the supervisor won't run, as said to a person: its own
+/// log since C6 — except what it says before it gets that far (a binary that
+/// won't start, a bad argument), which stays wherever the service manager put
+/// it: the plist's file on macOS (the same one), the journal on Linux, nowhere
+/// under the Windows logon task.
 fn supervisor_log_hint() -> &'static str {
-    #[cfg(target_os = "macos")]
-    return "see ~/.mafold/supervisor.log";
     #[cfg(target_os = "linux")]
-    return "see `journalctl --user -u mafold-supervisor` (or ~/.mafold/supervisor.log when it runs detached)";
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return "see ~/.mafold/supervisor.log when it runs detached (the logon task keeps no log yet)";
+    return "see `mafold logs` (~/.mafold/supervisor.log) — or, if it never got that far, `journalctl --user -u mafold-supervisor`";
+    #[cfg(not(target_os = "linux"))]
+    return "see `mafold logs` (~/.mafold/supervisor.log)";
 }
 
 // ── boot-persistence (a daemon must survive reboot — autostart is part of the
@@ -393,7 +453,9 @@ fn launchagent_path() -> PathBuf {
 #[cfg(target_os = "macos")]
 fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
-    let log = home().join(".mafold/supervisor.log");
+    // Only what the process says before it points its output at this same file
+    // itself (`supervise` → `logfile::keep`): a crash at startup.
+    let log = supervisor_log();
     fs::create_dir_all(home().join(".mafold"))?;
     fs::create_dir_all(home().join("Library/LaunchAgents"))?;
     let plist = launchagent_path();
@@ -836,17 +898,6 @@ fn autostart_promise() -> &'static str {
     return "starts on login + relaunches on crash";
 }
 
-/// Where the registered service's own output goes — launchd writes the file
-/// the plist names; systemd keeps it in the journal; the Windows task runs
-/// headless and keeps none yet.
-fn service_log() -> Option<&'static str> {
-    #[cfg(target_os = "macos")]
-    return Some("~/.mafold/supervisor.log");
-    #[cfg(target_os = "linux")]
-    return Some("journalctl --user -u mafold-supervisor");
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return None;
-}
 
 /// `mafold up` — bring the supervisor up as a boot-persistent service (one per
 /// machine): it keeps every configured daemon running and OWNS updates. Autostart
@@ -905,10 +956,7 @@ pub fn up(base: &str, no_auto_update: bool) -> Result<()> {
         Ok(()) => {
             let pid = await_supervisor().context("registered the supervisor to start on login")?;
             println!("✓ supervisor running (pid {pid}) — {what}; {}", autostart_promise());
-            match service_log() {
-                Some(log) => println!("  logs:   ~/.mafold/daemons/<name>/log  (supervisor: {log})"),
-                None => println!("  logs:   ~/.mafold/daemons/<name>/log"),
-            }
+            println!("  logs:   mafold logs <name>  ·  the supervisor's: mafold logs");
             println!("  status: mafold status   ·   stop: mafold down");
         }
         Err(e) => {
@@ -941,7 +989,9 @@ fn managing(n: usize) -> String {
 fn start_supervisor(base: &str, no_auto_update: bool) -> Result<u32> {
     fs::create_dir_all(daemons_dir())?;
     let exe = std::env::current_exe()?;
-    let out = fs::OpenOptions::new().create(true).append(true).open(home().join(".mafold/supervisor.log"))?;
+    // Already its own log, begun with the mark — so whatever it prints before
+    // it takes the file over (an error it dies of) is read like the rest.
+    let out = crate::logfile::open_for_child(&supervisor_log())?;
     let err = out.try_clone()?;
     let mut cmd = platform::std_command(exe);
     cmd.arg("--base").arg(base).arg("supervise");
@@ -967,6 +1017,15 @@ fn start_supervisor(base: &str, no_auto_update: bool) -> Result<u32> {
 /// then stop all daemons and re-exec self so the new supervisor respawns them on
 /// the new version.
 pub async fn supervise(base: String, auto_update: bool) {
+    // Its own log file, whoever started it — launchd, systemd, the Windows
+    // logon task, `up` detached, a person in a terminal (who is told where).
+    let log = supervisor_log();
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        println!("logging to {} — `mafold logs -f` to watch", log.display());
+    }
+    if let Err(e) = crate::logfile::keep(&log) {
+        eprintln!("⚠️  couldn't write {} ({e}) — output stays where it was", log.display());
+    }
     let _ = fs::create_dir_all(daemons_dir());
     if let Ok(mut f) = fs::File::create(sup_pid_path()) {
         let _ = writeln!(f, "{}", std::process::id());
@@ -991,6 +1050,38 @@ pub async fn supervise(base: String, auto_update: bool) {
     // A busy mark left by the process this one replaced (an update re-execs
     // in place, mid-«waiting for turns») is not true of this one.
     let _ = fs::remove_file(doing_path());
+    // What commands ask of it (`control`: `mafold restart`, and `update` /
+    // `rollback` having put another binary on disk), on a thread of its own —
+    // a bot restarts now, not once the loop below is done waiting on an
+    // install or on turns. A request the one before took and never answered
+    // is answered first.
+    crate::control::recover(&crate::control::dir(), crate::accounts::now());
+    {
+        let base = base.clone();
+        let served = std::thread::Builder::new().name("control".into()).spawn(move || loop {
+            if SERVING.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut moving = None;
+                // A request that panics this thread would end it for good,
+                // with the run record still saying requests are taken.
+                let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::control::serve_once(&crate::control::dir(), crate::accounts::now(), &mut |a| carry_out(&base, a, &mut moving));
+                }));
+                if pass.is_err() {
+                    eprintln!("✗ carrying out a request failed — still taking the next ones");
+                }
+                // Its own restart goes to the loop only now, answered: a
+                // re-exec can't answer once it has happened.
+                if let Some(m) = moving {
+                    *MOVING.lock().unwrap_or_else(|e| e.into_inner()) = Some(m);
+                    wake().notify_one();
+                }
+            }
+            std::thread::sleep(crate::control::POLL);
+        });
+        if let Err(e) = served {
+            eprintln!("⚠️  couldn't start taking requests ({e}) — `mafold restart` won't be answered");
+        }
+    }
     // Keep this machine's harness report fresh (every 30s) so New-Bot and the
     // computers card see it online — on its own task, so the loop below can
     // wait on turns, an update or an install without the machine going dark
@@ -1004,28 +1095,39 @@ pub async fn supervise(base: String, auto_update: bool) {
     // ticks stalls while a Mac sleeps, so a laptop that wakes up an hour past
     // a release still waited up to 10 more minutes before it looked.
     let mut last_update_check = std::time::SystemTime::now();
-    // The daemons this supervisor has seen running, by pid. Only one of
-    // those vanishing is news: a pid file left from before it started (a
-    // reboot, a supervisor that took its daemons down with it — systemd stops
-    // the whole unit) says nothing about the daemon.
-    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // The update setting as last said in the log — a change is said once.
+    let mut said_setting: Option<bool> = None;
     loop {
         reap(); // clear zombies so the liveness check below is accurate
         // A daemon whose bot was deleted server-side tombstones itself and
         // exits — drop it from the config BEFORE the respawn pass below.
         sweep_deprovisioned();
         let cfg = load();
+        // `mafold update` / `rollback` put another binary on disk and asked to
+        // move onto it (`control`) — here, between two passes.
+        let moving = MOVING.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((why, version)) = moving {
+            let what = match why {
+                crate::control::Moved::Update => "updated",
+                crate::control::Moved::Rollback => "rolled back",
+            };
+            println!("↻ the binary on disk was {what}{} — restarting onto it…", version.as_deref().map(|v| format!(" to v{v}")).unwrap_or_default());
+            move_on(&cfg.daemons, version.as_deref(), last_exit.as_ref()).await;
+        }
         // Keep every configured daemon running (start any that died / aren't up).
         for d in &cfg.daemons {
             let had = read_pid(&d.name);
             if let Some(pid) = had.filter(|p| alive(*p)) {
-                seen.insert(d.name.clone(), pid);
+                seen().insert(d.name.clone(), pid);
                 continue;
             }
+            // Not while a restart is between stopping it and starting it.
+            let _one = spawning();
             match start_one(&base, d) {
                 Ok(Some(pid)) => {
                     // `status` reads a few of those in a row as a bot that
                     // won't stay up.
+                    let mut seen = seen();
                     if died_by_itself(had, seen.get(&d.name).copied(), &stopping_path(&d.name)) {
                         crate::lifecycle::note_death(&deaths_path(&d.name), crate::accounts::now());
                     }
@@ -1046,7 +1148,20 @@ pub async fn supervise(base: String, auto_update: bool) {
         // retried later, not on every tick, and the skip is logged.
         let nudged = crate::update::take_nudge();
         let due = crate::update::wall_elapsed(last_update_check) >= std::time::Duration::from_secs(600);
-        if auto_update && (nudged || due) {
+        // The machine setting, read on every pass: `mafold update
+        // --auto-update off` holds this one back from its next check on, with
+        // no restart and nothing re-registered (activity center C8).
+        let setting = crate::update::auto_update_on();
+        if auto_update && said_setting != Some(setting) {
+            if said_setting.is_some() || !setting {
+                println!("{}", setting_note(setting));
+            }
+            said_setting = Some(setting);
+        }
+        if auto_update && !setting && nudged {
+            println!("↻ update nudge from a daemon — automatic updates are off on this computer, so not checking");
+        }
+        if auto_update && setting && (nudged || due) {
             last_update_check = std::time::SystemTime::now();
             if nudged { println!("↻ update nudge from a daemon — checking now"); }
             let checked = crate::update::check(&http, &base, crate::update::Channel::current()).await;
@@ -1061,22 +1176,7 @@ pub async fn supervise(base: String, auto_update: bool) {
                     match crate::update::apply(&http, &r.url, &r.version, r.sha256.as_deref()).await {
                         Ok(()) => {
                             crate::update::note_installed();
-                            // Graceful drain: download is done; now let in-flight turns
-                            // finish before the kill+reexec, so a daemon watching its
-                            // own release doesn't cut off a reply. Capped so a stuck
-                            // turn can't block updates forever.
-                            let _busy = Busy::start(&doing_path(), "waiting_for_turns", Some(&r.version));
-                            drain_daemons(&cfg.daemons, std::time::Duration::from_secs(300)).await;
-                            for d in &cfg.daemons { let _ = stop_one(&d.name); }
-                            // New supervisor respawns daemons (new binary). If the
-                            // re-exec fails we keep running as the OLD supervisor with
-                            // daemons stopped — the keep-alive loop below respawns them
-                            // (they'll be the new binary), but say so loudly.
-                            crate::lifecycle::note_exit(std::process::id(), crate::lifecycle::Why::Update, Some(&r.version));
-                            crate::update::reexec_or_warn(&r.version);
-                            // Still here: the re-exec failed, so this one didn't
-                            // stop after all — the stop before it is still the last.
-                            crate::lifecycle::restore_exit(last_exit.as_ref());
+                            move_on(&cfg.daemons, Some(&r.version), last_exit.as_ref()).await;
                         }
                         Err(e) => {
                             let wait = crate::update::mark_failed(&r.version, &e);
@@ -1110,7 +1210,136 @@ pub async fn supervise(base: String, auto_update: bool) {
                 ));
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        // Or sooner, when a command asks it to move onto a new binary.
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            _ = wake().notified() => {}
+        }
+    }
+}
+
+/// Move onto the binary on disk — `onto`, its version when known: let the
+/// replies in progress finish (at most 5 minutes, so a stuck one can't hold
+/// it forever), stop every daemon, re-exec; the new supervisor starts them
+/// again on the new binary. How an update the supervisor installed itself
+/// lands, and how `mafold update` / `rollback` ask for theirs (`control`).
+///
+/// Returns only when the re-exec failed — said loudly — and this, the old
+/// supervisor, carries on: its loop starts the daemons again, on the binary
+/// on disk.
+async fn move_on(daemons: &[DaemonCfg], onto: Option<&str>, last_exit: Option<&crate::lifecycle::Exit>) {
+    let _busy = Busy::start(&doing_path(), "waiting_for_turns", onto);
+    drain_daemons(daemons, std::time::Duration::from_secs(300)).await;
+    // No restart a command asked for starts one in between.
+    let _one = spawning();
+    for d in daemons {
+        let _ = stop_one(&d.name);
+    }
+    crate::lifecycle::note_exit(std::process::id(), crate::lifecycle::Why::Update, onto);
+    SERVING.store(false, std::sync::atomic::Ordering::SeqCst);
+    crate::update::reexec_or_warn(onto);
+    // Still here: this one didn't stop after all — the stop before it is
+    // still the last, and the requests are still its to take.
+    SERVING.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::lifecycle::restore_exit(last_exit);
+}
+
+/// A restart of the supervisor itself that a command asked for (`control`),
+/// left for the loop, which re-execs between two of its passes.
+static MOVING: std::sync::Mutex<Option<(crate::control::Moved, Option<String>)>> = std::sync::Mutex::new(None);
+
+/// Wakes the loop from its wait between two passes.
+fn wake() -> &'static tokio::sync::Notify {
+    static W: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    W.get_or_init(tokio::sync::Notify::new)
+}
+
+/// What the supervisor does with a request a command left (`control`). Its
+/// own restart is put in `moving`, for the loop once the answer is written.
+fn carry_out(
+    base: &str,
+    a: &crate::control::Action,
+    moving: &mut Option<(crate::control::Moved, Option<String>)>,
+) -> (crate::control::Code, crate::control::Reply) {
+    use crate::control::{Action, Code, Reply};
+    match a {
+        Action::RestartBot { name } => {
+            let (code, reply) = restart_bot(base, name);
+            match code {
+                Code::Restarted => println!(
+                    "↻ restarted {name} as asked ({} → pid {})",
+                    reply.old_pid.map_or("wasn't running".into(), |p| format!("pid {p}")),
+                    reply.new_pid.map_or("?".into(), |p| p.to_string()),
+                ),
+                _ => eprintln!("✗ restarting {name} as asked: {code:?}{}", reply.detail.as_deref().map(|d| format!(" — {d}")).unwrap_or_default()),
+            }
+            (code, reply)
+        }
+        Action::RestartSupervisor { why, version } => {
+            *moving = Some((*why, version.clone()));
+            (Code::Accepted, Reply::default())
+        }
+    }
+}
+
+/// Restart one bot's daemon: stop it — until it is gone — and start it
+/// again, with nothing else starting daemons meanwhile.
+fn restart_bot(base: &str, name: &str) -> (crate::control::Code, crate::control::Reply) {
+    use crate::control::Code;
+    let cfg = load();
+    let Some(d) = cfg.daemons.iter().find(|d| d.name == name) else {
+        return (Code::UnknownBot, crate::control::Reply::default());
+    };
+    let _one = spawning();
+    // A daemon that died since the loop last reaped is still a zombie, which
+    // `start_one` would take for running and start nothing.
+    reap();
+    let had = read_pid(name);
+    let (code, reply) = restart_with(name, &pid_path(name), STOP_WAIT, || start_one(base, d));
+    if let Some(pid) = reply.new_pid.filter(|_| code == Code::Restarted) {
+        let mut seen = seen();
+        // Down before anyone asked, the loop not having noticed yet: a death
+        // all the same, for `status` to count.
+        if reply.old_pid.is_none() && died_by_itself(had, seen.get(name).copied(), &stopping_path(name)) {
+            crate::lifecycle::note_death(&deaths_path(name), crate::accounts::now());
+        }
+        // The loop's to keep from here — and a death of this one is news.
+        seen.insert(name.to_string(), pid);
+    }
+    (code, reply)
+}
+
+/// [`restart_bot`] for the daemon whose pid file is `pid_file`, started
+/// again by `start`.
+fn restart_with(
+    name: &str,
+    pid_file: &std::path::Path,
+    wait: std::time::Duration,
+    start: impl FnOnce() -> Result<Option<u32>>,
+) -> (crate::control::Code, crate::control::Reply) {
+    use crate::control::{Code, Reply};
+    let running = || fs::read_to_string(pid_file).ok()?.trim().parse::<u32>().ok().filter(|p| platform::pid_running(*p));
+    let old = running();
+    // The replies it is cut off in the middle of; the new one picks them up.
+    let interrupted = old
+        .and_then(|_| fs::read_to_string(pid_file.with_file_name("busy")).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if let Some(pid) = old {
+        if let Some(Err(e)) = stop_all_confirmed_at(&[(name, pid_file.to_path_buf())], wait).pop() {
+            return (Code::StillRunning, Reply { detail: Some(format!("{e:#}")), old_pid: old, ..Reply::default() });
+        }
+        // Stopped on purpose: not a death of the daemon's own.
+        crate::lifecycle::take_stop(&pid_file.with_file_name("stopping"), pid);
+    }
+    match start() {
+        Ok(Some(pid)) => (Code::Restarted, Reply { old_pid: old, new_pid: Some(pid), interrupted, detail: None }),
+        // Up already — something started it the moment it stopped.
+        Ok(None) => match running() {
+            Some(pid) if Some(pid) != old => (Code::Restarted, Reply { old_pid: old, new_pid: Some(pid), interrupted, detail: None }),
+            _ => (Code::Failed, Reply { detail: Some("it didn't start again".into()), old_pid: old, ..Reply::default() }),
+        },
+        Err(e) => (Code::Failed, Reply { detail: Some(format!("{e:#}")), old_pid: old, ..Reply::default() }),
     }
 }
 
@@ -1482,8 +1711,13 @@ fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {
     }
     let dir = daemons_dir().join(safe(&d.name));
     fs::create_dir_all(&dir)?;
-    let exe = std::env::current_exe()?;
-    let out = fs::OpenOptions::new().create(true).append(true).open(log_path(&d.name))?;
+    let exe = platform::current_exe()?;
+    // Where it writes until it points its output here itself, which it does
+    // first thing (`agent::run` → `logfile::keep`) — and from then on rotates.
+    // Begun with the mark and rotated here too: a daemon that dies before it
+    // gets that far, again every 10 s, says why in a file `mafold diagnose`
+    // reads, and that doesn't grow without end.
+    let out = crate::logfile::open_for_child(&bot_log(&d.name))?;
     let err = out.try_clone()?;
 
     let mut cmd = platform::std_command(exe);
@@ -1500,6 +1734,8 @@ fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {
         // So the daemon writes its busy marker at the path the supervisor's drain
         // check reads (keyed by THIS exact daemon name).
         .env("MAFOLD_DAEMON_NAME", &d.name)
+        // The log it takes over and rotates itself (`agent::run` → `logfile::keep`).
+        .env(crate::logfile::LOG_ENV, bot_log(&d.name))
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
@@ -1603,6 +1839,242 @@ fn down_order<'a>(daemons: &'a [DaemonCfg], only: Option<&str>, own: Option<&str
         .partition(|n| own == Some(*n))
 }
 
+/// How long `restart` gives the supervisor to take its request — it looks
+/// every 300 ms — before withdrawing it. Asked while another restart is under
+/// way, it is taken once that one is done: up to its stop's wait (10 s) and a
+/// start, so twice that.
+const TAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// …and then to answer: the stop's own wait, the start, and room to spare.
+const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A daemon that starts and dies at once isn't a restart that worked: how
+/// long after it started `restart` looks at it again.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// What `mafold restart` came to — all it prints with `--json`.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub(crate) struct Restart {
+    pub ok: bool,
+    /// `restarted`; or `unverified` — asked, and maybe done, but the new
+    /// daemon couldn't be read back; or not done: `unknown_bot`,
+    /// `no_supervisor`, `supervisor_too_old` (it takes no requests),
+    /// `not_taken` (it didn't take this one: withdrawn), `still_running`
+    /// (the bot didn't stop), `exited` (it started and died at once),
+    /// `failed`.
+    pub code: &'static str,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_pid: Option<u32>,
+    /// Replies it was cut off in the middle of; the new daemon picks them up.
+    pub interrupted: usize,
+}
+
+/// `mafold restart <name>` — restart one bot. The supervisor does it (a
+/// `control` request); it counts once the bot's pid file names a new process
+/// that is still running a moment later. Exit status 0: restarted; 2: asked,
+/// not confirmed; 1: not done.
+pub fn restart(name: &str, json: bool) -> Result<()> {
+    if !json && std::env::var("MAFOLD_DAEMON_NAME").ok().as_deref() == Some(name) {
+        println!("… restarting {name} — the daemon this command runs under, so this may be its last line");
+        let _ = std::io::stdout().flush();
+    }
+    let r = restarting(name);
+    if json {
+        println!("{}", serde_json::to_string(&r)?);
+    } else if r.ok {
+        match r.old_pid {
+            Some(old) => println!("✓ restarted {name} (pid {old} → {})", r.new_pid.unwrap_or_default()),
+            None => println!("✓ started {name} (pid {}) — it wasn't running", r.new_pid.unwrap_or_default()),
+        }
+        if r.interrupted > 0 {
+            let n = r.interrupted;
+            println!("  cut off {n} {} in progress — it picks {} back up now", if n == 1 { "reply" } else { "replies" }, if n == 1 { "it" } else { "them" });
+        }
+    } else {
+        eprintln!("{}", restart_failure(&r));
+    }
+    let _ = std::io::stdout().flush();
+    match r.code {
+        "restarted" => Ok(()),
+        "unverified" => std::process::exit(2),
+        _ => std::process::exit(1),
+    }
+}
+
+/// Ask the running supervisor to restart `name`, and read back what it did.
+fn restarting(name: &str) -> Restart {
+    use crate::control::{Action, Asked, Code};
+    let mut r = Restart { ok: false, code: "failed", name: name.to_string(), detail: None, old_pid: None, new_pid: None, interrupted: 0 };
+    if let Err(e) = require_known(Some(name), &load().daemons) {
+        r.code = "unknown_bot";
+        r.detail = Some(format!("{e:#}"));
+        return r;
+    }
+    let Some(sup) = sup_running() else {
+        r.code = "no_supervisor";
+        return r;
+    };
+    let run = crate::lifecycle::read::<crate::lifecycle::Run>(&crate::lifecycle::run_path()).filter(|x| x.pid == sup);
+    if run.as_ref().is_none_or(|x| x.control < 1) {
+        r.code = "supervisor_too_old";
+        r.detail = Some(too_old_note(run.as_ref(), name));
+        return r;
+    }
+    r.old_pid = read_pid(name).filter(|p| platform::pid_running(*p));
+    let a = match crate::control::ask(Action::RestartBot { name: name.to_string() }, TAKE_WAIT, ANSWER_WAIT) {
+        Ok(Asked::Answered(a)) => a,
+        Ok(Asked::Untaken) => {
+            r.code = "not_taken";
+            r.detail = Some(format!("the supervisor (pid {sup}) didn't take the request within {}s — nothing was restarted", TAKE_WAIT.as_secs()));
+            return r;
+        }
+        Ok(Asked::Unanswered) => {
+            r.code = "unverified";
+            r.detail = Some(format!("the supervisor took the request but didn't say how it went within {}s", ANSWER_WAIT.as_secs()));
+            return r;
+        }
+        Err(e) => {
+            r.detail = Some(format!("couldn't ask the supervisor: {e:#}"));
+            return r;
+        }
+    };
+    r.detail = a.detail.clone();
+    match a.code {
+        Code::Restarted => {}
+        Code::UnknownBot => {
+            r.code = "unknown_bot";
+            return r;
+        }
+        Code::StillRunning => {
+            r.code = "still_running";
+            return r;
+        }
+        Code::Failed => return r,
+        // Answered, and not carried out.
+        Code::Expired => {
+            r.code = "not_taken";
+            r.detail = Some("the supervisor got to the request too late and didn't carry it out — nothing was restarted".into());
+            return r;
+        }
+        Code::Unknown => {
+            r.detail.get_or_insert_with(|| "the supervisor couldn't read the request — nothing was restarted".into());
+            return r;
+        }
+        // Maybe carried out, maybe not.
+        Code::Accepted | Code::Interrupted => {
+            r.code = "unverified";
+            r.detail.get_or_insert_with(|| format!("the supervisor answered `{:?}`", a.code));
+            return r;
+        }
+    }
+    r.old_pid = a.old_pid.or(r.old_pid);
+    r.interrupted = a.interrupted;
+    // Not the supervisor's word for it: the pid file, read here, names the
+    // process it says it started, which is not the one before and is running
+    // — still, a moment later.
+    let now = read_pid(name).filter(|p| platform::pid_running(*p));
+    match a.new_pid {
+        Some(new) if now == Some(new) && a.old_pid != Some(new) => {
+            r.new_pid = Some(new);
+            std::thread::sleep(SETTLE);
+            if platform::pid_running(new) {
+                r.ok = true;
+                r.code = "restarted";
+            } else {
+                r.code = "exited";
+                r.detail = Some(format!("it started (pid {new}) and exited right away — `mafold logs {name}` says why"));
+            }
+        }
+        said => {
+            r.code = "unverified";
+            r.new_pid = now;
+            r.detail = Some(format!(
+                "the supervisor says it started pid {}, but the pid file names {}",
+                said.map_or("?".into(), |p| p.to_string()),
+                now.map_or("no running process".into(), |p| format!("pid {p}")),
+            ));
+        }
+    }
+    r
+}
+
+/// A supervisor from before `restart`: nothing was asked of it. When it
+/// moves onto a newer one, and what does the job until then.
+fn too_old_note(run: Option<&crate::lifecycle::Run>, name: &str) -> String {
+    let which = run.map(|r| format!(" (v{})", r.version)).unwrap_or_default();
+    let when = match run.map(|r| r.auto_update) {
+        Some(false) => "It stays on its version until it is restarted",
+        _ => "It moves onto a newer one by itself within ~10 minutes",
+    };
+    format!(
+        "the supervisor running here{which} is from before `mafold restart` and takes no requests — nothing was restarted. \
+         {when}; meanwhile `mafold down {name}` restarts the bot (the supervisor starts it again)"
+    )
+}
+
+/// `restart` not done, or not confirmed, in a line for a person.
+fn restart_failure(r: &Restart) -> String {
+    let name = &r.name;
+    let detail = r.detail.as_deref().map(|d| format!(" — {d}")).unwrap_or_default();
+    match r.code {
+        "no_supervisor" => {
+            "✗ the supervisor isn't running, so nothing here keeps bots up — `mafold up` starts it, and every bot with it".into()
+        }
+        "supervisor_too_old" | "unknown_bot" | "not_taken" => format!("✗ {}", r.detail.as_deref().unwrap_or("not restarted")),
+        "still_running" => format!("✗ {name} didn't stop, so it wasn't restarted{detail}"),
+        "exited" => format!("✗ {}", r.detail.as_deref().unwrap_or("it exited right away")),
+        "unverified" => format!("? asked the supervisor to restart {name}, but couldn't confirm it{detail} — `mafold status` shows where it is"),
+        _ => format!("✗ couldn't restart {name}{detail}"),
+    }
+}
+
+/// The binary on disk was just replaced (`mafold update`, `mafold rollback`):
+/// ask the supervisor running here to move onto it, and say what came of
+/// it — a line for the command to print, and whether it is moving. Read
+/// back from the record the new supervisor writes first thing; one still
+/// letting replies finish says so.
+pub fn move_onto_disk(why: crate::control::Moved, version: Option<&str>) -> (String, bool) {
+    use crate::control::{Action, Asked, Code};
+    use crate::lifecycle::{read, run_path, Run};
+    let Some(pid) = sup_running() else {
+        return ("no supervisor runs here — `mafold up` starts one on it".into(), false);
+    };
+    // What happens without being asked: an update the supervisor picks up
+    // itself; a rollback, never — it runs on the newer one it started with.
+    let unasked = || match why {
+        crate::control::Moved::Update => update_pickup_note().to_string(),
+        crate::control::Moved::Rollback => "the supervisor here keeps running the version it started with until it is restarted".into(),
+    };
+    if read::<Run>(&run_path()).filter(|r| r.pid == pid).is_none_or(|r| r.control < 1) {
+        return (format!("{} (it is from before restart requests)", unasked()), false);
+    }
+    let asked = crate::accounts::now();
+    let action = Action::RestartSupervisor { why, version: version.map(str::to_string) };
+    match crate::control::ask(action, TAKE_WAIT, std::time::Duration::from_secs(5)) {
+        Ok(Asked::Answered(a)) if a.code == Code::Accepted => {
+            let mut back = None;
+            platform::wait_until(std::time::Duration::from_secs(20), || {
+                back = read::<Run>(&run_path()).filter(|r| r.started_at >= asked && sup_running() == Some(r.pid));
+                back.is_some()
+            });
+            let line = match back {
+                Some(r) => format!("the supervisor restarted onto it (v{}, pid {})", r.version, r.pid),
+                None => "the supervisor restarts onto it as soon as the replies in progress are written (at most 5 minutes) — `mafold status` shows when".into(),
+            };
+            (line, true)
+        }
+        Ok(Asked::Answered(a)) => (format!("the supervisor answered `{:?}` — {}", a.code, unasked()), false),
+        Ok(Asked::Untaken) => (format!("the supervisor didn't take the request — {}", unasked()), false),
+        Ok(Asked::Unanswered) => ("asked the supervisor to restart onto it — `mafold status` shows when it has".into(), true),
+        Err(e) => (format!("couldn't ask the supervisor to restart ({e:#}) — {}", unasked()), false),
+    }
+}
+
 /// `down <name>` while the supervisor runs is a restart, not an off: the
 /// supervisor's next tick starts every configured daemon that isn't running.
 /// Said, rather than leaving "✓ stopped" to be found out ten seconds later.
@@ -1633,14 +2105,22 @@ fn stop_confirmed_at(pid_file: &std::path::Path, name: &str, wait: std::time::Du
 /// `Ok(None)`: it wasn't running.
 fn stop_all_confirmed_at(daemons: &[(&str, PathBuf)], wait: std::time::Duration) -> Vec<Result<Option<u32>>> {
     let read = |f: &std::path::Path| -> Option<u32> { fs::read_to_string(f).ok()?.trim().parse().ok() };
-    let pids: Vec<Option<u32>> = daemons.iter().map(|(_, f)| read(f).filter(|p| platform::pid_running(*p))).collect();
-    for ((_, f), pid) in daemons.iter().zip(&pids) {
-        if let Some(pid) = pid {
+    let mut pids: Vec<Option<u32>> = daemons.iter().map(|(_, f)| read(f).filter(|p| platform::pid_running(*p))).collect();
+    for ((_, f), pid) in daemons.iter().zip(pids.iter_mut()) {
+        if let Some(p) = *pid {
             // Said before the signal: the supervisor must not count this
             // stop as the daemon dying — not even when the daemon is the
             // one running this command, and takes it down with it.
-            crate::lifecycle::note_stop(&f.with_file_name("stopping"), *pid);
-            platform::terminate(*pid);
+            crate::lifecycle::note_stop(&f.with_file_name("stopping"), p);
+            if !end_daemon(p, f) {
+                // Not the daemon: a process that took its pid since the pid
+                // file was written. Nothing of it runs; the file goes.
+                crate::lifecycle::take_stop(&f.with_file_name("stopping"), p);
+                if read(f) == Some(p) {
+                    let _ = fs::remove_file(f);
+                }
+                *pid = None;
+            }
         }
     }
     platform::wait_until(wait, || pids.iter().flatten().all(|p| !platform::pid_running(*p)));
@@ -1691,16 +2171,45 @@ fn require_known(only: Option<&str>, daemons: &[DaemonCfg]) -> Result<()> {
 fn stop_one(name: &str) -> Result<()> {
     match read_pid(name) {
         Some(pid) => {
-            // Plain SIGTERM: the DAEMON's own shutdown handler kills its
-            // in-flight claude children precisely (harness::live_children).
-            // Never group-kill here — the agent's legitimate background tasks
-            // share the daemon's pgroup and must survive a restart (the
-            // 2026-07-19 bg-task regression).
-            platform::terminate(pid);
+            end_daemon(pid, &pid_path(name));
             let _ = fs::remove_file(pid_path(name));
             Ok(())
         }
         None => anyhow::bail!("not running"),
+    }
+}
+
+/// Stop the daemon `pid`, the way every stop of one goes.
+///
+/// Unix: plain SIGTERM. The daemon's own shutdown handler kills its in-flight
+/// claude children precisely (harness::live_children). Never group-kill
+/// here — the agent's legitimate background tasks share the daemon's pgroup
+/// and must survive a restart (the 2026-07-19 bg-task regression).
+///
+/// Windows: nothing reaches the daemon to run that handler, and a process
+/// outlives its parent — ending the daemon alone left its claude processes
+/// running. It goes with everything it started, but for its background tasks'
+/// workers and what runs under them (activity center C7) — and only if it is
+/// the process `pid_file` was written about: one that started after it took
+/// the pid since (a pid file left from before a reboot), and is left be.
+/// `false`: so it was — not a daemon of ours, nothing was asked to stop.
+pub(crate) fn end_daemon(pid: u32, pid_file: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        // A process started before the note about it was written; a few
+        // seconds' slack for a file system that keeps coarse times (FAT: two).
+        let by = |at: std::time::SystemTime| platform::ticks_of(at) + 30_000_000;
+        let written = fs::metadata(pid_file).and_then(|m| m.modified()).map(by).unwrap_or(0);
+        let mut workers = crate::bgtasks::registry_dir().map(|d| crate::bgtasks::running_in(&d)).unwrap_or_default();
+        workers.extend(crate::bgtasks::running_in(&crate::computer::tasks_root()));
+        let spare: Vec<platform::Spare> = workers.into_iter().map(|(pid, at)| platform::Spare { pid, by: by(at) }).collect();
+        platform::end_tree(pid, written, &spare)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid_file;
+        platform::terminate(pid);
+        true
     }
 }
 
@@ -1711,6 +2220,9 @@ pub fn status() {
     match running {
         Some(p) => println!("supervisor: running (pid {p}) · autostart {auto} · owns updates"),
         None => println!("supervisor: not running · autostart {auto} (mafold up)"),
+    }
+    if !crate::update::auto_update_on() {
+        println!("  automatic updates off on this computer (`mafold update --auto-update on`)");
     }
     let now = crate::accounts::now();
     let service = crate::lifecycle::service(running);
@@ -1741,7 +2253,7 @@ pub fn status() {
     println!("bot daemons ({}):", c.daemons.len());
     for d in &c.daemons {
         let state = match read_pid(&d.name) {
-            Some(p) if alive(p) => match crate::lifecycle::read_turns(&turns_path(&d.name), p).and_then(|t| t.since) {
+            Some(p) if platform::pid_running(p) => match crate::lifecycle::read_turns(&turns_path(&d.name), p).and_then(|t| t.since) {
                 Some(since) => format!("running (pid {p}) · replying {}", EN.elapsed((now - since).max(0) as f64 * 1000.0)),
                 None => format!("running (pid {p})"),
             },
@@ -1838,24 +2350,22 @@ fn canonical(p: &str) -> String {
     fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string())
 }
 
-/// Where the supervisor's own output goes, as `(file, systemd unit)`: launchd
-/// writes the file the plist names; a systemd service writes the journal; the
-/// Windows logon task keeps none; run detached (no service), it's the file.
-fn supervisor_log(registered: bool) -> (Option<String>, Option<&'static str>) {
-    let file = Some(home().join(".mafold/supervisor.log").display().to_string());
-    if !registered || cfg!(target_os = "macos") {
-        (file, None)
-    } else if cfg!(target_os = "linux") {
-        (None, Some("mafold-supervisor"))
-    } else {
-        (None, None)
-    }
-}
-
 /// When `p` was last written, epoch seconds.
 fn written_at(p: &std::path::Path) -> Option<i64> {
     let t = fs::metadata(p).ok()?.modified().ok()?;
     Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64)
+}
+
+/// Does the supervisor here update itself? When it was started to (no
+/// `--no-auto-update`) — and, if it reads the machine setting, the setting
+/// says on; one from before the setting updates whatever it says. With no
+/// record, its registration — and the setting the next one will read. `None`
+/// when nothing says.
+fn updates_itself(run: Option<&crate::lifecycle::Run>, reg: Option<&Registration>, setting: bool) -> Option<bool> {
+    match run {
+        Some(r) => Some(r.auto_update && (setting || !r.update_setting)),
+        None => reg.map(|r| !r.no_auto_update && setting),
+    }
 }
 
 /// Everything a managing program needs to decide what it may do here, as one
@@ -1869,7 +2379,9 @@ fn written_at(p: &std::path::Path) -> Option<i64> {
 /// runtimes itself only when no running supervisor has reported them lately.
 pub async fn status_json() -> serde_json::Value {
     let now = crate::accounts::now();
-    let me = std::env::current_exe().ok().map(|p| p.display().to_string());
+    // By the path on disk now: after an update on Linux, current_exe() alone
+    // is `<path> (deleted)`, which no managing program can find.
+    let me = platform::current_exe().ok().map(|p| p.display().to_string());
     let reg = registration();
     let pid = sup_running();
     let service = crate::lifecycle::service(pid);
@@ -1880,7 +2392,9 @@ pub async fn status_json() -> serde_json::Value {
         .iter()
         .map(|d| {
             let harness = d.harness.as_deref().unwrap_or("claude-code");
-            let running = read_pid(&d.name).filter(|p| alive(*p));
+            // Asked from outside the supervisor: a daemon that exited stays its
+            // zombie until the next reap (≤10 s), and is not running.
+            let running = read_pid(&d.name).filter(|p| platform::pid_running(*p));
             // A count left by a daemon that is gone isn't a reply being written.
             let busy = running.map(|_| busy_count(&d.name)).unwrap_or(0);
             let turns = running.and_then(|p| crate::lifecycle::read_turns(&turns_path(&d.name), p));
@@ -1911,7 +2425,7 @@ pub async fn status_json() -> serde_json::Value {
                 // (a daemon from before C5 only has the count).
                 "turns": turns.as_ref().map_or(busy, |t| t.active),
                 "turn_since": turns.and_then(|t| t.since),
-                "log": log_path(&d.name).display().to_string(),
+                "log": bot_log(&d.name).display().to_string(),
             })
         })
         .collect();
@@ -1946,7 +2460,8 @@ pub async fn status_json() -> serde_json::Value {
     // binary is (it may be another install's) says nothing about either.
     let running_version =
         service.run.as_ref().map_or_else(|| crate::update::current_version().to_string(), |r| r.version.clone());
-    let auto_update = service.run.as_ref().map(|r| r.auto_update).or_else(|| reg.as_ref().map(|r| !r.no_auto_update));
+    let setting = crate::update::auto_update_on();
+    let auto_update = updates_itself(service.run.as_ref(), reg.as_ref(), setting);
     let seen = crate::update::seen();
     let failing = crate::update::failing(&seen, &running_version, auto_update == Some(true))
         .map(|f| crate::machine::Failing { version: f.version.clone(), since: f.since });
@@ -1959,7 +2474,6 @@ pub async fn status_json() -> serde_json::Value {
         runtimes: &runtimes,
         update: failing.as_ref(),
     });
-    let (log, journal) = supervisor_log(reg.is_some());
     serde_json::json!({
         "schema": 2,
         // When this was read, epoch seconds — every `*_at` / `since` below is
@@ -1983,12 +2497,18 @@ pub async fn status_json() -> serde_json::Value {
             "started_at": service.run.as_ref().map(|r| r.started_at),
             "version": service.run.as_ref().map(|r| r.version.clone()),
             "auto_update": service.run.as_ref().map(|r| r.auto_update),
+            // The requests it takes (`mafold restart`): 0 for one from before
+            // them — or from before C5, which says nothing (null).
+            "control": service.run.as_ref().map(|r| r.control),
             // Running: why the one before it stopped. Not running: why it did.
             "last_exit": service.last_exit,
             // Its starts after a crash in the last 10 minutes.
             "crashes": service.crashes,
-            "log": log,
-            "journal": journal,
+            // Its own file on every OS since C6 (rotated to `<log>.1` past 10 MB).
+            "log": supervisor_log().display().to_string(),
+            // Was the systemd unit whose journal held it; kept for readers of
+            // schema 2, always null now.
+            "journal": serde_json::Value::Null,
         },
         "accounts": sessions.iter().map(|s| s.username.clone()).collect::<Vec<_>>(),
         // Each login's heartbeat, as Mafold last answered it.
@@ -1999,6 +2519,9 @@ pub async fn status_json() -> serde_json::Value {
         "update": {
             "channel": crate::update::Channel::current().as_str(),
             "auto_update": auto_update,
+            // The machine setting alone (`mafold update --auto-update`), set
+            // or not: `auto_update` is false while either keeps it off.
+            "auto_update_setting": setting,
             "supported": crate::update::platform_supported(),
             "checked_at": seen.checked_at,
             // A release newer than the supervisor runs, as the last check saw.
@@ -2009,16 +2532,85 @@ pub async fn status_json() -> serde_json::Value {
     })
 }
 
-/// `mafold logs <name>` — last ~40 lines of a daemon's log.
-pub fn logs(name: &str) -> Result<()> {
-    let p = log_path(name);
-    let text = fs::read_to_string(&p).with_context(|| format!("no log for `{name}` (looked at {})", p.display()))?;
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(40);
-    for l in &lines[start..] {
-        println!("{l}");
+/// `mafold logs [<name>] [-n N] [-f] [--json]` — the last lines of a bot's log,
+/// or with no name the supervisor's; `-f` keeps printing what is written,
+/// across a rotation, until the reader goes away. `--json` is one object per
+/// line: `{"type":"open","source","name","path"}` first, then
+/// `{"type":"line","text"}` for each line and `{"type":"rotated"}` when the
+/// log moved aside under `-f`.
+pub fn logs(name: Option<&str>, lines: usize, follow: bool, json: bool) -> Result<()> {
+    use std::io::Write as _;
+    let path = match name {
+        Some(n) => bot_log(n),
+        None => supervisor_log(),
+    };
+    let tail = crate::logfile::tail(&path, lines, false).with_context(|| match name {
+        Some(n) => format!("no log for `{n}` (looked at {})", path.display()),
+        None => format!("no supervisor log yet (looked at {})", path.display()),
+    })?;
+    let stdout = std::io::stdout();
+    // A reader that went away (the desktop closed the window, `| head`) ends
+    // this quietly instead of a panic on the broken pipe.
+    let say = |tick: crate::logfile::Tick| -> bool {
+        let mut out = stdout.lock();
+        let written = match (&tick, json) {
+            (crate::logfile::Tick::Line(text), false) => writeln!(out, "{text}"),
+            (crate::logfile::Tick::Rotated, false) => Ok(()),
+            (crate::logfile::Tick::Line(text), true) => writeln!(out, "{}", serde_json::json!({ "type": "line", "text": text })),
+            (crate::logfile::Tick::Rotated, true) => writeln!(out, "{}", serde_json::json!({ "type": "rotated" })),
+        };
+        written.and_then(|_| out.flush()).is_ok()
+    };
+    if json {
+        let open = serde_json::json!({
+            "type": "open",
+            "source": if name.is_some() { "bot" } else { "supervisor" },
+            "name": name,
+            "path": path.display().to_string(),
+        });
+        if writeln!(stdout.lock(), "{open}").is_err() {
+            return Ok(());
+        }
+    }
+    let crate::logfile::Tail { lines: last, end, unfinished, file, .. } = tail;
+    for line in last {
+        if !say(crate::logfile::Tick::Line(line)) {
+            return Ok(());
+        }
+    }
+    if follow {
+        // From the last line break (a line still being written comes whole),
+        // in the very file those lines came from.
+        let file = match file {
+            Some(f) => f,
+            None => fs::File::open(&path)?,
+        };
+        crate::logfile::follow_on(file, &path, end, std::time::Duration::from_millis(500), say)
+            .with_context(|| format!("stopped reading {}", path.display()))?;
+    } else if let Some(rest) = unfinished {
+        say(crate::logfile::Tick::Line(rest));
     }
     Ok(())
+}
+
+/// The bots configured here as `mafold diagnose` shows them: only fields a
+/// person helping would ask about. Never the token (a fingerprint tells two
+/// apart) nor an `--env` value (its names only).
+pub fn config_summary() -> serde_json::Value {
+    let daemons: Vec<serde_json::Value> = load()
+        .daemons
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.name,
+                "harness": d.harness,
+                "workdir": d.workdir,
+                "env": d.env.keys().collect::<Vec<_>>(),
+                "token": crate::account_health::fingerprint(&d.token),
+            })
+        })
+        .collect();
+    serde_json::json!({ "daemons": daemons })
 }
 
 #[cfg(test)]
@@ -2256,6 +2848,110 @@ mod stop_tests {
         child.wait().unwrap();
         assert_eq!(stop_confirmed_at(&f, "a:bot", Duration::from_secs(5)).unwrap(), None, "dead, reaped");
         let _ = fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    /// A restart asked for (`control`, activity center C7): the daemon is
+    /// stopped — gone — before another is started, and the answer names both.
+    #[test]
+    fn a_restart_stops_the_daemon_and_starts_another() {
+        use crate::control::Code;
+        let mut old = platform::idle_child();
+        let f = pid_file("restart", old.id());
+        fs::write(f.with_file_name("busy"), "1").unwrap();
+        let mut started = None;
+        let (code, r) = restart_with("a:bot", &f, Duration::from_secs(5), || {
+            assert!(!platform::pid_running(old.id()), "the old one is gone before the new one starts");
+            let c = platform::idle_child();
+            let pid = c.id();
+            fs::write(&f, format!("{pid}\n"))?;
+            started = Some(c);
+            Ok(Some(pid))
+        });
+        let mut new = started.expect("started again");
+        assert_eq!(code, Code::Restarted, "{r:?}");
+        assert_eq!((r.old_pid, r.new_pid, r.interrupted), (Some(old.id()), Some(new.id()), 1), "the reply it was writing is said");
+        assert!(platform::pid_running(new.id()));
+        assert!(!f.with_file_name("stopping").exists(), "stopped on purpose, and no note of it left to mistake later");
+        old.wait().unwrap();
+        let _ = new.kill();
+        let _ = new.wait();
+        let _ = fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    #[test]
+    fn restarting_a_bot_that_isnt_running_starts_it() {
+        use crate::control::Code;
+        let mut gone = platform::idle_child();
+        let f = pid_file("restart-down", gone.id());
+        gone.kill().unwrap();
+        gone.wait().unwrap();
+        let (code, r) = restart_with("a:bot", &f, Duration::from_secs(5), || Ok(Some(4242)));
+        assert_eq!((code, r.old_pid, r.new_pid, r.interrupted), (Code::Restarted, None, Some(4242), 0));
+        let _ = fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    /// A daemon that won't stop is left alone, and no second one of the same
+    /// bot is started beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_that_wont_stop_is_not_restarted() {
+        use crate::control::Code;
+        let stuck = platform::stubborn_child();
+        let f = pid_file("restart-stuck", stuck.0.id());
+        let mut ran = false;
+        let (code, r) = restart_with("a:bot", &f, Duration::from_secs(1), || {
+            ran = true;
+            Ok(Some(1))
+        });
+        assert_eq!(code, Code::StillRunning);
+        assert!(!ran, "never two of one bot");
+        assert!(r.detail.as_deref().is_some_and(|d| d.contains("still running")), "{r:?}");
+        let _ = fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    /// The supervisor's own restart is left for its loop — which re-execs
+    /// between two passes, never in the middle of one — and woken for it.
+    #[test]
+    fn a_restart_of_the_supervisor_is_left_for_its_loop() {
+        use crate::control::{Action, Code, Moved};
+        let mut moving = None;
+        let (code, _) = carry_out("http://127.0.0.1:1", &Action::RestartSupervisor { why: Moved::Rollback, version: Some("0.9.146".into()) }, &mut moving);
+        assert_eq!(code, Code::Accepted, "accepted now: a re-exec can't answer once it has happened");
+        assert_eq!(moving, Some((Moved::Rollback, Some("0.9.146".to_string()))), "for the loop, once the answer is written");
+        assert!(MOVING.lock().unwrap().is_none(), "not handed over before that");
+    }
+
+    /// What `restart` says when it didn't — or couldn't tell that it did.
+    #[test]
+    fn a_restart_not_done_says_so_and_what_to_do() {
+        let r = |code: &'static str, detail: Option<&str>| Restart {
+            ok: false, code, name: "ops:bot".into(), detail: detail.map(Into::into), old_pid: None, new_pid: None, interrupted: 0,
+        };
+        assert!(restart_failure(&r("no_supervisor", None)).contains("`mafold up` starts it"));
+        assert!(restart_failure(&r("unverified", Some("x"))).starts_with("? asked the supervisor to restart ops:bot, but couldn't confirm it — x"));
+        assert!(restart_failure(&r("still_running", None)).contains("didn't stop, so it wasn't restarted"));
+        let run = |auto| crate::lifecycle::Run { pid: 1, started_at: 1, version: "0.9.148".into(), auto_update: auto, crashes: vec![], control: 0, update_setting: false };
+        let old = too_old_note(Some(&run(true)), "ops:bot");
+        assert!(old.contains("(v0.9.148)") && old.contains("within ~10 minutes") && old.contains("`mafold down ops:bot` restarts the bot"), "{old}");
+        assert!(too_old_note(Some(&run(false)), "ops:bot").contains("until it is restarted"), "a supervisor that doesn't update itself won't move on its own");
+        assert!(too_old_note(None, "ops:bot").starts_with("the supervisor running here is from before"));
+    }
+
+    /// It updates itself when started to and — if it reads the setting — the
+    /// setting says on. One from before the setting updates whatever it says.
+    #[test]
+    fn whether_it_updates_itself_takes_the_setting_where_it_is_read() {
+        let run = |auto, reads| crate::lifecycle::Run {
+            pid: 1, started_at: 1, version: "0.9.150".into(), auto_update: auto, crashes: vec![], control: 1, update_setting: reads,
+        };
+        assert_eq!(updates_itself(Some(&run(true, true)), None, true), Some(true));
+        assert_eq!(updates_itself(Some(&run(true, true)), None, false), Some(false), "off by the setting");
+        assert_eq!(updates_itself(Some(&run(false, true)), None, true), Some(false), "off by --no-auto-update");
+        assert_eq!(updates_itself(Some(&run(true, false)), None, false), Some(true), "from before the setting");
+        let reg = |no| Registration { exe: None, no_auto_update: no };
+        assert_eq!(updates_itself(None, Some(&reg(false)), false), Some(false));
+        assert_eq!(updates_itself(None, Some(&reg(true)), true), Some(false));
+        assert_eq!(updates_itself(None, None, true), None);
     }
 
     /// `down <name>` with the supervisor up is a restart, and says so.

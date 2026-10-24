@@ -5,11 +5,12 @@
 //! (`client-shared/thumbPlan.cases.json`), so the two can't drift.
 //!
 //! For each picture: the VIEW (fitted into 2560×2560, shrink only — what
-//! everyone is shown and what models read), a 40px inline STRIP, and the
-//! original only when asked for (`mafold attach --original`). Screenshots stay
-//! lossless (WebP lossless); photos are JPEG q85 — the `image` crate encodes
-//! WebP losslessly only, and JPEG is the fallback the rule names. Anything that
-//! can't be decoded here (HEIC) goes up as it is, exactly as before.
+//! everyone is shown and what models read; a picture the box would leave under
+//! 1080px on its short side, a long screenshot, goes as it is), a 40px inline
+//! STRIP, and the original only when asked for (`mafold attach --original`).
+//! Screenshots stay lossless (WebP lossless); photos are JPEG q85 — the `image`
+//! crate encodes WebP losslessly only, and JPEG is the fallback the rule names.
+//! Anything that can't be decoded here (HEIC) goes up as it is, exactly as before.
 
 use std::io::Cursor;
 
@@ -20,6 +21,7 @@ pub const STRIP_EDGE: u32 = 40;
 pub const STRIP_QUALITY: f64 = 0.6;
 pub const PHOTO_QUALITY: f64 = 0.85;
 pub const SMALL_ENOUGH_BYTES: u64 = 1_000_000;
+pub const MIN_VIEW_SHORT_EDGE: u32 = 1080;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,6 +97,10 @@ pub fn plan_upload(w: u32, h: u32, mime: &str, bytes: u64) -> Option<UploadPlan>
         return Some(UploadPlan { view: ViewPlan::Reuse, strip, offers_original: false });
     }
     let size = fit(w, h, VIEW_EDGE);
+    // Rule 3: past the box, but the box would leave it too narrow to read.
+    if !fits && size.w.min(size.h) < MIN_VIEW_SHORT_EDGE {
+        return Some(UploadPlan { view: ViewPlan::Reuse, strip, offers_original: false });
+    }
     let quality = if encoding == Encoding::Lossless { 1.0 } else { PHOTO_QUALITY };
     Some(UploadPlan {
         view: ViewPlan::Encode { w: size.w, h: size.h, encoding, quality },

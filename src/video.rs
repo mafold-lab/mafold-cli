@@ -265,11 +265,7 @@ pub async fn run(cmd: VideoCmd, client: &Client) -> Result<()> {
                         "no message to attach to — run inside an agent turn or pass --message <id>",
                     )?,
                 };
-                let msg = std::fs::read_to_string(crate::agent::draft_ptr_path(&msg))
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(msg);
+                let msg = crate::agent::current_draft(msg).await?;
                 let att = json!({ "kind": "video", "id": file_id, "file": file_id });
                 client.attach(&msg, json!([att])).await?;
                 eprintln!("✓ attached {file_id} to {msg}");

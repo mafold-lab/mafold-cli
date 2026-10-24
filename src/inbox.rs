@@ -1432,7 +1432,7 @@ async fn pick_seat(ctx: &Ctx) -> (Option<crate::accounts::Account>, Vec<mafold_t
         return (None, Vec::new());
     }
     let choice = crate::accounts::choose(ctx.seat_pref.as_deref(), ctx.opts.model.as_deref()).await;
-    if let Some(note) = choice.note() {
+    if let Some(note) = choice.note().or_else(|| choice.none_note()) {
         println!("inbox: {note}");
     }
     (choice.account, choice.skipped)

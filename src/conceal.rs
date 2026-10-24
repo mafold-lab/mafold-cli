@@ -247,6 +247,12 @@ pub fn scrub_outgoing(method: &str, body: &mut serde_json::Value, own: &str) -> 
     scrub_value(body, &values)
 }
 
+/// Every string in `v`, in place — `mafold diagnose` runs its whole bundle
+/// through this with [`local_credentials`].
+pub(crate) fn scrub_with(v: &mut serde_json::Value, values: &[String]) -> usize {
+    scrub_value(v, values)
+}
+
 /// Every string in `v`, in place.
 fn scrub_value(v: &mut serde_json::Value, values: &[String]) -> usize {
     let mut concealer = Concealer::new(values.iter().map(String::as_str));
@@ -290,7 +296,7 @@ impl Concealer {
 static SWEPT: std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>> = std::sync::Mutex::new(None);
 
 /// This machine's credentials, from a sweep at most [`RESWEEP`] old.
-fn local_credentials() -> Vec<String> {
+pub(crate) fn local_credentials() -> Vec<String> {
     use std::time::Instant;
     let mut cache = SWEPT.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((at, values)) = cache.as_ref() {

@@ -14,6 +14,7 @@ mod ask_hook;
 mod bash_hook;
 #[cfg(windows)]
 mod background_windows;
+mod bgtasks;
 mod bot_token;
 mod cards;
 mod cardtags;
@@ -25,8 +26,10 @@ mod compact_hook;
 mod computer;
 mod conceal;
 mod connection;
+mod control;
 mod d1;
 mod daemon;
+mod diagnose;
 mod discover;
 mod drafts;
 mod drive;
@@ -37,6 +40,7 @@ mod inbox;
 mod install;
 mod langpack;
 mod lifecycle;
+mod logfile;
 mod machine;
 mod mcp_link;
 mod msgops;
@@ -138,8 +142,20 @@ enum Cmd {
         /// real machine WITHOUT turning auto-update off. The choice is sticky
         /// (`~/.mafold/channel`): the supervisor and every agent here follow it
         /// until you switch back with `--channel stable`.
-        #[arg(long, value_name = "stable|dev")]
+        #[arg(long, value_name = "stable|dev", value_parser = ["stable", "dev"])]
         channel: Option<String>,
+        /// Only ask whether a newer release is out — nothing is downloaded or
+        /// installed.
+        #[arg(long)]
+        check: bool,
+        /// Turn this computer's automatic updates on or off — a setting
+        /// (`~/.mafold/auto-update`) the supervisor reads on every pass.
+        /// Installs nothing; the service and its bots are left as they are.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        auto_update: Option<String>,
+        /// One JSON object for a program to read (the desktop app).
+        #[arg(long)]
+        json: bool,
     },
     /// Install a coding-agent runtime (claude-code / codex / kimi-code /
     /// opencode). No argument lists the runtimes + their install state.
@@ -432,8 +448,44 @@ enum Cmd {
     /// just that daemon — while the supervisor runs, it starts it again within
     /// ~10s (a restart). Waits for each to exit; fails if one doesn't.
     Down { name: Option<String> },
-    /// Show the last lines of a bot daemon's log.
-    Logs { name: String },
+    /// Restart one bot: the supervisor stops its daemon and starts it again.
+    /// Done once the new one is read back running — exit status 2 when it
+    /// was asked but couldn't be confirmed. Replies it was writing are picked
+    /// back up.
+    Restart {
+        /// The bot, as in `mafold status`.
+        name: String,
+        /// Print the outcome as one JSON object, for a program to read (the
+        /// desktop app).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the last lines of a bot's log — or, with no name, the supervisor's
+    /// (the background service). Logs move aside to `<log>.1` past 10 MB.
+    Logs {
+        /// The bot (as in `mafold status`). Leave out for the supervisor's log.
+        name: Option<String>,
+        /// How many lines.
+        #[arg(short = 'n', long, default_value_t = 40)]
+        lines: usize,
+        /// Keep printing what gets written, until interrupted.
+        #[arg(short, long)]
+        follow: bool,
+        /// One JSON object per line, for a program to read (the desktop app).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a diagnostics file to send to whoever helps you: this computer's
+    /// status, its bots' settings (no tokens) and the end of each log, with
+    /// tokens and email addresses masked — and no conversations.
+    Diagnose {
+        /// Where to write it (default: mafold-diagnose-<time>.json here).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Print where it went as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 
     // ── human control plane (New-Bot harness recommendation + provisioning) ──
     /// Log in your HUMAN account so the Mafold app can recommend a harness from
@@ -614,7 +666,9 @@ async fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Up => return supervisor::up(&cli.base, cli.no_auto_update),
         Cmd::Down { name } => return supervisor::down(name.as_deref()),
-        Cmd::Logs { name } => return supervisor::logs(name),
+        Cmd::Restart { name, json } => return supervisor::restart(name, *json),
+        Cmd::Logs { name, lines, follow, json } => return supervisor::logs(name.as_deref(), *lines, *follow, *json),
+        Cmd::Diagnose { out, json } => return diagnose::run(out.clone(), *json).await,
         Cmd::Rm { name } => return supervisor::rm(name),
         Cmd::Rollback => return update::rollback(),
         Cmd::Supervise { hidden } => {
@@ -626,44 +680,15 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    if let Cmd::Update { channel } = &cli.cmd {
-        // No release binary is built for this platform (e.g. linux-arm64) → don't
-        // claim "up to date" (the check would always no-op). Be honest instead.
-        if !update::platform_supported() {
-            println!("no mafold release is built for your platform — self-update isn't available.\nSee https://github.com/mafold-lab/mafold-cli/releases");
-            return Ok(());
-        }
+    if let Cmd::Update { channel, check, auto_update, json } = &cli.cmd {
         // `--channel` is persisted BEFORE the update runs, so the update that
         // follows is already the new channel's — one command switches and
         // lands, instead of switching and leaving the machine on the old line
         // until the next tick.
-        let channel = match channel {
-            Some(name) => {
-                let c = update::Channel::parse(name).with_context(|| {
-                    format!("unknown channel {name:?} — expected `stable` or `dev`")
-                })?;
-                c.save()?;
-                println!("✓ channel → {}", c.as_str());
-                c
-            }
-            None => update::Channel::current(),
-        };
-        let http = reqwest::Client::new();
-        match update::update_to_latest(&http, &cli.base, channel).await {
-            // `mafold stop` only knows the old `agent --detach` — on a machine
-            // the supervisor runs, that hint stopped nothing.
-            Ok(Some(v)) if supervisor::supervisor_running() => {
-                println!("✓ updated to v{v} — {}", supervisor::update_pickup_note())
-            }
-            Ok(Some(v)) => println!("✓ updated to v{v} — restart a running agent with: mafold stop && mafold agent --detach …"),
-            Ok(None) => println!(
-                "already up to date (v{}, {} channel)",
-                update::current_version(),
-                channel.as_str()
-            ),
-            Err(e) => { eprintln!("update failed: {e}"); std::process::exit(1); }
-        }
-        return Ok(());
+        // clap took only `stable` / `dev`.
+        let channel = channel.as_deref().and_then(update::Channel::parse);
+        let ask = update::Ask { check: *check, auto_update: auto_update.as_deref().map(|v| v == "on"), channel, json: *json };
+        return update::command(&cli.base, ask).await;
     }
     // Cards: init/dev need no token; publish/list check for one themselves.
     if matches!(cli.cmd, Cmd::Cards { .. }) {
@@ -882,7 +907,7 @@ async fn main() -> Result<()> {
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }
         | Cmd::Account { .. } | Cmd::Report
-        | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
+        | Cmd::Up | Cmd::Down { .. } | Cmd::Restart { .. } | Cmd::Logs { .. } | Cmd::Diagnose { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
         | Cmd::SteerHook | Cmd::DriveHook | Cmd::CompactHook { .. } | Cmd::PermissionMcp => unreachable!(),
         #[cfg(windows)]
@@ -1288,11 +1313,9 @@ async fn attach(
             // leaves a forwarding address keyed by the original id
             // (`agent::draft_ptr_path`); without following it, a picture the
             // agent just made would be hung on a draft that no longer exists.
-            std::fs::read_to_string(agent::draft_ptr_path(&env_id))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(env_id)
+            // An update turn's bubble may not be open yet: sending a file
+            // opens it (`agent::current_draft`).
+            agent::current_draft(env_id).await?
         }
     };
     for f in files {

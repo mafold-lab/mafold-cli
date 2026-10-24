@@ -70,6 +70,20 @@ pub struct Run {
     /// seconds — this one's included when it did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crashes: Vec<i64>,
+    /// The requests it takes from `~/.mafold/control/` ([`crate::control::VERSION`]);
+    /// 0 — left out — for a supervisor from before them, which a command
+    /// asking it to restart a bot would wait on for nothing.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub control: u32,
+    /// It reads the machine's update setting on every pass
+    /// ([`crate::update::auto_update_on`]); false — left out — for one from
+    /// before it, which updates whatever the setting says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub update_setting: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Why a supervisor stopped.
@@ -144,7 +158,7 @@ pub(crate) fn begin_at(run_p: &Path, exit_p: &Path, pid: u32, version: &str, aut
     if last.as_ref().is_some_and(|x| x.reason.is_crash()) {
         crashes.push(now);
     }
-    let run = Run { pid, started_at: now, version: version.to_string(), auto_update, crashes };
+    let run = Run { pid, started_at: now, version: version.to_string(), auto_update, crashes, control: crate::control::VERSION, update_setting: true };
     if let Some(x) = &last {
         write(exit_p, x);
     }
@@ -413,7 +427,12 @@ mod tests {
         let (r, x) = tmp("first");
         let (run, last) = begin_at(&r, &x, 100, "0.9.150", true, 1_000);
         assert_eq!(last, None);
-        assert_eq!(run, Run { pid: 100, started_at: 1_000, version: "0.9.150".into(), auto_update: true, crashes: vec![] });
+        assert_eq!(run, Run { pid: 100, started_at: 1_000, version: "0.9.150".into(), auto_update: true, crashes: vec![], control: crate::control::VERSION, update_setting: true });
+        // Said in the record a command reads before it asks anything.
+        assert_eq!(read::<Run>(&r).map(|r| r.control), Some(crate::control::VERSION));
+        // A supervisor from before the requests wrote none: it takes nothing.
+        let old: Run = serde_json::from_str(r#"{"pid":1,"started_at":2,"version":"0.9.148","auto_update":true}"#).unwrap();
+        assert_eq!(old.control, 0);
         let s = service_at(&r, &x, Some(100), 1_030);
         assert_eq!(s.run.as_ref().map(|r| r.started_at), Some(1_000));
         assert_eq!(s.last_exit, None);

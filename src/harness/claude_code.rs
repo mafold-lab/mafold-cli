@@ -224,6 +224,7 @@ impl Harness for ClaudeCode {
             perm: ask_file.as_ref().map(|af| format!("{af}.perm")).unwrap_or_default(),
             surface: surface.clone(),
             skill_plugins,
+            bg_events: crate::bgtasks::events_on(),
         };
         crate::turnenv::write(&crate::turnenv::path_for(&conn.id), &tenv);
         // An OLDER `mafold` on the agent's $PATH still reads `MAFOLD_DRAFT` from
@@ -1205,13 +1206,16 @@ fn seat_limit_label(kind: &str, l: &Value) -> String {
 /// daemon log, which is how this class of dead reply went unexplained for weeks.
 fn exit_reason(code: Option<i32>, stderr: &str, plain_tail: &[String]) -> String {
     const HEAD: &str = "claude exited unsuccessfully";
+    // What claude said follows `logfile::EXITED`, so a diagnostics file
+    // keeps how long it was and not what it said.
+    let said = |text: &str| format!("claude{}{text}", crate::logfile::EXITED);
     let stderr = stderr.trim();
     if !stderr.is_empty() {
-        return format!("{HEAD}: {stderr}");
+        return said(stderr);
     }
     let tail: Vec<&str> = plain_tail.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if !tail.is_empty() {
-        return format!("{HEAD}: {}", tail.join(" / "));
+        return said(&tail.join(" / "));
     }
     match code {
         Some(c) => format!("{HEAD} (exit code {c}, and it printed nothing to stdout or stderr)"),
@@ -1340,6 +1344,9 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         // registers detached background tasks under it, so their wrap-up turn
         // comes back to THIS channel instead of leaking into another one.
         cmd.env("MAFOLD_SURFACE", &shape.surface);
+        // …and how it watches them (`turnenv::bg_events` — a reused
+        // connection's turn file says it per turn).
+        cmd.env("MAFOLD_BGTASK_EVENTS", if crate::bgtasks::events_on() { "1" } else { "" });
         // Name this process in the machine's session registry
         // (`~/.claude/sessions/<pid>.json`), which is the address book every
         // other local claude session sees. Without it the name is auto-derived

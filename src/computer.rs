@@ -341,9 +341,15 @@ fn kill_group(pid: i32) {
 /// directory: those belong to a conversation's agent turn and are swept when
 /// that turn reports them, and a task started over a connection has no turn.
 fn tasks_dir() -> Result<PathBuf> {
-    let dir = home().join(".mafold").join("computer");
+    let dir = tasks_root();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+/// [`tasks_dir`], not created — for the supervisor, which ends a daemon
+/// without its background tasks (`bgtasks::running_in`).
+pub(crate) fn tasks_root() -> PathBuf {
+    home().join(".mafold").join("computer")
 }
 
 fn now_ms() -> i64 {
@@ -592,13 +598,18 @@ mod tests {
     async fn win_spawn_status_exit_and_tree_kill() {
         let dir = std::env::temp_dir().join(format!("mf spawn & spaces {}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        // A task's first output waits on two process starts: the worker, which
+        // in tests is this test binary (its "running 1 test" banner lands in the
+        // log), then the command. A PowerShell cold start on a CI runner pushed
+        // that past 10s (run 39946530592, #1122).
+        let start = std::time::Duration::from_secs(20);
         let task = spawn("echo spawned-output & exit /b 7", dir.to_str()).await.unwrap();
         let id = task["task_id"].as_str().unwrap();
         let began = std::time::Instant::now();
         let done = loop {
             let value = status(id, 30).unwrap();
             if value["running"] == false { break value; }
-            assert!(began.elapsed() < std::time::Duration::from_secs(10));
+            assert!(began.elapsed() < start, "{value}");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         assert_eq!(done["exit_code"], 7, "{done}");
@@ -610,7 +621,7 @@ mod tests {
         let child_pid = loop {
             let value = status(id, 30).unwrap();
             if let Some(pid) = value["output"].as_str().unwrap().lines().find_map(|l| l.trim().parse::<u32>().ok()) { break pid; }
-            assert!(began.elapsed() < std::time::Duration::from_secs(10), "{value}");
+            assert!(began.elapsed() < start, "{value}");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         assert_eq!(crate::platform::console_window_of(child_pid), Some(false));

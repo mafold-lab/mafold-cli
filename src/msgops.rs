@@ -12,16 +12,12 @@ use crate::client::Client;
 
 /// The reply being written right now, following the daemon's forwarding
 /// pointer when a steered turn re-opened its draft (same rule as `attach`).
-fn current_reply() -> Result<String> {
+async fn current_reply() -> Result<String> {
     let env_id = std::env::var("MAFOLD_DRAFT").ok().filter(|s| !s.is_empty()).context(
         "no message given and no reply in flight — run inside an agent turn (the daemon \
          presets MAFOLD_DRAFT), or name the message id",
     )?;
-    Ok(std::fs::read_to_string(crate::agent::draft_ptr_path(&env_id))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(env_id))
+    crate::agent::current_draft(env_id).await
 }
 
 async fn chat_of(client: &Client, chat: Option<&str>) -> Result<String> {
@@ -36,7 +32,7 @@ async fn chat_of(client: &Client, chat: Option<&str>) -> Result<String> {
 pub async fn pin(client: &Client, message: Option<&str>, chat: Option<&str>, unpin: bool) -> Result<()> {
     let msg = match message {
         Some(m) => m.to_string(),
-        None => current_reply()?,
+        None => current_reply().await?,
     };
     let chat_id = chat_of(client, chat).await?;
     let method = if unpin { "unpinMessage" } else { "pinMessage" };

@@ -46,6 +46,9 @@ unicode-normalization = "0.1.25"
 automerge = "0.5"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `mafold diagnose` masks what looks like a token, a JWT or an email in the
+# logs it bundles (diagnose.rs) — shapes, not values, so a pattern language.
+regex = "1"
 
 # Process/session control (detach via setsid, liveness + stop via signals) — Unix only.
 [target.'cfg(unix)'.dependencies]
@@ -71,6 +74,9 @@ windows-sys = { version = "0.59", features = [
     # GetTickCount64: when the machine booted (platform::boot_time), so a
     # supervisor that went down with it doesn't read as a crash.
     "Win32_System_SystemInformation",
+    # CreateToolhelp32Snapshot: the processes a daemon started, ended with it
+    # (platform::end_tree) — nothing else on Windows takes them down.
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 # Test-only: `#[tokio::test(start_paused = true)]`. A failed attachment fetch

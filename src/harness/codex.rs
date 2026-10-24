@@ -688,14 +688,12 @@ async fn run_once(
                 None => String::new(),
             };
             let err = err.trim();
-            bail!(
-                "codex exited unsuccessfully{}",
-                if err.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {err}")
-                }
-            );
+            // After `logfile::EXITED`, like claude's: a diagnostics file keeps
+            // its length, not codex's words.
+            if err.is_empty() {
+                bail!("codex exited unsuccessfully");
+            }
+            bail!("codex{}{err}", crate::logfile::EXITED);
         }
         if let Some(t) = stderr_task {
             t.abort();

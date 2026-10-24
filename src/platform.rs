@@ -22,6 +22,13 @@ mod imp {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 
+    /// Is anyone left in process group `pgid` (ours to signal)? A detached
+    /// background task is its group (`bash_hook::spawn_detached` setsid's it):
+    /// its shell can be gone while what it ran lives on.
+    pub fn group_alive(pgid: u32) -> bool {
+        pgid > 1 && unsafe { libc::kill(-(pgid as i32), 0) == 0 }
+    }
+
     /// Is `pid` still running — alive and NOT a zombie? For asking about a
     /// process that is somebody else's child: a daemon the supervisor started
     /// stays a zombie from the moment it exits until the supervisor's next
@@ -66,6 +73,37 @@ mod imp {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn zombie(_pid: u32) -> bool {
         false
+    }
+
+    /// When `pid` started, as an opaque token that only has to compare equal
+    /// for the same process — so a pid that has since been handed to another
+    /// process reads as a different one. `None` when nobody by that pid can be
+    /// asked (gone, a zombie, another user's).
+    ///
+    /// macOS: `proc_bsdinfo.pbi_start_tv*`, in microseconds.
+    #[cfg(target_os = "macos")]
+    pub fn pid_start(pid: u32) -> Option<u64> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the kernel writes at most `size` bytes into `info`.
+        let n = unsafe {
+            libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+        };
+        (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    }
+
+    /// Linux: field 22 of `/proc/<pid>/stat`, clock ticks since boot.
+    #[cfg(target_os = "linux")]
+    pub fn pid_start(pid: u32) -> Option<u64> {
+        // `pid (comm) state …` — comm may hold spaces and parentheses, so the
+        // fields are counted from the LAST `)`; starttime is the 20th after it.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn pid_start(_pid: u32) -> Option<u64> {
+        None
     }
 
     /// When this machine last booted, epoch seconds.
@@ -211,6 +249,17 @@ mod imp {
         pid_alive(pid)
     }
 
+    /// Not needed here: a Windows background task's worker always leaves an
+    /// exit receipt, and that answers before any pid is asked.
+    pub fn pid_start(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    /// No process groups to ask: as above, the receipt answers.
+    pub fn group_alive(_pgid: u32) -> bool {
+        false
+    }
+
     /// Is `pid` — a CHILD of this process — still running?
     ///
     /// Not [`pid_alive`]: the `Child` that spawned it holds a handle, and an
@@ -242,6 +291,118 @@ mod imp {
                 CloseHandle(h);
             }
         }
+    }
+
+    /// Every process running: its pid, its parent's, and when it started.
+    pub fn processes() -> Vec<super::Proc> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        };
+        let mut out = Vec::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return out;
+            }
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut more = Process32FirstW(snap, &mut e) != 0;
+            while more {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.th32ProcessID);
+                let started = if h.is_null() {
+                    0
+                } else {
+                    let t = started_of(h);
+                    CloseHandle(h);
+                    t
+                };
+                out.push(super::Proc { pid: e.th32ProcessID, ppid: e.th32ParentProcessID, started });
+                more = Process32NextW(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+        }
+        out
+    }
+
+    /// When the process `h` started, FILETIME ticks; 0 if it can't say.
+    unsafe fn started_of(h: windows_sys::Win32::Foundation::HANDLE) -> u64 {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        if GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+            return 0;
+        }
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+    }
+
+    /// Now, on the clock [`processes`] says when each started on.
+    fn now_ticks() -> u64 {
+        use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+        let mut t = windows_sys::Win32::Foundation::FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        unsafe { GetSystemTimeAsFileTime(&mut t) };
+        (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
+    }
+
+    /// End `p` — if the pid still is that process, not one started under a
+    /// reused pid since the list was taken.
+    fn end_one(p: super::Proc) {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, p.pid);
+            if h.is_null() {
+                return;
+            }
+            if p.started == 0 || started_of(h) == p.started {
+                TerminateProcess(h, 1);
+            }
+            CloseHandle(h);
+        }
+    }
+
+    /// End `root` and everything it started ([`super::tree_of`]), but what
+    /// `spare` names and what runs under it — and never the process calling
+    /// this, which is inside that tree when a bot's own turn stops its daemon
+    /// (`mafold down <itself>`): it would end itself halfway through. Swept
+    /// twice more, for a process one of them started in the moment before
+    /// it was ended.
+    ///
+    /// `by`: the latest `root` can have started (ticks, as [`super::Proc::started`])
+    /// — its pid comes from a note written after it started. A process that
+    /// started later took the pid since (a pid file left from before a
+    /// reboot), and nothing is ended; nor when its start can't be read, as it
+    /// then can't be told from one. `false`: left be, for either reason.
+    pub fn end_tree(root: u32, by: u64, spare: &[super::Spare]) -> bool {
+        let procs = processes();
+        let Some(root) = procs.iter().find(|p| p.pid == root).copied() else { return true };
+        if root.started == 0 || root.started > by {
+            return false;
+        }
+        let mut spare = spare.to_vec();
+        spare.push(super::Spare { pid: std::process::id(), by: u64::MAX });
+        let spare = &spare[..];
+        let mut ended: Vec<(super::Proc, u64)> = Vec::new();
+        let mut doomed = super::tree_of(root, &procs, spare, u64::MAX);
+        for _ in 0..3 {
+            if doomed.is_empty() {
+                break;
+            }
+            for p in doomed.drain(..) {
+                let at = now_ticks();
+                end_one(p);
+                ended.push((p, at));
+            }
+            let procs = processes();
+            for (p, at) in &ended {
+                for c in super::tree_of(*p, &procs, spare, *at).into_iter().skip(1) {
+                    let done = ended.iter().any(|(e, _)| e.pid == c.pid && e.started == c.started);
+                    if !done && !doomed.contains(&c) {
+                        doomed.push(c);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Configure `cmd` to spawn detached from the console so it survives the
@@ -324,6 +485,67 @@ pub fn wait_until(max: std::time::Duration, mut done: impl FnMut() -> bool) -> b
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+// ─────────────────────── ending a process tree ───────────────────────
+// On Windows a process outlives its parent, and nothing reaches a console-less
+// daemon the way SIGTERM does on unix, where the daemon's own shutdown ends
+// the claude processes it started. Ending only the daemon there left those
+// running — mid-turn, with the hooks, MCP servers and tool shells under them —
+// next to the daemon that replaced it (activity center C7). So a daemon is
+// ended with what it started (`end_tree`), but for the background tasks,
+// which outlive it on purpose.
+
+/// A process, as a list of all of them gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    /// When it started, in the OS's own ticks; 0 when that couldn't be asked.
+    pub started: u64,
+}
+
+/// A process to leave be, and all under it: the one with this pid that
+/// started no later than `by` (ticks, as [`Proc::started`]) — a pid named in
+/// a note from before is somebody else's once a newer process has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spare {
+    pub pid: u32,
+    pub by: u64,
+}
+
+/// `root` and what it started, out of `procs`: parents before children. A
+/// child names its parent's pid AND started after it — pids are reused, and
+/// a process older than the one it names as parent is not its child. `root`
+/// ended at `before`: a process naming it that started later is a reused
+/// pid's child, not its own (`u64::MAX` while it runs). What `spare` names,
+/// and all under it, stays out.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn tree_of(root: Proc, procs: &[Proc], spare: &[Spare], before: u64) -> Vec<Proc> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let parent = out[i];
+        let until = if i == 0 { before } else { u64::MAX };
+        for p in procs {
+            let child = p.ppid == parent.pid && p.pid != parent.pid && p.started != 0 && p.started >= parent.started && p.started <= until;
+            let spared = spare.iter().any(|s| s.pid == p.pid && p.started <= s.by);
+            if child && !spared && !out.iter().any(|o| o.pid == p.pid) {
+                out.push(*p);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `t` in Windows' process-time ticks (100 ns since 1601) — what a note's
+/// time is compared to, as [`Spare::by`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn ticks_of(t: std::time::SystemTime) -> u64 {
+    const UNIX_AT: u64 = 116_444_736_000_000_000;
+    let since = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    UNIX_AT + (since.as_nanos() / 100) as u64
 }
 
 /// Hide the console window this process owns (Windows). A supervisor launched
@@ -507,10 +729,31 @@ pub fn lock_file_exclusive(file: &std::fs::File) -> std::io::Result<()> {
 // process image via `exec()` (keeps the same pid). Windows has no `exec`, so we
 // spawn a fresh copy with the same args/env and exit.
 
+/// This process's binary, by the path that names it on disk NOW.
+///
+/// Linux reports a running binary whose file was replaced — what an update
+/// does, renaming the new one over it — as `<path> (deleted)`, a name nothing
+/// answers to: exec'ing it failed, so the supervisor that had just installed
+/// an update kept running the old one, and starting a daemon from it failed
+/// too (activity center C8, caught by `tests/update_cli.rs` on Linux). The
+/// path without the suffix is the new binary — the one these want.
+pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe().map(on_disk)
+}
+
+fn on_disk(exe: std::path::PathBuf) -> std::path::PathBuf {
+    if cfg!(target_os = "linux") {
+        if let Some(path) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            return std::path::PathBuf::from(path);
+        }
+    }
+    exe
+}
+
 /// Replace the current process with a fresh `mafold` of the same args. Never
 /// returns on success.
 pub fn reexec() -> std::io::Error {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("mafold"));
+    let exe = current_exe().unwrap_or_else(|_| std::path::PathBuf::from("mafold"));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -660,6 +903,22 @@ pub fn console_window_of(pid: u32) -> Option<bool> {
 mod tests {
     use super::*;
 
+    /// A binary replaced under a running process is named by its path on disk
+    /// — the new binary — not Linux's `… (deleted)`; anywhere else, and any
+    /// path that merely contains the words, is left as it is.
+    #[test]
+    fn a_replaced_binary_is_named_by_its_path_on_disk() {
+        let p = |s: &str| std::path::PathBuf::from(s);
+        let replaced = on_disk(p("/home/a/.mafold/mafold (deleted)"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(replaced, p("/home/a/.mafold/mafold"));
+        } else {
+            assert_eq!(replaced, p("/home/a/.mafold/mafold (deleted)"));
+        }
+        assert_eq!(on_disk(p("/home/a/.mafold/mafold")), p("/home/a/.mafold/mafold"));
+        assert_eq!(on_disk(p("/x (deleted)/mafold")), p("/x (deleted)/mafold"));
+    }
+
     /// `console_window_of`'s console-less half: asks about
     /// `MAFOLD_CONSOLE_PROBE_PID` and prints the answer for the caller.
     #[cfg(windows)]
@@ -798,6 +1057,121 @@ mod tests {
         assert!(pid_alive(pid), "positive control: kill(pid, 0) still answers for the zombie");
         child.wait().expect("reap it");
         assert!(!pid_running(pid));
+    }
+
+    fn proc(pid: u32, ppid: u32, started: u64) -> Proc {
+        Proc { pid, ppid, started }
+    }
+
+    /// Who goes with a daemon on Windows (`end_tree`): what it started, and
+    /// theirs — but what it is told to spare, and never a process that only
+    /// names a pid one of them once had.
+    #[test]
+    fn a_tree_is_what_its_root_started() {
+        let root = proc(10, 1, 100);
+        let procs = [
+            root,
+            proc(11, 10, 110), // claude
+            proc(12, 11, 120), // a hook claude started
+            proc(13, 10, 130), // a background task's worker
+            proc(14, 13, 140), // …and its shell
+            proc(15, 10, 90),  // names pid 10, but is older: pid 10 was another process then
+            proc(16, 2, 150),  // nothing to do with it
+            proc(17, 12, 0),   // when it started couldn't be asked: not shown to be a child
+        ];
+        let pids = |v: Vec<Proc>| v.into_iter().map(|p| p.pid).collect::<Vec<_>>();
+        assert_eq!(pids(tree_of(root, &procs, &[], u64::MAX)), vec![10, 11, 13, 12, 14], "parents before children");
+        let worker = Spare { pid: 13, by: 135 };
+        assert_eq!(pids(tree_of(root, &procs, &[worker], u64::MAX)), vec![10, 11, 12], "a spared one keeps what is under it");
+        // The note sparing pid 13 was written before this process started:
+        // it names a pid since reused, by one of the daemon's own.
+        assert_eq!(pids(tree_of(root, &procs, &[Spare { pid: 13, by: 125 }], u64::MAX)), vec![10, 11, 13, 12, 14]);
+        // Ended at 115: a process naming pid 10 that started later has a
+        // reused pid for a parent. 12's parent, 11, still ran.
+        assert_eq!(pids(tree_of(root, &procs, &[], 115)), vec![10, 11, 12]);
+        // A note's time, on the clock process starts are read on (Windows').
+        assert_eq!(ticks_of(std::time::UNIX_EPOCH), 116_444_736_000_000_000);
+        assert_eq!(ticks_of(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)), 116_444_736_010_000_000);
+    }
+
+    /// The tree `win_a_tree_ends_with_its_root_but_what_it_spares` ends, the
+    /// shape of a daemon's: this process (the daemon), a `cmd` running a
+    /// `ping` (a background task's worker and its shell, to be spared) and two
+    /// `ping`s (its claude processes) — each started the way mafold starts
+    /// one, with a console of its own. Their pids go to
+    /// `MAFOLD_TREE_PROBE_DIR`; then it waits to be ended.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "started by win_a_tree_ends_with_its_root_but_what_it_spares"]
+    fn tree_probe() {
+        use std::process::Stdio;
+        let Some(dir) = std::env::var_os("MAFOLD_TREE_PROBE_DIR").map(std::path::PathBuf::from) else { return };
+        let start = |program: &str, args: &[&str]| {
+            let mut c = std_command(program);
+            c.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            c.spawn().expect("start a child").id()
+        };
+        let worker = start("cmd.exe", &["/d", "/c", "ping -n 120 127.0.0.1 >nul"]);
+        let one = start("ping", &["-n", "121", "127.0.0.1"]);
+        let two = start("ping", &["-n", "122", "127.0.0.1"]);
+        std::fs::write(dir.join("pids"), format!("{worker} {one} {two}")).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// `end_tree` on a real tree (activity center C7): `TerminateProcess` on
+    /// a daemon alone left everything it had started running.
+    #[cfg(windows)]
+    #[test]
+    fn win_a_tree_ends_with_its_root_but_what_it_spares() {
+        use std::process::Stdio;
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("mafold-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut probe = std_command(std::env::current_exe().unwrap());
+        probe
+            .args(["--exact", "platform::tests::tree_probe", "--ignored", "--nocapture"])
+            .env("MAFOLD_TREE_PROBE_DIR", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut root = probe.spawn().expect("start the probe");
+        let r = root.id();
+        let mut pids: Vec<u32> = Vec::new();
+        let started = wait_until(Duration::from_secs(30), || {
+            pids = std::fs::read_to_string(dir.join("pids")).unwrap_or_default().split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            pids.len() == 3
+        });
+        assert!(started, "the probe never started its tree");
+        let (worker, one, two) = (pids[0], pids[1], pids[2]);
+        // What runs under the one spared: its ping (and its console host).
+        let mut under: Vec<u32> = Vec::new();
+        let found = wait_until(Duration::from_secs(10), || {
+            let procs = processes();
+            under = procs
+                .iter()
+                .find(|p| p.pid == worker)
+                .map(|w| tree_of(*w, &procs, &[], u64::MAX).into_iter().skip(1).map(|p| p.pid).collect())
+                .unwrap_or_default();
+            !under.is_empty()
+        });
+        assert!(found, "the spared cmd's ping");
+        // A pid from a note written before the root started — a pid file left
+        // from before a reboot — is somebody else's now: nothing is ended.
+        let earlier = ticks_of(std::time::SystemTime::now() - Duration::from_secs(3600));
+        end_tree(r, earlier, &[]);
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(pid_running(r) && pid_running(one) && pid_running(two), "not the process the note was about");
+        end_tree(r, ticks_of(std::time::SystemTime::now()), &[Spare { pid: worker, by: u64::MAX }]);
+        let gone = |pid: u32| wait_until(Duration::from_secs(5), || !pid_running(pid));
+        assert!(gone(r), "the root");
+        assert!(gone(one) && gone(two), "started by the root, ended with it");
+        assert!(pid_running(worker), "spared");
+        assert!(under.iter().all(|p| pid_running(*p)), "…and what runs under it");
+        end_tree(worker, u64::MAX, &[]);
+        assert!(gone(worker) && under.iter().all(|p| gone(*p)), "until it is ended itself");
+        let _ = root.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `stop_and_wait` says a process is gone only once it is.

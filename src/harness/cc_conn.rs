@@ -399,15 +399,12 @@ impl Conn {
             // this side cannot reconstruct afterwards.
             let tail = self.stderr_text();
             let tail = tail.trim_end();
-            eprintln!(
-                "[cc-pool] hook handshake failed after {}ms ({why}) rid={rid}{}",
-                began.elapsed().as_millis(),
-                if tail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — claude stderr: {}", tail.replace('\n', " ⏎ "))
-                }
-            );
+            let words = format!("[cc-pool] hook handshake failed after {}ms ({why}) rid={rid}", began.elapsed().as_millis());
+            if tail.is_empty() {
+                eprintln!("{words}");
+            } else {
+                eprintln!("{}", crate::logfile::quoting(&format!("{words} — claude stderr"), &tail.replace('\n', " ⏎ ")));
+            }
         }
         self.shared.pending.lock().unwrap().remove(&rid);
         self.control_hooks = ok;
@@ -503,11 +500,12 @@ impl Conn {
     pub async fn begin_turn(&mut self, prompt: &str, env: crate::turnenv::TurnEnv) -> Result<()> {
         let (dropped, orphan) = self.drain_parked();
         if !orphan.is_empty() {
-            eprintln!(
+            let words = format!(
                 "[cc-pool] ⚠️ discarded {dropped} frame(s) claude produced while parked \
-(pid {}) — that reply belonged to an already-finalized turn and reached nobody: {orphan}",
+(pid {}) — that reply belonged to an already-finalized turn and reached nobody",
                 self.pid().unwrap_or(0)
             );
+            eprintln!("{}", crate::logfile::quoting(&words, &orphan));
         }
         self.shared.plain.lock().unwrap().clear();
         *self.shared.turn.lock().unwrap() = env;

@@ -228,6 +228,26 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Daemon],
         server: NotRead,
     },
+    // Owner 10-22 (via realopsdu): the daemon's own «⏳ 后台还在跑» / «超过 2 小时»
+    // messages go; what happens to a background task is handed to the agent,
+    // which decides what to say. Read by the daemon, per person like the one
+    // above; off until verified on dev and released.
+    FlagMeta {
+        key: "bgtaskEvents",
+        default: false,
+        dev_default: false,
+        label: "Background tasks: events to the agent",
+        description: "Each background task is watched on its own clock until it exits — no two-hour \
+                      cut-off — and what happens to it (finished, killed by its timeout, log gone \
+                      quiet, running very long) goes to the agent, which decides whether to say \
+                      anything. The daemon posts no «still running» / «over two hours» messages of \
+                      its own. Off = the old watcher: one clock per channel, those messages, and \
+                      watching stops after two hours.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Daemon],
+        server: NotRead,
+    },
     // Owner 10-09: the left rail is fine as the wide-screen default, but it
     // goes out behind this flag, off, with its own line on the release card —
     // on only once the owner has clicked it there.

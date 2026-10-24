@@ -692,7 +692,9 @@ impl Client {
         // Sent from inside a turn (an agent's `mafold send`): name the turn's
         // reply, and the server stamps this with whom the turn speaks for
         // (`messageOrigin`). The daemon's own notices run outside any turn.
-        if let Some(draft) = crate::turnenv::draft() {
+        // The reply as it stands NOW (a steer moves it; an update turn's held
+        // bubble may not exist yet, and then there is nothing to name).
+        if let Some(draft) = crate::turnenv::draft().and_then(|d| crate::agent::reply_now(&d)) {
             body["carries"] = json!(draft);
         }
         if let Some(ch) = dest.channel_id {
@@ -1906,24 +1908,13 @@ fn retype(name: &str, mime: &str) -> String {
     format!("{stem}.{ext}")
 }
 
-/// Content type for everything else, by extension. Only a display/download hint
-/// — the server's own allow-list still decides how the bytes are STORED (an
-/// `.html` is kept extensionless there so it can never be served as an active
-/// same-origin document).
+/// Content type for everything else, by extension — the table the api types
+/// undeclared uploads from too (`mafold_types::mime`). Only a display/download
+/// hint: the server's own allow-list still decides how the bytes are STORED
+/// (an `.html` is kept extensionless there so it can never be served as an
+/// active same-origin document).
 fn mime_from_ext(name: &str) -> &'static str {
-    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "json" => "application/json",
-        "svg" => "image/svg+xml",
-        "csv" => "text/csv; charset=utf-8",
-        "md" | "markdown" => "text/markdown; charset=utf-8",
-        "txt" | "log" => "text/plain; charset=utf-8",
-        "pdf" => "application/pdf",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }
+    mafold_core::mafold_types::mime::for_name(name).unwrap_or("application/octet-stream")
 }
 
 /// Intrinsic size from a PNG's IHDR, so the bubble can reserve the box before
@@ -2008,6 +1999,29 @@ mod attach_tests {
         assert_eq!(classify("paper.pdf", b"%PDF-1.7"), ("file", "application/pdf"));
         assert_eq!(classify("logo.svg", b"<svg xmlns="), ("file", "image/svg+xml"));
         assert_eq!(classify("thing", b"\0\0binary"), ("file", "application/octet-stream"));
+    }
+
+    /// An Office document goes up as what it is. Its bytes are a ZIP like any
+    /// other, so the name is the only evidence — and until 10-24 the name
+    /// wasn't read: every .docx / .xlsx / .pptx a bot sent was declared
+    /// `application/octet-stream`, and every client showed it as one.
+    #[test]
+    fn office_documents_carry_their_real_type() {
+        let zip = b"PK\x03\x04\x14\0\x06\0";
+        for (name, mime) in [
+            ("报告.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            ("2027预算.XLSX", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ("Q3 复盘.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            ("old.doc", "application/msword"),
+            ("old.xls", "application/vnd.ms-excel"),
+            ("old.ppt", "application/vnd.ms-powerpoint"),
+        ] {
+            assert_eq!(classify(name, zip), ("file", mime), "{name}");
+        }
+        // Same bytes, the name says zip: still a zip.
+        assert_eq!(classify("bundle.zip", zip), ("file", "application/zip"));
+        // No extension at all is nothing to go on.
+        assert_eq!(classify("docx", zip), ("file", "application/octet-stream"));
     }
 
     /// Media is stored under an extension that matches its bytes — the serve path

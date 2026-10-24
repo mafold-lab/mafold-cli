@@ -12,7 +12,9 @@
 //! - a **backup** (`mafold.old`) for `mafold rollback`.
 //!
 //! Used by the supervisor (which owns updates for its daemons) and by a
-//! standalone `mafold agent` (self-update, unless `--no-auto-update`).
+//! standalone `mafold agent` (self-update) — neither when started with
+//! `--no-auto-update`, nor while this computer's [`auto_update_on`] setting is
+//! off.
 //!
 //! Two CHANNELS (`stable` / `dev`) — see [`Channel`]. The dev channel is how a
 //! real machine runs a prerelease build without switching auto-update off for
@@ -110,6 +112,44 @@ fn mafold_dir() -> PathBuf {
 
 fn channel_path() -> PathBuf {
     mafold_dir().join("channel")
+}
+
+/// Does this machine install new releases by itself? A MACHINE SETTING
+/// (`~/.mafold/auto-update`, beside `channel`), read by the supervisor on every
+/// pass and by a standalone agent before each check — `mafold update
+/// --auto-update off|on` writes it, and nothing is restarted or re-registered.
+///
+/// Turning updates off used to mean re-registering the service with
+/// `--no-auto-update`. The desktop app reads a service registered with flags it
+/// would not pass as someone else's, and showed the whole computer read-only
+/// (activity center C8). The flag still works — for a local build — and still
+/// wins: updates run only when the process was started without it AND this
+/// says on.
+///
+/// Anything but `off` is on: the default, and what a garbled file means. A
+/// machine that quietly stops updating is the failure nobody notices.
+pub fn auto_update_on() -> bool {
+    auto_update_at(&auto_update_path())
+}
+
+fn auto_update_at(p: &Path) -> bool {
+    std::fs::read_to_string(p).map_or(true, |s| !s.trim().eq_ignore_ascii_case("off"))
+}
+
+/// Persist [`auto_update_on`] for every mafold process on this machine.
+pub fn set_auto_update(on: bool) -> Result<()> {
+    set_auto_update_at(&auto_update_path(), on)
+}
+
+fn set_auto_update_at(p: &Path, on: bool) -> Result<()> {
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(p, if on { "on" } else { "off" }).with_context(|| format!("writing {}", p.display()))
+}
+
+fn auto_update_path() -> PathBuf {
+    mafold_dir().join("auto-update")
 }
 
 /// This build's release-asset target triple (matches the release workflow).
@@ -238,14 +278,14 @@ impl Release {
             // On the dev channel a same-version swap is routine — a rebuild of
             // the same ordinal — not the "someone put a hand-built binary here"
             // case the stable wording describes. Saying REINSTALL there would
-            // point the reader at --no-auto-update, i.e. at leaving the very
+            // point the reader at turning updates off, i.e. at leaving the very
             // channel they opted into.
             if self.channel == Channel::Dev {
                 return format!("↻ v{} rebuild — refreshing the dev build", self.version);
             }
             format!(
                 "↻ v{} REINSTALL — this binary is not the build v{} published (checksum differs). \
-                 Run the supervisor with --no-auto-update to keep a local build",
+                 `mafold update --auto-update off` keeps a local build",
                 self.version, self.version,
             )
         } else {
@@ -430,7 +470,7 @@ async fn sha256_for(
 
 /// The real binary path (resolve a PATH symlink to the file we replace).
 fn binary_path() -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::platform::current_exe()?;
     Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
 }
 
@@ -678,6 +718,21 @@ pub fn note_checked(offered: Option<&str>) {
     note_seen(|s| checked(s, offered, now));
 }
 
+/// A check by hand (`mafold update --check`) saw `latest` as the newest
+/// release. Kept against the version the supervisor here RUNS, which `status`
+/// measures with — not the version of the binary that asked — and without
+/// clearing a failed install: a binary that is current says nothing about a
+/// supervisor still behind it.
+pub fn note_looked(latest: Option<&str>, running: &str) {
+    let now = crate::accounts::now();
+    note_seen(|s| looked(s, latest, running, now));
+}
+
+fn looked(s: &mut Seen, latest: Option<&str>, running: &str, now: i64) {
+    s.checked_at = Some(now);
+    s.offered = latest.filter(|v| is_newer(v, running)).map(str::to_string);
+}
+
 fn checked(s: &mut Seen, offered: Option<&str>, now: i64) {
     s.checked_at = Some(now);
     s.offered = offered.map(str::to_string);
@@ -832,6 +887,18 @@ pub async fn check(
     base: &str,
     channel: Channel,
 ) -> Result<Option<Release>> {
+    Ok(latest_offer(http, base, channel).await?.and_then(|(r, wanted)| wanted.then_some(r)))
+}
+
+/// The newest release on `channel` for this platform, and whether this binary
+/// should install it ([`wants_update`]); `None` where no release is built.
+/// Downloads nothing — `mafold update --check` says the release even when there
+/// is nothing to install, [`check`] keeps only one to install.
+pub async fn latest_offer(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<(Release, bool)>> {
     if target_triple().is_none() {
         return Ok(None);
     }
@@ -841,7 +908,8 @@ pub async fn check(
     let our_sha = is_same_version(&r.version, current_version())
         .then(|| binary_path().ok().as_deref().and_then(sha256_of_file))
         .flatten();
-    Ok(wants_update(&r, our_sha.as_deref()).then_some(r))
+    let wanted = wants_update(&r, our_sha.as_deref());
+    Ok(Some((r, wanted)))
 }
 
 /// Safely download + verify + swap in the binary. Coordinated across processes
@@ -945,7 +1013,8 @@ fn install_running_binary(src: &Path, bin: &Path, mv: bool) -> Result<()> {
     }
 }
 
-/// Restore the previous binary (`mafold.old`) — `mafold rollback`.
+/// Restore the previous binary (`mafold.old`) — `mafold rollback` — and ask
+/// the supervisor running here to move onto it (`control`), as `update` does.
 pub fn rollback() -> Result<()> {
     let bin = binary_path()?;
     let backup = bin.with_file_name("mafold.old");
@@ -955,13 +1024,30 @@ pub fn rollback() -> Result<()> {
             backup.display()
         );
     }
+    let version = version_of(&backup);
     install_running_binary(&backup, &bin, false)?;
     let _ = std::fs::remove_file(stamp_path());
-    println!(
-        "✓ rolled back to the previous binary ({})",
-        backup.display()
-    );
+    let to = version.as_deref().map_or_else(|| "the previous binary".to_string(), |v| format!("v{v}"));
+    println!("✓ rolled back to {to} ({})", backup.display());
+    if crate::supervisor::supervisor_running() {
+        let (line, moving) = crate::supervisor::move_onto_disk(crate::control::Moved::Rollback, version.as_deref());
+        println!("  {line}");
+        // Nothing keeps it there yet: the next check finds the newer release.
+        let run = crate::lifecycle::read::<crate::lifecycle::Run>(&crate::lifecycle::run_path());
+        if moving && run.is_none_or(|r| r.auto_update) && auto_update_on() {
+            println!("  it updates itself again at its next check (~10 minutes) — `mafold update --auto-update off` keeps it on {to}");
+        }
+    }
     Ok(())
+}
+
+/// The version a mafold binary says it is (`mafold --version`).
+fn version_of(bin: &Path) -> Option<String> {
+    let mut cmd = crate::platform::std_command(bin);
+    cmd.arg("--version");
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().last().filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit())).map(str::to_string)
 }
 
 /// Check + update if newer. Returns the new version if updated. (`mafold update`)
@@ -976,6 +1062,163 @@ pub async fn update_to_latest(
             Ok(Some(r.version))
         }
         None => Ok(None),
+    }
+}
+
+/// What `mafold update` was asked.
+pub struct Ask {
+    /// `--check`: say what is on offer; install nothing.
+    pub check: bool,
+    /// `--auto-update on|off`: set [`auto_update_on`]; install nothing.
+    pub auto_update: Option<bool>,
+    /// `--channel`: switched (and kept) first, so what follows is on it.
+    pub channel: Option<Channel>,
+    /// One JSON object instead of lines — for the desktop app.
+    pub json: bool,
+}
+
+/// `mafold update`. Installs only when neither `--check` nor `--auto-update`
+/// is given, then asks the supervisor here to move onto the new binary — once
+/// the replies in progress are written ([`crate::supervisor::move_onto_disk`]).
+///
+/// `--json` prints one object: `ok`, `code` (`available` / `current` from a
+/// check, `set`, `updated` / `current` from an install, else `unsupported` /
+/// `failed` with `detail`), and always this binary's `version`, the `channel`
+/// and the `auto_update` setting; `latest` is the release a check or install
+/// found, `restart` + `moving` what the supervisor made of an install.
+pub async fn command(base: &str, ask: Ask) -> Result<()> {
+    let channel = ask.channel.unwrap_or_else(Channel::current);
+    let said = |code: &str, more: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "ok": !matches!(code, "failed" | "unsupported"),
+            "code": code,
+            "version": current_version(),
+            "channel": channel.as_str(),
+            "auto_update": auto_update_on(),
+        });
+        if let (Some(o), serde_json::Value::Object(m)) = (v.as_object_mut(), more) {
+            o.extend(m);
+        }
+        println!("{v}");
+    };
+    // What fails — a setting that can't be written, a check, an install —
+    // fails as itself, and with `--json` still as one object.
+    let failed = |what: &str, e: &anyhow::Error| -> ! {
+        if ask.json {
+            said("failed", serde_json::json!({ "detail": format!("{e:#}") }));
+        } else {
+            eprintln!("{what} failed: {e:#}");
+        }
+        std::process::exit(1)
+    };
+    if let Some(c) = ask.channel {
+        if let Err(e) = c.save() {
+            failed("switching the channel", &e);
+        }
+        if !ask.json {
+            println!("✓ channel → {}", c.as_str());
+        }
+    }
+    if let Some(on) = ask.auto_update {
+        if let Err(e) = set_auto_update(on) {
+            failed("setting automatic updates", &e);
+        }
+        if !ask.json {
+            println!("{}", setting_line(on));
+            if on && started_without_updates() {
+                println!("  but the supervisor here runs with --no-auto-update, and that still keeps it off");
+            }
+        }
+    }
+    if !ask.check && ask.auto_update.is_some() {
+        if ask.json {
+            said("set", serde_json::json!({}));
+        }
+        return Ok(());
+    }
+    // No release binary is built for this platform (e.g. linux-arm64) → don't
+    // claim "up to date" (the check would always no-op). Be honest instead.
+    if !platform_supported() {
+        if ask.json {
+            said("unsupported", serde_json::json!({}));
+        } else {
+            println!("no mafold release is built for your platform — self-update isn't available.\nSee https://github.com/mafold-lab/mafold-cli/releases");
+        }
+        return Ok(());
+    }
+    let http = reqwest::Client::new();
+    if ask.check {
+        let offer = match latest_offer(&http, base, channel).await {
+            Ok(o) => o,
+            Err(e) => failed("update check", &e),
+        };
+        let wanted = offer.as_ref().filter(|(_, w)| *w).map(|(r, _)| r.version.clone());
+        let latest = offer.as_ref().map(|(r, _)| r.version.clone());
+        let running = crate::supervisor::running_version().unwrap_or_else(|| current_version().to_string());
+        note_looked(latest.as_deref(), &running);
+        if ask.json {
+            let code = if wanted.is_some() { "available" } else { "current" };
+            said(code, serde_json::json!({ "latest": latest }));
+        } else {
+            println!("{}", check_line(channel, latest.as_deref(), wanted.is_some()));
+        }
+        return Ok(());
+    }
+    match update_to_latest(&http, base, channel).await {
+        Ok(Some(v)) => {
+            note_installed();
+            // `mafold stop` only knows the old `agent --detach` — on a machine
+            // the supervisor runs, that hint stopped nothing. The supervisor
+            // is asked to move onto it (`control`), as after `rollback`.
+            let (restart, moving) = if crate::supervisor::supervisor_running() {
+                crate::supervisor::move_onto_disk(crate::control::Moved::Update, Some(&v))
+            } else {
+                ("restart a running agent with: mafold stop && mafold agent --detach …".to_string(), false)
+            };
+            if ask.json {
+                said("updated", serde_json::json!({ "latest": v, "restart": restart, "moving": moving }));
+            } else {
+                println!("✓ updated to v{v} — {restart}");
+            }
+        }
+        Ok(None) => {
+            if ask.json {
+                said("current", serde_json::json!({}));
+            } else {
+                println!("already up to date (v{}, {} channel)", current_version(), channel.as_str());
+            }
+        }
+        Err(e) => failed("update", &e),
+    }
+    Ok(())
+}
+
+fn setting_line(on: bool) -> &'static str {
+    if on {
+        "✓ automatic updates on — new releases are installed within ~10 minutes, once the replies in progress are written"
+    } else {
+        "✓ automatic updates off — this computer installs a new release only when you run `mafold update`"
+    }
+}
+
+/// The supervisor here was started with `--no-auto-update`, which the setting
+/// doesn't override.
+fn started_without_updates() -> bool {
+    crate::supervisor::started_to_update() == Some(false)
+}
+
+/// What `--check` found, as a line: `latest` is the newest release on the
+/// channel, `wanted` whether this binary should install it.
+fn check_line(channel: Channel, latest: Option<&str>, wanted: bool) -> String {
+    let here = current_version();
+    let ch = channel.as_str();
+    match latest {
+        Some(v) if wanted && is_same_version(v, here) => format!(
+            "v{v} on the {ch} channel is not this binary's build (checksum differs) — `mafold update` reinstalls it"
+        ),
+        Some(v) if wanted => format!("v{v} is available on the {ch} channel (this is v{here}) — `mafold update` installs it"),
+        Some(v) if is_newer(here, v) => format!("up to date (v{here} — newer than v{v}, the latest on the {ch} channel)"),
+        _ => format!("up to date (v{here}, {ch} channel)"),
     }
 }
 
@@ -998,13 +1241,14 @@ pub fn reexec() -> std::io::Error {
 /// to hit on Windows, where a virus scanner can hold the fresh exe just long
 /// enough for the spawn to fail). Retry once after a beat, then leave an
 /// unmissable log line instead of the old `let _ =` swallow.
-pub fn reexec_or_warn(new_version: &str) {
+pub fn reexec_or_warn(new_version: Option<&str>) {
     let e = reexec(); // only returns on failure
     std::thread::sleep(std::time::Duration::from_millis(750));
     let e2 = reexec();
+    let onto = new_version.map_or_else(|| "the binary on disk".to_string(), |v| format!("v{v}"));
     eprintln!(
-        "⚠️  re-exec into v{new_version} FAILED (first: {e}; retry: {e2}) — STILL RUNNING v{} \
-         while the binary on disk is v{new_version}. Restart me: `mafold down && mafold up`.",
+        "⚠️  re-exec into {onto} FAILED (first: {e}; retry: {e2}) — STILL RUNNING v{} \
+         while the binary on disk is {onto}. Restart me: `mafold down && mafold up`.",
         current_version()
     );
 }
@@ -1091,7 +1335,7 @@ mod tests {
     fn a_same_version_install_announces_itself_as_a_repair() {
         let repair = rel(current_version(), Some("cafebabe")).action_line();
         assert!(repair.contains("REINSTALL"), "{repair}");
-        assert!(repair.contains("--no-auto-update"), "must name the escape hatch: {repair}");
+        assert!(repair.contains("mafold update --auto-update off"), "must name the escape hatch: {repair}");
         assert!(rel(&newer_than_current(), None).action_line().contains("update v"));
     }
 
@@ -1139,14 +1383,14 @@ mod tests {
     }
 
     /// The dev channel's same-version wording must not point the reader at
-    /// `--no-auto-update` — that would tell them to leave the channel they
+    /// turning updates off — that would tell them to leave the channel they
     /// deliberately joined.
     #[test]
     fn a_dev_rebuild_does_not_shout_reinstall() {
         let line = dev_rel(current_version(), Some("cafebabe")).action_line();
         assert!(line.contains("rebuild"), "{line}");
         assert!(!line.contains("REINSTALL"), "{line}");
-        assert!(!line.contains("--no-auto-update"), "{line}");
+        assert!(!line.contains("auto-update"), "{line}");
     }
 
     // ── mafold-api as the metadata source ──
@@ -1373,5 +1617,62 @@ mod seen_tests {
         assert!(failing(&failed("0.9.151", 1), "0.9.150", true).is_none(), "once is a blip");
         assert!(failing(&failed("0.9.151", 3), "0.9.151", true).is_none(), "installed after all");
         assert!(failing(&failed("0.9.151", 3), "0.9.150", false).is_none(), "it isn't trying to");
+    }
+
+    /// A check by hand keeps what is on offer for the version the supervisor
+    /// RUNS — not the binary that asked — and leaves a failed install as it was.
+    #[test]
+    fn a_check_by_hand_is_kept_against_the_running_version() {
+        let mut s = failed("0.9.151", 3);
+        looked(&mut s, Some("0.9.151"), "0.9.150", 9);
+        assert_eq!((s.checked_at, s.offered.as_deref()), (Some(9), Some("0.9.151")));
+        assert!(s.failed.is_some(), "a check is no install");
+        looked(&mut s, Some("0.9.151"), "0.9.151", 10);
+        assert_eq!((s.checked_at, s.offered.as_deref()), (Some(10), None), "it runs that already");
+        assert!(s.failed.is_some());
+    }
+}
+
+#[cfg(test)]
+mod setting_tests {
+    use super::*;
+
+    /// Off only when the file says off. Missing, empty or garbled is on — a
+    /// machine that quietly stops updating is the failure nobody notices.
+    #[test]
+    fn auto_update_is_on_unless_it_says_off() {
+        let dir = std::env::temp_dir().join(format!("mafold-auto-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("auto-update");
+        assert!(auto_update_at(&p), "never set");
+        for (text, on) in [("off", false), ("OFF\n", false), (" off ", false), ("on", true), ("", true), ("nope", true)] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&p, text).unwrap();
+            assert_eq!(auto_update_at(&p), on, "{text:?}");
+        }
+        set_auto_update_at(&p, false).unwrap();
+        assert!(!auto_update_at(&p));
+        set_auto_update_at(&p, true).unwrap();
+        assert!(auto_update_at(&p));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--check` in words: on offer, a repair, current — and a build newer
+    /// than the latest release says so instead of claiming to be it.
+    #[test]
+    fn a_check_says_which_it_is() {
+        let here = current_version();
+        let newer = {
+            let mut p = here.split('.').map(str::to_string).collect::<Vec<_>>();
+            let last = p.len() - 1;
+            p[last] = (p[last].parse::<u64>().unwrap_or(0) + 1).to_string();
+            p.join(".")
+        };
+        let offer = check_line(Channel::Stable, Some(&newer), true);
+        assert!(offer.contains(&format!("v{newer} is available on the stable channel (this is v{here})")), "{offer}");
+        assert!(check_line(Channel::Stable, Some(here), true).contains("reinstalls it"));
+        assert_eq!(check_line(Channel::Dev, Some(here), false), format!("up to date (v{here}, dev channel)"));
+        assert!(check_line(Channel::Stable, Some("0.0.1"), false).contains("newer than v0.0.1"));
+        assert_eq!(check_line(Channel::Stable, None, false), format!("up to date (v{here}, stable channel)"));
     }
 }
