@@ -361,6 +361,90 @@ fn turning_updates_off_is_a_setting_and_leaves_the_service_as_it_was() {
 
 /// A setting that can't be written fails — and with `--json` still as the one
 /// object a program reads, not an error line on stderr alone.
+/// `mafold rollback <args> --json`: exit code and its JSON.
+fn rollback(bin: &Path, home: &Path, base: &str, args: &[&str]) -> (Option<i32>, Value) {
+    let out = mafold(bin, home, base).arg("rollback").args(args).arg("--json").output().expect("run mafold rollback");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let json = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("rollback --json printed {text:?} ({e}); stderr {}", String::from_utf8_lossy(&out.stderr)));
+    (out.status.code(), json)
+}
+
+/// Activity center C9. A rollback used to hold for one check: ~10 minutes
+/// later the updater found the release rolled back from newer than the binary
+/// it was rolled back to, and put it back. Now the version rolled back from is
+/// skipped — and a backup too old to know that is refused without `--force`.
+#[test]
+fn a_rollback_sticks_and_one_that_cant_is_refused() {
+    let home = temp_home("rollback");
+    let bin = install_copy(&home);
+    let api = Api::start(false);
+    let here = env!("CARGO_PKG_VERSION");
+    let backup = bin.with_file_name("mafold.old");
+
+    let (code, r) = rollback(&bin, &home, &api.base, &["--check"]);
+    assert_eq!((code, r["code"].as_str()), (Some(0), Some("no_backup")), "{r}");
+    let (code, r) = rollback(&bin, &home, &api.base, &[]);
+    assert_eq!((code, r["ok"].as_bool(), r["code"].as_str()), (Some(1), Some(false), Some("no_backup")), "{r}");
+
+    // A backup from before the skip: it says its version, it fails `capabilities`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&backup, "#!/bin/sh\n[ \"$1\" = --version ] && echo 'mafold 0.9.140' && exit 0\nexit 2\n").unwrap();
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (code, r) = rollback(&bin, &home, &api.base, &["--check"]);
+        assert_eq!((code, r["code"].as_str(), r["sticks"].as_bool()), (Some(0), Some("too_old"), Some(false)), "{r}");
+        assert_eq!(r["to"], "0.9.140", "{r}");
+        let (code, r) = rollback(&bin, &home, &api.base, &[]);
+        assert_eq!((code, r["code"].as_str()), (Some(1), Some("too_old")), "refused without --force: {r}");
+        assert_eq!(std::fs::read(&bin).unwrap(), std::fs::read(env!("CARGO_BIN_EXE_mafold")).unwrap(), "nothing was swapped");
+        assert!(!home.join(".mafold/update-skip.json").exists(), "nor a skip written");
+    }
+
+    // A backup that knows the skip (this very build): it rolls back, and sticks.
+    std::fs::copy(env!("CARGO_BIN_EXE_mafold"), &backup).unwrap();
+    let (code, r) = rollback(&bin, &home, &api.base, &["--check"]);
+    assert_eq!((code, r["code"].as_str(), r["sticks"].as_bool()), (Some(0), Some("possible"), Some(true)), "{r}");
+    let (code, r) = rollback(&bin, &home, &api.base, &[]);
+    assert_eq!((code, r["ok"].as_bool(), r["code"].as_str()), (Some(0), Some(true), Some("rolled_back")), "{r}");
+    let skip: Value = serde_json::from_slice(&std::fs::read(home.join(".mafold/update-skip.json")).unwrap()).unwrap();
+    assert_eq!(skip["version"], here, "the version rolled back from is the one skipped: {skip}");
+    assert_eq!(status(&bin, &home, &api.base)["update"]["skipped"]["version"], here);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The skip is honoured by the supervisor's own updates: the version rolled
+/// back from is checked and left alone, every time; a NEWER release ends the
+/// skip and installs.
+#[test]
+fn the_version_rolled_back_from_is_not_put_back_until_a_newer_one_is_out() {
+    let home = temp_home("skip");
+    let bin = install_copy(&home);
+    let api = Api::start(true);
+    configure_bot(&home);
+    let skip = home.join(".mafold/update-skip.json");
+    std::fs::write(&skip, json!({ "version": NEWER, "at": 1_760_000_000 }).to_string()).unwrap();
+    let sup = Supervisor::start(&bin, &home, &api.base, true);
+    sup.wait("the daemon started", Duration::from_secs(30), || bot_pid(&bin, &home, &api.base));
+
+    let nudge = home.join(".mafold/update-nudge");
+    std::fs::write(&nudge, "").unwrap();
+    sup.wait("checked", Duration::from_secs(25), || (api.checks() >= 1).then_some(()));
+    sup.wait("the skip said", Duration::from_secs(10), || {
+        sup.log().contains(&format!("skipped: this computer rolled back from v{NEWER}")).then_some(())
+    });
+    assert_eq!(api.downloads(), 0, "the version rolled back from was put back\n{}", sup.log());
+    assert!(skip.exists());
+
+    // Rolled back from an OLDER release than the one now out: that newer one is the fix.
+    std::fs::write(&skip, json!({ "version": "9.9.8", "at": 1_760_000_000 }).to_string()).unwrap();
+    std::fs::write(&nudge, "").unwrap();
+    sup.wait("installed", Duration::from_secs(30), || (api.downloads() == 1).then_some(()));
+    assert!(!skip.exists(), "a newer release ends the skip\n{}", sup.log());
+    drop(sup);
+}
+
 #[test]
 fn a_setting_that_cant_be_written_fails_as_one_json_object() {
     let home = temp_home("unwritable");

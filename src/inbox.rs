@@ -14,7 +14,9 @@
 //!   react` — one message per call, as many as it likes, none at all being a
 //!   perfectly good outcome.
 //! * **One mind.** One harness session for the whole account, one turn at a
-//!   time, rolled over daily; the working directory is its notebook.
+//!   time, rolled over the way a bot's session is (`session_life`: full, or
+//!   idle); the working directory is its notebook. A session is handed each
+//!   message once — what it already holds is not given again.
 //!
 //! Nothing here knows which account it runs: a bot can run it as well as a
 //! person (`--account`). No special case for anyone.
@@ -101,6 +103,13 @@ pub struct InboxOpts {
     /// Reasoning effort for the harness (low/medium/high/xhigh/max).
     #[arg(long)]
     pub effort: Option<String>,
+    /// The harness's built-in tools, comma-separated (Claude Code `--tools`;
+    /// other harnesses keep their own). This mode acts through `mafold` in a
+    /// shell and keeps its notebook in files; every other tool is a
+    /// description re-read on every model call — 13 unused ones were 11.5k
+    /// tokens of each request (2026-10-25). `default` = the harness's full set.
+    #[arg(long, default_value = "Bash,Read,Edit,Write,WebFetch,WebSearch")]
+    pub tools: String,
 }
 
 /// At most this many messages are read from one timeline per look.
@@ -128,9 +137,16 @@ struct State {
     /// The one harness session — the account's single mind.
     #[serde(default)]
     session: Option<String>,
-    /// Local date the session was started on; a new day starts a new one.
+    /// What `session_life` knows about it — its context when its last turn
+    /// ended, and when that was — keyed like a bot's ([`surface_of`]). It ends
+    /// the way a bot's session does ([`ends`]). Kept here rather than in
+    /// `~/.mafold/session_life.json`: every daemon process saves that file
+    /// whole, and a second writer's record would be dropped.
     #[serde(default)]
-    session_day: Option<String>,
+    life: HashMap<String, crate::session_life::Life>,
+    /// What that session already holds ([`Known`]).
+    #[serde(default)]
+    known: Known,
     /// Timeline key → consecutive exchanges with AI and no human in between.
     #[serde(default)]
     ai_streak: HashMap<String, u32>,
@@ -186,6 +202,60 @@ struct Watched {
 /// How long a draft is watched for. One still unfinished after this is an
 /// abandoned turn, not a reply on its way.
 const WATCH_SECS: u64 = 2 * 24 * 3600;
+
+/// What the current session already holds, so a resumed one isn't handed it
+/// again. Every look used to give each timeline a few already-read lines of
+/// context, as if each turn started fresh — and the session, resumed all day,
+/// held 323 messages 1393 times (2026-10-25: 29% of one 605k-token request).
+/// Starts over with every new session and every compaction.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+struct Known {
+    /// The session this is about. Any other one holds none of it.
+    #[serde(default)]
+    session: Option<String>,
+    /// Messages it was handed in full — a look's lines, a steered aside — or sent.
+    #[serde(default)]
+    msgs: HashSet<String>,
+    /// Replies still being written whose status line it was given → which
+    /// status ([`status_kind`]). Told again only when that changes.
+    #[serde(default)]
+    drafts: HashMap<String, char>,
+}
+
+impl Known {
+    /// What `session` already holds: this record, if it is about that
+    /// session — nothing for a new one (None) or another.
+    fn of(&self, session: Option<&str>) -> Option<&Known> {
+        (session.is_some() && self.session.as_deref() == session).then_some(self)
+    }
+
+    fn has(&self, m: &Value) -> bool {
+        m["id"].as_str().is_some_and(|id| self.msgs.contains(id))
+    }
+
+    fn told(&self, d: &Draft) -> bool {
+        self.drafts.get(&d.id) == Some(&d.kind)
+    }
+
+    /// A turn on `session` ran: what it was handed and what it sent are in
+    /// that session now. A compaction rewrote the session into a summary —
+    /// nothing in it is verbatim any more, so nothing counts as held.
+    fn settle(
+        &mut self,
+        session: Option<&str>,
+        compacted: bool,
+        msgs: impl IntoIterator<Item = String>,
+        drafts: impl IntoIterator<Item = (String, char)>,
+    ) {
+        if compacted || self.session.as_deref() != session {
+            *self = Known { session: session.map(str::to_string), ..Default::default() };
+        }
+        if !compacted {
+            self.msgs.extend(msgs);
+            self.drafts.extend(drafts);
+        }
+    }
+}
 
 /// One piece of work a patrol found, as the agent writes it to `proposals.json`
 /// (array order = its priority order).
@@ -373,6 +443,32 @@ fn save_state(dir: &Path, s: &State) {
             let _ = std::fs::rename(&tmp, dir.join("state.json"));
         }
     }
+}
+
+/// `--tools` as a mount takes it: `default` (or nothing) = the harness's own set.
+fn tools_of(arg: &str) -> Option<String> {
+    let t = arg.trim();
+    (!t.is_empty() && !t.eq_ignore_ascii_case("default")).then(|| t.to_string())
+}
+
+/// The surface an inbox turn runs on: its process's name in the pool, and the
+/// key its session's `session_life` record is kept under.
+fn surface_of(me_lc: &str) -> String {
+    format!("inbox____{}", me_lc.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '-'), "_"))
+}
+
+/// Has the session run its course, by the rule a bot's session ends by
+/// (`session_life`: past its context limit, or idle until its cache is gone)?
+/// Then the session it was, and why. One this loop holds no record of — from
+/// before it kept them — isn't resumed either: nothing says how big it grew.
+/// It used to roll over at midnight instead: by evening one day's session
+/// carried 600k tokens into every call.
+fn ends(state: &State, surface: &str, now: i64) -> Option<(String, String)> {
+    let sid = state.session.as_deref()?;
+    if !state.life.get(surface).is_some_and(|l| l.session == sid) {
+        return Some((sid.to_string(), "no record of how big it is".into()));
+    }
+    crate::session_life::verdict_in(&state.life, surface, sid, now).map(|why| (sid.to_string(), why.to_string()))
 }
 
 // ───────────────────────────── time ─────────────────────────────
@@ -624,6 +720,33 @@ fn working_line(m: &Value, me_lc: &str, principal: Option<&str>, off: i32, now_m
     format!("{}: {}", msg_head(m, me_lc, principal, off), working_status(m, now_ms))
 }
 
+/// Which status a [`working_status`] reports — its first character: ⏳
+/// writing, ⏸ waiting on a card, ⚠ gone quiet. "Still writing, two minutes
+/// further on" is no news to a session that was told it was writing.
+fn status_kind(status: &str) -> char {
+    status.chars().next().unwrap_or('⏳')
+}
+
+/// A reply still being written, as a look hands it over: its [`working_line`]
+/// and which status that is.
+#[derive(Debug, Clone, PartialEq)]
+struct Draft {
+    id: String,
+    kind: char,
+    line: String,
+}
+
+impl Draft {
+    fn of(m: &Value, me_lc: &str, principal: Option<&str>, off: i32, now_ms: u64) -> Draft {
+        let status = working_status(m, now_ms);
+        Draft {
+            id: m["id"].as_str().unwrap_or("").to_string(),
+            kind: status_kind(&status),
+            line: format!("{}: {status}", msg_head(m, me_lc, principal, off)),
+        }
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -796,8 +919,9 @@ fn secs_of(ts: Option<&str>) -> Option<i64> {
 /// scans before deciding what to open. DMs stay out: what matters there
 /// arrives as unread anyway. Read-only: no marker moves. Also returns, per
 /// timeline shown, the newest message in it — what the agent has now seen
-/// there (the send guard's starting point).
-async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> (String, Vec<(String, String)>) {
+/// there (the send guard's starting point). A line the session already holds
+/// (`known`) is only counted: it is right there above.
+async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>, known: Option<&Known>) -> (String, Vec<(String, String)>) {
     let mut shown: Vec<(String, String)> = Vec::new();
     let Ok(list) = ctx.client.chats().await else { return (String::new(), shown) };
     let off = ctx.opts.utc_offset;
@@ -856,7 +980,12 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> (String, Vec
             shown.push((tl.key(), created(last).to_string()));
         }
         out.push_str(&format!("\n== {} ==\n", tl.heading()));
+        let mut held = 0usize;
         for m in &items {
+            if known.is_some_and(|k| k.has(m)) {
+                held += 1;
+                continue;
+            }
             // A reply still being written is a status ("on it since …"), not
             // a half-sentence to read as the answer.
             let line = if in_progress(m) {
@@ -872,6 +1001,9 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> (String, Vec
             };
             out.push_str(&line);
             out.push('\n');
+        }
+        if held > 0 {
+            out.push_str(&format!("(另有 {held} 条这个会话里给你看过)\n"));
         }
     }
     if dropped > 0 {
@@ -978,6 +1110,23 @@ fn collapse_blank(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// What an agent's reply SAID: its working trail cut whole — the run group,
+/// each tool call, the result stamp (`render::strip_trail_cards`) — and the
+/// rest folded the way every history view folds it (`agent::model_view`): an
+/// ask or an html page it wrote, and how it ended (an error, a limit, tasks
+/// still running). Folded, the trail was still a tag and a note per card —
+/// 39k tokens of one day's prompts, none of it an answer; `mafold msg <id>`
+/// opens it. A reply that was nothing but its trail keeps the folded trail,
+/// so it doesn't read as «—».
+fn agent_said(raw: &str, id: &str) -> String {
+    let said = crate::agent::model_view(&mafold_transcript::render::strip_trail_cards(raw), id);
+    if said.trim().is_empty() {
+        crate::agent::model_view(raw, id)
+    } else {
+        said
+    }
+}
+
 /// One message as the agent reads it: id to reply with, time, who (and what
 /// kind of who), what it answers, then the text a person would see.
 /// `#id [when] @who(tag)` — the head every line about a message starts with.
@@ -1014,14 +1163,13 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
     if who != me_lc && aliases().iter().any(|a| *a != who && mafold_transcript::mention::summons(raw, a, is_bot(m))) {
         line.push_str(" [找本人的]");
     }
-    // Folded like every other history view (`agent::model_view`): an agent's
-    // 80–130 KB working trail becomes one line per card, and its answer — the
-    // prose, usually the last paragraph — is what's left. An agent's reply
+    // An agent's reply is read for what it SAID ([`agent_said`]): its answer —
+    // the prose, usually the last paragraph — without its working trail. It
     // keeps head AND tail when long: clipping from the front is exactly how
     // this loop read "no answer yet" into replies that had one.
     let mid = m["id"].as_str().unwrap_or("");
     let body = if is_bot(m) {
-        head_tail(&collapse_blank(&crate::agent::model_view(raw, mid)), BOT_HEAD, BOT_TAIL)
+        head_tail(&collapse_blank(&agent_said(raw, mid)), BOT_HEAD, BOT_TAIL)
     } else {
         clip(&crate::chat::readable_body(raw, mid), BODY_MAX)
     };
@@ -1064,8 +1212,8 @@ struct Batch {
     tl: Timeline,
     context: Vec<Value>,
     new: Vec<Value>,
-    /// Status lines for other people's replies still being written ([`working_line`]).
-    working: Vec<String>,
+    /// Other people's replies still being written, as status lines ([`Draft`]).
+    working: Vec<Draft>,
     /// Ids among `new` that are replies which just finished — shown with a
     /// "(刚写完)" mark, since they may sit far back in the timeline.
     finished: HashSet<String>,
@@ -1075,6 +1223,13 @@ struct Batch {
 }
 
 impl Batch {
+    /// Leave out what the session already holds ([`Known`]): context lines it
+    /// was handed before, a status it was told already. The new lines always go.
+    fn without(&mut self, known: &Known) {
+        self.context.retain(|m| !known.has(m));
+        self.working.retain(|w| !known.told(w));
+    }
+
     /// The newest thing in this timeline the agent was shown.
     fn newest_seen(&self) -> Option<String> {
         self.context
@@ -1102,7 +1257,7 @@ struct Patrol<'a> {
 fn build_prompt(
     now_local: &str,
     reasons: &[&str],
-    new_day: bool,
+    fresh: bool,
     batches: &[Batch],
     braked: &[String],
     due: &[Followup],
@@ -1113,8 +1268,8 @@ fn build_prompt(
     off: i32,
 ) -> String {
     let mut p = format!("[{now_local} · 这次看消息是因为:{}]\n", reasons.join(" / "));
-    if new_day {
-        p.push_str("新的一天(新会话)。先看一眼工作目录里的 ledger.md、followups.json 和 memory/,接上昨天的事,再处理下面的消息。\n");
+    if fresh {
+        p.push_str("新会话:之前会话里的事这里都没有。先看一眼工作目录里的 ledger.md、followups.json 和 memory/,接上之前的事,再处理下面的消息。\n");
     }
     if let Some(d) = decision {
         p.push_str(d);
@@ -1170,7 +1325,7 @@ fn build_prompt(
             p.push('\n');
         }
         for w in &b.working {
-            p.push_str(w);
+            p.push_str(&w.line);
             p.push('\n');
         }
     }
@@ -1236,6 +1391,9 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
         ),
         None => "- 没有指定「本人」:所有消息都是信息,你按工作目录 CLAUDE.md 里的身份和判断行事。\n".to_string(),
     };
+    // When a session ends — the same rule a bot's session ends by ([`ends`]).
+    let limit = crate::session_life::CONTEXT_LIMIT / 10_000;
+    let idle = crate::session_life::IDLE_SECS / 3600;
     format!(
         "你以 Mafold 账号 @{me} 的身份在线,现在是「收件箱模式」:\n\
          - 你这一轮写下的任何文字都**不会被任何人看到**——只进日志。想让别人看到,只有调工具:\n\
@@ -1255,7 +1413,10 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
          「⏸ 在等 @X 回答卡片」= 卡在等那个人点卡,该提醒的是那个人。只有「⚠️ … 没动静了」才去问一声。\n\
          - `mafold send` 回你「✋ 没发出去」= 你想的这会儿,那里又有人说话(或开始回复)了:先看它列出的新消息再决定说什么;确定还要照原样发,加 `--anyway`。\n\
          - 要在某个时间回头看某件事:写进工作目录的 followups.json(数组,每项 {{\"at\": \"带时区的 RFC3339\", \"conv\": \"会话 id\", \"note\": \"要做什么\"}}),到点会叫醒你;做完就删掉那一项。\n\
-         - ledger.md 记谁答应了什么、什么时候到期;memory/ 记决定和人。它们是你跨天的记忆——会话每天换一次。\n\
+         - ledger.md 记谁答应了什么、什么时候到期;memory/ 记决定和人。它们是你跨会话的记忆:上下文到了约 {limit} 万 token、\
+         或者闲了 {idle} 小时,就换一个新会话,之前会话里的事新会话里都没有。\n\
+         - 同一个会话里,一条消息只给你一次:看过的不会再以「(之前)」补给你(往上翻就有);正在写的回复,状态变了才再说。\
+         AI 的回复只留它说的话,过程卡、用量卡都去掉了 —— 要看全过程:`mafold msg <消息id>`。\n\
          - 这一轮进行中新到的消息,会在工具调用之间递给你;你说完一句之后对方回了,也会这样接上。\n\
          - 这一轮最后写一两句中文总结(只进日志,给本人看):看了什么、做了什么;没开口的话,为什么。过程里的自言自语也用中文——日志是给本人看的。\n"
     )
@@ -1518,6 +1679,36 @@ fn event_json(ev: &AgentEvent) -> Option<Value> {
     })
 }
 
+/// What a turn's events say about its session: the largest context a model
+/// request reported (what `session_life` decides the next look by, as the
+/// daemon does) and whether it compacted.
+#[derive(Debug, Default)]
+struct Gauge {
+    context: u64,
+    compacted: bool,
+}
+
+impl Gauge {
+    fn read(&mut self, ev: &AgentEvent) {
+        match ev {
+            AgentEvent::Stats(s) => self.context = self.context.max(s.context_used_tokens.unwrap_or(0)),
+            AgentEvent::Compacted { .. } => self.compacted = true,
+            _ => {}
+        }
+    }
+}
+
+/// The messages the agent sent this turn, from the send journal: ids.
+fn sent_ids(journal: &Path) -> Vec<String> {
+    std::fs::read_to_string(journal)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["kind"].as_str() == Some("send"))
+        .filter_map(|v| v["message_id"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// Who the agent spoke to this turn, from the send journal: timeline keys.
 fn spoke_to(journal: &Path) -> (HashSet<String>, usize) {
     let mut keys = HashSet::new();
@@ -1778,8 +1969,7 @@ async fn look(
             braked.push(format!("{}{}", tl.label, tl.channel_name.as_deref().map(|c| format!(" #{c}")).unwrap_or_default()));
             continue;
         }
-        let working =
-            a.working.iter().map(|d| working_line(d, &ctx.me_lc, ctx.principal.as_deref(), off, now_m)).collect();
+        let working = a.working.iter().map(|d| Draft::of(d, &ctx.me_lc, ctx.principal.as_deref(), off, now_m)).collect();
         let finished = new.iter().filter_map(|m| m["id"].as_str()).filter(|id| finished_ids.contains(*id)).map(str::to_string).collect();
         batches.push(Batch { tl, context, new, working, finished, newest_working: a.working.iter().map(|d| created(d).to_string()).max() });
     }
@@ -1832,16 +2022,27 @@ async fn look(
         }
     }
 
-    // One mind, rolled over daily. A dry run never touches it: it starts fresh
-    // and its thoughts don't become the live account's memory.
-    let today = local(now, off).format("%Y-%m-%d").to_string();
-    let new_day = dry || state.session_day.as_deref() != Some(today.as_str());
-    if new_day && !dry {
-        state.session = None;
-        state.session_day = Some(today);
+    // One mind, for as long as a bot's session would last ([`ends`]): past its
+    // context limit, or idle until its cache is gone, the next look starts a
+    // new one, the notebook its memory. A dry run never touches it: it starts
+    // fresh and its thoughts don't become the live account's memory.
+    let surface = surface_of(&ctx.me_lc);
+    if !dry {
+        if let Some((sid, why)) = ends(state, &surface, now as i64) {
+            println!("inbox: 🆕 new session ({why}); {sid} stays resumable");
+            state.session = None;
+        }
+    }
+    let fresh = dry || state.session.is_none();
+    // What the session it resumes already holds is not handed over again.
+    let known = if fresh { None } else { state.known.of(state.session.as_deref()) };
+    if let Some(k) = known {
+        for b in &mut batches {
+            b.without(k);
+        }
     }
     let (seen, overview_seen) = if patrol {
-        overview(ctx, now as i64 - (ctx.opts.patrol_window * 3600) as i64, &skip).await
+        overview(ctx, now as i64 - (ctx.opts.patrol_window * 3600) as i64, &skip, known).await
     } else {
         (String::new(), Vec::new())
     };
@@ -1862,7 +2063,7 @@ async fn look(
     let prompt = build_prompt(
         &now_local,
         &reasons,
-        new_day,
+        fresh,
         &batches,
         &braked,
         &due,
@@ -1928,6 +2129,7 @@ async fn look(
     let turn_keys: HashSet<String> = batches.iter().map(|b| b.tl.key()).collect();
     let mut steered: Vec<(String, HashSet<String>)> = Vec::new();
     let mut session_seen: Option<String> = None;
+    let mut gauge = Gauge::default();
     let mut last_good_session = None;
     let mut seats_tried: Vec<String> = seat.iter().map(|a| a.name.clone()).collect();
     // One attempt per login. A run that ended on its SEAT — a full window, a
@@ -1969,7 +2171,7 @@ async fn look(
         let turn = Turn {
             prompt: prompt.clone(),
             conv: String::new(),
-            surface: format!("inbox____{}", ctx.me_lc.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '-'), "_")),
+            surface: surface.clone(),
             draft: String::new(),
             workdir: ctx.workdir.clone(),
             session: last_good_session.clone().or_else(|| if dry { None } else { state.session.clone() }),
@@ -1983,8 +2185,14 @@ async fn look(
             env,
             // The inbox speaks as a PERSON; people have no bot drive to mount —
             // only Mafold's own plugin (`mafold:mafold-video`, …), which used to
-            // reach it through `~/.claude/skills`.
-            mount: crate::drive::mount(None).await,
+            // reach it through `~/.claude/skills`. One mind for the whole
+            // account, nobody else's turn: it reads with the account's own eyes.
+            // And it gets the tools this mode works with (`--tools`), no more.
+            mount: crate::harness::Mount {
+                reads: crate::chat::ReadsFor::All,
+                tools: tools_of(&ctx.opts.tools),
+                ..crate::drive::mount(None).await
+            },
             // It runs for the person whose skills these are.
             skill_plugins: None,
             // …and no generating card whose heartbeat it would keep.
@@ -2000,6 +2208,7 @@ async fn look(
                 out = &mut run => break out,
                 Some(ev) = rx.recv() => {
                     if let AgentEvent::Session(s) = &ev { session_seen = Some(s.clone()); }
+                    gauge.read(&ev);
                     write(event_json(&ev));
                     tx_log.push(&ev);
                 }
@@ -2031,6 +2240,7 @@ async fn look(
             if let AgentEvent::Session(s) = &ev {
                 session_seen = Some(s.clone());
             }
+            gauge.read(&ev);
             write(event_json(&ev));
             tx_log.push(&ev);
         }
@@ -2048,12 +2258,15 @@ async fn look(
         seat = Some(next);
     };
 
-    // What never reached the model stays unread for the next look.
-    if let Some(left) = crate::steer_hook::take(&steer_file) {
-        for (text, ids) in &steered {
-            if left.contains(text.trim()) {
-                markers.forget(ids);
-            }
+    // What never reached the model stays unread for the next look; what did
+    // is in the session now.
+    let left = crate::steer_hook::take(&steer_file);
+    let mut steered_in: Vec<String> = Vec::new();
+    for (text, ids) in &steered {
+        if left.as_deref().is_some_and(|l| l.contains(text.trim())) {
+            markers.forget(ids);
+        } else {
+            steered_in.extend(ids.iter().cloned());
         }
     }
     let _ = std::fs::remove_file(&steer_file);
@@ -2064,6 +2277,12 @@ async fn look(
     };
     if !dry {
         if let Some(s) = last_good_session { state.session = Some(s); }
+        // What `session_life` decides the next look by ([`ends`]): how big the
+        // session is now, when the harness said, and that it was just used.
+        if let Some(sid) = state.session.clone() {
+            let context = (gauge.context > 0).then_some(gauge.context);
+            crate::session_life::record_in(&mut state.life, &surface, &sid, context, now_secs() as i64, HashMap::new());
+        }
     }
     let (spoke, sends) = spoke_to(&ctx.journal);
 
@@ -2071,6 +2290,19 @@ async fn look(
         markers.mark(&ctx.client).await;
         book.settle(state, &markers);
         update_streaks(&mut state.ai_streak, &turn_keys, &humans, &spoke);
+        // What the session holds now ([`Known`]): the lines it was handed, the
+        // asides steered into it, what it sent, the statuses it was told.
+        let handed: Vec<String> = batches
+            .iter()
+            .flat_map(|b| b.context.iter().chain(b.new.iter()))
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .chain(steered_in)
+            .chain(sent_ids(&ctx.journal))
+            .collect();
+        let told: Vec<(String, char)> =
+            batches.iter().flat_map(|b| b.working.iter().map(|d| (d.id.clone(), d.kind))).collect();
+        let sid = state.session.clone();
+        state.known.settle(sid.as_deref(), gauge.compacted, handed, told);
     }
     if sends > 0 && !dry {
         state.waiting_until = now_secs() + WAITING_WINDOW;
@@ -2211,6 +2443,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         workdir = scratch.to_string_lossy().into_owned();
     }
     let harness = harness::select(&harness_id);
+    anyhow::ensure!(harness.runs(), "{}", harness::unsupported::refusal(harness.id()));
     anyhow::ensure!(
         harness.available(),
         "harness {harness_id} isn't installed here — `mafold install {harness_id}`"
@@ -2515,6 +2748,7 @@ mod tests {
         let line = render_msg(&m, "realopsdu", Some("opsdu"), 8);
         assert!(line.contains("只差 api 和 cli 发版,要 ops 点头"), "the ending survives");
         assert!(!line.contains("output line") && !line.contains("mafold/tool"), "the trail is gone");
+        assert!(!line.contains("mafold/run") && !line.contains("[folded"), "…not even a folded line of it: {line}");
         assert!(line.contains("中间省略"), "long prose is cut in the middle, not at the end");
         assert!(line.chars().count() < BOT_HEAD + BOT_TAIL + 200);
         // In the overview the END is what's kept, too.
@@ -2828,14 +3062,18 @@ mod tests {
                 msg("9", "opsdu:claude-code", "bot", "2026-09-25T01:50:00Z", "根因是重启丢了游标"),
                 msg("1", "linsky", "human", "2026-09-25T02:01:00Z", "@realopsdu 看下"),
             ],
-            working: vec!["#w [09-25 10:01] @opsdu:codex(AI): ⏳ 正在回复 · 已写 3 分钟".into()],
+            working: vec![Draft {
+                id: "w".into(),
+                kind: '⏳',
+                line: "#w [09-25 10:01] @opsdu:codex(AI): ⏳ 正在回复 · 已写 3 分钟".into(),
+            }],
             finished: ["9".to_string()].into_iter().collect(),
             newest_working: None,
         };
         let due = vec![Followup { at: "2026-09-25T10:00:00+08:00".into(), conv: "c1".into(), note: "追 PR".into() }];
         let p = build_prompt("2026-09-25 10:01", &["心跳"], true, &[b], &["某群".into()], &due, None, None, "realopsdu", Some("opsdu"), 8);
         assert!(!p.contains("主动巡视"), "no patrol brief on a plain look");
-        assert!(p.contains("新的一天"));
+        assert!(p.contains("新会话") && p.contains("ledger.md"), "a new session is told to pick up from the notebook");
         assert!(p.contains("== Mafold DEV · 24 人群 · #dev · chat=c1 channel=ch1 =="));
         assert!(p.contains("  (之前) #0"));
         assert!(p.contains("#1 [09-25 10:01] @linsky: @realopsdu 看下"));
@@ -2843,6 +3081,154 @@ mod tests {
         assert!(p.contains("[到期的跟进]") && p.contains("追 PR"));
         assert!(p.contains("(刚写完) #9 "), "a reply that just finished is marked as such");
         assert!(p.contains("⏳ 正在回复 · 已写 3 分钟"), "a reply in progress shows as a status line");
+    }
+
+    /// A session resumed all day held 323 messages 1393 times: every look
+    /// re-handed each timeline's last few lines as context. A line the session
+    /// already holds is left out now, and so is a status it was already told;
+    /// the new lines — and a status that changed — always go.
+    #[test]
+    fn a_resumed_session_is_not_handed_what_it_holds() {
+        let tl = Timeline {
+            chat_id: "c1".into(),
+            channel_id: None,
+            channel_name: None,
+            label: "ops · 私聊".into(),
+            is_dm: true,
+            unread: 1,
+        };
+        let draft = |kind: char| Draft { id: "w".into(), kind, line: format!("#w [09-25 10:01] @opsdu:codex(AI): {kind} …") };
+        let batch = |kind: char| Batch {
+            tl: tl.clone(),
+            context: vec![
+                msg("0", "opsdu", "human", "2026-09-25T02:00:00Z", "早上那句"),
+                msg("1", "realopsdu", "human", "2026-09-25T02:01:00Z", "我回的那句"),
+            ],
+            new: vec![msg("2", "opsdu", "human", "2026-09-25T02:02:00Z", "新的这句")],
+            working: vec![draft(kind)],
+            finished: HashSet::new(),
+            newest_working: None,
+        };
+        let mut known = Known::default();
+        known.settle(Some("s1"), false, ["0".to_string(), "1".to_string()], [("w".to_string(), '⏳')]);
+        let k = known.of(Some("s1")).expect("the session this record is about");
+        let mut same = batch('⏳');
+        same.without(k);
+        let p = build_prompt("2026-09-25 10:02", &["私聊"], false, &[same], &[], &[], None, None, "realopsdu", Some("opsdu"), 8);
+        assert!(!p.contains("(之前)"), "{p}");
+        assert!(p.contains("#2 ") && p.contains("新的这句"), "the new line always goes: {p}");
+        assert!(!p.contains("#w "), "a status it was told already: {p}");
+        let mut changed = batch('⚠');
+        changed.without(k);
+        assert_eq!(changed.working.len(), 1, "a status that changed is news");
+        // Another session — or a new one — holds none of it.
+        assert!(known.of(Some("s2")).is_none() && known.of(None).is_none());
+        let p = build_prompt("2026-09-25 10:02", &["私聊"], true, &[batch('⏳')], &[], &[], None, None, "realopsdu", Some("opsdu"), 8);
+        assert!(p.contains("(之前) #0") && p.contains("(之前) #1") && p.contains("#w "), "{p}");
+    }
+
+    #[test]
+    fn what_a_session_holds_starts_over_with_a_new_one_or_a_compaction() {
+        let none = Vec::<(String, char)>::new;
+        let mut k = Known::default();
+        k.settle(Some("s1"), false, ["a".to_string()], [("d".to_string(), '⏳')]);
+        k.settle(Some("s1"), false, ["b".to_string()], none());
+        assert!(k.msgs.contains("a") && k.msgs.contains("b") && k.drafts.contains_key("d"));
+        k.settle(Some("s2"), false, ["c".to_string()], none());
+        assert_eq!(k.session.as_deref(), Some("s2"));
+        assert!(!k.msgs.contains("a") && k.msgs.contains("c") && k.drafts.is_empty(), "a new session holds only its own");
+        k.settle(Some("s2"), true, ["e".to_string()], none());
+        assert!(k.msgs.is_empty(), "a compaction leaves nothing verbatim");
+        assert_eq!(k.session.as_deref(), Some("s2"));
+    }
+
+    /// The session ends by the rule a bot's does — past `session_life`'s
+    /// context limit, or idle until the cache is gone — not at midnight.
+    #[test]
+    fn the_session_ends_the_way_a_bots_does() {
+        use crate::session_life::{record_in, Why, CONTEXT_LIMIT, IDLE_SECS};
+        let surface = surface_of("realopsdu");
+        assert_eq!(surface, "inbox____realopsdu");
+        let mut s = State { session: Some("s1".into()), ..Default::default() };
+        assert!(ends(&s, &surface, 1_000).is_some(), "a session from before records were kept isn't resumed");
+        record_in(&mut s.life, &surface, "s1", Some(CONTEXT_LIMIT / 2), 1_000, HashMap::new());
+        assert!(ends(&s, &surface, 1_000 + IDLE_SECS - 1).is_none());
+        assert_eq!(ends(&s, &surface, 1_000 + IDLE_SECS), Some(("s1".to_string(), Why::Idle(IDLE_SECS).to_string())));
+        record_in(&mut s.life, &surface, "s1", Some(CONTEXT_LIMIT), 2_000, HashMap::new());
+        assert_eq!(ends(&s, &surface, 2_001), Some(("s1".to_string(), Why::Context(CONTEXT_LIMIT).to_string())));
+        // A record about another session is no record of this one.
+        s.session = Some("s2".into());
+        assert!(ends(&s, &surface, 2_001).is_some());
+        s.session = None;
+        assert!(ends(&s, &surface, 2_001).is_none(), "no session, nothing to end");
+    }
+
+    /// An agent's reply is read for what it said and how it ended — the tasks
+    /// it left running stay (folded, like any history view); its trail and
+    /// its stamps go. A reply that was nothing but its trail still shows it.
+    #[test]
+    fn an_agents_reply_keeps_what_it_said_and_how_it_ended() {
+        let content = "{% mafold/trace summary=\"Ran 6 shell commands\" steps=\"6\" %}\n\
+            {% mafold/bash cmd=\"gh pr checks\" /%}\n{% /mafold/trace %}\n\n\
+            CI 在跑,跑完我回来报。\n\
+            {% mafold/bgtasks n=1 %}\nwatching the PR\n{% /mafold/bgtasks %}\n\n\
+            {% mafold/result duration=\"2m\" %}\n{\"cost_usd\":1.2}\n{% /mafold/result %}\n";
+        let mut m = msg("r", "opsdu:claude-code", "bot", "2026-09-25T12:45:00Z", content);
+        m["finalized_at"] = json!("2026-09-25T12:46:00Z");
+        let line = render_msg(&m, "realopsdu", Some("opsdu"), 8);
+        assert!(line.contains("CI 在跑,跑完我回来报。"), "{line}");
+        assert!(line.contains("mafold/bgtasks"), "the tasks it left running: {line}");
+        for gone in ["mafold/trace", "Ran 6 shell commands", "gh pr checks", "mafold/result", "cost_usd"] {
+            assert!(!line.contains(gone), "{gone} survived: {line}");
+        }
+        let trail = "{% mafold/run summary=\"Ran 1 shell command\" %}\n{% mafold/bash cmd=\"ls\" /%}\n{% /mafold/run %}";
+        let line = render_msg(&msg("t", "opsdu:claude-code", "bot", "2026-09-25T12:45:00Z", trail), "realopsdu", Some("opsdu"), 8);
+        assert!(line.contains("mafold/run"), "a reply that was only its trail isn't «—»: {line}");
+    }
+
+    #[test]
+    fn the_journal_names_what_was_sent() {
+        let dir = std::env::temp_dir().join(format!("inbox-sent-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let j = dir.join("j.jsonl");
+        std::fs::write(
+            &j,
+            "{\"kind\":\"send\",\"chat_id\":\"c1\",\"message_id\":\"m1\"}\n\
+             {\"kind\":\"send\",\"dry\":true,\"chat_id\":\"c1\"}\n\
+             {\"kind\":\"react\",\"message_id\":\"m2\"}\n",
+        )
+        .unwrap();
+        assert_eq!(sent_ids(&j), vec!["m1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mode works through `mafold` in a shell and a notebook in files —
+    /// it starts on those tools, not on every description the harness has.
+    #[test]
+    fn the_inbox_runs_on_the_tools_it_works_with() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            o: InboxOpts,
+        }
+        let o = <Cli as clap::Parser>::parse_from(["inbox"]).o;
+        let tools = tools_of(&o.tools).expect("a narrow set by default");
+        for t in ["Bash", "Read", "Edit", "Write"] {
+            assert!(tools.split(',').any(|x| x == t), "{t} in {tools}");
+        }
+        for t in ["Agent", "Skill", "Workflow", "ToolSearch"] {
+            assert!(!tools.split(',').any(|x| x == t), "{t} in {tools}");
+        }
+        assert_eq!(tools_of("default"), None);
+        assert_eq!(tools_of(" "), None);
+    }
+
+    #[test]
+    fn preamble_says_what_a_session_holds_and_when_it_ends() {
+        let p = preamble("realopsdu", Some("opsdu"));
+        assert!(p.contains("看过的不会再以「(之前)」补给你"), "{p}");
+        assert!(p.contains(&format!("约 {} 万 token", crate::session_life::CONTEXT_LIMIT / 10_000)), "{p}");
+        assert!(!p.contains("会话每天换"), "{p}");
     }
 
     /// A turn names its login explicitly: a named login's directory rides the

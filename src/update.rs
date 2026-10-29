@@ -784,11 +784,93 @@ pub fn unresolved<'a>(s: &'a Seen, running: &str) -> Option<&'a Failed> {
     s.failed.as_ref().filter(|f| is_newer(&f.version, running))
 }
 
+/// What a rollback leaves behind (activity center C9): the version it rolled
+/// back FROM, which automatic updates leave alone until a newer one is out.
+/// Without it the rollback held for one check: ~10 minutes later the updater
+/// found that same release newer than the binary rolled back to, and put it
+/// back. Its own file, not a field of `update.json`: a binary from before it
+/// rewrites that one whole and would drop a field it doesn't know.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Skip {
+    pub version: String,
+    /// When the rollback was made, epoch seconds.
+    pub at: i64,
+}
+
+fn skip_path() -> PathBuf {
+    mafold_dir().join("update-skip.json")
+}
+
+fn skip_at(path: &Path) -> Option<Skip> {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// The skip in force on this computer, if any.
+pub fn skipped() -> Option<Skip> {
+    skip_at(&skip_path())
+}
+
+fn write_skip_at(path: &Path, version: &str, at: i64) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&Skip { version: version.to_string(), at })?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The skip is over: a newer release came, or a person installed by hand.
+pub fn clear_skip() {
+    let _ = std::fs::remove_file(skip_path());
+}
+
+/// Does a rollback hold `offered` back? The version rolled back from (or an
+/// older one) is held; a NEWER release is the fix the rollback was waiting
+/// for — the skip ends and the update goes ahead. Said either way.
+fn skip_holds_at(path: &Path, offered: &str) -> bool {
+    let Some(s) = skip_at(path) else { return false };
+    if is_newer(offered, &s.version) {
+        let _ = std::fs::remove_file(path);
+        eprintln!("↻ v{offered} is newer than v{}, which this computer rolled back from — updating again", s.version);
+        return false;
+    }
+    eprintln!(
+        "↻ v{offered} available — skipped: this computer rolled back from v{} (`mafold update` installs it anyway)",
+        s.version
+    );
+    true
+}
+
+/// What this binary can do that an older one can't, by name — so another
+/// binary (a rollback's target, the desktop app) can ASK instead of guessing
+/// from a version number. `mafold capabilities` prints them; a binary from
+/// before it fails that command, which reads as "none".
+pub const CAPABILITIES: &[&str] = &[
+    // `runtime login claude-code [--name] [--console] [--json]`: the sign-in a
+    // bot's `/login` runs, without a chat.
+    "runtime-login",
+    // Honours `update-skip.json`: a rollback to this binary sticks.
+    "update-skip",
+    // `up --adopt [--check] [--json]`: moves another install's service, and
+    // its bots, onto this binary; `status --json` says `supervisor.not_ours`.
+    "adopt",
+];
+
+/// `bin`'s [`CAPABILITIES`] (empty for one from before them).
+fn capabilities_of(bin: &Path) -> Vec<String> {
+    let mut cmd = crate::platform::std_command(bin);
+    cmd.arg("capabilities");
+    let Some(out) = cmd.output().ok().filter(|o| o.status.success()) else { return Vec::new() };
+    serde_json::from_slice::<Vec<String>>(&out.stdout).unwrap_or_default()
+}
+
 /// Should the auto-updater try `version` now? When it shouldn't, it SAYS SO:
 /// a cooldown that skips without a word is indistinguishable from an updater
 /// that has stopped working, which is exactly what this looked like on
 /// 2026-09-27 (one `checking now` line in the log, then nothing for 90 min).
+/// A rollback's skip ([`Skip`]) holds it back the same way.
 pub fn should_attempt(version: &str) -> bool {
+    if skip_holds_at(&skip_path(), version) {
+        return false;
+    }
     let g = LAST_FAILED.lock().unwrap();
     let Some(f) = g.as_ref() else { return true };
     let now = std::time::SystemTime::now();
@@ -975,7 +1057,8 @@ pub async fn apply(
 }
 
 /// Install `src` as `bin`, where `bin` may be the CURRENTLY RUNNING executable.
-/// Unix overwrites in place (rename/copy straight over it). Windows can't
+/// Unix renames over it (a copy goes beside it first: Linux won't open a
+/// running executable for writing — `Text file busy`). Windows can't
 /// overwrite a running `.exe`, but it CAN rename the live file aside (the running
 /// process keeps executing the moved image), so we move it out of the way first,
 /// then put the new binary at the canonical path. `mv` renames `src` in (consumes
@@ -1007,7 +1090,14 @@ fn install_running_binary(src: &Path, bin: &Path, mv: bool) -> Result<()> {
         if mv {
             std::fs::rename(src, bin).context("failed to replace the binary")?;
         } else {
-            std::fs::copy(src, bin).context("failed to restore the previous binary")?;
+            // `mafold rollback` IS the running binary, so not a copy straight
+            // over it: copy beside it, then rename in, as apply does.
+            let tmp = bin.with_file_name(format!("mafold.rollback.{}", std::process::id()));
+            let placed = std::fs::copy(src, &tmp).and_then(|_| std::fs::rename(&tmp, bin));
+            if placed.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            placed.context("failed to restore the previous binary")?;
         }
         Ok(())
     }
@@ -1015,30 +1105,134 @@ fn install_running_binary(src: &Path, bin: &Path, mv: bool) -> Result<()> {
 
 /// Restore the previous binary (`mafold.old`) — `mafold rollback` — and ask
 /// the supervisor running here to move onto it (`control`), as `update` does.
-pub fn rollback() -> Result<()> {
+/// What `mafold rollback` was asked.
+pub struct RollbackAsk {
+    /// `--check`: say whether a rollback is possible and would stick; do nothing.
+    pub check: bool,
+    /// `--force`: roll back to a binary that can't keep it (see [`rollback`]).
+    pub force: bool,
+    /// One JSON object instead of lines — for the desktop app.
+    pub json: bool,
+}
+
+/// Can this computer roll back, and would it stay rolled back?
+#[derive(Debug, PartialEq)]
+enum CanRollBack {
+    /// No `mafold.old` beside this binary.
+    NoBackup,
+    /// The backup is from before the skip (it doesn't know
+    /// `update-skip.json`): rolled back to, it would update itself straight
+    /// back at its next check. No button for it; `--force` for a person.
+    TooOld,
+    Yes,
+}
+
+fn can_roll_back(backup: &Path, capabilities: impl FnOnce(&Path) -> Vec<String>) -> CanRollBack {
+    if !backup.exists() {
+        CanRollBack::NoBackup
+    } else if capabilities(backup).iter().any(|c| c == "update-skip") {
+        CanRollBack::Yes
+    } else {
+        CanRollBack::TooOld
+    }
+}
+
+/// `mafold rollback`: put the previous binary back and keep it — the version
+/// rolled back from is skipped by automatic updates until a newer one is out
+/// ([`Skip`]), and the supervisor here moves onto the old binary once the
+/// replies in progress are written ([`crate::supervisor::move_onto_disk`]).
+/// A backup that can't keep it (from before the skip) is refused without
+/// `--force`: the rollback would undo itself ~10 minutes later.
+///
+/// `--json` prints one object: `ok`, `code` (`possible` / `too_old` /
+/// `no_backup` from a check; `rolled_back` / `too_old` / `no_backup` /
+/// `failed` from a rollback), `from` (this binary's version), `to` (the
+/// backup's, when it says), `sticks`; after a rollback also `restart` +
+/// `moving`, as `mafold update --json` says them.
+pub fn rollback(ask: RollbackAsk) -> Result<()> {
+    let from = current_version();
+    // Not done is exit 1, as `mafold update --json` says it; a check's answer,
+    // whatever it is, is exit 0.
+    let out = |v: serde_json::Value| -> Result<()> {
+        if ask.json {
+            println!("{v}");
+            if v["ok"] == false && !ask.check {
+                std::process::exit(1);
+            }
+        }
+        Ok(())
+    };
     let bin = binary_path()?;
     let backup = bin.with_file_name("mafold.old");
-    if !backup.exists() {
+    let can = can_roll_back(&backup, capabilities_of);
+    let version = if can == CanRollBack::NoBackup { None } else { version_of(&backup) };
+    let to = version.as_deref().map_or_else(|| "the previous binary".to_string(), |v| format!("v{v}"));
+    let base = |code: &str| {
+        serde_json::json!({
+            "ok": matches!(code, "possible" | "rolled_back"),
+            "code": code, "from": from, "to": version, "sticks": can == CanRollBack::Yes,
+        })
+    };
+    if can == CanRollBack::NoBackup {
+        if ask.json {
+            return out(base("no_backup"));
+        }
+        anyhow::bail!("no backup to roll back to (looked for {})", backup.display());
+    }
+    if ask.check {
+        if ask.json {
+            return out(base(if can == CanRollBack::Yes { "possible" } else { "too_old" }));
+        }
+        match can {
+            CanRollBack::Yes => println!("✓ can roll back to {to}, and it stays there until a release newer than v{from}"),
+            _ => println!("• {to} is from before rollbacks could stick: it would update itself back to v{from} at its next check"),
+        }
+        return Ok(());
+    }
+    if can == CanRollBack::TooOld && !ask.force {
+        if ask.json {
+            return out(base("too_old"));
+        }
         anyhow::bail!(
-            "no backup to roll back to (looked for {})",
-            backup.display()
+            "{to} is from before rollbacks could stick: it would update itself back to v{from} at its next check (~10 minutes). \
+             `mafold rollback --force` rolls back anyway — then `mafold update --auto-update off` keeps it there"
         );
     }
-    let version = version_of(&backup);
-    install_running_binary(&backup, &bin, false)?;
+    // The skip first: the moment the old binary runs, its first check must
+    // already find it.
+    if let Err(e) = write_skip_at(&skip_path(), &from, crate::accounts::now()) {
+        if ask.json {
+            return out(serde_json::json!({ "ok": false, "code": "failed", "from": from, "to": version, "detail": format!("{e:#}") }));
+        }
+        return Err(e.context("couldn't note the version to skip — nothing rolled back"));
+    }
+    if let Err(e) = install_running_binary(&backup, &bin, false) {
+        clear_skip();
+        if ask.json {
+            return out(serde_json::json!({ "ok": false, "code": "failed", "from": from, "to": version, "detail": format!("{e:#}") }));
+        }
+        return Err(e);
+    }
     let _ = std::fs::remove_file(stamp_path());
-    let to = version.as_deref().map_or_else(|| "the previous binary".to_string(), |v| format!("v{v}"));
-    println!("✓ rolled back to {to} ({})", backup.display());
+    if !ask.json {
+        println!("✓ rolled back to {to} ({}) — v{from} is skipped until a newer release is out", backup.display());
+    }
+    let mut said = base("rolled_back");
     if crate::supervisor::supervisor_running() {
         let (line, moving) = crate::supervisor::move_onto_disk(crate::control::Moved::Rollback, version.as_deref());
-        println!("  {line}");
-        // Nothing keeps it there yet: the next check finds the newer release.
-        let run = crate::lifecycle::read::<crate::lifecycle::Run>(&crate::lifecycle::run_path());
-        if moving && run.is_none_or(|r| r.auto_update) && auto_update_on() {
-            println!("  it updates itself again at its next check (~10 minutes) — `mafold update --auto-update off` keeps it on {to}");
+        if ask.json {
+            said["restart"] = serde_json::json!(line);
+            said["moving"] = serde_json::json!(moving);
+        } else {
+            println!("  {line}");
+            // Forced onto a binary that doesn't know the skip: nothing keeps it there.
+            let run = crate::lifecycle::read::<crate::lifecycle::Run>(&crate::lifecycle::run_path());
+            if can == CanRollBack::TooOld && moving && run.is_none_or(|r| r.auto_update) && auto_update_on() {
+                println!("  it updates itself again at its next check (~10 minutes) — `mafold update --auto-update off` keeps it on {to}");
+            }
         }
     }
-    Ok(())
+    out(said)
 }
 
 /// The version a mafold binary says it is (`mafold --version`).
@@ -1167,6 +1361,8 @@ pub async fn command(base: &str, ask: Ask) -> Result<()> {
     match update_to_latest(&http, base, channel).await {
         Ok(Some(v)) => {
             note_installed();
+            // A person asked for it by hand: a rollback's skip is over.
+            clear_skip();
             // `mafold stop` only knows the old `agent --detach` — on a machine
             // the supervisor runs, that hint stopped nothing. The supervisor
             // is asked to move onto it (`control`), as after `rollback`.
@@ -1674,5 +1870,79 @@ mod setting_tests {
         assert_eq!(check_line(Channel::Dev, Some(here), false), format!("up to date (v{here}, dev channel)"));
         assert!(check_line(Channel::Stable, Some("0.0.1"), false).contains("newer than v0.0.1"));
         assert_eq!(check_line(Channel::Stable, None, false), format!("up to date (v{here}, stable channel)"));
+    }
+}
+
+/// A rollback that sticks (activity center C9): the version rolled back from
+/// is skipped by automatic updates until a newer release is out.
+#[cfg(test)]
+mod rollback_skip_tests {
+    use super::*;
+
+    fn dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mf-skip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_version_rolled_back_from_is_skipped_until_a_newer_one_is_out() {
+        let d = dir();
+        let path = d.join("update-skip.json");
+        assert!(!skip_holds_at(&path, "0.9.150"), "no rollback, nothing held");
+
+        write_skip_at(&path, "0.9.150", 1_760_000_000).unwrap();
+        assert_eq!(skip_at(&path), Some(Skip { version: "0.9.150".into(), at: 1_760_000_000 }));
+        // The release it rolled back from: held, every check, until…
+        assert!(skip_holds_at(&path, "0.9.150"));
+        assert!(skip_holds_at(&path, "0.9.150"), "the next check too — the bug was it came back ~10 minutes later");
+        assert!(skip_holds_at(&path, "0.9.149"), "nothing older either");
+        // …a newer release: it ends the skip and goes ahead.
+        assert!(!skip_holds_at(&path, "0.9.151"));
+        assert_eq!(skip_at(&path), None, "the skip is gone once a newer release is out");
+        assert!(!skip_holds_at(&path, "0.9.150"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_backup_from_before_the_skip_is_not_rolled_back_to_without_force() {
+        let d = dir();
+        let backup = d.join("mafold.old");
+        assert_eq!(can_roll_back(&backup, |_| vec!["update-skip".into()]), CanRollBack::NoBackup);
+        std::fs::write(&backup, b"#!/bin/sh\n").unwrap();
+        assert_eq!(can_roll_back(&backup, |_| vec!["update-skip".into(), "later".into()]), CanRollBack::Yes);
+        // A binary from before `mafold capabilities` fails it ⇒ no names.
+        assert_eq!(can_roll_back(&backup, |_| Vec::new()), CanRollBack::TooOld);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The probe asks the target itself: a binary from before the command
+    /// fails it, which reads as no capabilities (not a crash, not a guess).
+    #[test]
+    fn capabilities_are_asked_of_the_binary_itself() {
+        assert!(CAPABILITIES.contains(&"update-skip"));
+        assert!(capabilities_of(Path::new("/nonexistent/mafold.old")).is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let d = dir();
+            let fake = d.join("mafold.old");
+            std::fs::write(&fake, "#!/bin/sh\n[ \"$1\" = capabilities ] && echo '[\"update-skip\"]' && exit 0\nexit 2\n").unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A test thread forking at the moment the script was written can
+            // hold it open a moment (ETXTBSY): ask again rather than flake.
+            let mut got = Vec::new();
+            for _ in 0..10 {
+                got = capabilities_of(&fake);
+                if !got.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            assert_eq!(got, vec!["update-skip".to_string()]);
+            std::fs::write(&fake, "#!/bin/sh\necho \"error: unrecognized subcommand '$1'\" >&2\nexit 2\n").unwrap();
+            assert!(capabilities_of(&fake).is_empty(), "an older binary");
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

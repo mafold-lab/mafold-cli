@@ -81,8 +81,9 @@ impl Harness for Codex {
             draft,
             // The drive mount is Claude Code's today (`--plugin-dir`); how
             // Codex takes an outside skills folder is measured before it is
-            // wired (`.docs/bot-drive-v1.md` §5.5).
-            mount: _,
+            // wired (`.docs/bot-drive-v1.md` §5.5). Whose eyes the turn reads
+            // with is every harness's (`turn_env`).
+            mount,
             // No PreToolUse hook to hold it with (`crate::drive::skill_gate`).
             skill_plugins: _,
             proc,
@@ -107,6 +108,7 @@ impl Harness for Codex {
             effort: effort.as_deref(),
             conv: &conv,
             surface: &surface,
+            reads: &mount.reads,
             draft: &draft,
             cancel: &cancel,
             sink: &sink,
@@ -267,6 +269,8 @@ struct RunParams<'a> {
     conv: &'a str,
     /// The turn's surface tag — where its forum channel comes from (`turn_env`).
     surface: &'a str,
+    /// Whose eyes the turn reads with (`Mount::reads`, exported by `turn_env`).
+    reads: &'a crate::chat::ReadsFor,
     draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
@@ -465,7 +469,7 @@ async fn run_once(
     leg: Leg,
     item_stats: &mut super::codex_stats::ItemStats,
 ) -> Result<LegEnd> {
-    let RunParams { program, full_prompt, workdir, model, effort, conv, surface, draft, cancel, sink, proc } = *p;
+    let RunParams { program, full_prompt, workdir, model, effort, conv, surface, reads, draft, cancel, sink, proc } = *p;
     let stats_started_ms = leg.started_ms;
     let _ = sink.send(AgentEvent::Stats(RunStats {
         model: model.map(str::to_string),
@@ -475,9 +479,9 @@ async fn run_once(
 
     let mut cmd = crate::platform::command(program);
         cmd.args(exec_args(session, model, effort));
-        // Export the current conversation and forum channel, so `mafold room`,
-        // `send` and `read` default to THIS room and channel (`turn_env`).
-        for (k, v) in super::turn_env(conv, surface) {
+        // Export the current conversation and forum channel, so `mafold send`
+        // and `read` default to THIS room and channel (`turn_env`).
+        for (k, v) in super::turn_env(conv, surface, reads) {
             cmd.env(k, v);
         }
         // The reply being streamed right now — `mafold attach <file>` hangs
@@ -1106,6 +1110,7 @@ mod tests {
                 effort: None,
                 conv: "c1",
                 surface,
+                reads: &crate::chat::ReadsFor::All,
                 draft: "draft",
                 cancel: &cancel,
                 sink: &sink,
@@ -1142,6 +1147,7 @@ mod tests {
                 effort: None,
                 conv: "conv",
                 surface: "",
+                reads: &crate::chat::ReadsFor::All,
                 draft,
                 cancel: &cancel,
                 sink: &sink,
@@ -1394,6 +1400,7 @@ mod tests {
             effort: None,
             conv: "conv",
             surface: "",
+            reads: &crate::chat::ReadsFor::All,
             draft: "draft",
             cancel: &cancel,
             sink: &sink,

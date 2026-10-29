@@ -96,6 +96,24 @@ pub struct HarnessInfo {
     /// CLIs and for harnesses that have no account registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accounts: Vec<AccountSeat>,
+    /// Whether Mafold on that computer can drive this runtime at all,
+    /// installed or not (≥ the CLI that stopped running Claude Code in place
+    /// of a runtime it doesn't know, 10-29). `None` from older CLIs: read it
+    /// through [`HarnessInfo::runs`], never directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs: Option<bool>,
+}
+
+/// The runtimes every CLI before `HarnessInfo::runs` could drive. An older CLI
+/// reported `opencode` and `openclaw` too, and quietly ran Claude Code for
+/// them — so what it doesn't say is read as this list, not as "yes".
+pub const RUNTIMES_BEFORE_RUNS: &[&str] = &["claude-code", "codex", "kimi-code"];
+
+impl HarnessInfo {
+    /// Can Mafold on the reporting computer run this runtime?
+    pub fn runs(&self) -> bool {
+        self.runs.unwrap_or_else(|| RUNTIMES_BEFORE_RUNS.contains(&self.id.as_str()))
+    }
 }
 
 /// A mafold-cli device's harness capability report (the control plane). Keyed by
@@ -115,6 +133,10 @@ pub struct DeviceHarnesses {
     pub cli_version: Option<String>,
     /// Epoch seconds of the last report.
     pub reported_at: i64,
+    /// `macos` / `linux` / `windows` (Rust's `std::env::consts::OS`). Sent by
+    /// the CLI with each report; for an older CLI, what its sign-in said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
 }
 
 impl DeviceHarnesses {
@@ -158,6 +180,9 @@ pub struct HarnessHost {
     /// Reported within the freshness window (the cli heartbeats periodically).
     pub online: bool,
     pub reported_at: i64,
+    /// `macos` / `linux` / `windows`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,11 +303,13 @@ mod tests {
                         checked_at: 1760000001,
                     }),
                     accounts: vec![AccountSeat { name: "default".into(), email: Some("a@b.c".into()), health: None }],
+                    runs: None,
                 },
-                HarnessInfo { id: "codex".into(), available: false, version: None, health: None, accounts: vec![] },
+                HarnessInfo { id: "codex".into(), available: false, version: None, health: None, accounts: vec![], runs: None },
             ],
             cli_version: Some("0.9.147".into()),
             reported_at: 1760000002,
+            os: None,
         }
     }
 
@@ -298,7 +325,7 @@ mod tests {
 
     fn heartbeat(version: Option<&str>, available: bool) -> DeviceHarnesses {
         let mut d = host();
-        d.harnesses = vec![HarnessInfo { id: "claude-code".into(), available, version: version.map(Into::into), health: None, accounts: vec![] }];
+        d.harnesses = vec![HarnessInfo { id: "claude-code".into(), available, version: version.map(Into::into), health: None, accounts: vec![], runs: None }];
         d
     }
 
@@ -342,13 +369,42 @@ mod tests {
         assert!(d.harnesses[0].health.is_none() && d.harnesses[0].accounts.is_empty() && d.harnesses[0].version.is_none());
     }
 
+    /// A CLI from before `runs` reported `opencode` too, and ran Claude Code
+    /// for it: what it doesn't say is read as the runtimes it really ran.
+    #[test]
+    fn a_runtime_runs_when_its_computer_says_so_or_an_older_cli_could() {
+        let row = |id: &str, runs: Option<bool>| HarnessInfo { id: id.into(), available: true, version: None, health: None, accounts: vec![], runs };
+        for id in ["claude-code", "codex", "kimi-code"] {
+            assert!(row(id, None).runs(), "{id} from an older CLI");
+        }
+        for id in ["opencode", "openclaw"] {
+            assert!(!row(id, None).runs(), "{id} from an older CLI ran Claude Code instead");
+        }
+        assert!(row("opencode", Some(true)).runs(), "once a CLI says it runs it, it does");
+        assert!(!row("codex", Some(false)).runs(), "and a CLI's no is a no");
+        let wire = r#"{"id":"opencode","available":true,"version":null,"runs":false}"#;
+        assert_eq!(serde_json::to_string(&row("opencode", Some(false))).unwrap(), wire);
+        let back: HarnessInfo = serde_json::from_str(wire).unwrap();
+        assert_eq!(back.runs, Some(false));
+    }
+
+    #[test]
+    fn a_computer_names_its_os_when_it_knows_it() {
+        let mut d = host();
+        d.os = Some("linux".into());
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.ends_with(r#""reported_at":1760000002,"os":"linux"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<DeviceHarnesses>(&json).unwrap().os.as_deref(), Some("linux"));
+        assert!(serde_json::from_str::<DeviceHarnesses>(DEVICE).unwrap().os.is_none(), "a stored row without it still loads");
+    }
+
     #[test]
     fn hosts_list_bytes_unchanged() {
         let d = host();
         let r = HarnessHostsResult {
             items: vec![
-                HarnessHost { device_id: d.device_id.clone(), device_name: d.device_name.clone(), harnesses: d.harnesses.clone(), cli_version: d.cli_version.clone(), online: true, reported_at: d.reported_at },
-                HarnessHost { device_id: "dev-2".into(), device_name: "PC".into(), harnesses: vec![], cli_version: None, online: false, reported_at: 5 },
+                HarnessHost { device_id: d.device_id.clone(), device_name: d.device_name.clone(), harnesses: d.harnesses.clone(), cli_version: d.cli_version.clone(), online: true, reported_at: d.reported_at, os: None },
+                HarnessHost { device_id: "dev-2".into(), device_name: "PC".into(), harnesses: vec![], cli_version: None, online: false, reported_at: 5, os: None },
             ],
         };
         assert_eq!(

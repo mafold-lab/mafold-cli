@@ -148,6 +148,16 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
         )?,
     };
     let chat = resolve_room(client, &raw).await?;
+    // Whether this turn may open it as this account at all (`own_room`) —
+    // asked before anything else about the room is: its channels, its unread
+    // count. One of this account's rooms that isn't this turn's people's is
+    // refused outright, by id, not name: what it is called is already more
+    // than they may know about it. No ticket is the way round that.
+    let reads = ReadsFor::from_env();
+    let own = own_room(client, &chat.id, &reads).await;
+    if matches!(own, Own::Closed) {
+        not_theirs(&reads, &chat.id);
+    }
     // Inside a channel turn, this room means THIS channel unless told
     // otherwise — the same default `send` has, so an agent reads where it is
     // about to write. `--main` asks for `#all`.
@@ -172,13 +182,20 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
 
     // Try as myself first. A participant never touches the grant table, so the
     // ordinary case costs exactly one request.
-    let mine = client.chat_history(&chat.id, limit, channel.as_deref(), None).await;
+    let mine = match own {
+        Own::Open => client.chat_history(&chat.id, limit, channel.as_deref(), None).await,
+        Own::Closed => not_theirs(&reads, &chat.id),
+        // Not among its rooms, as far as the list says: only a ticket opens
+        // it — and the read that would have answered «you are in it» anyway
+        // (an old room, past the list) is not made.
+        Own::NotIn => Err(anyhow::anyhow!("permission denied: not a participant")),
+    };
     let (page, lender) = match mine {
         Ok(p) => (p, None),
         Err(e) if !is_permission_error(&e) => return Err(e),
         Err(_) => {
             let grants = client.list_chat_grants().await.unwrap_or_else(|_| json!({}));
-            match held_grantor(&grants, &chat.id) {
+            match lender_for(&grants, &chat.id, &reads) {
                 Some(g) => {
                     let p = client
                         .chat_history(&chat.id, a.limit, channel.as_deref(), Some(&g))
@@ -186,7 +203,7 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
                         .with_context(|| format!("reading as @{g}"))?;
                     (p, Some(g))
                 }
-                None => return no_ticket(client, &grants, &chat, a.limit).await,
+                None => return no_ticket(client, &grants, &chat, a.limit, &reads).await,
             }
         }
     };
@@ -314,9 +331,11 @@ async fn fetch_media(client: &Client, page: &Value) -> std::collections::HashMap
     out
 }
 
-/// No live ticket: say what is already in flight, or ask — and never just fail.
-async fn no_ticket(client: &Client, grants: &Value, chat: &Room, limit: usize) -> Result<()> {
-    if let Some(p) = pending_for(grants, &chat.id) {
+/// No live ticket this turn may use: say what is already in flight, or ask —
+/// and never just fail. An ask from a turn outside the owner's circle says
+/// whom it is for (`ReadsFor::askers`), so the ticket it brings is theirs.
+async fn no_ticket(client: &Client, grants: &Value, chat: &Room, limit: usize, reads: &ReadsFor) -> Result<()> {
+    if let Some(p) = pending_for(grants, &chat.id, reads) {
         let asked = p["asked"].as_str().unwrap_or("");
         let at = p["asked_at"].as_str().unwrap_or("");
         eprintln!("⏳ 已经问过了,还没人回应 —— 卡还挂在「{}」里", chat.label);
@@ -324,13 +343,32 @@ async fn no_ticket(client: &Client, grants: &Value, chat: &Room, limit: usize) -
         eprintln!("   别再问一次。等对方点了「允许」,重跑这条命令。");
         std::process::exit(EXIT_PENDING);
     }
-    match ask(client, &chat.id, None, 7, None).await {
+    match ask(client, &chat.id, None, 7, None, reads.askers()).await {
         Ok(r) if r["granted"].as_bool() == Some(true) => {
-            // Raced a grant between the refusal and the ask.
-            let g = r["grantor"].as_str().map(str::to_string);
+            // Raced a grant between the refusal and the ask. Outside the circle
+            // that is only so if the ticket is one this turn may use — an api
+            // that predates `askers` says «granted» for anybody's — and «you are
+            // in that room» is the room `own_room` already refused.
+            let g = if reads.is_all() {
+                r["grantor"].as_str().map(str::to_string)
+            } else {
+                if r["reason"].as_str() == Some("participant") {
+                    not_theirs(reads, &chat.label);
+                }
+                let fresh = client.list_chat_grants().await.unwrap_or_else(|_| json!({}));
+                match lender_for(&fresh, &chat.id, reads) {
+                    Some(g) => Some(g),
+                    None => not_theirs(reads, &chat.label),
+                }
+            };
             let page = client.chat_history(&chat.id, limit, None, g.as_deref()).await?;
             print_transcript(chat, g.as_deref(), &page, &Default::default());
             Ok(())
+        }
+        Ok(r) if someone_elses_ask(&r) => {
+            eprintln!("⏳ 「{}」已经有一张卡在等回应 —— 不是替这一轮的人问的", chat.label);
+            eprintln!("   一次只挂一张卡。等那张有了结果,再跑一次这条命令,会替这一轮的人另问。");
+            std::process::exit(EXIT_PENDING);
         }
         Ok(r) => {
             eprintln!("✗ 没有这个房间的读取票 —— 已经替你申请了");
@@ -348,6 +386,14 @@ async fn no_ticket(client: &Client, grants: &Value, chat: &Room, limit: usize) -
             std::process::exit(EXIT_REFUSED);
         }
     }
+}
+
+/// The api's «a card is already up for this room — and it isn't asking for
+/// you» (`yours: false`): one card at a time, and nobody rides in on a tap
+/// that never saw their name. An api from before says nothing, which reads as
+/// the old «still waiting».
+fn someone_elses_ask(r: &Value) -> bool {
+    r["pending"].as_bool() == Some(true) && r["yours"].as_bool() == Some(false)
 }
 
 /// Ask for a ticket, working out WHO to address when nobody said.
@@ -368,9 +414,10 @@ async fn ask(
     from: Option<&str>,
     days: i64,
     for_account: Option<&str>,
+    askers: &[String],
 ) -> Result<Value> {
     if let Some(u) = from {
-        return client.request_chat_access(conv, u, days, for_account).await;
+        return client.request_chat_access(conv, u, days, for_account, askers).await;
     }
     let candidates = neighbours(client).await;
     if candidates.is_empty() {
@@ -378,7 +425,7 @@ async fn ask(
     }
     let mut last = None;
     for u in &candidates {
-        match client.request_chat_access(conv, u, days, for_account).await {
+        match client.request_chat_access(conv, u, days, for_account, askers).await {
             Ok(r) => return Ok(r),
             Err(e) => last = Some(e),
         }
@@ -512,13 +559,189 @@ pub(crate) fn attachment_name(a: &Value) -> String {
 pub async fn print_message(client: &Client, id: &str, json: bool) -> Result<()> {
     let id = id.trim().trim_start_matches('#');
     let m = client.get_message(id).await?;
+    // A message id opens whichever of this account's rooms it was said in —
+    // so it answers to the same rule `read` does (`own_room`).
+    let reads = ReadsFor::from_env();
+    if !reads.is_all() {
+        let conv = m["conversation_id"].as_str().unwrap_or_default();
+        if !matches!(own_room(client, conv, &reads).await, Own::Open) {
+            not_theirs(&reads, "这条消息所在的房间");
+        }
+    }
+    let mut m = m;
+    let me = my_username(client).await;
+    let sender = m["sender"].clone();
+    if let Some(items) = m.get_mut("sidecar").and_then(|s| s.get_mut("state")).and_then(Value::as_object_mut) {
+        named_for(items, &sender, &me);
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&m)?);
         return Ok(());
     }
     print!("{}", message_text(&m));
+    // Its controlled state, as far as this account may read it — fetched when
+    // there was too much to come with the message.
+    let mut state = if m["sidecar"]["state_more"].as_bool() == Some(true) {
+        client.get_card_state(id).await.map(|r| r["state"].clone()).unwrap_or(Value::Null)
+    } else {
+        m["sidecar"]["state"].clone()
+    };
+    if let Some(items) = state.as_object_mut() {
+        named_for(items, &m["sender"], &me);
+    }
+    if let Some(items) = state.as_object().filter(|s| !s.is_empty()) {
+        print!("\n── 卡片状态(`mafold state` 读写)──\n{}", state_lines(items));
+    }
     Ok(())
 }
+
+/// This account's username, lowercase ("" when the server would not say —
+/// then [`named_for`] keeps only what every reader may read).
+async fn my_username(client: &Client) -> String {
+    client.me().await.ok().and_then(|m| m["username"].as_str().map(str::to_lowercase)).unwrap_or_default()
+}
+
+/// What an agent is SHOWN of a message's state: the items whose read list
+/// names `me` — not every item it may read as the message's author. The
+/// author reads all of its own message's items (card-state §3.3), an owner's
+/// summary, a failure's detail for whoever paid and a note for one person
+/// included; printed into a turn, the model can repeat them to whoever asked.
+/// The api's `card_state::named_for`, read off each item's own list.
+fn named_for(items: &mut serde_json::Map<String, Value>, sender: &Value, me: &str) {
+    let name = sender["username"].as_str().unwrap_or_default();
+    let owner = sender["parent_username"]
+        .as_str()
+        .filter(|o| !o.is_empty())
+        .or_else(|| name.split_once(':').map(|(o, _)| o))
+        .unwrap_or(name);
+    let is = |n: &str| !me.is_empty() && me.eq_ignore_ascii_case(n.trim_start_matches('@'));
+    items.retain(|_, it| {
+        it["read"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|w| {
+            if w.eq_ignore_ascii_case("all") {
+                true
+            } else if w.eq_ignore_ascii_case("owner") {
+                is(owner)
+            } else if w.eq_ignore_ascii_case("sender") {
+                is(name)
+            } else if w.eq_ignore_ascii_case("server") {
+                false
+            } else {
+                is(w)
+            }
+        })
+    });
+}
+
+/// A message's state items, one per line: key = value · who · when · rev.
+fn state_lines(items: &serde_json::Map<String, Value>) -> String {
+    let mut out = String::new();
+    for (key, it) in items {
+        let v = serde_json::to_string(&it["v"]).unwrap_or_default();
+        let v = if v.chars().count() > 400 { format!("{}…", v.chars().take(400).collect::<String>()) } else { v };
+        let when = it["at"]
+            .as_i64()
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|t| t.format("%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{key} = {v} · {} · {when} · rev {}\n",
+            it["by"].as_str().unwrap_or("?"),
+            it["rev"].as_u64().unwrap_or(0)
+        ));
+    }
+    out
+}
+
+/// `mafold state` — a message's controlled state (`.docs/card-state-v1.md`).
+#[derive(Subcommand)]
+pub enum StateCmd {
+    /// What you may read of a message's state: every item, or the keys named.
+    Get {
+        /// The message id.
+        message: String,
+        /// Only these keys (`mafold/html/0.items`, `mafold/html/0.vote@linsky`).
+        keys: Vec<String>,
+        /// As the API returns it.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write one item as yourself. The first write of a key fixes its lists
+    /// (default read all, write sender); only a message's sender creates a key,
+    /// except one ending `@<your name>`, which is yours alone.
+    Set {
+        /// The message id.
+        message: String,
+        /// `<card tag>/<sid or ordinal>.<field>` — `mafold/html/0.items`.
+        key: String,
+        /// The value as JSON: `'"text"'`, `3`, `'["a","b"]'`, `null`.
+        value: String,
+        /// Who may read it (first write only): all, sender, owner, @name — comma separated.
+        #[arg(long, value_delimiter = ',')]
+        read: Option<Vec<String>>,
+        /// Who may write it (first write only), same words.
+        #[arg(long, value_delimiter = ',')]
+        write: Option<Vec<String>>,
+        /// Only if the item is still at this revision (0: only if there is none
+        /// yet) — read, change, write back without losing someone else's edit.
+        #[arg(long)]
+        if_rev: Option<u64>,
+    },
+}
+
+pub async fn run_state(cmd: StateCmd, client: &Client) -> Result<()> {
+    let room_of = |m: &Value| m["conversation_id"].as_str().unwrap_or_default().to_string();
+    let reads = ReadsFor::from_env();
+    match cmd {
+        StateCmd::Get { message, keys, json } => {
+            let id = message.trim().trim_start_matches('#');
+            let m = client.get_message(id).await?;
+            if !reads.is_all() && !matches!(own_room(client, &room_of(&m), &reads).await, Own::Open) {
+                not_theirs(&reads, "这条消息所在的房间");
+            }
+            let r = client.get_card_state(id).await?;
+            let mut state = r["state"].as_object().cloned().unwrap_or_default();
+            named_for(&mut state, &m["sender"], &my_username(client).await);
+            if !keys.is_empty() {
+                state.retain(|k, _| keys.iter().any(|w| w == k));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&Value::Object(state))?);
+            } else if state.is_empty() {
+                println!("(这条消息没有你能读的卡片状态)");
+            } else {
+                print!("{}", state_lines(&state));
+            }
+        }
+        StateCmd::Set { message, key, value, read, write, if_rev } => {
+            let id = message.trim().trim_start_matches('#');
+            if !reads.is_all() {
+                let m = client.get_message(id).await?;
+                if !matches!(own_room(client, &room_of(&m), &reads).await, Own::Open) {
+                    not_theirs(&reads, "这条消息所在的房间");
+                }
+            }
+            let v: Value = serde_json::from_str(&value)
+                .with_context(|| format!("the value must be JSON — text is written '\"{value}\"'"))?;
+            let r = client
+                .set_card_state_with(id, &key, &v, read.as_deref(), write.as_deref(), if_rev)
+                .await?;
+            let item = &r["item"];
+            if r["applied"].as_bool() == Some(false) {
+                println!(
+                    "✗ not applied — {key} is at rev {} now: {}",
+                    item["rev"].as_u64().unwrap_or(0),
+                    serde_json::to_string(&item["v"]).unwrap_or_default()
+                );
+                std::process::exit(EXIT_CONFLICT);
+            }
+            println!("✓ {key} = {} · rev {}", serde_json::to_string(&item["v"]).unwrap_or_default(), item["rev"].as_u64().unwrap_or(0));
+        }
+    }
+    Ok(())
+}
+
+/// `mafold state set --if-rev` found the item moved on.
+pub const EXIT_CONFLICT: i32 = 6;
 
 fn message_text(m: &Value) -> String {
     let ts = m["created_at"].as_str().unwrap_or("");
@@ -555,16 +778,29 @@ pub(crate) fn readable_body(text: &str, id: &str) -> String {
 // ─────────────────────────── mafold access ───────────────────────────
 
 pub async fn run(cmd: AccessCmd, client: &Client) -> Result<()> {
+    // Outside the owner's circle a turn may ask for a room of its own — the
+    // ticket is then theirs — and see only its own. Which rooms this account
+    // lends, and to whom, stays its owner's business.
+    let reads = ReadsFor::from_env();
+    if !reads.is_all() && matches!(cmd, AccessCmd::Grant { .. } | AccessCmd::Revoke { .. } | AccessCmd::List) {
+        eprintln!("✗ 这一轮不是这个 agent 主人圈子的人发起的 —— 它把哪些房间借给谁、收不收回,是主人的事");
+        std::process::exit(EXIT_REFUSED);
+    }
     match cmd {
         AccessCmd::Request { chat: None, of: Some(of), with: Some(with), days, for_account, .. } => {
             let who = for_account.as_deref().unwrap_or("你");
             let r = client
-                .request_chat_access_pair(&of, &with, days, for_account.as_deref())
+                .request_chat_access_pair(&of, &with, days, for_account.as_deref(), reads.askers())
                 .await?;
             let pair = format!("@{} 和 @{} 的私聊", of.trim_start_matches('@'), with.trim_start_matches('@'));
-            if r["granted"].as_bool() == Some(true) {
+            // Outside the circle «granted» can't be checked here — the pair
+            // form never names the room — and saying it would tell this turn
+            // that a DM exists and the agent may read it: the very answer this
+            // form keeps uniform. It hears what «no such DM» hears.
+            let restricted = !reads.is_all() && for_account.is_none();
+            if r["granted"].as_bool() == Some(true) && !restricted {
                 println!("✓ {who} 已经能读「{pair}」了 —— 不用再问");
-            } else if r["pending"].as_bool() == Some(true) {
+            } else if r["pending"].as_bool() == Some(true) && !restricted {
                 println!("⏳ 已经问过了,卡还挂着,没人回应");
                 std::process::exit(EXIT_PENDING);
             } else {
@@ -583,10 +819,23 @@ pub async fn run(cmd: AccessCmd, client: &Client) -> Result<()> {
             }
             let chat = chat.context("要指名一个会话:<chat>,或者 --of @某人 --with @某人")?;
             let room = resolve_room(client, &chat).await?;
-            let r = ask(client, &room.id, from.as_deref(), days, for_account.as_deref()).await?;
+            let r = ask(client, &room.id, from.as_deref(), days, for_account.as_deref(), reads.askers()).await?;
             let who = for_account.as_deref().unwrap_or("你");
+            // «Granted» outside the circle only if this turn may use it: an api
+            // from before `askers` says so for anybody's ticket, and «you are in
+            // it» is a room `read` will refuse this turn anyway.
+            if r["granted"].as_bool() == Some(true) && !reads.is_all() && for_account.is_none() {
+                let theirs = r["reason"].as_str() != Some("participant")
+                    && lender_for(&client.list_chat_grants().await.unwrap_or_else(|_| json!({})), &room.id, &reads).is_some();
+                if !theirs {
+                    not_theirs(&reads, &room.label);
+                }
+            }
             if r["granted"].as_bool() == Some(true) {
                 println!("✓ {who} 已经能读「{}」了 —— 不用再问", room.label);
+            } else if someone_elses_ask(&r) {
+                println!("⏳ 「{}」已经有一张卡在等回应 —— 不是替这一轮的人问的;等它有了结果再申请", room.label);
+                std::process::exit(EXIT_PENDING);
             } else if r["pending"].as_bool() == Some(true) {
                 println!("⏳ 已经问过了,卡还挂在「{}」里,没人回应", room.label);
                 std::process::exit(EXIT_PENDING);
@@ -610,8 +859,8 @@ pub async fn run(cmd: AccessCmd, client: &Client) -> Result<()> {
         }
         AccessCmd::Status => {
             let g = client.list_chat_grants().await?;
-            let held = g["held"].as_array().cloned().unwrap_or_default();
-            let pending = g["pending"].as_array().cloned().unwrap_or_default();
+            let held: Vec<Value> = g["held"].as_array().into_iter().flatten().filter(|r| reads.admits_ticket(r)).cloned().collect();
+            let pending: Vec<Value> = g["pending"].as_array().into_iter().flatten().filter(|r| reads.admits_ask(r)).cloned().collect();
             if held.is_empty() && pending.is_empty() {
                 println!("(没有任何房间的读取票,也没有在等的申请)");
                 return Ok(());
@@ -688,9 +937,9 @@ fn expiry(unix: i64) -> String {
 /// history itself.
 ///
 /// A capability nobody tells the agent about does not exist: the daemon has
-/// been through this once already with `mafold room`, which sat unused until
-/// the installed apps were named in the prompt. So `chat.read` gets the same
-/// treatment, in the same place, in the same shape.
+/// been through this once already with the (since retired) `mafold room`, which
+/// sat unused until the installed apps were named in the prompt. So `chat.read`
+/// gets the same treatment, in the same place, in the same shape.
 ///
 /// Deliberately NOT the transcripts. Folding five rooms' history into every
 /// system prompt would burn the context window on turn one and be wasted on
@@ -699,9 +948,23 @@ fn expiry(unix: i64) -> String {
 ///
 /// `None` when there are no tickets — no tickets, no prompt overhead, exactly
 /// like the apps block.
-pub async fn context_block(client: &Client) -> Option<String> {
+pub async fn context_block(client: &Client, reads: &ReadsFor) -> Option<String> {
     let g = client.list_chat_grants().await.ok()?;
-    let held = g["held"].as_array().filter(|a| !a.is_empty())?;
+    access_block(&g, reads)
+}
+
+/// [`context_block`] for a `listChatGrants` answer already in hand: the
+/// tickets `reads` may use, as the prompt names them.
+///
+/// Only those. A ticket this turn may not use is not named either: the block
+/// used to list every ticket in every turn, so a stranger in a group the
+/// agent answers was told, by name and id, which DMs it could read — and
+/// `mafold read` would have read them (DEV #agent内记录转发, 2026-10-25).
+pub fn access_block(g: &Value, reads: &ReadsFor) -> Option<String> {
+    let held: Vec<&Value> = g["held"].as_array()?.iter().filter(|r| reads.admits_ticket(r)).collect();
+    if held.is_empty() {
+        return None;
+    }
     let mut s = String::from(
         "[CHAT ACCESS — conversations you are NOT in but hold a read ticket for. \
 Tickets expire; when one does, this line disappears and so does the access.]\n",
@@ -727,6 +990,186 @@ Tickets expire; when one does, this line disappears and so does the access.]\n",
     Some(s)
 }
 
+// ─────────────────────── whose eyes a turn reads with ───────────────────────
+
+/// Whose eyes a turn reads with: what it may open beyond the room it is in.
+///
+/// An agent holds `chat.read` tickets and sits in rooms of its own — other
+/// people's DMs with it, other groups. A turn is somebody talking to it, and
+/// what that turn may open is a question about THEM: the owner's circle may
+/// open whatever the agent can, someone else only what is theirs. Until
+/// 2026-10-25 nothing asked: every turn could open everything, so in a
+/// 28-person group anyone the agent takes orders from could have it read DMs
+/// it held tickets for, or its own DM with its owner.
+///
+/// The daemon decides it per turn (`agent::AllowList::reads_for`), the agent's
+/// process carries it ([`READS_FOR_ENV`], exported through the one door every
+/// harness uses, `harness::turn_env`), and every read verb here asks it:
+/// `read`, `msg`, `chats`, `access`. It is what the agent's own tools will
+/// do, not a sandbox — the process still holds the account's token. What it
+/// guarantees is that nothing hands a turn someone else's rooms: not the
+/// prompt, not the commands it is told to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadsFor {
+    /// The owner's circle — or no daemon turn at all (a person at their own
+    /// terminal, the agent's own machinery): whatever this account can read.
+    All,
+    /// Someone outside the circle, and whoever relayed them: rooms every one
+    /// of these people sits in, and tickets asked for or lent by every one of
+    /// them. Empty is nobody in particular, whom nothing is for.
+    People(Vec<String>),
+}
+
+/// Where a turn's process finds [`ReadsFor`]: `*` for the owner's circle, the
+/// people otherwise (comma-separated), `-` for nobody in particular.
+pub const READS_FOR_ENV: &str = "MAFOLD_READS_FOR";
+
+impl Default for ReadsFor {
+    /// Nobody in particular. A process nobody said it was for opens nothing
+    /// of anyone's — the wrong guess here costs a refusal, never a leak.
+    fn default() -> Self {
+        ReadsFor::People(vec![])
+    }
+}
+
+impl ReadsFor {
+    /// The turn this process is serving, as the daemon exported it. Unset is
+    /// not a daemon turn at all — a person at their own terminal — and they
+    /// read what their account reads.
+    pub fn from_env() -> Self {
+        match std::env::var(READS_FOR_ENV) {
+            Ok(v) => Self::parse(&v),
+            Err(_) => ReadsFor::All,
+        }
+    }
+
+    pub fn parse(v: &str) -> Self {
+        if v.trim() == "*" {
+            return ReadsFor::All;
+        }
+        ReadsFor::People(
+            v.split(',')
+                .map(|p| p.trim().trim_start_matches('@').to_lowercase())
+                .filter(|p| !p.is_empty() && p != "-")
+                .collect(),
+        )
+    }
+
+    /// [`Self::parse`]'s inverse — what the daemon exports.
+    pub fn env_value(&self) -> String {
+        match self {
+            ReadsFor::All => "*".into(),
+            ReadsFor::People(p) if p.is_empty() => "-".into(),
+            ReadsFor::People(p) => p.join(","),
+        }
+    }
+
+    /// Whom an ask made in this turn is for — recorded beside the ticket, so
+    /// the people who asked can use it and nobody else outside the circle can.
+    /// Empty for the circle, who may use every ticket anyway.
+    pub fn askers(&self) -> &[String] {
+        match self {
+            ReadsFor::All => &[],
+            ReadsFor::People(p) => p,
+        }
+    }
+
+    pub fn is_all(&self) -> bool {
+        matches!(self, ReadsFor::All)
+    }
+
+    /// Is every one of this turn's people among `names`? Nobody in particular
+    /// is among no one.
+    fn all_among<'a>(&self, names: impl Iterator<Item = &'a str> + Clone) -> bool {
+        match self {
+            ReadsFor::All => true,
+            ReadsFor::People(p) => {
+                !p.is_empty() && p.iter().all(|x| names.clone().any(|n| n.eq_ignore_ascii_case(x)))
+            }
+        }
+    }
+
+    /// May this turn use a `held` ticket (a `listChatGrants` row)? It is for
+    /// the people it was asked for (`for`) and for its lender (`account`),
+    /// who can read that room themselves.
+    pub fn admits_ticket(&self, row: &Value) -> bool {
+        let on = row["for"].as_array().into_iter().flatten().filter_map(Value::as_str);
+        self.all_among(on.chain(row["account"].as_str()))
+    }
+
+    /// May this turn see an ask still waiting (a `pending` row)?
+    pub fn admits_ask(&self, row: &Value) -> bool {
+        self.all_among(row["for"].as_array().into_iter().flatten().filter_map(Value::as_str))
+    }
+}
+
+/// May a turn reading for `reads` open `conv`, a room this account sits in?
+/// `row` is the room's line in `getChats` (None: not among them), `here` the
+/// room the turn is happening in — which everyone in the turn can read.
+pub(crate) fn may_read_room(row: Option<&Value>, conv: &str, here: Option<&str>, reads: &ReadsFor) -> bool {
+    if reads.is_all() || here.is_some_and(|h| h.trim().eq_ignore_ascii_case(conv.trim())) {
+        return true;
+    }
+    let Some(row) = row else { return false };
+    reads.all_among(row["participants"].as_array().into_iter().flatten().filter_map(|p| p["username"].as_str()))
+}
+
+/// The room this turn is happening in (`MAFOLD_CONV`), if it is a turn.
+fn turn_conv() -> Option<String> {
+    std::env::var("MAFOLD_CONV").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// What [`own_room`] found.
+enum Own {
+    /// This turn may open it as this account.
+    Open,
+    /// One of this account's rooms, and not this turn's people's.
+    Closed,
+    /// Not among this account's rooms, as far as its chat list says.
+    NotIn,
+}
+
+/// [`may_read_room`] against this account's chat list. The circle's turns and
+/// the turn's own room never ask. A room missing from the list (or a list that
+/// can't be fetched) is one nobody can vouch for: a restricted turn opens it
+/// only on a ticket of its own.
+async fn own_room(client: &Client, conv: &str, reads: &ReadsFor) -> Own {
+    let here = turn_conv();
+    if reads.is_all() || here.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(conv.trim())) {
+        return Own::Open;
+    }
+    let Ok(list) = client.chats().await else { return Own::NotIn };
+    match list["items"].as_array().into_iter().flatten().find(|c| c["id"].as_str() == Some(conv)) {
+        Some(row) if may_read_room(Some(row), conv, here.as_deref(), reads) => Own::Open,
+        Some(_) => Own::Closed,
+        None => Own::NotIn,
+    }
+}
+
+/// The rule `read` keeps, for every other verb that opens one of this
+/// account's rooms by id (`channels`, `tap`, `app call`): in a turn outside
+/// the owner's circle, a room its people could not open themselves is refused
+/// (`own_room`). The circle's turns, and the turn's own room, pass without a
+/// lookup.
+pub(crate) async fn ensure_may_open(client: &Client, conv: &str) {
+    let reads = ReadsFor::from_env();
+    if !reads.is_all() && !matches!(own_room(client, conv, &reads).await, Own::Open) {
+        not_theirs(&reads, conv);
+    }
+}
+
+/// What a restricted turn hears when the room is not its people's to open.
+fn not_theirs(reads: &ReadsFor, label: &str) -> ! {
+    let who = match reads {
+        ReadsFor::People(p) if !p.is_empty() => p.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join("、"),
+        _ => "不具名的访客".into(),
+    };
+    eprintln!("✗ 这一轮是替 {who} 跑的,「{label}」不是这一轮能打开的");
+    eprintln!("   这个 agent 待的别的房间、它持有的读取票,只在它主人圈子的那几轮、");
+    eprintln!("   或者房间里本来就有这个人 / 票是替这个人申请的时候才能用。别换个办法再试。");
+    std::process::exit(EXIT_REFUSED);
+}
+
 // ─────────────────────────── naming rooms ───────────────────────────
 
 /// A conversation, named the way every surface here should name one.
@@ -746,17 +1189,34 @@ pub struct Room {
 /// the screen can now pass it straight back.
 pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
     let a = arg.trim();
+    // A turn outside the owner's circle resolves among the rooms its people
+    // could open (`may_read_room`): naming one — or listing them when a name
+    // matches none or several — is the first thing about the others it has no
+    // business with. (`mafold chats` lists by the same rule.)
+    let reads = ReadsFor::from_env();
+    let here = turn_conv();
+    let theirs = |c: &Value| may_read_room(Some(c), c["id"].as_str().unwrap_or_default(), here.as_deref(), &reads);
     if is_uuid(a) {
         // A room I may not be in: name it from the grant list if it's there,
         // and otherwise say the uuid rather than inventing a title.
         if let Ok(list) = client.chats().await {
             if let Some(c) = list["items"].as_array().into_iter().flatten().find(|c| c["id"].as_str() == Some(a)) {
-                return Ok(room_from(client, c).await);
+                if theirs(c) {
+                    return Ok(room_from(client, c).await);
+                }
+                return Ok(Room { id: a.into(), label: a.into(), shape: String::new() });
             }
         }
         if let Ok(g) = client.list_chat_grants().await {
-            for key in ["held", "granted"] {
-                if let Some(r) = g[key].as_array().into_iter().flatten().find(|r| r["conversation_id"].as_str() == Some(a)) {
+            // Only from a ticket this turn may use.
+            let keys: &[&str] = if reads.is_all() { &["held", "granted"] } else { &["held"] };
+            for key in keys {
+                if let Some(r) = g[*key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|r| r["conversation_id"].as_str() == Some(a) && (*key != "held" || reads.admits_ticket(r)))
+                {
                     return Ok(Room {
                         id: a.into(),
                         label: r["title"].as_str().unwrap_or(a).to_string(),
@@ -769,7 +1229,7 @@ pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
     }
 
     let list = client.chats().await?;
-    let items = list["items"].as_array().cloned().unwrap_or_default();
+    let items: Vec<Value> = list["items"].as_array().into_iter().flatten().filter(|c| theirs(*c)).cloned().collect();
     let me = client.me().await.ok();
     let my = me
         .as_ref()
@@ -936,20 +1396,25 @@ fn is_permission_error(e: &anyhow::Error) -> bool {
     s.contains("permission denied") || s.contains("not a participant") || s.contains("chat.read")
 }
 
-fn held_grantor(grants: &Value, conv: &str) -> Option<String> {
+/// Whose ticket `mafold read` reads `conv` on, for a turn reading for `reads`:
+/// the longest-lived of the tickets this turn may use ([`ReadsFor::admits_ticket`]).
+/// A room lent several times keeps reading until the last of them lapses.
+pub(crate) fn lender_for(grants: &Value, conv: &str, reads: &ReadsFor) -> Option<String> {
     grants["held"]
         .as_array()?
         .iter()
-        .find(|r| r["conversation_id"].as_str() == Some(conv))?["account"]
+        .filter(|r| r["conversation_id"].as_str() == Some(conv) && reads.admits_ticket(r))
+        .max_by_key(|r| r["expires_at"].as_i64().unwrap_or(0))?["account"]
         .as_str()
         .map(str::to_string)
 }
 
-fn pending_for(grants: &Value, conv: &str) -> Option<Value> {
+/// An ask for `conv` still waiting, if it is this turn's to wait on.
+fn pending_for(grants: &Value, conv: &str, reads: &ReadsFor) -> Option<Value> {
     grants["pending"]
         .as_array()?
         .iter()
-        .find(|r| r["conversation_id"].as_str() == Some(conv))
+        .find(|r| r["conversation_id"].as_str() == Some(conv) && reads.admits_ask(r))
         .cloned()
 }
 
@@ -1195,9 +1660,75 @@ mod tests {
             {"conversation_id": "aaa", "account": "layg"},
             {"conversation_id": "bbb", "account": "kim"},
         ]});
-        assert_eq!(held_grantor(&g, "bbb").as_deref(), Some("kim"));
-        assert!(held_grantor(&g, "ccc").is_none());
-        assert!(held_grantor(&json!({}), "aaa").is_none());
+        let all = ReadsFor::All;
+        assert_eq!(lender_for(&g, "bbb", &all).as_deref(), Some("kim"));
+        assert!(lender_for(&g, "ccc", &all).is_none());
+        assert!(lender_for(&json!({}), "aaa", &all).is_none());
+    }
+
+    fn people(p: &[&str]) -> ReadsFor {
+        ReadsFor::People(p.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// A ticket asked for in one person's turn is THAT person's (and its
+    /// lender's — they can read the room anyway). The next stranger to talk to
+    /// the agent does not inherit it, and a relay is held to everyone in it.
+    #[test]
+    fn a_ticket_is_for_whoever_asked_for_it() {
+        let g = json!({"held": [{"conversation_id": "room", "account": "kim", "for": ["alice"]}]});
+        assert_eq!(lender_for(&g, "room", &people(&["alice"])).as_deref(), Some("kim"));
+        assert_eq!(lender_for(&g, "room", &people(&["kim"])).as_deref(), Some("kim"), "the lender's own turn");
+        assert!(lender_for(&g, "room", &people(&["bob"])).is_none(), "bob never asked");
+        assert!(lender_for(&g, "room", &people(&["alice", "bob"])).is_none(), "bob relaying alice");
+        assert!(lender_for(&g, "room", &people(&[])).is_none(), "nobody in particular");
+        assert_eq!(lender_for(&g, "room", &ReadsFor::All).as_deref(), Some("kim"), "the owner's circle");
+        // Among several lenders, the one whose ticket is this turn's.
+        let two = json!({"held": [
+            {"conversation_id": "room", "account": "kim", "for": ["alice"], "expires_at": 9},
+            {"conversation_id": "room", "account": "lee", "for": ["bob"], "expires_at": 5},
+        ]});
+        assert_eq!(lender_for(&two, "room", &people(&["bob"])).as_deref(), Some("lee"));
+        assert_eq!(lender_for(&two, "room", &ReadsFor::All).as_deref(), Some("kim"), "the longest-lived");
+    }
+
+    /// The prompt names exactly the tickets the turn may use, and an ask still
+    /// waiting is only the business of whom it is for.
+    #[test]
+    fn a_turn_is_told_only_of_its_own_tickets_and_asks() {
+        let g = json!({
+            "held": [
+                {"conversation_id": "r-alice", "title": "Alice's", "kind": "direct", "participant_count": 2, "account": "kim", "for": ["alice"], "expires_at": 0},
+                {"conversation_id": "r-owner", "title": "Owner's", "kind": "direct", "participant_count": 2, "account": "ops", "expires_at": 0},
+            ],
+            "pending": [{"conversation_id": "r-wait", "asked": "kim", "for": ["alice"]}, {"conversation_id": "r-old", "asked": "kim"}],
+        });
+        let alice = access_block(&g, &people(&["alice"])).expect("alice's ticket");
+        assert!(alice.contains("r-alice") && !alice.contains("r-owner"), "{alice}");
+        assert!(access_block(&g, &people(&["bob"])).is_none(), "no block at all for a turn with none");
+        let all = access_block(&g, &ReadsFor::All).unwrap();
+        assert!(all.contains("r-alice") && all.contains("r-owner"));
+        assert!(pending_for(&g, "r-wait", &people(&["alice"])).is_some());
+        assert!(pending_for(&g, "r-wait", &people(&["bob"])).is_none());
+        assert!(pending_for(&g, "r-old", &people(&["alice"])).is_none(), "an ask from before `for` is the circle's");
+        assert!(pending_for(&g, "r-old", &ReadsFor::All).is_some());
+    }
+
+    /// The same hole without any ticket: the agent's OWN other rooms — the
+    /// owner's DM with it, someone else's. In a stranger's turn it opens the
+    /// room the turn is in and rooms the stranger sits in themselves.
+    #[test]
+    fn a_strangers_turn_cannot_open_the_agents_other_rooms() {
+        let row = |id: &str, who: &[&str]| json!({"id": id, "participants": who.iter().map(|u| json!({"username": u})).collect::<Vec<_>>()});
+        let owners_dm = row("dm", &["ops", "ops:claude"]);
+        let shared = row("g2", &["Stranger", "ops:claude", "ann"]);
+        let s = people(&["stranger"]);
+        assert!(!may_read_room(Some(&owners_dm), "dm", Some("dev"), &s), "the owner's DM, from a stranger's turn");
+        assert!(may_read_room(Some(&shared), "g2", Some("dev"), &s), "a room the stranger is in");
+        assert!(may_read_room(None, "dev", Some("dev"), &s), "the room the turn is in");
+        assert!(!may_read_room(None, "elsewhere", Some("dev"), &s), "a room nobody can vouch for");
+        assert!(!may_read_room(Some(&shared), "g2", Some("dev"), &people(&["stranger", "bob"])), "bob isn't in it");
+        assert!(!may_read_room(Some(&shared), "g2", Some("dev"), &people(&[])));
+        assert!(may_read_room(Some(&owners_dm), "dm", Some("dev"), &ReadsFor::All));
     }
 
     /// Only a turn in an untitled channel is told to name it, with both ids
@@ -1217,5 +1748,36 @@ mod tests {
         // The list arrives either bare or wrapped in `items`.
         let wrapped = json!({"items": list});
         assert!(untitled_block_from(&wrapped, "conv-1", "c-new").is_some());
+    }
+
+    /// `mafold msg` / `mafold state get` on the bot's own reply: the server
+    /// hands the author every item, the agent is shown only those whose read
+    /// lists name it — an owner's summary or a note for one person printed
+    /// into a turn would go to whoever asked.
+    #[test]
+    fn an_agent_is_shown_the_items_its_lists_name_it_for() {
+        let item = |read: Value| json!({ "v": 1, "read": read, "write": ["sender"], "by": "ops:claude", "rev": 1 });
+        let mut items = json!({
+            "a.note": item(json!(["@linsky"])),
+            "a.summary": item(json!(["owner"])),
+            "a.tally": item(json!(["sender"])),
+            "a.open": item(json!(["all"])),
+            "a.mine": item(json!(["@Ops:Claude"])),
+            "a.receipt": item(json!(["server"])),
+        });
+        let items = items.as_object_mut().unwrap();
+        named_for(items, &json!({ "username": "ops:claude" }), "ops:claude");
+        let mut kept: Vec<&str> = items.keys().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, vec!["a.mine", "a.open", "a.tally"]);
+
+        // The owner reading their bot's reply is named by `owner`.
+        let mut theirs = json!({ "a.summary": item(json!(["owner"])), "a.tally": item(json!(["sender"])) });
+        named_for(theirs.as_object_mut().unwrap(), &json!({ "username": "ops:claude" }), "ops");
+        assert_eq!(theirs.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["a.summary"]);
+        // Nobody known: only what everyone reads.
+        let mut nobody = json!({ "a.open": item(json!(["all"])), "a.tally": item(json!(["sender"])) });
+        named_for(nobody.as_object_mut().unwrap(), &json!({ "username": "ops:claude" }), "");
+        assert_eq!(nobody.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["a.open"]);
     }
 }

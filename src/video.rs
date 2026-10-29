@@ -1118,8 +1118,8 @@ pub(crate) fn retryable(e: &anyhow::Error) -> bool {
 }
 
 /// Install the `mafold-video` skill into the daemon's own plugin
-/// (`~/.mafold/plugins/mafold`), beside `mafold-room` (`room::install_skill`):
-/// the agent sees it as `mafold:mafold-video`, the text lives in this binary,
+/// (`~/.mafold/plugins/mafold`): the agent sees it as `mafold:mafold-video`,
+/// the text lives in this binary,
 /// so the commands it names are the ones this version has. Loaded on demand by
 /// the harness (description-matched), so it costs nothing on unrelated turns.
 ///

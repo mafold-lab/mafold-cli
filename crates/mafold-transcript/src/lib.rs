@@ -19,6 +19,7 @@
 //! They differ only in transport — snapshots vs. append-only deltas — which is
 //! the one axis [`Transcript`] deliberately leaves to the caller.
 
+pub mod catalog;
 pub mod event;
 pub mod failure;
 pub mod fold;

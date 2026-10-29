@@ -18,6 +18,7 @@ mod codex_stats;
 #[allow(dead_code)]
 pub mod codex_app_server;
 pub mod kimi_code;
+pub mod unsupported;
 
 use async_trait::async_trait;
 use mafold_core::mafold_types::{CapsSource, HarnessCaps, ModeCap, ModelCap};
@@ -224,12 +225,29 @@ pub struct Mount {
     /// Claude Code (their `~/.claude/skills`, plugins, `CLAUDE.md`, settings),
     /// only the project's and the plugin folders above.
     pub guest: bool,
+    /// Whose eyes the process reads with — which of the agent's other rooms
+    /// and read tickets its `mafold read` may open ([`crate::chat::ReadsFor`]).
+    /// Exported by [`turn_env`]; a process started for one guest never serves
+    /// another's turn (it's part of the pool key).
+    pub reads: crate::chat::ReadsFor,
+    /// The built-in tools the process may use, comma-separated (Claude Code
+    /// `--tools`); None = the harness's own set. A tool left out never reaches
+    /// the model, description included — and every description is re-read on
+    /// every model call of the session.
+    pub tools: Option<String>,
 }
 
 impl Mount {
-    /// Stable text for the pool key: a guest's process is never an owner's.
+    /// Stable text for the pool key: a guest's process is never an owner's,
+    /// nor one guest's another's — nor one with fewer tools one with more.
     pub fn signature(&self) -> String {
-        format!("{}{}", self.plugin_dirs.join(","), if self.guest { "|guest" } else { "" })
+        format!(
+            "{}{}|reads={}{}",
+            self.plugin_dirs.join(","),
+            if self.guest { "|guest" } else { "" },
+            self.reads.env_value(),
+            self.tools.as_deref().map(|t| format!("|tools={t}")).unwrap_or_default()
+        )
     }
 }
 
@@ -245,10 +263,16 @@ impl Mount {
 /// and the chat list showed that line as if the channel's reply had finished.
 /// Exported EMPTY on `#all`, so a value inherited from the daemon's own
 /// environment can never stand in for a channel the turn isn't in.
-pub fn turn_env(conv: &str, surface: &str) -> [(&'static str, String); 2] {
+///
+/// `MAFOLD_READS_FOR` is whose eyes the turn reads with (`Mount::reads`):
+/// what `mafold read`, `msg`, `chats` and `access` may open beyond this room.
+/// Always exported, for the same reason — an inherited value must never stand
+/// in for the turn's own.
+pub fn turn_env(conv: &str, surface: &str, reads: &crate::chat::ReadsFor) -> [(&'static str, String); 3] {
     [
         ("MAFOLD_CONV", conv.to_string()),
         ("MAFOLD_FORUM_CHANNEL", forum_channel_of(surface).unwrap_or_default()),
+        (crate::chat::READS_FOR_ENV, reads.env_value()),
     ]
 }
 
@@ -289,7 +313,7 @@ pub fn forum_channel_of(surface: &str) -> Option<String> {
 pub struct Turn {
     pub prompt: String,
     /// The conversation id this turn runs in — exported to the agent's process
-    /// env as `MAFOLD_CONV` so `mafold room …` (the room skill) targets it.
+    /// env as `MAFOLD_CONV` so `mafold send` / `read` / `app call` target it.
     pub conv: String,
     /// The fully scoped SURFACE this turn runs on: bot, harness, conversation,
     /// forum channel and cwd. Exported as `MAFOLD_SURFACE` and used by the
@@ -600,6 +624,14 @@ pub trait Harness: Send + Sync {
     /// Is the harness CLI installed / runnable on this machine?
     fn available(&self) -> bool;
 
+    /// Can this build of mafold drive it at all, installed or not? False only
+    /// for [`unsupported::Unsupported`], the stand-in for a runtime the server
+    /// knows and this CLI doesn't — what `reportHarnesses` sends as `runs`, so
+    /// New Agent never offers a runtime the computer would refuse.
+    fn runs(&self) -> bool {
+        true
+    }
+
     /// Can a turn of this harness be CORRECTED while it runs — i.e. does it read
     /// [`Turn::steer_file`] and deliver what it finds to the model mid-flight?
     ///
@@ -738,25 +770,44 @@ pub trait Harness: Send + Sync {
     }
 }
 
-/// Every harness id the CLI knows about (installed or not) — for menus / docs.
-/// (Used by the supervisor to list/validate harnesses — Phase 2.)
-#[allow(dead_code)]
+/// Every harness id the CLI knows about (installed or not) — what it probes
+/// and reports, whether or not it can drive it ([`Harness::runs`]).
 pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw", "kimi-code"];
 
 /// The default when a bot doesn't specify one.
 #[allow(dead_code)]
 pub const DEFAULT: &str = "claude-code";
 
-/// Resolve a harness by id (case/alias tolerant). Unknown ids fall back to the
-/// default so a misconfigured bot still runs Claude Code.
+/// Resolve a harness by id (case/alias tolerant). No id means the default,
+/// Claude Code. Any other id this build can't drive — `opencode` and
+/// `openclaw` today, or a name it has never heard of — gets
+/// [`unsupported::Unsupported`], which keeps the id and refuses every turn.
+/// It used to get Claude Code: an agent set to OpenCode then answered as
+/// Claude Code on the machine's Claude login, and nobody could tell (10-29).
 pub fn select(id: &str) -> Arc<dyn Harness> {
     match id.trim().to_lowercase().as_str() {
         "claude-code" | "claude" | "claudecode" | "" => Arc::new(claude_code::ClaudeCode),
         "codex" | "codex-cli" => Arc::new(codex::Codex),
         "kimi-code" | "kimi" | "kimi-cli" | "kimicode" => Arc::new(kimi_code::KimiCode),
-        // opencode / openclaw plug in here as they're implemented.
-        _ => Arc::new(claude_code::ClaudeCode),
+        other => Arc::new(unsupported::Unsupported { id: intern(other) }),
     }
+}
+
+/// A `&'static str` for an id that came in at runtime, kept once per distinct
+/// id: `Harness::id` is `'static`, and the supervisor asks `select` again on
+/// every `status`, so leaking a fresh copy each time would grow forever.
+fn intern(id: &str) -> &'static str {
+    if let Some(k) = KNOWN.iter().find(|k| **k == id) {
+        return k;
+    }
+    static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if let Some(k) = seen.get(id) {
+        return k;
+    }
+    let k: &'static str = Box::leak(id.to_string().into_boxed_str());
+    seen.insert(k);
+    k
 }
 
 // (harness id, the CLI binary whose presence signals it's installed)
@@ -838,13 +889,14 @@ pub async fn report_rows() -> Vec<Value> {
         // `null` (not `unknown`) when the harness isn't installed: there is no
         // seat to have an opinion about.
         //
-        // `select()` deliberately falls back to Claude Code for ids it doesn't
-        // implement, so asking it directly would attribute CLAUDE's seat to
-        // `opencode`/`openclaw` — verified live: both rows came back "Max
-        // (20x)" with Claude's windows. Ask the harness who it actually is
-        // instead of keeping a second list of "ids that are implemented" (§9).
+        // Only a harness this build can drive has a seat to ask about: an
+        // `opencode` row once came back "Max (20x)" with Claude's windows,
+        // when `select()` still answered every unknown id with Claude Code.
+        // Ask the harness itself (`runs`) instead of keeping a second list of
+        // "ids that are implemented" (§9).
         let h = select(id);
-        let implemented = available && h.id() == id;
+        let runs = h.runs();
+        let implemented = available && runs;
         let (health, accounts) = if implemented {
             // Only Claude Code keys logins by directory today; every other
             // harness has exactly one seat, its default.
@@ -869,6 +921,9 @@ pub async fn report_rows() -> Vec<Value> {
         rows.push(serde_json::json!({
             "id": id,
             "available": available,
+            // Mafold here can drive it (installed or not): New Agent offers
+            // only these, and createBot refuses the others on this computer.
+            "runs": runs,
             "version": version,
             "health": health,
             "accounts": accounts,
@@ -887,6 +942,8 @@ pub async fn report_body(sess: &crate::session::Session) -> Value {
         "device_id": sess.device_id,
         "device_name": sess.device_name,
         "cli_version": env!("CARGO_PKG_VERSION"),
+        // `macos` / `linux` / `windows`: New Agent names each computer's OS.
+        "os": std::env::consts::OS,
         "harnesses": report_rows().await,
     })
 }
@@ -1437,6 +1494,60 @@ mod exit_watch_tests {
     async fn exit_watch_without_a_pid_waits_forever() {
         let mut watch = ExitWatch::new(None);
         assert!(tokio::time::timeout(Duration::from_millis(600), watch.gone()).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    /// 10-29: an agent created with runtime `opencode` answered as Claude Code
+    /// — on the machine's Claude login, with Claude's models in its Customize
+    /// sheet — because `select` turned every id it didn't implement into
+    /// Claude Code, and the only trace was one stdout line. A runtime is run
+    /// by itself or not at all.
+    #[test]
+    fn no_runtime_is_quietly_run_by_another() {
+        for id in KNOWN {
+            assert_eq!(select(id).id(), *id, "`{id}` must be run by itself or refused, never by another runtime");
+        }
+    }
+
+    /// The runtimes this build drives say so; the others say they can't —
+    /// which is what `reportHarnesses` sends as `runs`.
+    #[test]
+    fn a_runtime_says_whether_mafold_can_run_it() {
+        for id in ["claude-code", "codex", "kimi-code"] {
+            assert!(select(id).runs(), "{id}");
+        }
+        for id in ["opencode", "openclaw", "some-new-thing"] {
+            assert!(!select(id).runs(), "{id}");
+            assert!(!select(id).available(), "{id}: nothing here can run it, installed or not");
+        }
+        // No id is the default, and aliases still find their runtime.
+        assert_eq!(select("").id(), "claude-code");
+        assert_eq!(select(" Claude ").id(), "claude-code");
+        assert_eq!(select("kimi").id(), "kimi-code");
+    }
+
+    /// The person talking to the agent is told what happened and what to do,
+    /// and the runtimes it names are the ones `select` really runs.
+    #[test]
+    fn a_turn_on_a_runtime_mafold_cant_run_is_refused_in_words() {
+        assert_eq!(
+            unsupported::refusal("opencode"),
+            "This agent is set to run OpenCode, which Mafold on this computer can't run, so nothing ran. \
+             Mafold runs Claude Code, Codex and Kimi Code: make a new agent on one of them."
+        );
+    }
+
+    /// One id, one string: the supervisor asks again on every `status`.
+    #[test]
+    fn an_unheard_of_id_is_kept_once() {
+        let a = select("brand-new").id();
+        let b = select("brand-new").id();
+        assert_eq!(a, "brand-new");
+        assert!(std::ptr::eq(a, b));
     }
 }
 

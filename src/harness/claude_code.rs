@@ -558,11 +558,7 @@ impl Harness for ClaudeCode {
                 // any `result` was reported as a normal Done — errors vanished).
                 let subtype = v["subtype"].as_str().unwrap_or("");
                 if v["is_error"].as_bool().unwrap_or(false) || (!subtype.is_empty() && subtype != "success") {
-                    error = Some(
-                        v["result"].as_str().map(str::trim).filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| format!("agent ended with `{}`", if subtype.is_empty() { "error" } else { subtype })),
-                    );
+                    error = Some(result_error(&v));
                     break;
                 }
                 // Not OUR receipt. `claude -p --resume` drains the session's
@@ -1300,6 +1296,11 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         for d in &shape.mount.plugin_dirs {
             cmd.arg("--plugin-dir").arg(d);
         }
+        // The built-in tools this process may use (`Mount::tools`). Per
+        // process too: the set is fixed when claude starts.
+        if let Some(t) = &shape.mount.tools {
+            cmd.arg("--tools").arg(t);
+        }
         // A guest's turn (`Mount::guest`) runs on none of the owner's own
         // Claude Code: `user` drops out of the setting sources, and with it
         // their skills, plugins and CLAUDE.md. Measured on CC 2.1.289: the
@@ -1319,11 +1320,11 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         if let Some(e) = &shape.effort {
             cmd.arg("--effort").arg(e);
         }
-        // Export the current conversation and forum channel so `mafold room …`,
-        // `send` and `read` default to THIS room and channel (`turn_env`).
+        // Export the current conversation and forum channel so `mafold send`
+        // and `read` default to THIS room and channel (`turn_env`).
         // Per-process: a warm process serves one surface, and the surface
         // carries the channel.
-        for (k, v) in super::turn_env(&shape.conv, &shape.surface) {
+        for (k, v) in super::turn_env(&shape.conv, &shape.surface, &shape.mount.reads) {
             cmd.env(k, v);
         }
         // `mafold …` in the agent's shell is THIS daemon's binary: the commands
@@ -1593,6 +1594,31 @@ fn is_queued_receipt(v: &Value, produced: bool) -> bool {
         && v["result"].as_str().map(str::trim).is_none_or(str::is_empty)
 }
 
+/// Why a non-success `result` ended the turn: its `result` text, else its
+/// `errors` list, else the subtype.
+///
+/// `errors` is not optional reading. A `--resume` whose transcript is gone
+/// (claude 2.1.280) ends on `error_during_execution` with NO `result` text and
+/// the reason only in `errors` — "No conversation found with session ID: …".
+/// Reading `result` alone turned that into "agent ended with
+/// `error_during_execution`", which the stale-session retry in `agent` cannot
+/// recognise: the channel kept resuming the dead session and every message
+/// died in three seconds on an `unknown` card.
+fn result_error(v: &Value) -> String {
+    let subtype = v["subtype"].as_str().unwrap_or("");
+    if let Some(text) = v["result"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return text.to_string();
+    }
+    let errors: Vec<&str> = v["errors"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    if !errors.is_empty() {
+        return errors.join(" / ");
+    }
+    format!("agent ended with `{}`", if subtype.is_empty() { "error" } else { subtype })
+}
+
 #[cfg(test)]
 mod permission_tests {
     use super::*;
@@ -1823,6 +1849,29 @@ mod tests {
         assert_eq!(env_of("c1____opsdu_claude-code"), (Some("c1".into()), Some(String::new())));
     }
 
+    /// …and whose eyes it reads with (`Mount::reads`), on every way a process
+    /// starts: a guest's process reads for that guest, a process nobody said
+    /// anything about for nobody.
+    #[test]
+    fn the_agent_process_is_told_whom_it_reads_for() {
+        let reads_of = |reads: crate::chat::ReadsFor, forked: bool| {
+            let mount = super::super::Mount { reads, ..Default::default() };
+            let shape = super::super::TurnShape { mount, ..resuming("reads-env-test") };
+            let b = build_cmd(&shape, "mafold", forked);
+            b.cmd
+                .as_std()
+                .get_envs()
+                .find(|(n, _)| *n == crate::chat::READS_FOR_ENV)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        for forked in [false, true] {
+            assert_eq!(reads_of(crate::chat::ReadsFor::All, forked).as_deref(), Some("*"));
+            assert_eq!(reads_of(crate::chat::ReadsFor::People(vec!["alice".into()]), forked).as_deref(), Some("alice"));
+            assert_eq!(reads_of(Default::default(), forked).as_deref(), Some("-"));
+        }
+    }
+
     /// The drive mount is per PROCESS and `--resume` doesn't carry it (measured,
     /// CC 2.1.282: no `--plugin-dir` on a resume = no skills), so every way a
     /// process starts — fresh, resumed, forked — must carry both plugin folders.
@@ -1863,6 +1912,28 @@ mod tests {
         assert!(!args(&plain).iter().any(|a| a == "--plugin-dir"));
     }
 
+    /// A mount that names its tools starts every process on just those —
+    /// fresh, resumed or forked — and is a different process in the pool than
+    /// one on the full set. No tools named = claude's own set, no flag.
+    #[test]
+    fn a_mount_that_names_its_tools_gets_only_those() {
+        let narrow = super::super::Mount { tools: Some("Bash,Read,Edit,Write".into()), ..Default::default() };
+        let sid = format!("tools-test-{}", std::process::id());
+        let fresh = super::super::TurnShape { session: None, mount: narrow.clone(), ..resuming(&sid) };
+        let resumed = super::super::TurnShape { mount: narrow.clone(), ..resuming(&sid) };
+        for (label, b) in [
+            ("fresh", build_cmd(&fresh, "mafold", false)),
+            ("resumed", build_cmd(&resumed, "mafold", false)),
+            ("forked", build_cmd(&resumed, "mafold", true)),
+        ] {
+            let a = args(&b);
+            let tools: Vec<&str> = a.windows(2).filter(|w| w[0] == "--tools").map(|w| w[1].as_str()).collect();
+            assert_eq!(tools, ["Bash,Read,Edit,Write"], "{label}");
+        }
+        assert!(!args(&build_cmd(&resuming(&sid), "mafold", false)).iter().any(|a| a == "--tools"));
+        assert_ne!(narrow.signature(), super::super::Mount::default().signature());
+    }
+
     /// What a guest's process keeps of the owner's settings: their guardrails
     /// and what reaching a model needs — never their hooks or plugins, and
     /// never over the daemon's own keys.
@@ -1893,7 +1964,7 @@ mod tests {
     #[test]
     fn a_guests_process_leaves_the_owners_own_settings_out() {
         let sid = format!("guest-test-{}", std::process::id());
-        let mount = super::super::Mount { plugin_dirs: vec!["/h/.mafold/plugins/mafold".into()], guest: true };
+        let mount = super::super::Mount { plugin_dirs: vec!["/h/.mafold/plugins/mafold".into()], guest: true, ..Default::default() };
         let fresh = super::super::TurnShape { session: None, mount: mount.clone(), ..resuming(&sid) };
         let resumed = super::super::TurnShape { mount: mount.clone(), ..resuming(&sid) };
         for (label, b) in [
@@ -1976,6 +2047,24 @@ mod tests {
     fn stderr_is_the_reason_when_claude_writes_there() {
         let r = exit_reason(Some(1), "No conversation found with session ID: 29cbfee1\n", &[]);
         assert!(r.contains("No conversation found"), "{r}");
+    }
+
+    /// claude 2.1.280 says a missing `--resume` transcript ON the stream: an
+    /// `error_during_execution` result with no `result` text and the reason
+    /// only in `errors` (frame as captured from the field, 10-26).
+    #[test]
+    fn a_result_without_text_reads_its_errors() {
+        let v = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "num_turns": 0, "session_id": "bd681c70-93c8-45d0-8c03-0bfd11daa4ec",
+            "errors": ["No conversation found with session ID: bd681c70-93c8-45d0-8c03-0bfd11daa4ec"],
+        });
+        let r = result_error(&v);
+        assert_eq!(r, "No conversation found with session ID: bd681c70-93c8-45d0-8c03-0bfd11daa4ec");
+        // `result` text still wins, and with neither the subtype is the reason.
+        assert_eq!(result_error(&serde_json::json!({"subtype": "error_during_execution", "result": "API Error: 500", "errors": ["x"]})), "API Error: 500");
+        assert_eq!(result_error(&serde_json::json!({"subtype": "error_max_turns", "errors": []})), "agent ended with `error_max_turns`");
+        assert_eq!(result_error(&serde_json::json!({"is_error": true})), "agent ended with `error`");
     }
 
     /// The regression this fixes: claude printed the reason as PLAIN TEXT on

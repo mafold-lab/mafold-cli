@@ -152,7 +152,7 @@ async fn exec(cmd: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Value> {
     let pid = child.id();
     // Into the job at once, before the shell has started anything — see `Tree`.
     #[cfg(windows)]
-    let tree = Tree::of(&child);
+    let tree = child.raw_handle().and_then(Tree::of);
     let (mut out, mut err) = (Captured::from(child.stdout.take()), Captured::from(child.stderr.take()));
 
     let deadline = std::time::Duration::from_millis(timeout_ms);
@@ -266,58 +266,14 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// The process TREE a command started, so a timeout can end all of it.
-///
-/// Unix gets that from `setsid` + `killpg`. Windows has no process group to
-/// signal, and `kill_group` was a no-op there — so the timeout killed nothing,
-/// the wait under it waited for the command to finish on its own, and a
-/// `shell.exec` on Windows ran as long as it liked: the caller gave up at 30s
-/// with "no device answered", and the machine stayed busy with it for minutes.
-/// A job object is Windows' process group: everything the shell starts joins
-/// it, and `TerminateJobObject` ends the lot. No `KILL_ON_JOB_CLOSE` — a
-/// command that FINISHES leaves whatever it started running, as on Unix.
+/// The process TREE a command started, so a timeout can end all of it: on
+/// Windows a job object ([`crate::platform::JobTree`]) — Unix has `setsid` +
+/// `killpg`. Before it, `kill_group` was a no-op there, so the timeout killed
+/// nothing and a `shell.exec` on Windows ran as long as it liked: the caller
+/// gave up at 30s with "no device answered", and the machine stayed busy with
+/// it for minutes.
 #[cfg(windows)]
-struct Tree(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl Tree {
-    fn of(child: &tokio::process::Child) -> Option<Self> {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
-        let process = child.raw_handle()?;
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                return None;
-            }
-            if AssignProcessToJobObject(job, process as _) == 0 {
-                CloseHandle(job);
-                return None;
-            }
-            Some(Self(job))
-        }
-    }
-
-    fn kill(&self) {
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Tree {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-
-// The handle is only ever used to terminate the job, from whichever task owns
-// the exec future.
-#[cfg(windows)]
-unsafe impl Send for Tree {}
+use crate::platform::JobTree as Tree;
 
 #[cfg(unix)]
 fn kill_group(pid: i32) {

@@ -109,6 +109,9 @@ impl<'a> Dest<'a> {
 pub const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 /// How long the lost-turn notice waits before the journal takes it over.
 const NOTICE_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The error a compare-and-set write ends on when the server predates
+/// revisions (card-state §3.6): it wrote, but unchecked.
+pub const IF_REV_UNSUPPORTED: &str = "this server does not check if_rev yet";
 /// The longest single pause between connect attempts while the link is down.
 const LINK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -412,12 +415,17 @@ impl Client {
     }
 
     /// Ask a room's people for a `chat.read` ticket (.docs/chat-record-sharing-v1.md).
+    ///
+    /// `askers`: whom, outside the owner's circle, the turn asking is for
+    /// (`chat::ReadsFor::askers`). Recorded with the ticket, so it is theirs
+    /// to use and nobody else's; empty for the circle's own asks.
     pub async fn request_chat_access(
         &self,
         chat_id: &str,
         from: &str,
         days: i64,
         for_account: Option<&str>,
+        askers: &[String],
     ) -> Result<Value> {
         let mut body = json!({
             "conversation_id": chat_id,
@@ -429,6 +437,9 @@ impl Client {
         });
         if let Some(f) = for_account {
             body["for"] = json!(f.trim_start_matches('@'));
+        }
+        if !askers.is_empty() {
+            body["askers"] = json!(askers);
         }
         self.post("requestChatAccess", body).await
     }
@@ -445,6 +456,7 @@ impl Client {
         with: &str,
         days: i64,
         for_account: Option<&str>,
+        askers: &[String],
     ) -> Result<Value> {
         let mut body = json!({
             "of": of.trim_start_matches('@'),
@@ -453,6 +465,9 @@ impl Client {
         });
         if let Some(f) = for_account {
             body["for"] = json!(f.trim_start_matches('@'));
+        }
+        if !askers.is_empty() {
+            body["askers"] = json!(askers);
         }
         self.post("requestChatAccess", body).await
     }
@@ -519,6 +534,53 @@ impl Client {
             json!({ "message_id": message_id, "key": key, "v": v, "read": read, "write": write }),
         )
         .await
+    }
+
+    /// [`Self::set_card_state`] with the lists left out unless given (an
+    /// existing item's are fixed; a new one's default to `read:[all]`,
+    /// `write:[sender]`), and optionally only if the item is still at revision
+    /// `if_rev` (`0`: only if there is none yet). Not applied is an answer, not
+    /// an error: `applied: false` and the item as it is now (§3.6).
+    pub async fn set_card_state_with(
+        &self,
+        message_id: &str,
+        key: &str,
+        v: &Value,
+        read: Option<&[String]>,
+        write: Option<&[String]>,
+        if_rev: Option<u64>,
+    ) -> Result<Value> {
+        let mut body = json!({ "message_id": message_id, "key": key, "v": v });
+        if let Some(read) = read {
+            body["read"] = json!(read);
+        }
+        if let Some(write) = write {
+            body["write"] = json!(write);
+        }
+        if let Some(rev) = if_rev {
+            body["if_rev"] = json!(rev);
+        }
+        let mut r = self.post_idempotent("setCardState", body).await?;
+        if if_rev.is_some() && r.get("applied").is_none() {
+            // A server from before revisions drops `if_rev` and writes anyway;
+            // its answer has no `applied`. Never report that as a checked write.
+            anyhow::bail!("{IF_REV_UNSUPPORTED}: {key} was written WITHOUT the revision check");
+        }
+        // Not applied, yet the item is exactly what this write said, by this
+        // account: the first attempt landed and its answer was lost, and the
+        // retry (`post_idempotent`) met its own write at the next revision.
+        if r["applied"].as_bool() == Some(false) && r["item"]["v"] == *v {
+            let me = self.me().await.ok().and_then(|m| m["username"].as_str().map(str::to_lowercase));
+            if me.is_some_and(|me| r["item"]["by"].as_str().is_some_and(|by| by.trim_start_matches('@').eq_ignore_ascii_case(&me))) {
+                r["applied"] = json!(true);
+            }
+        }
+        Ok(r)
+    }
+
+    /// What this account may read of a message's controlled state.
+    pub async fn get_card_state(&self, message_id: &str) -> Result<Value> {
+        self.post("getCardState", json!({ "message_id": message_id })).await
     }
 
     pub async fn get_thread_messages(
@@ -622,18 +684,6 @@ impl Client {
         .await
     }
 
-    // ── shared-room CRDT relay (the AI's room peer; see room.rs) ──
-    pub async fn room_changes(&self, conv: &str, app: &str) -> Result<Value> {
-        self.post("roomChanges", json!({ "conv": conv, "app": app }))
-            .await
-    }
-    pub async fn room_change(&self, conv: &str, app: &str, changes: Vec<String>) -> Result<Value> {
-        self.post(
-            "roomChange",
-            json!({ "conv": conv, "app": app, "changes": changes }),
-        )
-        .await
-    }
     pub async fn list_installs(&self, conv: &str) -> Result<Value> {
         self.post("listInstalls", json!({ "conversation_id": conv }))
             .await

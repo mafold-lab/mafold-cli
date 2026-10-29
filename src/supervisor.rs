@@ -452,7 +452,7 @@ fn launchagent_path() -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = platform::current_exe()?;
     // Only what the process says before it points its output at this same file
     // itself (`supervise` → `logfile::keep`): a crash at startup.
     let log = supervisor_log();
@@ -532,7 +532,7 @@ fn systemd_unit_path() -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = platform::current_exe()?;
     fs::create_dir_all(home().join(".config/systemd/user"))?;
     // Carry `--no-auto-update` into the boot-persistent unit (see the macOS/Windows
     // paths) so a locally-patched install survives a reboot un-clobbered.
@@ -700,7 +700,7 @@ fn task_arguments(exe: &str, base: &str, no_auto_update: bool) -> String {
 
 #[cfg(windows)]
 fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = platform::current_exe()?;
     fs::create_dir_all(home().join(".mafold"))?;
     // Scope the logon trigger + run-as principal to the current user (the task
     // is per-user, like a launchd gui-domain agent / systemd --user unit).
@@ -821,7 +821,7 @@ fn remove_autostart() {
 /// re-registers the task against the current binary.
 #[cfg(windows)]
 fn autostart_loaded() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = platform::current_exe() else { return false };
     let Some(xml) = query_task_xml() else { return false };
     xml.contains(&xml_escape(&exe.display().to_string())) && xml.contains("supervise")
 }
@@ -834,7 +834,7 @@ fn autostart_loaded() -> bool {
 /// registered without it — the user's intent would never reach the logon task).
 #[cfg(windows)]
 fn autostart_current(base: &str, no_auto_update: bool) -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = platform::current_exe() else { return false };
     let Some(xml) = query_task_xml() else { return false };
     // The expected arguments embed the (quoted) exe path, so this one check
     // also rejects a task pointing at another binary — and a pre-conhost task
@@ -937,6 +937,11 @@ pub fn up(base: &str, no_auto_update: bool) -> Result<()> {
             }
         };
         println!("✓ supervisor running (pid {pid}) — {what}; picks up changes within ~10s");
+        // On macOS and Linux "current" never looks at the binary: the service
+        // may be another install's, and this `up` changed nothing about that.
+        if let Some(theirs) = registered_elsewhere() {
+            println!("  note: it runs {theirs}, not this mafold — `mafold up --adopt` moves it (and its bots) onto this one");
+        }
         return Ok(());
     }
     // An older supervisor (detached, or registered with other flags) goes
@@ -988,7 +993,7 @@ fn managing(n: usize) -> String {
 /// Spawn the detached `mafold supervise` process.
 fn start_supervisor(base: &str, no_auto_update: bool) -> Result<u32> {
     fs::create_dir_all(daemons_dir())?;
-    let exe = std::env::current_exe()?;
+    let exe = platform::current_exe()?;
     // Already its own log, begun with the mark — so whatever it prints before
     // it takes the file over (an error it dies of) is read like the rest.
     let out = crate::logfile::open_for_child(&supervisor_log())?;
@@ -1009,6 +1014,454 @@ fn start_supervisor(base: &str, no_auto_update: bool) -> Result<u32> {
     // `up`'s read-back proves the new process got that far — a file written
     // on its behalf would read as running while it crashed at startup.
     Ok(child.id())
+}
+
+// ---------------- `mafold up --adopt` (activity center C10) ----------------
+//
+// Hand this computer's bots to the mafold running the command — the desktop
+// app's copy, typically, taking over a service another install set up. Plain
+// `up` can't: on macOS and Linux it never compares the registered binary
+// (`autostart_current`), so it confirms another install's service as running
+// and leaves it; and with other flags it re-registers onto the caller without
+// a word about the bots it just took.
+
+/// Why the service here isn't this mafold's to manage. Each is something
+/// `up --adopt` changes; a managing program (the desktop app) shows them by
+/// name instead of working them out again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NotOurs {
+    /// Registered to run another binary: another install (Homebrew, a dev
+    /// build, the cli someone installed before the app) or one that's gone.
+    Elsewhere,
+    /// A supervisor no service manager started: `mafold supervise` in a
+    /// terminal, or `up` on a machine whose service manager refused it.
+    ByHand,
+    /// Registered with `--no-auto-update`, the old way to keep updates off.
+    /// The machine setting (`mafold update --auto-update`) is the way now,
+    /// and it stays as it is.
+    UpdateFlag,
+}
+
+/// The reasons, from the registration as written, whether the service
+/// manager holds it, whether a supervisor runs, and this binary (canonical).
+fn not_ours(reg: Option<&Registration>, held: bool, running: bool, me: &str) -> Vec<NotOurs> {
+    let mut why = Vec::new();
+    if let Some(r) = reg {
+        if r.exe.as_deref().is_none_or(|e| canonical(e) != me) {
+            why.push(NotOurs::Elsewhere);
+        }
+        if r.no_auto_update {
+            why.push(NotOurs::UpdateFlag);
+        }
+    }
+    if running && !(reg.is_some() && held) {
+        why.push(NotOurs::ByHand);
+    }
+    why
+}
+
+/// The binary the service is registered to run, when it isn't this one.
+fn registered_elsewhere() -> Option<String> {
+    let me = canonical(&platform::current_exe().ok()?.display().to_string());
+    let theirs = registration()?.exe?;
+    (canonical(&theirs) != me).then_some(theirs)
+}
+
+fn same_base(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// What stands in the way of moving the service, as `up --adopt` sees it
+/// before touching anything.
+#[derive(Default)]
+struct Obstacles<'a> {
+    /// The Mafold the service talks to: as registered, else as the running
+    /// supervisor says (its run record, its command line).
+    theirs: Option<&'a str>,
+    /// A supervisor started by hand runs, and nothing says its Mafold.
+    by_hand_unknown: bool,
+    /// The service manager can't be reached from here (`systemctl --user`
+    /// without the session's bus) while a service is registered: removing it
+    /// would only delete the file, and the manager would start the old one
+    /// again.
+    no_manager: bool,
+    /// Running inside a bot's own reply.
+    inside_bot: bool,
+}
+
+/// Why `up --adopt` won't move the service: `(code, what to say)`.
+fn adopt_refused(o: &Obstacles, base: &str) -> Option<(&'static str, String)> {
+    if let Some(theirs) = o.theirs.filter(|b| !same_base(b, base)) {
+        return Some((
+            "base_differs",
+            format!(
+                "the service here talks to {theirs}, this mafold to {base} — adopting it would move its bots to another Mafold. To keep {theirs}: `mafold --base {theirs} up --adopt`"
+            ),
+        ));
+    }
+    if o.by_hand_unknown {
+        return Some((
+            "base_unknown",
+            "the supervisor here was started by hand and doesn't say which Mafold it talks to, so adopting it could move its bots to another one — stop it (`mafold down`), then `mafold up` starts this one".into(),
+        ));
+    }
+    if o.no_manager {
+        return Some((
+            "no_service_manager",
+            "the service manager can't be reached from here, so the old service couldn't be removed for good — it would start again. Run this in the computer's own session (the desktop app, or a terminal there)".into(),
+        ));
+    }
+    if o.inside_bot {
+        return Some((
+            "inside_bot",
+            "this is running inside a bot's reply, and adopting restarts every bot here — this one too, halfway through. Run it from a terminal or the desktop app".into(),
+        ));
+    }
+    None
+}
+
+/// The Mafold a running supervisor talks to: its run record (since C10), else
+/// `--base` on its command line.
+fn base_of_running(pid: u32) -> Option<String> {
+    if let Some(b) = crate::lifecycle::read::<crate::lifecycle::Run>(&crate::lifecycle::run_path())
+        .filter(|r| r.pid == pid)
+        .and_then(|r| r.base)
+    {
+        return Some(b);
+    }
+    #[cfg(unix)]
+    return platform::std_command("ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| base_after(String::from_utf8_lossy(&o.stdout).trim()));
+    #[cfg(not(unix))]
+    return None;
+}
+
+/// Can this process reach the service manager the service is registered
+/// with? Removing a service it can't reach deletes only the file.
+fn service_manager_reachable() -> bool {
+    #[cfg(target_os = "linux")]
+    return platform::std_command("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    #[cfg(target_os = "macos")]
+    return platform::std_command("launchctl")
+        .arg("print")
+        .arg(format!("gui/{}", unsafe { libc::getuid() }))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return true;
+}
+
+/// How long `up --adopt` waits for the replies in progress before it restarts
+/// the bots anyway — what an update waits.
+const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long it waits for every bot to be running again under the new
+/// supervisor (which starts them on its first pass).
+const BOTS_BACK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What `mafold up --adopt [--check]` found or did — `--json` prints it as one
+/// object: the desktop app's confirmation dialog, and its read-back.
+#[derive(Serialize, Debug)]
+pub(crate) struct Adopt {
+    pub ok: bool,
+    /// `--check`: `adoptable` (`reasons` say why), `managed` (this mafold's
+    /// already: nothing to move), `not_set_up` (nothing registered or
+    /// running: `--adopt` sets it up here, as `up` does).
+    /// Done: `adopted`, or `managed` (it was this mafold's, running).
+    /// Refused, nothing touched: `base_differs`, `inside_bot`.
+    /// Not done as asked: `not_registered` (running, but not registered to
+    /// run this binary on login), `bots_not_back` (a bot isn't running again),
+    /// `failed` (`detail` says how far it got).
+    pub code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// This binary: what the service runs afterwards.
+    pub exe: Option<String>,
+    pub reasons: Vec<NotOurs>,
+    /// The service as found: the binary it's registered to run, and the
+    /// Mafold it talks to (as registered, else as its supervisor says).
+    pub registered_exe: Option<String>,
+    pub service_base: Option<String>,
+    /// The supervisor running when this started, and the one running after.
+    pub was_running: Option<u32>,
+    pub pid: Option<u32>,
+    /// Every bot here — each restarted once by the move.
+    pub bots: Vec<AdoptBot>,
+    /// Bots still writing a reply when the wait for them ran out: cut off.
+    pub cut: Vec<String>,
+    /// Whether it updates itself afterwards: the machine setting alone (the
+    /// `--no-auto-update` flag doesn't come along).
+    pub auto_update: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub(crate) struct AdoptBot {
+    pub name: String,
+    /// Its daemon: running before (`--check`), or again after the move.
+    pub pid: Option<u32>,
+    /// Writing a reply right now.
+    pub busy: bool,
+}
+
+/// `mafold up --adopt [--check] [--json]`.
+pub fn adopt(base: &str, check: bool, json: bool) -> Result<()> {
+    let a = adopting(base, check, &mut |line| {
+        if !json {
+            println!("{line}");
+        }
+    });
+    if json {
+        println!("{}", serde_json::to_string(&a)?);
+    } else {
+        say_adopt(&a, check);
+    }
+    let _ = std::io::stdout().flush();
+    match a.code {
+        _ if a.ok => Ok(()),
+        "not_registered" | "bots_not_back" => std::process::exit(2),
+        _ => std::process::exit(1),
+    }
+}
+
+fn adopting(base: &str, check: bool, say: &mut dyn FnMut(&str)) -> Adopt {
+    let me_path = platform::current_exe().ok().map(|p| p.display().to_string());
+    let reg = registration();
+    let running = sup_running();
+    let held = reg.is_some() && service_registered();
+    let c = load();
+    let bots_now = |c: &Config| -> Vec<AdoptBot> {
+        c.daemons
+            .iter()
+            .map(|d| {
+                let pid = read_pid(&d.name).filter(|p| platform::pid_running(*p));
+                AdoptBot { name: d.name.clone(), pid, busy: pid.is_some() && busy_count(&d.name) > 0 }
+            })
+            .collect()
+    };
+    let mut a = Adopt {
+        ok: false,
+        code: "failed",
+        detail: None,
+        exe: me_path.clone(),
+        reasons: Vec::new(),
+        registered_exe: reg.as_ref().and_then(|r| r.exe.clone()),
+        service_base: reg.as_ref().and_then(|r| r.base.clone()).or_else(|| running.and_then(base_of_running)),
+        was_running: running,
+        pid: None,
+        bots: bots_now(&c),
+        cut: Vec::new(),
+        auto_update: crate::update::auto_update_on(),
+    };
+    let Some(me) = me_path.as_deref().map(canonical) else {
+        a.detail = Some("couldn't tell where this mafold is on disk — nothing was changed".into());
+        return a;
+    };
+    a.reasons = not_ours(reg.as_ref(), held, running.is_some(), &me);
+    let obstacles = Obstacles {
+        theirs: a.service_base.as_deref(),
+        by_hand_unknown: a.reasons.contains(&NotOurs::ByHand) && a.service_base.is_none(),
+        // A check reads only; the move needs the manager to remove the service.
+        no_manager: !check && reg.is_some() && !service_manager_reachable(),
+        inside_bot: !check && std::env::var("MAFOLD_DAEMON_NAME").is_ok_and(|n| !n.is_empty()),
+    };
+    if let Some((code, why)) = adopt_refused(&obstacles, base) {
+        a.code = code;
+        a.detail = Some(why);
+        return a;
+    }
+    if check {
+        a.ok = true;
+        a.code = if !a.reasons.is_empty() {
+            "adoptable"
+        } else if reg.is_some() || running.is_some() {
+            "managed"
+        } else {
+            "not_set_up"
+        };
+        return a;
+    }
+    if a.reasons.is_empty() && held && running.is_some() {
+        a.ok = true;
+        a.code = "managed";
+        a.pid = running;
+        return a;
+    }
+
+    // 1. The replies being written get written.
+    a.cut = wait_for_replies(REPLY_WAIT, std::time::Duration::from_secs(2), || busy_bots(&c.daemons), |busy| {
+        say(&format!(
+            "… waiting for {} to finish the reply in progress (up to {} min)",
+            busy.join(", "),
+            REPLY_WAIT.as_secs() / 60
+        ))
+    });
+    // 2. The service goes first, then its supervisor — so nothing starts the
+    //    old one again while the bots move (KeepAlive, Restart=always, the
+    //    Windows watchdog). As `down` does it.
+    remove_autostart();
+    if service_registered() {
+        // Removing can stop the supervisor and still leave the service
+        // (Windows ends the task before deleting it): put it back as it was.
+        let back = match (running, sup_running()) {
+            (Some(_), None) => match start_registered(base, reg.as_ref().is_some_and(|r| r.no_auto_update)).and_then(|_| await_supervisor()) {
+                Ok(pid) => format!("; its supervisor had stopped and runs again (pid {pid})"),
+                Err(e) => format!("; its supervisor stopped and couldn't be started again ({e:#}) — `mafold up` starts it"),
+            },
+            _ => String::new(),
+        };
+        a.detail = Some(format!("couldn't remove the service registered here, so nothing moved — it would start the old supervisor again{back}"));
+        return a;
+    }
+    if let Some(old) = running {
+        if !platform::stop_and_wait(old, STOP_WAIT) {
+            a.detail = Some(format!(
+                "the service is removed, but its supervisor (pid {old}) is still running {}s after being asked to stop — the bots were left alone; run `mafold up --adopt` again once it's gone",
+                STOP_WAIT.as_secs()
+            ));
+            return a;
+        }
+        crate::lifecycle::note_exit(old, crate::lifecycle::Why::Stopped, Some("mafold up --adopt"));
+    }
+    let _ = fs::remove_file(sup_pid_path());
+    // 3. Every bot stops, so the new supervisor starts each from this binary
+    //    — a daemon left running stays on the binary that started it.
+    let before: std::collections::BTreeMap<String, Option<u32>> = a.bots.iter().map(|b| (b.name.clone(), b.pid)).collect();
+    let files: Vec<(&str, PathBuf)> = c.daemons.iter().map(|d| (d.name.as_str(), pid_path(&d.name))).collect();
+    let stuck: Vec<String> =
+        stop_all_confirmed_at(&files, STOP_WAIT).into_iter().filter_map(|r| r.err().map(|e| format!("{e:#}"))).collect();
+    // 4. Registered to run this binary, without the flag — or, with no
+    //    service manager, at least running.
+    let registered = ensure_autostart(base, false);
+    if registered.is_err() && sup_running().is_none() {
+        if let Err(e) = start_supervisor(base, false) {
+            a.detail = Some(format!("the old supervisor and its bots are stopped, but a new one couldn't start: {e:#} — `mafold up` starts it"));
+            return a;
+        }
+    }
+    match await_supervisor() {
+        Ok(pid) => a.pid = Some(pid),
+        Err(e) => {
+            a.detail = Some(format!("the old supervisor and its bots are stopped, but {e:#}"));
+            return a;
+        }
+    }
+    // 5. Read back, not assumed: the service holds this binary, flag-free…
+    let ours = service_registered()
+        && registration().is_some_and(|r| !r.no_auto_update && r.exe.as_deref().is_some_and(|e| canonical(e) == me));
+    // 6. …and every bot is running again: a new process, not the one before.
+    platform::wait_until(BOTS_BACK_WAIT, || {
+        c.daemons.iter().all(|d| read_pid(&d.name).is_some_and(|p| platform::pid_running(p) && before.get(&d.name) != Some(&Some(p))))
+    });
+    a.bots = bots_now(&c);
+    for b in &mut a.bots {
+        if before.get(&b.name) == Some(&b.pid) {
+            b.pid = None; // the one from before, never stopped: not moved
+        }
+    }
+    if !ours {
+        a.code = "not_registered";
+        a.detail = Some(match registered {
+            Err(e) => format!("running, but not registered to start on login ({e:#}) — it won't survive a restart of this computer"),
+            Ok(()) => "running, but the service read back doesn't run this mafold".into(),
+        });
+        return a;
+    }
+    let missing: Vec<&str> = a.bots.iter().filter(|b| b.pid.is_none()).map(|b| b.name.as_str()).collect();
+    if !missing.is_empty() || !stuck.is_empty() {
+        a.code = "bots_not_back";
+        let mut why = Vec::new();
+        if !missing.is_empty() {
+            why.push(format!("not running again after {}s: {} — `mafold logs <name>` says why", BOTS_BACK_WAIT.as_secs(), missing.join(", ")));
+        }
+        why.extend(stuck);
+        a.detail = Some(why.join("; "));
+        return a;
+    }
+    a.ok = true;
+    a.code = "adopted";
+    a
+}
+
+/// The bots writing a reply right now — a daemon that's gone left its count
+/// behind, and isn't.
+fn busy_bots(daemons: &[DaemonCfg]) -> Vec<String> {
+    daemons.iter().filter(|d| read_pid(&d.name).is_some_and(alive) && busy_count(&d.name) > 0).map(|d| d.name.clone()).collect()
+}
+
+/// Wait up to `max` for the bots `busy()` names to finish the replies they are
+/// writing, telling `say` whenever who that is changes. The ones still
+/// writing when the wait runs out.
+fn wait_for_replies(
+    max: std::time::Duration,
+    every: std::time::Duration,
+    mut busy: impl FnMut() -> Vec<String>,
+    mut say: impl FnMut(&[String]),
+) -> Vec<String> {
+    let start = std::time::Instant::now();
+    let mut said = Vec::new();
+    loop {
+        let now = busy();
+        if now.is_empty() || start.elapsed() >= max {
+            return now;
+        }
+        if now != said {
+            say(&now);
+            said = now;
+        }
+        std::thread::sleep(every);
+    }
+}
+
+fn say_adopt(a: &Adopt, check: bool) {
+    let exe = a.exe.as_deref().unwrap_or("this mafold");
+    let updates = if a.auto_update { "on" } else { "off (the machine setting — `mafold update --auto-update on`)" };
+    let names: Vec<&str> = a.bots.iter().map(|b| b.name.as_str()).collect();
+    match a.code {
+        "adoptable" => {
+            println!("The bots here are run by another mafold:");
+            for r in &a.reasons {
+                match r {
+                    NotOurs::Elsewhere => {
+                        println!("  · the service runs {} (this is {exe})", a.registered_exe.as_deref().unwrap_or("a binary it doesn't name"))
+                    }
+                    NotOurs::ByHand => println!(
+                        "  · the supervisor (pid {}) was started by hand — no service starts it on login",
+                        a.was_running.map_or("?".into(), |p| p.to_string())
+                    ),
+                    NotOurs::UpdateFlag => println!("  · it was registered with --no-auto-update"),
+                }
+            }
+            println!(
+                "`mafold up --adopt` moves it onto this one: it waits for replies in progress (up to {} min), restarts {} once{}, and registers the service to run {exe}. Automatic updates afterwards: {updates}.",
+                REPLY_WAIT.as_secs() / 60,
+                if names.len() == 1 { "the bot".to_string() } else { format!("the {} bots", names.len()) },
+                if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) },
+            );
+        }
+        "managed" if check => println!("✓ the service here runs this mafold ({exe}) — nothing to adopt"),
+        "managed" => println!("✓ already this mafold's — the supervisor runs (pid {}), nothing to move", a.pid.unwrap_or_default()),
+        "not_set_up" => println!("Nothing runs bots here yet — `mafold up --adopt` (or `mafold up`) sets it up to run {exe}."),
+        "adopted" => {
+            println!("✓ the service now runs this mafold — supervisor pid {}, {} restarted onto it", a.pid.unwrap_or_default(), match names.len() {
+                1 => "1 bot".to_string(),
+                n => format!("{n} bots"),
+            });
+            if !a.cut.is_empty() {
+                println!("  cut off the reply {} was still writing after {} min", a.cut.join(", "), REPLY_WAIT.as_secs() / 60);
+            }
+            println!("  automatic updates: {updates}");
+        }
+        _ => eprintln!("✗ {}", a.detail.as_deref().unwrap_or("couldn't adopt the service here")),
+    }
 }
 
 /// The long-lived supervisor loop: keep every configured daemon running, and own
@@ -1032,7 +1485,7 @@ pub async fn supervise(base: String, auto_update: bool) {
     }
     // Since when and on what this one runs, and why the one before it
     // stopped — for `mafold status` (activity center C5).
-    let (_, last_exit) = crate::lifecycle::begin(std::process::id(), auto_update);
+    let (_, last_exit) = crate::lifecycle::begin(std::process::id(), auto_update, &base);
     note_own_exits();
     println!("supervisor up (pid {}) · base {base}", std::process::id());
     if let Some(x) = &last_exit {
@@ -1413,8 +1866,10 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
         }
         // Installers default to ~/.local/bin; make sure this process (and the
         // daemons it spawns) resolve it even when the service PATH predates the
-        // install — else probe() never flips the runtime available.
-        if let Some(home) = std::env::var_os("HOME") {
+        // install — else probe() never flips the runtime available. On Windows
+        // too: Claude Code's installer adds it to the user's PATH, which a
+        // running supervisor never sees.
+        if let Some(home) = crate::platform::home_dir() {
             let local = std::path::Path::new(&home).join(".local/bin");
             let path = std::env::var_os("PATH").unwrap_or_default();
             if local.is_dir() && !std::env::split_paths(&path).any(|p| p == local) {
@@ -2288,6 +2743,8 @@ pub fn status() {
 #[derive(Debug, PartialEq)]
 pub(crate) struct Registration {
     pub exe: Option<String>,
+    /// The Mafold it talks to (`--base`), as registered.
+    pub base: Option<String>,
     pub no_auto_update: bool,
 }
 
@@ -2303,7 +2760,19 @@ pub(crate) fn parse_plist_registration(xml: &str) -> Registration {
         .and_then(|rest| rest.split("<string>").nth(1))
         .and_then(|s| s.split("</string>").next())
         .map(xml_unescape);
-    Registration { exe, no_auto_update: xml.contains("--no-auto-update") }
+    let args: Vec<String> = xml
+        .split("<key>ProgramArguments</key>")
+        .nth(1)
+        .and_then(|rest| rest.split("</array>").next())
+        .map(|a| a.split("<string>").skip(1).filter_map(|s| s.split("</string>").next()).map(xml_unescape).collect())
+        .unwrap_or_default();
+    let base = args.iter().position(|a| a == "--base").and_then(|i| args.get(i + 1)).cloned();
+    Registration { exe, base, no_auto_update: xml.contains("--no-auto-update") }
+}
+
+/// The word after `--base ` in a command line.
+fn base_after(line: &str) -> Option<String> {
+    line.split(" --base ").nth(1)?.split_whitespace().next().map(str::to_string)
 }
 
 /// The program of `ExecStart=` in a systemd unit — everything before
@@ -2311,7 +2780,7 @@ pub(crate) fn parse_plist_registration(xml: &str) -> Registration {
 pub(crate) fn parse_unit_registration(unit: &str) -> Registration {
     let exec = unit.lines().find_map(|l| l.strip_prefix("ExecStart="));
     let exe = exec.map(|e| e.split(" --base ").next().unwrap_or(e).trim().to_string());
-    Registration { exe, no_auto_update: exec.is_some_and(|e| e.contains("--no-auto-update")) }
+    Registration { exe, base: exec.and_then(base_after), no_auto_update: exec.is_some_and(|e| e.contains("--no-auto-update")) }
 }
 
 /// The quoted binary inside the scheduled task's `<Arguments>` (`task_arguments`
@@ -2324,7 +2793,7 @@ pub(crate) fn parse_task_registration(xml: &str) -> Registration {
         .map(xml_unescape)
         .unwrap_or_default();
     let exe = args.split('"').nth(1).map(str::to_string).filter(|s| !s.is_empty());
-    Registration { exe, no_auto_update: args.contains("--no-auto-update") }
+    Registration { exe, base: base_after(&args), no_auto_update: args.contains("--no-auto-update") }
 }
 
 #[cfg(target_os = "macos")]
@@ -2400,7 +2869,7 @@ pub async fn status_json() -> serde_json::Value {
             let turns = running.and_then(|p| crate::lifecycle::read_turns(&turns_path(&d.name), p));
             // The runtime it runs: what Mafold told the daemon, as it says;
             // otherwise the local hint as a daemon would resolve it
-            // (`claude` → claude-code, anything unimplemented → Claude Code).
+            // (`claude` → claude-code; a runtime it can't run keeps its own id).
             let runtime = turns
                 .as_ref()
                 .and_then(|t| t.runtime.clone())
@@ -2453,6 +2922,7 @@ pub async fn status_json() -> serde_json::Value {
                 version: h["version"].as_str().map(str::to_string),
                 health: serde_json::from_value(h["health"].clone()).ok(),
                 accounts: Vec::new(),
+                runs: h["runs"].as_bool(),
             })
         })
         .collect();
@@ -2491,6 +2961,10 @@ pub async fn status_json() -> serde_json::Value {
             "registered_exe": reg.as_ref().and_then(|r| r.exe.clone()),
             "registered_exe_canonical": reg.as_ref().and_then(|r| r.exe.as_deref()).map(canonical),
             "no_auto_update": reg.as_ref().map(|r| r.no_auto_update),
+            // Why the service isn't THIS binary's to manage — what
+            // `up --adopt` would change (`elsewhere`, `by_hand`,
+            // `update_flag`); empty when it is, or when nothing is set up.
+            "not_ours": me.as_deref().map(|m| not_ours(reg.as_ref(), reg.is_some() && service_registered(), pid.is_some(), &canonical(m))),
             // Busy installing a runtime or updating (null = not busy).
             "doing": read_doing(&doing_path(), pid),
             // From its own record — null for a supervisor from before C5.
@@ -2527,6 +3001,9 @@ pub async fn status_json() -> serde_json::Value {
             // A release newer than the supervisor runs, as the last check saw.
             "available": crate::update::available(&seen, &running_version),
             "failed": crate::update::unresolved(&seen, &running_version),
+            // A rollback's skip: `{version, at}` automatic updates leave alone
+            // until a newer release is out (`mafold rollback`, C9).
+            "skipped": crate::update::skipped(),
         },
         "issues": issues,
     })
@@ -2614,6 +3091,106 @@ pub fn config_summary() -> serde_json::Value {
 }
 
 #[cfg(test)]
+mod adopt_tests {
+    use super::*;
+
+    fn reg(exe: &str, no_auto_update: bool) -> Registration {
+        Registration { exe: Some(exe.into()), base: Some("https://api.mafold.com".into()), no_auto_update }
+    }
+
+    #[test]
+    fn another_installs_service_is_not_ours_and_this_ones_is() {
+        let me = "/home/a/.mafold/mafold";
+        assert_eq!(not_ours(Some(&reg("/opt/homebrew/bin/mafold", false)), true, true, me), vec![NotOurs::Elsewhere]);
+        assert_eq!(not_ours(Some(&reg(me, true)), true, true, me), vec![NotOurs::UpdateFlag]);
+        assert_eq!(
+            not_ours(Some(&reg("/opt/homebrew/bin/mafold", true)), true, false, me),
+            vec![NotOurs::Elsewhere, NotOurs::UpdateFlag]
+        );
+        // A registration that names no binary isn't this one's either.
+        let nameless = Registration { exe: None, base: None, no_auto_update: false };
+        assert_eq!(not_ours(Some(&nameless), true, false, me), vec![NotOurs::Elsewhere]);
+        // This binary's, held by the service manager, running: nothing to move.
+        assert_eq!(not_ours(Some(&reg(me, false)), true, true, me), vec![]);
+        // Nothing set up at all is nobody's.
+        assert_eq!(not_ours(None, false, false, me), vec![]);
+    }
+
+    #[test]
+    fn a_supervisor_no_service_manager_holds_was_started_by_hand() {
+        let me = "/home/a/.mafold/mafold";
+        assert_eq!(not_ours(None, false, true, me), vec![NotOurs::ByHand]);
+        // The file is there, but nothing loaded it: the one running isn't its.
+        assert_eq!(not_ours(Some(&reg(me, false)), false, true, me), vec![NotOurs::ByHand]);
+        // Not running: a stale file of this binary's is no reason.
+        assert_eq!(not_ours(Some(&reg(me, false)), false, false, me), vec![]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_same_binary_by_another_path_is_ours() {
+        let dir = std::env::temp_dir().join(format!("mafold-adopt-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("mafold");
+        fs::write(&real, "").unwrap();
+        let link = dir.join("bin-mafold");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let me = canonical(&real.display().to_string());
+        assert_eq!(not_ours(Some(&reg(&link.display().to_string(), false)), true, true, &me), vec![]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopting_refuses_another_mafold_and_a_bots_own_reply() {
+        let base = "https://api.mafold.com";
+        let code = |o: Obstacles| adopt_refused(&o, base).map(|r| r.0);
+        assert_eq!(code(Obstacles { theirs: Some("https://api.mafold.com/"), ..Default::default() }), None);
+        assert_eq!(code(Obstacles::default()), None);
+        let (c, why) = adopt_refused(&Obstacles { theirs: Some("http://127.0.0.1:4100"), ..Default::default() }, base).expect("another Mafold");
+        assert_eq!(c, "base_differs");
+        assert!(why.contains("mafold --base http://127.0.0.1:4100 up --adopt"), "{why}");
+        // A supervisor started by hand that doesn't say its Mafold could be another's.
+        assert_eq!(code(Obstacles { by_hand_unknown: true, ..Default::default() }), Some("base_unknown"));
+        // Removing a service the manager can't be asked about only deletes its file.
+        assert_eq!(code(Obstacles { no_manager: true, ..Default::default() }), Some("no_service_manager"));
+        assert_eq!(code(Obstacles { inside_bot: true, ..Default::default() }), Some("inside_bot"));
+        // Another Mafold is said first: running it from a terminal wouldn't help.
+        assert_eq!(
+            code(Obstacles { theirs: Some("http://127.0.0.1:4100"), inside_bot: true, no_manager: true, ..Default::default() }),
+            Some("base_differs")
+        );
+    }
+
+    #[test]
+    fn the_wait_ends_when_the_replies_are_written_and_says_each_change_once() {
+        let mut polls = vec![vec![], vec!["t:b".to_string()], vec!["t:a".to_string()], vec!["t:a".to_string()]];
+        let mut said = Vec::new();
+        let left = wait_for_replies(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+            || polls.pop().unwrap(),
+            |b| said.push(b.to_vec()),
+        );
+        assert!(left.is_empty());
+        assert_eq!(said, vec![vec!["t:a".to_string()], vec!["t:b".to_string()]]);
+    }
+
+    #[test]
+    fn a_reply_that_never_ends_is_cut_off_when_the_wait_runs_out() {
+        let t = std::time::Instant::now();
+        let left = wait_for_replies(
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(10),
+            || vec!["t:a".to_string()],
+            |_| {},
+        );
+        assert_eq!(left, vec!["t:a".to_string()]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
 mod registration_tests {
     use super::*;
 
@@ -2625,9 +3202,13 @@ mod registration_tests {
         let xml = "<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.mafold.supervisor</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>/Users/a b/.mafold/mafold</string>\n    <string>--base</string><string>https://api.mafold.com</string>\n    <string>supervise</string>\n    <string>--no-auto-update</string>\n  </array>\n</dict></plist>";
         assert_eq!(
             parse_plist_registration(xml),
-            Registration { exe: Some("/Users/a b/.mafold/mafold".into()), no_auto_update: true }
+            Registration {
+                exe: Some("/Users/a b/.mafold/mafold".into()),
+                base: Some("https://api.mafold.com".into()),
+                no_auto_update: true
+            }
         );
-        assert_eq!(parse_plist_registration("<plist/>"), Registration { exe: None, no_auto_update: false });
+        assert_eq!(parse_plist_registration("<plist/>"), Registration { exe: None, base: None, no_auto_update: false });
     }
 
     #[test]
@@ -2635,7 +3216,7 @@ mod registration_tests {
         let unit = "[Service]\nEnvironment=PATH=/usr/bin\nExecStart=/home/a/.mafold/mafold --base https://api.mafold.com supervise\nRestart=always\n";
         assert_eq!(
             parse_unit_registration(unit),
-            Registration { exe: Some("/home/a/.mafold/mafold".into()), no_auto_update: false }
+            Registration { exe: Some("/home/a/.mafold/mafold".into()), base: Some("https://api.mafold.com".into()), no_auto_update: false }
         );
     }
 
@@ -2645,7 +3226,11 @@ mod registration_tests {
         let xml = format!("<Task><Actions><Exec><Command>conhost.exe</Command><Arguments>{}</Arguments></Exec></Actions></Task>", xml_escape(&args));
         assert_eq!(
             parse_task_registration(&xml),
-            Registration { exe: Some(r"C:\Users\John Smith\.mafold\mafold.exe".into()), no_auto_update: true }
+            Registration {
+                exe: Some(r"C:\Users\John Smith\.mafold\mafold.exe".into()),
+                base: Some("https://api.mafold.com".into()),
+                no_auto_update: true
+            }
         );
     }
 }
@@ -2930,7 +3515,9 @@ mod stop_tests {
         assert!(restart_failure(&r("no_supervisor", None)).contains("`mafold up` starts it"));
         assert!(restart_failure(&r("unverified", Some("x"))).starts_with("? asked the supervisor to restart ops:bot, but couldn't confirm it — x"));
         assert!(restart_failure(&r("still_running", None)).contains("didn't stop, so it wasn't restarted"));
-        let run = |auto| crate::lifecycle::Run { pid: 1, started_at: 1, version: "0.9.148".into(), auto_update: auto, crashes: vec![], control: 0, update_setting: false };
+        let run = |auto| crate::lifecycle::Run {
+            pid: 1, started_at: 1, version: "0.9.148".into(), auto_update: auto, crashes: vec![], control: 0, update_setting: false, base: None,
+        };
         let old = too_old_note(Some(&run(true)), "ops:bot");
         assert!(old.contains("(v0.9.148)") && old.contains("within ~10 minutes") && old.contains("`mafold down ops:bot` restarts the bot"), "{old}");
         assert!(too_old_note(Some(&run(false)), "ops:bot").contains("until it is restarted"), "a supervisor that doesn't update itself won't move on its own");
@@ -2942,13 +3529,13 @@ mod stop_tests {
     #[test]
     fn whether_it_updates_itself_takes_the_setting_where_it_is_read() {
         let run = |auto, reads| crate::lifecycle::Run {
-            pid: 1, started_at: 1, version: "0.9.150".into(), auto_update: auto, crashes: vec![], control: 1, update_setting: reads,
+            pid: 1, started_at: 1, version: "0.9.150".into(), auto_update: auto, crashes: vec![], control: 1, update_setting: reads, base: None,
         };
         assert_eq!(updates_itself(Some(&run(true, true)), None, true), Some(true));
         assert_eq!(updates_itself(Some(&run(true, true)), None, false), Some(false), "off by the setting");
         assert_eq!(updates_itself(Some(&run(false, true)), None, true), Some(false), "off by --no-auto-update");
         assert_eq!(updates_itself(Some(&run(true, false)), None, false), Some(true), "from before the setting");
-        let reg = |no| Registration { exe: None, no_auto_update: no };
+        let reg = |no| Registration { exe: None, base: None, no_auto_update: no };
         assert_eq!(updates_itself(None, Some(&reg(false)), false), Some(false));
         assert_eq!(updates_itself(None, Some(&reg(true)), true), Some(false));
         assert_eq!(updates_itself(None, None, true), None);

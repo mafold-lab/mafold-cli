@@ -214,7 +214,6 @@ const VISIBLE_WRITES: &[&str] = &[
     "botEditDraft",
     "botAppendDelta",
     "pushAlert",
-    "roomChange",
     "answerInlineQuery",
     "answerCardAction",
 ];

@@ -86,11 +86,13 @@ pub enum AppsCmd {
         /// clears it.
         #[arg(long = "screenshot")]
         screenshots: Vec<String>,
-        /// Room schema as a JSON object `{"<key>":"read"|"write"}` (a `key:*`
-        /// wildcard is allowed, e.g. `{"issue:*":"write"}`). Declares which room
-        /// variables participants — including the bot via `mafold room` — edit.
+        /// What an agent may call on the app's own backend, as a JSON object
+        /// (or `@file.json`): `{"issues.list": {"description": "…", "path":
+        /// "/api/agent/issues.list", "effect": "read", "params": {JSON Schema}}}`.
+        /// Each is a POST to `path` on the app's own origin with the caller's
+        /// launch token. `'{}'` clears them.
         #[arg(long)]
-        room_schema: Option<String>,
+        methods: Option<String>,
         /// Let THIS app's own origin put the Mafold login door in an iframe
         /// (`Mafold.mountSignIn`). Off until asked for: mafold.com refuses to
         /// be framed by anyone otherwise. `--auth-embed false` takes it back.
@@ -104,6 +106,30 @@ pub enum AppsCmd {
         /// frame instead of being sent away to do it.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         auth_register: Option<bool>,
+    },
+    /// What an agent may call on an app's own backend — the methods it
+    /// declares. `mafold app call` calls one.
+    Methods {
+        /// App id, `owner/slug`.
+        app: String,
+        /// Show each method's parameters (JSON Schema).
+        #[arg(long)]
+        schema: bool,
+    },
+    /// Call one of an app's methods on its own backend, as yourself: a POST to
+    /// the app's origin carrying your launch token (who you are, and this
+    /// conversation). The app decides what you may do; its answer is printed.
+    Call {
+        /// App id, `owner/slug`.
+        app: String,
+        /// The method (`mafold app methods <app>` lists them).
+        method: String,
+        /// Its parameters, a JSON object.
+        #[arg(long)]
+        params: Option<String>,
+        /// The conversation to call from (default `$MAFOLD_CONV`, this turn's).
+        #[arg(long)]
+        conv: Option<String>,
     },
     /// List the apps you can manage (own the namespace of).
     List,
@@ -164,7 +190,7 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
             capabilities,
             description,
             screenshots,
-            room_schema,
+            methods,
             auth_embed,
             auth_primary,
             auth_register,
@@ -177,7 +203,7 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
                 capabilities,
                 description,
                 screenshots,
-                room_schema,
+                methods,
                 auth_embed,
                 auth_primary,
                 auth_register,
@@ -186,6 +212,8 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
             )
             .await
         }
+        AppsCmd::Methods { app, schema } => cmd_methods(&app, schema, base, token).await,
+        AppsCmd::Call { app, method, params, conv } => cmd_call(&app, &method, params, conv, base, token).await,
         AppsCmd::List => cmd_list(base, token).await,
         AppsCmd::Remove { id } => cmd_remove(&id, base, token).await,
         AppsCmd::RotateSecret { id } => cmd_rotate_secret(&id, base, token).await,
@@ -471,7 +499,7 @@ async fn cmd_register(
     capabilities: Vec<String>,
     description: Option<String>,
     screenshots: Vec<String>,
-    room_schema: Option<String>,
+    methods: Option<String>,
     auth_embed: Option<bool>,
     auth_primary: Option<bool>,
     auth_register: Option<bool>,
@@ -480,17 +508,17 @@ async fn cmd_register(
 ) -> Result<()> {
     let token =
         token.context("register needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
-    // Parse --room-schema into a JSON object once, so a typo fails fast instead
-    // of registering an app with no room.
-    let room = match room_schema {
+    // `--methods` inline or `@file`; checked here for shape, by the server for
+    // everything else (names, paths on the app's own origin).
+    let methods = match methods {
         Some(s) => {
-            let v: Value = serde_json::from_str(&s)
-                .with_context(|| format!("--room-schema must be a JSON object (got `{s}`)"))?;
-            match v {
+            let text = match s.strip_prefix('@') {
+                Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?,
+                None => s,
+            };
+            match serde_json::from_str::<Value>(&text).context("--methods must be JSON")? {
                 Value::Object(m) => Some(m),
-                _ => anyhow::bail!(
-                    "--room-schema must be a JSON object, e.g. '{{\"issue:*\":\"write\"}}'"
-                ),
+                _ => anyhow::bail!("--methods must be a JSON object of name → {{description, path, effect?, params?}}"),
             }
         }
         None => None,
@@ -518,7 +546,7 @@ async fn cmd_register(
             "registerWebApp",
             serde_json::json!({
                 "id": id, "url": url, "name": name, "icon": icon,
-                "capabilities": capabilities, "room": room,
+                "capabilities": capabilities, "methods": methods,
                 "description": description, "auth": auth,
                 // Absent ⇒ the server keeps what's registered; `[]` clears.
                 "screenshots": shots,
@@ -538,6 +566,147 @@ async fn cmd_register(
         None => println!("(registration updated; existing signing secret unchanged)"),
     }
     Ok(())
+}
+
+/// `mafold app methods <app>`: what its backend lets an agent do.
+async fn cmd_methods(app: &str, schema: bool, base: String, token: Option<String>) -> Result<()> {
+    let token = token.context("methods needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let client = Client::new(base, token);
+    let r = client.call("getAppMethods", json!({ "app_id": app })).await?;
+    let methods = r["methods"].as_object().cloned().unwrap_or_default();
+    if methods.is_empty() {
+        println!("{app} declares no methods — there is no backend of its an agent can call");
+        return Ok(());
+    }
+    for (name, m) in &methods {
+        println!(
+            "• {name} [{}] — {}",
+            m["effect"].as_str().unwrap_or("write"),
+            m["description"].as_str().unwrap_or("")
+        );
+        if schema {
+            println!("    params: {}", serde_json::to_string(&m["params"]).unwrap_or_default());
+        }
+    }
+    println!("\ncall one: mafold app call {app} <method> --params '<json>'");
+    Ok(())
+}
+
+/// How long `mafold app call` waits for the app, and how much of its answer
+/// it reads — the same bounds the server keeps for a hosted agent's call.
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const MAX_ANSWER: usize = 256 * 1024;
+
+/// `mafold app call <app> <method>`: POST to the method's path on the app's
+/// own origin with a launch token for this account — the request the app's
+/// page makes for a person, made for an agent. Straight from this machine;
+/// Mafold only says who is asking.
+async fn cmd_call(
+    app: &str,
+    method: &str,
+    params: Option<String>,
+    conv: Option<String>,
+    base: String,
+    token: Option<String>,
+) -> Result<()> {
+    let token = token.context("call needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let params: Value = match params.as_deref() {
+        None => json!({}),
+        Some(s) => serde_json::from_str(s).context("--params must be a JSON object")?,
+    };
+    let conv = conv.or_else(|| std::env::var("MAFOLD_CONV").ok()).filter(|c| !c.trim().is_empty());
+    let client = Client::new(base, token);
+    // The room in the token is where the app thinks it is being asked from —
+    // linear hands that room's board to whoever calls from it. A turn outside
+    // the owner's circle calls only from a room its people could open
+    // themselves (`chat::ensure_may_open`), the rule `mafold room --conv` kept
+    // until room was retired: the owner's DM with this agent keeps its apps'
+    // data to itself. Such a turn always has a room; it never calls without.
+    match conv.as_deref() {
+        Some(c) => crate::chat::ensure_may_open(&client, c).await,
+        None if !crate::chat::ReadsFor::from_env().is_all() => {
+            eprintln!("✗ this turn calls an app only from a room — pass --conv");
+            std::process::exit(crate::chat::EXIT_REFUSED);
+        }
+        None => {}
+    }
+    let declared = client.call("getAppMethods", json!({ "app_id": app })).await?;
+    let path = declared["methods"][method]["path"]
+        .as_str()
+        .with_context(|| format!("{app} has no method `{method}` — `mafold app methods {app}` lists them"))?
+        .to_string();
+    let launch = client
+        .call("getAppLaunch", json!({ "app_id": app, "conversation_id": conv }))
+        .await?;
+    let init = launch["init_data"].as_str().context("no launch token came back")?;
+    let origin = reqwest::Url::parse(launch["url"].as_str().unwrap_or_default()).context("the app's url does not parse")?;
+    let target = origin.join(&path).context("the method's path does not parse")?;
+    // The token is who you are: it goes to the app it was minted for, nowhere else.
+    if target.origin() != origin.origin() {
+        anyhow::bail!("{app}'s method `{method}` points off the app's own origin — refusing to send your token there");
+    }
+    let http = public_only_client(&target).await.with_context(|| format!("{app}'s method `{method}`"))?;
+    let mut resp = http
+        .post(target)
+        .bearer_auth(init)
+        .header(reqwest::header::USER_AGENT, "Mafold-App-Call/1")
+        .json(&params)
+        .send()
+        .await
+        .with_context(|| format!("{app} did not answer"))?;
+    let status = resp.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.with_context(|| format!("{app} broke off"))? {
+        if bytes.len() + chunk.len() > MAX_ANSWER {
+            anyhow::bail!("{app}'s answer is over {MAX_ANSWER} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = serde_json::from_slice::<Value>(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    if !status.is_success() {
+        eprintln!("✗ {app} answered {status}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// A client for one request to `target` that can only reach the public
+/// internet. This runs on its owner's machine, beside their router, their NAS
+/// and whatever listens on localhost — and the address is the app's, i.e.
+/// whoever registered it; an agent talked into calling it must not become a
+/// way in. The same rules as the api's own fetches (`mafold_types::net`):
+/// the host as written, then every address it resolves to (refused, not
+/// filtered — a public and a private answer at once is a rebinding setup),
+/// and the connection pinned to the addresses just checked, no redirects.
+async fn public_only_client(target: &reqwest::Url) -> Result<reqwest::Client> {
+    use mafold_core::mafold_types::net::{host_is_public, ip_is_public};
+    if !matches!(target.scheme(), "http" | "https") {
+        anyhow::bail!("only http(s) addresses are called");
+    }
+    let host = target.host_str().unwrap_or_default();
+    if !host_is_public(host) {
+        anyhow::bail!("{host} is not on the public internet — refusing to call it from this machine");
+    }
+    let mut builder = reqwest::Client::builder().timeout(CALL_TIMEOUT).redirect(reqwest::redirect::Policy::none());
+    let literal = host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok();
+    if !literal {
+        let name = host;
+        let port = target.port_or_known_default().unwrap_or(443);
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((name, port))
+            .await
+            .with_context(|| format!("{name} does not resolve"))?
+            .collect();
+        if let Some(inside) = addrs.iter().find(|a| !ip_is_public(a.ip())) {
+            anyhow::bail!("{name} resolves to {}, which is not on the public internet — refusing to call it", inside.ip());
+        }
+        if addrs.is_empty() {
+            anyhow::bail!("{name} has no addresses");
+        }
+        builder = builder.resolve_to_addrs(name, &addrs);
+    }
+    Ok(builder.build()?)
 }
 
 async fn cmd_list(base: String, token: Option<String>) -> Result<()> {
@@ -794,4 +963,34 @@ fn readme(id: &str, slug: &str) -> String {
     format!(
         "# {slug} app\n\nA Mafold mini-app written in React Native (`{id}`).\n\n```\nmafold apps dev       # live preview\nmafold apps publish   # ship it (you must own the namespace)\nmafold apps list      # the apps you can manage\nmafold apps remove {id}\n```\n"
     )
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+
+    /// `mafold app call` runs on its owner's machine: an app registered at an
+    /// address inside it (localhost, the LAN, a cloud's metadata address) is
+    /// refused before anything is sent — whoever registered the app chose the
+    /// address, and an agent may be talked into calling it.
+    #[tokio::test]
+    async fn an_app_at_an_address_inside_this_machines_network_is_not_called() {
+        for at in [
+            "http://127.0.0.1:8080/admin/delete",
+            "http://localhost/x",
+            "http://[::1]:3000/x",
+            "https://192.168.1.1/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://router.local/x",
+            "http://[::ffff:10.0.0.1]/x",
+        ] {
+            let url = reqwest::Url::parse(at).unwrap();
+            let err = public_only_client(&url).await.expect_err(at);
+            assert!(format!("{err:#}").contains("public internet"), "{at}: {err:#}");
+        }
+        let ftp = reqwest::Url::parse("ftp://8.8.8.8/x").unwrap();
+        assert!(public_only_client(&ftp).await.is_err(), "only http(s)");
+        // A public literal is fine (no lookup needed to build the client).
+        assert!(public_only_client(&reqwest::Url::parse("https://8.8.8.8/x").unwrap()).await.is_ok());
+    }
 }

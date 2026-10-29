@@ -1999,7 +1999,8 @@ pub(crate) fn preview_from_head(head: &str) -> String {
         // real trigger is whatever follows the last END marker.
         let t = [
             "[END RECENT CONVERSATION — now handle the triggering message below.]",
-            "[END AVAILABLE APPS & ROOMS]",
+            "[END AVAILABLE APPS & ROOMS]", // before the room retired (2026-10-29)
+            "[END AVAILABLE APPS]",
             "[END REPLY CONTEXT]",
         ]
         .iter()

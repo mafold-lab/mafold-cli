@@ -23,10 +23,12 @@ struct Tool {
     name: &'static str,
     /// The binary whose presence on PATH means "installed".
     bin: &'static str,
-    /// The official installer, run via `bash -c`.
+    /// The official installer, run via `bash -c` (macOS, Linux).
     install_cmd: &'static str,
     /// Manual fallback shown when the installer fails.
     fallback: &'static str,
+    /// On Windows: the vendor's own installer, or why there is none to run.
+    windows: Win,
     /// Post-install auth step (every runtime authenticates on this machine).
     auth_hint: &'static str,
 }
@@ -39,6 +41,9 @@ const TOOLS: &[Tool] = &[
         bin: "claude",
         install_cmd: "curl -fsSL https://claude.ai/install.sh | bash",
         fallback: "try `npm install -g @anthropic-ai/claude-code` or see https://claude.com/claude-code",
+        // Anthropic's PowerShell installer (claude.com/claude-code): the
+        // native build into %USERPROFILE%\.local\bin.
+        windows: Win::PowerShell("irm https://claude.ai/install.ps1 | iex"),
         auth_hint: "run `claude` once in a project folder to sign in to Anthropic",
     },
     Tool {
@@ -48,6 +53,8 @@ const TOOLS: &[Tool] = &[
         bin: "codex",
         install_cmd: "npm install -g @openai/codex",
         fallback: "needs Node/npm on PATH — `brew install node` first, or see https://developers.openai.com/codex/cli",
+        // OpenAI ships Codex for Windows as the same npm package.
+        windows: Win::PowerShell("npm install -g @openai/codex"),
         auth_hint: "run `codex` once to sign in to OpenAI",
     },
     Tool {
@@ -57,6 +64,12 @@ const TOOLS: &[Tool] = &[
         bin: "kimi",
         install_cmd: "curl -LsSf https://code.kimi.com/install.sh | bash",
         fallback: "see https://moonshotai.github.io/kimi-cli/",
+        // Its PowerShell installer (code.kimi.com/install.ps1) now installs
+        // the deprecated Python kimi-cli only when told to, and otherwise
+        // hands over to the next-generation Kimi Code — not this runtime.
+        windows: Win::Unsupported(
+            "Kimi's Windows installer is moving from kimi-cli to its next-generation Kimi Code, so Mafold doesn't install it here",
+        ),
         auth_hint: "run `kimi login` to sign in to Moonshot",
     },
     Tool {
@@ -66,9 +79,68 @@ const TOOLS: &[Tool] = &[
         bin: "opencode",
         install_cmd: "curl -fsSL https://opencode.ai/install | bash",
         fallback: "try `npm install -g opencode-ai` or see https://opencode.ai",
+        // opencode.ai/install is bash only; on Windows its own docs give the
+        // npm package.
+        windows: Win::PowerShell("npm install -g opencode-ai"),
         auth_hint: "run `opencode auth login` to connect a provider",
     },
 ];
+
+/// A runtime's Windows install.
+#[derive(Clone, Copy)]
+enum Win {
+    /// Run by Windows PowerShell (`irm … | iex`, `npm …`).
+    PowerShell(&'static str),
+    /// Not installed automatically — why, said as such instead of trying.
+    Unsupported(&'static str),
+}
+
+/// What the installer runs: a `bash -c` line, or a PowerShell one.
+#[derive(Debug, PartialEq)]
+enum Installer {
+    Bash(&'static str),
+    PowerShell(&'static str),
+}
+
+/// `t`'s installer on this platform; `Err` = why there's none.
+fn installer(t: &Tool, windows: bool) -> std::result::Result<Installer, &'static str> {
+    match (windows, t.windows) {
+        (false, _) => Ok(Installer::Bash(t.install_cmd)),
+        (true, Win::PowerShell(cmd)) => Ok(Installer::PowerShell(cmd)),
+        (true, Win::Unsupported(why)) => Err(why),
+    }
+}
+
+/// The PowerShell line that runs `cmd` so a failure is an exit code: an error
+/// stops it (`irm` that can't download, a script that throws), and a native
+/// command's own exit code (`npm`) is the process's. PowerShell otherwise
+/// exits 0 after either.
+fn powershell_script(cmd: &str) -> String {
+    format!("$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; $global:LASTEXITCODE = 0; {cmd}; exit $LASTEXITCODE")
+}
+
+/// The arguments Windows PowerShell gets: no profile (a user's profile is not
+/// the installer's business), nothing interactive, the script policy of this
+/// one process only.
+fn powershell_args(cmd: &str) -> Vec<String> {
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(std::iter::once(powershell_script(cmd)))
+        .collect()
+}
+
+/// Where an installer that installs into the user's home puts `bin`, as a
+/// launchable file name: `~/.local/bin/<bin>` (Claude Code's native installer,
+/// on every OS).
+fn home_install(home: &std::path::Path, bin: &str, windows: bool) -> Vec<std::path::PathBuf> {
+    let dir = home.join(".local").join("bin");
+    if windows {
+        [".exe", ".cmd"].iter().map(|e| dir.join(format!("{bin}{e}"))).collect()
+    } else {
+        vec![dir.join(bin)]
+    }
+}
 
 fn find(tool: &str) -> Option<&'static Tool> {
     let q = tool.trim().to_lowercase();
@@ -115,12 +187,6 @@ fn list() -> Result<()> {
 }
 
 fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()> {
-    if cfg!(windows) {
-        bail!(
-            "automatic install isn't supported on Windows yet — {}",
-            t.fallback
-        );
-    }
     if crate::harness::on_path(t.bin) {
         println!(
             "✓ {} already installed ({})",
@@ -131,9 +197,17 @@ fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()
         return Ok(());
     }
 
+    // Said before anything runs, and without "try again": there is nothing
+    // here to try.
+    let how = match installer(t, cfg!(windows)) {
+        Ok(how) => how,
+        Err(why) => bail!("automatic install of {} isn't supported on Windows — {why}; {}", t.name, t.fallback),
+    };
     println!("{} (`{}`) not found on PATH.", t.name, t.bin);
     println!("About to run the official installer:");
-    println!("  {}", t.install_cmd);
+    println!("  {}", match &how {
+        Installer::Bash(c) | Installer::PowerShell(c) => c,
+    });
     if !yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
@@ -146,11 +220,9 @@ fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()
         }
     }
 
-    // `bash` is the installer's shell everywhere it exists; where it doesn't (a
-    // stock Windows box) the manual route in `fallback` IS the answer. Bailing
-    // with a bare "failed to run bash" left the user with no next step on the one
-    // platform that had no other way in.
-    let status = match run_installer(t.install_cmd, limit) {
+    // A shell that won't start leaves the manual route in `fallback` as the
+    // next step — never a bare "failed to run bash".
+    let status = match run_installer(&how, limit) {
         Ok(Some(s)) => s,
         Ok(None) => bail!(
             "the installer was still running after {} minutes — stopped it; {}",
@@ -173,9 +245,8 @@ fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()
         // Installers default to ~/.local/bin (or npm's prefix), which may not be
         // on PATH in this shell yet — installed-but-unresolvable is the common
         // case, not an error.
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let local = std::path::Path::new(&home).join(".local/bin").join(t.bin);
-        if local.is_file() {
+        let home = crate::platform::home_dir().unwrap_or_else(|| ".".into());
+        if let Some(local) = home_install(&home, t.bin, cfg!(windows)).into_iter().find(|p| p.is_file()) {
             println!("✓ installed to {} — open a new terminal (or add ~/.local/bin to PATH) so `{}` resolves", local.display(), t.bin);
         } else {
             bail!("installer finished but `{}` isn't on PATH — open a new terminal and re-check, or: {}", t.bin, t.fallback);
@@ -185,17 +256,37 @@ fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()
     Ok(())
 }
 
-/// Run `cmd` under `bash -c`. With a `limit` it runs in its own process
-/// group, and when the limit passes the whole group is killed — an installer
-/// is a pipeline (`curl … | bash`), so killing `bash` alone would leave the
-/// download running. `Ok(None)` = it was stopped. Without a limit it stays in
-/// the caller's group: `mafold install` in a terminal may ask its questions.
+/// Run the installer — `bash -c`, or Windows PowerShell by its full path (a
+/// service's PATH is no promise). With a `limit` it runs as a tree of its own,
+/// and when the limit passes the whole tree is killed — an installer is a
+/// pipeline (`curl … | bash`, `irm … | iex` downloading), so killing the shell
+/// alone would leave the download running. `Ok(None)` = it was stopped.
+/// Without a limit it stays in the caller's group: `mafold install` in a
+/// terminal may ask its questions.
 fn run_installer(
-    cmd: &str,
+    how: &Installer,
     limit: Option<std::time::Duration>,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
-    let mut c = crate::platform::console_std_command("bash");
-    c.arg("-c").arg(cmd);
+    let mut c = match how {
+        Installer::Bash(cmd) => {
+            let mut c = crate::platform::console_std_command("bash");
+            c.arg("-c").arg(cmd);
+            c
+        }
+        Installer::PowerShell(cmd) => {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            let mut c = crate::platform::console_std_command(format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"));
+            c.args(powershell_args(cmd));
+            // Started from PowerShell 7 (a pwsh terminal, or a supervisor
+            // that one started), PSModulePath lists 7's own modules first,
+            // and Windows PowerShell autoloads `Get-FileHash` from 7's
+            // Microsoft.PowerShell.Utility, which it can't load: Claude Code's
+            // installer dies at its checksum. Without the variable, Windows
+            // PowerShell builds its own module path.
+            c.env_remove("PSModulePath");
+            c
+        }
+    };
     let Some(limit) = limit else {
         return c.status().map(Some);
     };
@@ -205,6 +296,12 @@ fn run_installer(
         c.process_group(0);
     }
     let mut child = c.spawn()?;
+    // Into the job at once, before the shell has started anything.
+    #[cfg(windows)]
+    let tree = {
+        use std::os::windows::io::AsRawHandle;
+        crate::platform::JobTree::of(child.as_raw_handle())
+    };
     let end = std::time::Instant::now() + limit;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -215,6 +312,10 @@ fn run_installer(
             // SAFETY: plain kill(2) on the group this child leads.
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            if let Some(tree) = &tree {
+                tree.kill();
             }
             let _ = child.kill();
             let _ = child.wait();
@@ -248,7 +349,7 @@ fn next_steps(t: &Tool) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::run_installer;
+    use super::{run_installer, Installer};
     use std::time::{Duration, Instant};
 
     /// A stuck installer is stopped at its limit — and so is what it started
@@ -260,7 +361,7 @@ mod tests {
         let pidfile = dir.join("grandchild.pid");
         let cmd = format!("sleep 60 & echo $! > '{}'; wait", pidfile.display());
         let t = Instant::now();
-        let ran = run_installer(&cmd, Some(Duration::from_secs(1))).unwrap();
+        let ran = run_installer(&Installer::Bash(Box::leak(cmd.into_boxed_str())), Some(Duration::from_secs(1))).unwrap();
         assert!(ran.is_none(), "reported as stopped, not as an exit");
         assert!(t.elapsed() < Duration::from_secs(10), "stopped at the limit: {:?}", t.elapsed());
         let grandchild: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
@@ -273,10 +374,75 @@ mod tests {
 
     #[test]
     fn an_installer_that_finishes_in_time_reports_its_exit() {
-        let ok = run_installer("exit 0", Some(Duration::from_secs(30))).unwrap().unwrap();
+        let ok = run_installer(&Installer::Bash("exit 0"), Some(Duration::from_secs(30))).unwrap().unwrap();
         assert!(ok.success());
-        let failed = run_installer("exit 3", Some(Duration::from_secs(30))).unwrap().unwrap();
+        let failed = run_installer(&Installer::Bash("exit 3"), Some(Duration::from_secs(30))).unwrap().unwrap();
         assert_eq!(failed.code(), Some(3));
-        assert!(run_installer("exit 0", None).unwrap().unwrap().success(), "no limit: as before");
+        assert!(run_installer(&Installer::Bash("exit 0"), None).unwrap().unwrap().success(), "no limit: as before");
+    }
+}
+
+#[cfg(test)]
+mod windows_installer_tests {
+    use super::*;
+
+    fn tool(id: &str) -> &'static Tool {
+        find(id).expect(id)
+    }
+
+    /// Every runtime still installs with its bash line on macOS and Linux.
+    #[test]
+    fn unix_runs_each_official_installer_under_bash() {
+        for t in TOOLS {
+            assert_eq!(installer(t, false), Ok(Installer::Bash(t.install_cmd)), "{}", t.id);
+        }
+    }
+
+    /// Windows runs the vendor's own installer — never bash, which a stock
+    /// Windows doesn't have — or says why there's none, before trying.
+    #[test]
+    fn windows_runs_each_vendors_own_installer_or_says_why_not() {
+        assert_eq!(installer(tool("claude-code"), true), Ok(Installer::PowerShell("irm https://claude.ai/install.ps1 | iex")));
+        assert_eq!(installer(tool("codex"), true), Ok(Installer::PowerShell("npm install -g @openai/codex")));
+        assert_eq!(installer(tool("opencode"), true), Ok(Installer::PowerShell("npm install -g opencode-ai")));
+        let why = installer(tool("kimi"), true).expect_err("no Windows install for Kimi");
+        assert!(why.contains("Kimi Code"), "{why}");
+        for t in TOOLS {
+            if let Ok(Installer::PowerShell(cmd)) = installer(t, true) {
+                assert!(!cmd.contains("bash") && !cmd.contains("curl"), "{}: {cmd}", t.id);
+            }
+        }
+    }
+
+    /// The same npm package on both: Windows doesn't install something else.
+    #[test]
+    fn the_npm_routes_install_the_package_the_unix_side_names() {
+        assert_eq!(tool("codex").install_cmd, "npm install -g @openai/codex");
+        assert!(tool("opencode").fallback.contains("npm install -g opencode-ai"));
+    }
+
+    /// A failure is an exit code: an error stops the script, a native
+    /// command's code is the process's, and no profile or prompt gets a say.
+    #[test]
+    fn powershell_gets_a_script_whose_failure_is_its_exit_code() {
+        let args = powershell_args("irm https://claude.ai/install.ps1 | iex");
+        assert_eq!(&args[..5], ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]);
+        assert_eq!(
+            args[5],
+            "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; $global:LASTEXITCODE = 0; irm https://claude.ai/install.ps1 | iex; exit $LASTEXITCODE"
+        );
+        assert_eq!(args.len(), 6);
+    }
+
+    /// Installed but not on this shell's PATH yet: found where the native
+    /// installer puts it, as Windows names it.
+    #[test]
+    fn a_home_install_is_looked_for_under_its_windows_names() {
+        let home = std::path::Path::new("/h");
+        assert_eq!(
+            home_install(home, "claude", true),
+            vec![home.join(".local/bin/claude.exe"), home.join(".local/bin/claude.cmd")]
+        );
+        assert_eq!(home_install(home, "claude", false), vec![home.join(".local/bin/claude")]);
     }
 }

@@ -17,7 +17,7 @@
 //!
 //! So the daemon canonicalises what the model wrote before it becomes a
 //! message. We already fetch the authoritative card list to BUILD the preamble
-//! (`agent::available_card_tags`), so the same list can validate the output:
+//! (`agent::available_cards`), so the same list can validate the output:
 //! a bare tag whose slug is a published card gets its owner spliced in, and
 //! everything else is left byte-for-byte alone.
 //!
@@ -37,6 +37,8 @@ use std::sync::RwLock;
 // the client splitter, `cards/split.ts`.
 use mafold_transcript::prose::{code_ranges, in_code};
 
+use mafold_transcript::catalog::OfferedCard;
+
 /// The account whose cards are first-party. Mirrors `cards_api::OFFICIAL_SCOPE`.
 const OFFICIAL: &str = "mafold";
 
@@ -45,23 +47,25 @@ const OFFICIAL: &str = "mafold";
 /// refreshed on every daemon (re)connection.
 static REGISTRY: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
 
-/// The ids exactly as the last successful `listCards` handed them over — the
-/// MENU the preamble prints, kept beside the LOOKUP derived from it. One
-/// stored fact seen two ways, which is the property the call site depends on:
-/// the list that advertises the cards is the list that validates the output.
+/// The MENU the preamble prints, from the same `listCards` answer as the
+/// LOOKUP — every card an agent of this bot may write, with its manifest's
+/// notes (`mafold_transcript::catalog`). One answer seen two ways: the lookup
+/// holds every published id, the menu the ones on offer, so anything the menu
+/// advertises the lookup can qualify.
 ///
 /// It cannot be recovered from [`REGISTRY`], which is deduped by slug with the
 /// official scope winning — rebuilding the menu from the map would quietly
 /// retire every shadowed family card (`linsky/generating`) from the model's
 /// vocabulary.
-static IDS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+static MENU: RwLock<Vec<OfferedCard>> = RwLock::new(Vec::new());
 
-/// Record the card ids (`owner/slug`) this bot may embed. A slug published in
-/// BOTH the official scope and a family scope resolves to the official one:
-/// a bare tag then means the same card for every reader, which is the whole
-/// reason viewer-relative bare resolution was removed server-side. Ids without
-/// an owner are ignored — there is nothing to qualify them to.
-pub fn set_registry(ids: &[String]) {
+/// Record the card ids (`owner/slug`) this bot may embed, and the menu of
+/// those on offer. A slug published in BOTH the official scope and a family
+/// scope resolves to the official one: a bare tag then means the same card
+/// for every reader, which is the whole reason viewer-relative bare
+/// resolution was removed server-side. Ids without an owner are ignored —
+/// there is nothing to qualify them to.
+pub fn set_registry(ids: &[String], menu: &[OfferedCard]) {
     let mut map = BTreeMap::new();
     for id in ids {
         let Some((owner, slug)) = id.split_once('/') else { continue };
@@ -76,17 +80,17 @@ pub fn set_registry(ids: &[String]) {
     if let Ok(mut reg) = REGISTRY.write() {
         *reg = map;
     }
-    if let Ok(mut held) = IDS.write() {
-        *held = ids.to_vec();
+    if let Ok(mut held) = MENU.write() {
+        *held = menu.to_vec();
     }
 }
 
-/// The last list [`set_registry`] was given. A reconnect whose `listCards` did
+/// The last menu [`set_registry`] was given. A reconnect whose `listCards` did
 /// not answer re-advertises THIS rather than telling the model it has no
 /// cards: "we did not find out" must never render as "there are none". Empty
-/// only before the first successful fetch.
-pub fn registry_ids() -> Vec<String> {
-    IDS.read().map(|v| v.clone()).unwrap_or_default()
+/// before the first successful fetch (or for an account offered nothing).
+pub fn held_menu() -> Vec<OfferedCard> {
+    MENU.read().map(|v| v.clone()).unwrap_or_default()
 }
 
 /// How much of a streamed buffer can be committed without cutting a tag in
@@ -179,14 +183,21 @@ mod tests {
     use super::*;
 
     fn registry() {
-        set_registry(&[
-            "mafold/html".into(),
-            "mafold/ask".into(),
-            "mafold/run".into(),
-            "mafold/generating".into(),
-            "linsky/generating".into(),
-            "linsky/generating-swap".into(),
-        ]);
+        let ids: Vec<String> = [
+            "mafold/html",
+            "mafold/ask",
+            "mafold/run",
+            "mafold/generating",
+            "linsky/generating",
+            "linsky/generating-swap",
+        ]
+        .map(String::from)
+        .to_vec();
+        let menu: Vec<OfferedCard> = ids
+            .iter()
+            .filter_map(|id| mafold_transcript::catalog::offer(id, None, |_| true))
+            .collect();
+        set_registry(&ids, &menu);
     }
 
     #[test]
@@ -257,12 +268,12 @@ mod tests {
         // timed out would quietly retire `linsky/generating` from the model's
         // vocabulary — a slower version of the bug this replaced.
         registry();
-        let held = registry_ids();
-        assert_eq!(held.len(), 6, "the menu is the list as given: {held:?}");
-        assert!(held.contains(&"linsky/generating".to_string()));
-        assert!(held.contains(&"mafold/generating".to_string()));
-        // …while the lookup still collapses the shadowed pair.
+        let held: Vec<String> = held_menu().into_iter().map(|c| c.id).collect();
+        // The transcript machinery is never on the menu (`catalog::offer`)…
+        assert_eq!(held, ["mafold/html", "mafold/ask", "linsky/generating", "linsky/generating-swap"]);
+        // …while the lookup still knows every id, and collapses the shadowed pair.
         assert_eq!(qualify("{% generating /%}"), "{% mafold/generating /%}");
+        assert_eq!(qualify("{% run %}"), "{% mafold/run %}");
     }
 
     #[test]

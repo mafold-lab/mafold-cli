@@ -80,12 +80,54 @@ fn walk<'a>(md: &'a str, counts: &mut HashMap<&'a str, usize>, out: &mut Vec<Car
     }
 }
 
+/// One item a message's cards declare everybody may write (`shared="a b"` on
+/// a card tag, `.docs/card-state-v1.md` §3.7): `<scope>.<field>`, created by
+/// the SENDER with `v: null`, `read: [all]`, `write: [all]` right after the
+/// message is finished — only the sender may create an item that is nobody's
+/// own, and the server never reads a message to do it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub key: String,
+}
+
+/// Fields one card may declare shared, and how one is spelled.
+pub const MAX_SHARED: usize = 16;
+
+fn shared_field(f: &str) -> bool {
+    (1..=48).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Every shared item `md`'s cards declare, in document order, once each.
+pub fn declared_state(md: &str) -> Vec<Declared> {
+    let mut out: Vec<Declared> = Vec::new();
+    for card in card_scopes(md) {
+        let Some(list) = card.attr("shared") else { continue };
+        for field in list.split_whitespace().filter(|f| shared_field(f)).take(MAX_SHARED) {
+            let key = format!("{}.{field}", card.scope);
+            if !out.iter().any(|d| d.key == key) {
+                out.push(Declared { key });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn scopes(md: &str) -> Vec<String> {
         card_scopes(md).into_iter().map(|c| c.scope).collect()
+    }
+
+    #[test]
+    fn a_card_declares_its_shared_fields_under_its_own_scope() {
+        let md = "{% mafold/html shared=\"items done\" %}<p>a</p>{% /mafold/html %}\n\
+                  {% mafold/html %}<p>b</p>{% /mafold/html %}\n\
+                  {% mafold/html sid=\"list\" shared=\"items BAD x/y items\" %}<p>c</p>{% /mafold/html %}";
+        let keys: Vec<String> = declared_state(md).into_iter().map(|d| d.key).collect();
+        assert_eq!(keys, ["mafold/html/0.items", "mafold/html/0.done", "mafold/html/list.items"]);
+        assert!(declared_state("`{% mafold/html shared=\"x\" %}` in code").is_empty());
     }
 
     /// The same cases `client-shared/cardState.ts` is tested on

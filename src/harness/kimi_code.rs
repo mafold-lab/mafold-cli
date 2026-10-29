@@ -74,8 +74,9 @@ impl Harness for KimiCode {
             surface,
             draft,
             // Claude Code's today; Kimi's `extra_skill_dirs` is wired after it
-            // is measured (`.docs/bot-drive-v1.md` §5.5).
-            mount: _,
+            // is measured (`.docs/bot-drive-v1.md` §5.5). Whose eyes the turn
+            // reads with is every harness's (`turn_env`).
+            mount,
             // No PreToolUse hook to hold it with: Kimi has no Skill tool
             // gate yet (`crate::drive::skill_gate`).
             skill_plugins: _,
@@ -101,6 +102,7 @@ impl Harness for KimiCode {
             thinking,
             conv: &conv,
             surface: &surface,
+            reads: &mount.reads,
             draft: &draft,
             cancel: &cancel,
             sink: &sink,
@@ -163,6 +165,8 @@ struct RunParams<'a> {
     conv: &'a str,
     /// The turn's surface tag — where its forum channel comes from (`turn_env`).
     surface: &'a str,
+    /// Whose eyes the turn reads with (`Mount::reads`, exported by `turn_env`).
+    reads: &'a crate::chat::ReadsFor,
     draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
@@ -172,7 +176,7 @@ struct RunParams<'a> {
 /// One `kimi --print` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { program, full_prompt, workdir, model, thinking, conv, surface, draft, cancel, sink, proc } = *p;
+    let RunParams { program, full_prompt, workdir, model, thinking, conv, surface, reads, draft, cancel, sink, proc } = *p;
 
     let mut cmd = crate::platform::command(program);
     // `--print` runs one turn non-interactively (and implies `--yolo`, so tools
@@ -200,9 +204,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     if let Some(sid) = session {
         cmd.arg("--session").arg(sid);
     }
-    // Export the current conversation and forum channel, so `mafold room`,
-    // `send` and `read` default to THIS room and channel (`turn_env`).
-    for (k, v) in super::turn_env(conv, surface) {
+    // Export the current conversation and forum channel, so `mafold send`
+    // and `read` default to THIS room and channel (`turn_env`).
+    for (k, v) in super::turn_env(conv, surface, reads) {
         cmd.env(k, v);
     }
     // The reply being streamed right now — `mafold attach <file>` hangs media on
@@ -702,6 +706,7 @@ mod tests {
                 thinking: None,
                 conv: "c1",
                 surface,
+                reads: &crate::chat::ReadsFor::All,
                 draft: "draft",
                 cancel: &cancel,
                 sink: &sink,
@@ -737,6 +742,7 @@ mod tests {
             thinking: None,
             conv: "conv",
             surface: "",
+            reads: &crate::chat::ReadsFor::All,
             draft: "draft",
             cancel: &cancel,
             sink: &sink,

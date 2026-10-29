@@ -259,6 +259,9 @@ fn a_process_with_another_mount_is_another_pool_key() {
     assert_ne!(k().with_mount(&skills), k().with_mount(&two));
     let guest = Mount { guest: true, ..skills.clone() };
     assert_ne!(k().with_mount(&skills), k().with_mount(&guest), "a guest's process is never an owner's");
+    let alices = Mount { reads: crate::chat::ReadsFor::People(vec!["alice".into()]), ..guest.clone() };
+    let bobs = Mount { reads: crate::chat::ReadsFor::People(vec!["bob".into()]), ..guest.clone() };
+    assert_ne!(k().with_mount(&alices), k().with_mount(&bobs), "one guest's process is never another's");
 }
 
 #[test]

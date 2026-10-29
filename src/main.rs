@@ -38,6 +38,7 @@ mod flags;
 mod harness;
 mod inbox;
 mod install;
+mod installed;
 mod langpack;
 mod lifecycle;
 mod logfile;
@@ -48,7 +49,7 @@ mod pair;
 mod pending;
 mod permission_mcp;
 mod platform;
-mod room;
+mod runtime_login;
 mod session;
 mod session_life;
 mod sites;
@@ -216,6 +217,13 @@ enum Cmd {
     Access {
         #[command(subcommand)]
         cmd: chat::AccessCmd,
+    },
+    /// A message's card state: what a card's readers wrote (votes, a shared
+    /// list, moves) and what its sender put there — read what you may, write
+    /// as yourself. `mafold msg` lists it too.
+    State {
+        #[command(subcommand)]
+        cmd: chat::StateCmd,
     },
     /// Send a message. <chat> is a conversation id or a @username.
     Send {
@@ -402,17 +410,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cards::CardsCmd,
     },
-    /// Author, preview, and publish developer mini-apps.
+    /// Author, preview, and publish developer mini-apps — and call an app's
+    /// own backend (`mafold app methods` / `mafold app call`).
+    #[command(alias = "app")]
     Apps {
         #[command(subcommand)]
         cmd: apps::AppsCmd,
-    },
-    /// Read/write an app's shared CRDT room in a conversation (the AI's room
-    /// peer — backs the `mafold-room` skill). Conversation via `--conv` /
-    /// `MAFOLD_CONV`; auth via `--token` / `MAFOLD_BOT_TOKEN`.
-    Room {
-        #[command(subcommand)]
-        cmd: room::RoomCmd,
     },
     /// Publish the cloud language packs (langpacks/*.json) — first-party only.
     Langpack {
@@ -443,7 +446,22 @@ enum Cmd {
     Rm { name: String },
     /// Start the supervisor, now and on every login — keeps all configured
     /// daemons running + owns updates. Succeeds only once it is running.
-    Up,
+    Up {
+        /// Move the service here onto THIS mafold when another install set it
+        /// up (or it was started by hand, or registered with
+        /// --no-auto-update): waits for replies in progress, restarts every
+        /// bot once from this binary, and registers it to run this one.
+        /// Exit status 2 when it ran but couldn't be confirmed.
+        #[arg(long)]
+        adopt: bool,
+        /// With --adopt: say whose the service is and what adopting it would
+        /// do (the bots it restarts); change nothing.
+        #[arg(long, requires = "adopt")]
+        check: bool,
+        /// With --adopt: one JSON object instead of lines (for the desktop app).
+        #[arg(long, requires = "adopt")]
+        json: bool,
+    },
     /// Stop the supervisor + all daemons, until `mafold up`. With a name, stop
     /// just that daemon — while the supervisor runs, it starts it again within
     /// ~10s (a restart). Waits for each to exit; fails if one doesn't.
@@ -514,8 +532,29 @@ enum Cmd {
     },
     /// Re-report this machine's available harnesses (uses the saved login).
     Report,
-    /// Roll back to the previous binary (after a bad update).
-    Rollback,
+    /// The runtimes on this computer (Claude Code, …): sign one in.
+    Runtime {
+        #[command(subcommand)]
+        cmd: RuntimeCmd,
+    },
+    /// Roll back to the previous binary (after a bad update). The version rolled
+    /// back from is skipped by automatic updates until a newer one is out.
+    Rollback {
+        /// Say whether a rollback is possible and would stick; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Roll back to a binary from before rollbacks could stick (it updates
+        /// itself back at its next check unless automatic updates are off).
+        #[arg(long)]
+        force: bool,
+        /// One JSON object instead of lines (for the desktop app).
+        #[arg(long)]
+        json: bool,
+    },
+    /// (internal) What this binary can do that an older one can't, as a JSON
+    /// list of names — asked by another binary instead of guessing from versions.
+    #[command(hide = true)]
+    Capabilities,
     /// (internal) The long-lived supervisor loop — started by `up`.
     #[command(hide = true)]
     Supervise {
@@ -563,6 +602,32 @@ enum Cmd {
     /// ask card and blocks on the tap. Not for humans.
     #[command(hide = true)]
     PermissionMcp,
+}
+
+#[derive(Subcommand)]
+enum RuntimeCmd {
+    /// Sign a runtime in — what a bot's `/login` does in chat, without one:
+    /// prints the sign-in link (no browser opens here; open it on any device),
+    /// then reads the Authentication Code from stdin.
+    Login {
+        /// The runtime. Only Claude Code signs in this way.
+        #[arg(value_parser = ["claude-code"])]
+        runtime: String,
+        /// A named login: a second subscription next to this computer's own
+        /// (bots move onto it when a usage window fills). Leave out for this
+        /// computer's own login.
+        #[arg(long)]
+        name: Option<String>,
+        /// Sign in through the Anthropic Console instead of claude.ai.
+        #[arg(long)]
+        console: bool,
+        /// For a program (the desktop app): each step as one JSON line on
+        /// stdout — `{"event":"started",…}`, `{"event":"link","url":…}`, then
+        /// `{"event":"done",…}` or `{"event":"failed","code":…}` — and the code
+        /// as one line on stdin.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -664,13 +729,33 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     match &cli.cmd {
-        Cmd::Up => return supervisor::up(&cli.base, cli.no_auto_update),
+        Cmd::Up { adopt: true, check, json } => {
+            // Adopting registers without the flag; the machine setting is
+            // how to keep updates off now, and it stays as it is.
+            if cli.no_auto_update && !*check {
+                anyhow::bail!(
+                    "--adopt registers the service without --no-auto-update — to keep updates off on this computer: `mafold update --auto-update off`"
+                );
+            }
+            return supervisor::adopt(&cli.base, *check, *json);
+        }
+        Cmd::Up { .. } => return supervisor::up(&cli.base, cli.no_auto_update),
         Cmd::Down { name } => return supervisor::down(name.as_deref()),
         Cmd::Restart { name, json } => return supervisor::restart(name, *json),
         Cmd::Logs { name, lines, follow, json } => return supervisor::logs(name.as_deref(), *lines, *follow, *json),
         Cmd::Diagnose { out, json } => return diagnose::run(out.clone(), *json).await,
         Cmd::Rm { name } => return supervisor::rm(name),
-        Cmd::Rollback => return update::rollback(),
+        Cmd::Rollback { check, force, json } => {
+            return update::rollback(update::RollbackAsk { check: *check, force: *force, json: *json })
+        }
+        Cmd::Capabilities => {
+            println!("{}", serde_json::json!(update::CAPABILITIES));
+            return Ok(());
+        }
+        Cmd::Runtime { cmd: RuntimeCmd::Login { runtime: _, name, console, json } } => {
+            let ask = runtime_login::Ask { name: name.clone(), console: *console };
+            return runtime_login::command(ask, *json).await;
+        }
         Cmd::Supervise { hidden } => {
             if *hidden {
                 platform::hide_console();
@@ -703,13 +788,6 @@ async fn main() -> Result<()> {
             unreachable!()
         };
         return apps::run(cmd, cli.base, cli.token).await;
-    }
-    // Room: the AI's CRDT room peer. Auth via --token / MAFOLD_BOT_TOKEN.
-    if matches!(cli.cmd, Cmd::Room { .. }) {
-        let Cmd::Room { cmd } = cli.cmd else {
-            unreachable!()
-        };
-        return room::run(cmd, cli.base, cli.token).await;
     }
     // Langpack: publish/list check for the first-party token themselves.
     if matches!(cli.cmd, Cmd::Langpack { .. }) {
@@ -846,6 +924,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Msg { id, json } => chat::print_message(&Client::new(cli.base, token?), &id, json).await?,
         Cmd::Access { cmd } => chat::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::State { cmd } => chat::run_state(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Send {
             chat,
             channel,
@@ -904,11 +983,11 @@ async fn main() -> Result<()> {
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Flags { cmd } => flagcmd::run(cmd.unwrap_or(flagcmd::FlagsCmd::List), &Client::new(cli.base, token?)).await?,
         Cmd::Stop | Cmd::Status { .. } | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
-        | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
+        | Cmd::Apps { .. } | Cmd::Connection { .. } | Cmd::Runtime { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }
         | Cmd::Account { .. } | Cmd::Report
-        | Cmd::Up | Cmd::Down { .. } | Cmd::Restart { .. } | Cmd::Logs { .. } | Cmd::Diagnose { .. } | Cmd::Rm { .. }
-        | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
+        | Cmd::Up { .. } | Cmd::Down { .. } | Cmd::Restart { .. } | Cmd::Logs { .. } | Cmd::Diagnose { .. } | Cmd::Rm { .. }
+        | Cmd::Rollback { .. } | Cmd::Capabilities | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
         | Cmd::SteerHook | Cmd::DriveHook | Cmd::CompactHook { .. } | Cmd::PermissionMcp => unreachable!(),
         #[cfg(windows)]
         Cmd::BackgroundWorker { .. } => unreachable!(),
@@ -1232,6 +1311,19 @@ async fn chats(client: &Client) -> Result<()> {
         println!("(no conversations)");
         return Ok(());
     }
+    // A turn outside the owner's circle lists only the rooms its people sit in
+    // (and the one it is in): each row carries the room's last message, and
+    // the others are other people's conversations with this agent.
+    let reads = chat::ReadsFor::from_env();
+    let here = std::env::var("MAFOLD_CONV").ok();
+    let all = items.len();
+    let items: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter(|c| chat::may_read_room(Some(c), c["id"].as_str().unwrap_or_default(), here.as_deref(), &reads))
+        .collect();
+    if items.len() < all {
+        println!("(这一轮不是主人圈子的人发起的:只列 TA 自己也在的会话)");
+    }
     for c in items {
         // Three things this row used to drop, each of which is the difference
         // between two rows a reader can tell apart and two they cannot:
@@ -1483,6 +1575,9 @@ async fn send(
         "reply_to": reply,
         "text": text,
     }));
+    if let Some(id) = sent["id"].as_str() {
+        agent::write_declared(client, id, text).await;
+    }
     let id = sent["id"].as_str().map(|id| format!(" · #{id}")).unwrap_or_default();
     println!("✓ sent to {label}{id} · {}", msgops::receipt(text));
     Ok(())
@@ -1554,6 +1649,9 @@ async fn tap(client: &Client, message: &str, action: &str, value: Option<&str>, 
     }
     let before = client.get_message(message).await.context("reading the message the card is in")?;
     let chat_id = before["conversation_id"].as_str().context("that message has no conversation")?.to_string();
+    // A card in another of this agent's rooms is pressed — and read back —
+    // only for a turn whose people could open that room (`chat::ensure_may_open`).
+    chat::ensure_may_open(client, &chat_id).await;
     let r = client.send_component_action(&chat_id, message, action, payload).await?;
     journal(&serde_json::json!({ "kind": "tap", "chat_id": chat_id, "message_id": message, "action": action }));
     if let Some(m) = r["message"].as_str().filter(|m| !m.trim().is_empty()) {

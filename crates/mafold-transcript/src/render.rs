@@ -353,7 +353,15 @@ impl ToolKind {
 }
 
 pub fn kind_of(name: &str) -> ToolKind {
-    match name.to_lowercase().as_str() {
+    let lname = name.to_lowercase();
+    match connection_method(&lname) {
+        // A machine of one's own, driven through a connection: its shell is a
+        // shell, whatever the connection is called — "Ran 9 shell commands"
+        // on a hosted bot's card, like the daemon's Bash, not "Ran 9 tools".
+        "shell.exec" | "shell.spawn" | "shell.status" | "shell.kill" => return ToolKind::Shell,
+        _ => {}
+    }
+    match lname.as_str() {
         "bash" | "bashoutput" => ToolKind::Shell,
         "read" | "notebookedit" => ToolKind::Read,
         "edit" | "write" | "multiedit" | "apply_patch" => ToolKind::Edit,
@@ -367,6 +375,18 @@ pub fn kind_of(name: &str) -> ToolKind {
         "workflow" => ToolKind::Workflow,
         "skill" => ToolKind::Skill,
         _ => ToolKind::Other,
+    }
+}
+
+/// `{connection}.{method}` → `method`: how the hosted harness names a call it
+/// made through a connection (`computer.shell.exec`). The connection's name is
+/// whatever its owner called it, so no table can list it; the method is the
+/// provider's own. Connection names never hold a dot (`[a-z0-9_-]`), so the
+/// first one is the seam. A name with no connection in front comes back as is.
+fn connection_method(lname: &str) -> &str {
+    match lname.split_once('.') {
+        Some((_, method)) if method.contains('.') => method,
+        _ => lname,
     }
 }
 
@@ -1304,6 +1324,8 @@ fn tool_detail(name: &str, input: &Value) -> String {
             .or_else(|| input["path"].as_str())
             .or_else(|| input["file_path"].as_str())
             .or_else(|| input["command"].as_str())
+            // A connection's shell (`shell.exec` / `shell.spawn`) says `cmd`.
+            .or_else(|| input["cmd"].as_str())
             .or_else(|| input["query"].as_str())
             .or_else(|| input["url"].as_str())
             .or_else(|| input["name"].as_str()),
@@ -1358,6 +1380,16 @@ pub fn is_transcript_card(name: &str) -> bool {
 /// which a model reading its history should not be re-taught to write.
 pub fn strip_transcript_cards(md: &str) -> String {
     strip_cards_where(md, is_transcript_card)
+}
+
+/// [`strip_transcript_cards`] for someone READING another agent's reply: the
+/// trail and the stamps go, but the cards that say how the reply ENDED stay —
+/// the error it died on, the limit that stopped it, the background tasks it
+/// left running. Whoever decides whether to chase that agent needs all three.
+pub fn strip_trail_cards(md: &str) -> String {
+    strip_cards_where(md, |name| {
+        is_transcript_card(name) && !matches!(name, "mafold/error" | "mafold/ratelimit" | "mafold/bgtasks")
+    })
 }
 
 /// Is this line one of the renderer's own notices — a usage limit, a
@@ -1493,6 +1525,23 @@ mod strip_transcript_tests {
         let md = "{% mafold/quote %}said:\n{% mafold/result /%}\nthat{% /mafold/quote %}";
         let out = strip_transcript_cards(md);
         assert_eq!(out, "{% mafold/quote %}said:\n\nthat{% /mafold/quote %}");
+    }
+
+    /// A reader of the reply keeps what it said and how it ended — the error,
+    /// the limit, the tasks still running — and loses the trail around them.
+    #[test]
+    fn the_trail_goes_and_how_the_reply_ended_stays() {
+        let md = format!(
+            "{MD}{{% mafold/bgtasks n=1 %}}\nci watch\n{{% /mafold/bgtasks %}}\n\
+             {{% mafold/ratelimit kind=\"session\" /%}}\n{{% mafold/error title=\"Turn failed\" %}}boom{{% /mafold/error %}}"
+        );
+        let out = strip_trail_cards(&md);
+        for kept in ["Here:", "Done.", "mafold/html", "mafold/bgtasks", "ci watch", "mafold/ratelimit", "mafold/error", "boom"] {
+            assert!(out.contains(kept), "{kept} is gone: {out}");
+        }
+        for gone in ["mafold/run", "mafold/bash", "mafold/result", "tokens"] {
+            assert!(!out.contains(gone), "{gone} survived: {out}");
+        }
     }
 }
 
@@ -2268,6 +2317,27 @@ mod notice_tests {
             tool_detail("Bash", &serde_json::json!({ "command": "ls", "detail": "ignored" })),
             "ls"
         );
+    }
+
+    /// A hosted bot driving someone's machine calls `{connection}.shell.exec`
+    /// with a `cmd`: a shell command, like the daemon's Bash — counted as one in
+    /// its group's summary, and its card says what it ran. (2026-10-27: nine of
+    /// them on @claude's reply read "Ran 1 tool" each, no command on any.)
+    #[test]
+    fn a_connections_shell_reads_like_bash() {
+        for name in ["computer.shell.exec", "my-mac.shell.spawn", "laptop.shell.status", "box_1.shell.kill"] {
+            assert_eq!(kind_of(name), ToolKind::Shell, "{name}");
+        }
+        assert_eq!(kind_of("notion.search"), ToolKind::Other, "a connection's other tools stay tools");
+        let call = AgentEvent::ToolCall {
+            id: "a".into(),
+            name: "computer.shell.exec".into(),
+            input: serde_json::json!({ "cmd": "cargo build", "timeout_ms": 25000 }),
+        };
+        let mut counts = HashMap::new();
+        *counts.entry(tool_kind(&call).expect("a counted action")).or_insert(0) += 1;
+        assert_eq!(run_summary(&counts), "Ran 1 shell command");
+        assert_eq!(tool_detail("computer.shell.exec", &serde_json::json!({ "cmd": "cargo build" })), "cargo build");
     }
 
     #[test]

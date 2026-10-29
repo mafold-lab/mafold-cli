@@ -67,6 +67,9 @@ pub async fn run(cmd: ChannelsCmd, client: &Client) -> Result<()> {
     match cmd {
         ChannelsCmd::List { chat } => {
             let chat_id = client.resolve_chat(&chat).await?;
+            // Another of this agent's rooms is opened only for a turn whose
+            // people could open it themselves (`chat::ensure_may_open`).
+            crate::chat::ensure_may_open(client, &chat_id).await;
             let channels = fetch(client, &chat_id).await?;
             if channels.is_empty() {
                 println!("(no channels — the forum only has its implicit #all timeline)");
@@ -105,6 +108,7 @@ pub async fn run(cmd: ChannelsCmd, client: &Client) -> Result<()> {
         }
         ChannelsCmd::Create { chat, name, icon } => {
             let chat_id = client.resolve_chat(&chat).await?;
+            crate::chat::ensure_may_open(client, &chat_id).await;
             let ch = client
                 .create_channel(&chat_id, &name, icon.as_deref())
                 .await?;
@@ -236,6 +240,8 @@ fn is_untitled(c: &Value) -> bool {
 /// error lists what exists so bots can self-correct.
 pub async fn resolve(client: &Client, chat: &str, channel: &str) -> Result<(String, Value)> {
     let chat_id = client.resolve_chat(chat).await?;
+    // Before its channels are listed back — see `ChannelsCmd::List`.
+    crate::chat::ensure_may_open(client, &chat_id).await;
     let channels = fetch(client, &chat_id).await?;
     match find(&channels, channel) {
         Some(c) => Ok((chat_id, c.clone())),

@@ -80,6 +80,10 @@ pub struct Run {
     /// before it, which updates whatever the setting says.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub update_setting: bool,
+    /// The Mafold it talks to (`--base`); left out by one from before it —
+    /// what `up --adopt` can't tell of a supervisor started by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -135,10 +139,10 @@ fn write<T: Serialize>(path: &Path, v: &T) {
 /// At supervisor start: write down why the one before stopped and start this
 /// run's record. Returns both — the exit is put back if an update's re-exec
 /// fails and this process carries on ([`restore_exit`]).
-pub fn begin(pid: u32, auto_update: bool) -> (Run, Option<Exit>) {
+pub fn begin(pid: u32, auto_update: bool, base: &str) -> (Run, Option<Exit>) {
     let now = crate::accounts::now();
     let at = Clock { now, boot: crate::platform::boot_time() };
-    begin_at(&run_path(), &exit_path(), pid, crate::update::current_version(), auto_update, at)
+    begin_at(&run_path(), &exit_path(), pid, crate::update::current_version(), auto_update, Some(base), at)
 }
 
 /// Now, and when this machine last booted (epoch seconds) — what tells a
@@ -149,7 +153,15 @@ pub struct Clock {
     pub boot: Option<i64>,
 }
 
-pub(crate) fn begin_at(run_p: &Path, exit_p: &Path, pid: u32, version: &str, auto_update: bool, at: Clock) -> (Run, Option<Exit>) {
+pub(crate) fn begin_at(
+    run_p: &Path,
+    exit_p: &Path,
+    pid: u32,
+    version: &str,
+    auto_update: bool,
+    base: Option<&str>,
+    at: Clock,
+) -> (Run, Option<Exit>) {
     let now = at.now;
     let prev: Option<Run> = read(run_p);
     let last = ended(prev.as_ref(), read(exit_p), at.boot);
@@ -158,7 +170,16 @@ pub(crate) fn begin_at(run_p: &Path, exit_p: &Path, pid: u32, version: &str, aut
     if last.as_ref().is_some_and(|x| x.reason.is_crash()) {
         crashes.push(now);
     }
-    let run = Run { pid, started_at: now, version: version.to_string(), auto_update, crashes, control: crate::control::VERSION, update_setting: true };
+    let run = Run {
+        pid,
+        started_at: now,
+        version: version.to_string(),
+        auto_update,
+        crashes,
+        control: crate::control::VERSION,
+        update_setting: true,
+        base: base.map(str::to_string),
+    };
     if let Some(x) = &last {
         write(exit_p, x);
     }
@@ -370,7 +391,7 @@ mod tests {
 
     /// On a machine that hasn't booted since any of this (no boot time).
     fn begin_at(r: &Path, x: &Path, pid: u32, version: &str, auto: bool, now: i64) -> (Run, Option<Exit>) {
-        super::begin_at(r, x, pid, version, auto, Clock { now, boot: None })
+        super::begin_at(r, x, pid, version, auto, None, Clock { now, boot: None })
     }
 
     fn service_at(r: &Path, x: &Path, running: Option<u32>, now: i64) -> Service {
@@ -386,7 +407,7 @@ mod tests {
         let s = super::service_at(&r, &x, None, after_boot);
         assert_eq!(s.last_exit.as_ref().map(|x| x.reason), Some(Why::Shutdown));
         assert!(s.crashes.is_empty());
-        let (run, last) = super::begin_at(&r, &x, 200, "0.9.150", true, Clock { now: 5_100, boot: Some(5_000) });
+        let (run, last) = super::begin_at(&r, &x, 200, "0.9.150", true, None, Clock { now: 5_100, boot: Some(5_000) });
         assert_eq!(last.map(|x| x.reason), Some(Why::Shutdown));
         assert!(run.crashes.is_empty(), "a reboot is no crash");
         // Gone a few seconds into THIS boot, still without a word: that's no shutdown.
@@ -427,7 +448,19 @@ mod tests {
         let (r, x) = tmp("first");
         let (run, last) = begin_at(&r, &x, 100, "0.9.150", true, 1_000);
         assert_eq!(last, None);
-        assert_eq!(run, Run { pid: 100, started_at: 1_000, version: "0.9.150".into(), auto_update: true, crashes: vec![], control: crate::control::VERSION, update_setting: true });
+        assert_eq!(
+            run,
+            Run {
+                pid: 100,
+                started_at: 1_000,
+                version: "0.9.150".into(),
+                auto_update: true,
+                crashes: vec![],
+                control: crate::control::VERSION,
+                update_setting: true,
+                base: None
+            }
+        );
         // Said in the record a command reads before it asks anything.
         assert_eq!(read::<Run>(&r).map(|r| r.control), Some(crate::control::VERSION));
         // A supervisor from before the requests wrote none: it takes nothing.

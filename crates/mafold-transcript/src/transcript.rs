@@ -101,6 +101,10 @@ fn verbatim(full: &str) -> String {
     full.to_string()
 }
 
+/// `Clone` so a driver can keep the reply as it stood and put it back: a
+/// hosted step whose stream broke is asked again from the top, and what it
+/// had said is taken back first (mafold-api's `ChatEvent::Restart`).
+#[derive(Clone)]
 pub struct Transcript {
     stats: Option<crate::RunStats>,
     stats_started: std::time::Instant,

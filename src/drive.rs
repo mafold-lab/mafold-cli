@@ -374,7 +374,7 @@ pub fn current() -> Option<Arc<Mirror>> {
     CURRENT.get().cloned()
 }
 
-/// The daemon's own plugin (Mafold's skills, e.g. `mafold-room`), next to the
+/// The daemon's own plugin (Mafold's skills, e.g. `mafold-video`), next to the
 /// bots' drives: `~/.mafold/plugins/mafold`.
 pub fn mafold_plugin_dir() -> PathBuf {
     drives_dir().parent().map(|p| p.join("plugins").join("mafold")).unwrap_or_else(|| PathBuf::from("plugins/mafold"))
@@ -398,7 +398,9 @@ pub async fn mount(m: Option<&Mirror>) -> crate::harness::Mount {
     if let Some(m) = m {
         plugin_dirs.push(m.root());
     }
-    crate::harness::Mount { plugin_dirs, guest: false }
+    // Whose eyes it reads with is the turn's to say (`agent::AllowList::reads_for`);
+    // until it does, nobody's.
+    crate::harness::Mount { plugin_dirs, guest: false, reads: Default::default(), tools: None }
 }
 
 /// The skill gate: what a guest's turn — one someone outside the owner's

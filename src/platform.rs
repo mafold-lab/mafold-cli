@@ -465,6 +465,66 @@ mod imp {
 
 pub use imp::*;
 
+/// A process and everything it starts, as one thing to end — Windows' process
+/// group. Unix gets that from `setsid`/`process_group` + `killpg`; Windows has
+/// no process group to signal, so a timeout that killed only the shell left
+/// what the shell started running (a `shell.exec` ran as long as it liked; an
+/// installer's download carried on). A job object is the group: everything
+/// the process starts joins it, and [`JobTree::kill`] ends the lot. No
+/// `KILL_ON_JOB_CLOSE` — a process that FINISHES leaves whatever it started
+/// running, as on Unix. Put the process in at once, before it has started
+/// anything.
+#[cfg(windows)]
+pub struct JobTree(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl JobTree {
+    pub fn of(process: std::os::windows::io::RawHandle) -> Option<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            if AssignProcessToJobObject(job, process as _) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+
+    pub fn kill(&self) {
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobTree {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+// The handle is only ever used to terminate the job, from whichever task owns
+// the process.
+#[cfg(windows)]
+unsafe impl Send for JobTree {}
+
+/// The user's home: `$HOME`, else (Windows, where it's usually unset)
+/// `%USERPROFILE%`.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(std::path::PathBuf::from)
+}
+
 /// Ask `pid` to stop and wait up to `max` until it has; true once it's gone.
 /// What a command that stops something waits on before it says it did — a
 /// "✓ stopped" printed right after the signal was a guess.

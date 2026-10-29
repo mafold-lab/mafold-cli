@@ -330,6 +330,26 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // Room retirement (#1203/#1204) as hosted bots teach it: @mafold's app
+    // builder and the bundled product help send one-chat data (a poll, a game,
+    // a roll call) to an html card's shared state and lasting data to an app's
+    // own backend, instead of a room. web@0.1.171 / app.js@30 can't write that
+    // card state or deliver `appEvent`, so it stays shut until the clients
+    // that can are live (card 18) — realopsdu 10-29.
+    FlagMeta {
+        key: "roomRetireHosted",
+        default: false,
+        dev_default: false,
+        label: "Hosted bots teach room-free apps",
+        description: "@mafold's app builder answers a poll, a game or a roll call with an html card that \
+                      keeps shared state, and builds shared apps with their own backend instead of a room; \
+                      the hosted product help says the same. Read for the person the turn answers to. \
+                      Off = the builder and the help teach the room, as before.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     // The api reads it for Moments push notifications: a person without the
     // tab must not be pinged about a feed they can't open (`push.rs`).
     FlagMeta {
@@ -476,6 +496,46 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // 更新胶囊的「预览」(本人 10-24 拍「预览入口要」,更新胶囊 PV):胶囊只在真有新版时伸,本人手上的
+    // 正式包这几天等不到一个 —— 给要试的号开,设置 ▸ 更新 底下几行往这台机器的胶囊里喂假的(真组件、
+    // 假来源,client-shared/updatePillDemo.ts 两端一份)。生产关、dev 开:开发包、dev 环境天然看得到,
+    // 原来计划里「设置 ▸ 开发者」的演示行由它替代,不另做。跟 updatePill 一样老壳也读得到服务端记录。
+    FlagMeta {
+        key: "updatePillPreview",
+        default: false,
+        dev_default: true,
+        label: "Update pill: preview rows",
+        description: "Only for accounts that want to try the update pill. Settings > Updates shows a few \
+                      preview rows at the bottom (with updatePill on too); tapping one feeds this \
+                      device's pill a pretend update — new web page, desktop app, in-place bundle, App \
+                      Store, install package, waiting while busy, up to date, reset — so the real pill \
+                      stretches out of the badge. Nothing really reloads, swaps the bundle, opens the \
+                      store or downloads. Off = Settings > Updates as before.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // 谁能私聊我(本人 10-25 点头):Premium 可设「只收 Premium」,认证号还能设「只收名单里的人」。
+    // 服务端按设置的那个人(AI 号按它的主人)看这个开关:没记录 ⇒ 存着的设置一概不生效,开关就是
+    // 总闸;两端的设置项也跟着它。被拦的那一边(资料页的说明、锁住的输入框)不看开关 —— 服务端
+    // 拦了,谁都该看到为什么。
+    FlagMeta {
+        key: "dmPrivacy",
+        default: false,
+        dev_default: true,
+        label: "Who can message me",
+        description: "Settings > Privacy and Security gets \"Who can message me\": Premium members (and \
+                      verified accounts) may allow only Premium members; verified accounts may allow \
+                      only the people and groups on a list. People they've chatted with keep writing; \
+                      new people who don't qualify can't start a chat with them or add them to groups. \
+                      An AI account is judged by its owner. Off = the setting isn't offered and any \
+                      stored one is not enforced.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -558,6 +618,35 @@ mod tests {
             assert_eq!(m.server, NotRead, "{k}: read by the clients only");
             assert!(!server_default(k), "{k}: nothing server-side opens without a record");
         }
+    }
+
+    #[test]
+    fn update_pill_preview_ships_dark_beside_the_pill() {
+        // 更新胶囊的「预览」行(更新胶囊 PV):只给要试胶囊的号开 —— 生产关;dev 开,开发包、dev 环境
+        // 天然看得到(原来计划里「设置 ▸ 开发者」的演示行由它替代,不另做)。网页(桌面壳加载的就是
+        // 它)和手机都读,服务端不看。登记紧跟 updatePill / bootCurtain,写法同它们。
+        let k = "updatePillPreview";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, NotRead, "{k}: read by the clients only");
+        assert!(!server_default(k), "{k}: nothing server-side opens without a record");
+        assert_eq!((m.owner, m.added), ("ops", "2026-10"), "{k}: owner and month");
+        let at = |key: &str| KNOWN_FLAGS.iter().position(|f| f.key == key);
+        assert_eq!(at(k), at("bootCurtain").map(|i| i + 1), "{k}: registered right after updatePill / bootCurtain");
+    }
+
+    #[test]
+    fn dm_privacy_is_a_server_gate_that_ships_dark() {
+        // The api enforces a stored setting only where this resolves on, so
+        // with no record nothing is enforced and nothing is offered.
+        let k = "dmPrivacy";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
     }
 
     #[test]

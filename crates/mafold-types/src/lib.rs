@@ -18,6 +18,9 @@ pub mod connections;
 pub mod computers;
 /// D1 databases: names, wire shapes (`d1.rs`, `.docs/d1-v1.md`).
 pub mod d1;
+/// Who can send me messages: the setting, what it decides, why a sender is
+/// turned away (`dm_privacy.rs`).
+pub mod dm_privacy;
 pub mod drive;
 /// The feature-flag registry — keys, defaults, who reads each, and what the
 /// server decides without a record (`flags.rs`, `.docs/feature-flags.md`).
@@ -30,6 +33,9 @@ pub mod mime;
 pub mod receipts;
 /// A mafold.app site's own Worker (`sites.rs`, `.docs/site-workers-v1.md`).
 pub mod sites;
+/// Which addresses a request to somebody else's URL may reach — the api's
+/// fetches and a daemon's `mafold app call` (`net.rs`).
+pub mod net;
 /// Mid-turn words: which running turn takes them, and how they are framed —
 /// one rule for the daemon and the hosted brains (`steer.rs`).
 pub mod steer;
@@ -795,11 +801,18 @@ pub struct Sidecar {
     /// already left out every item this reader may not read.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub state: std::collections::BTreeMap<String, StateItem>,
+    /// How many writes this message's state has taken (§3.6).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub rev: u64,
+    /// This reader's items were too many to carry with the message (over
+    /// 32KB): `state` is left out and `getCardState` has them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub state_more: bool,
 }
 
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
-        self.state.is_empty()
+        self.state.is_empty() && !self.state_more
     }
 }
 
@@ -840,6 +853,10 @@ pub struct StateItem {
     /// Unix seconds of the last write.
     #[serde(default)]
     pub at: i64,
+    /// The message's state revision at this item's last write — what
+    /// `setCardState`'s `if_rev` compares; `0` on items from before (§3.6).
+    #[serde(default)]
+    pub rev: u64,
 }
 
 /// One picture: re-hosted on our CDN, still being fetched, or not to be had.

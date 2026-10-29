@@ -9,12 +9,12 @@
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use mafold_transcript::catalog::OfferedCard;
 use mafold_transcript::failure::AccountIssue;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -712,10 +712,63 @@ async fn trusted_turn(sender: &str, relayed_for: Option<&str>) -> bool {
     standing(sender, relayed_for).await != Standing::Guest
 }
 
+/// What the turn `sender` starts may read beyond its own room — see
+/// [`crate::chat::ReadsFor`].
+async fn reads_for(sender: &str, relayed_for: Option<&str>) -> crate::chat::ReadsFor {
+    match ACCESS.get() {
+        Some(access) => access.read().await.reads_for(sender, relayed_for),
+        None => crate::chat::ReadsFor::People(vec![]),
+    }
+}
+
+/// The people a turn is for: who sent it and, when that is a bot passing
+/// someone on, whom it came from. `""` — nobody in particular — names nobody.
+fn turn_people(sender: &str, relayed_for: Option<&str>) -> Vec<String> {
+    let mut people: Vec<String> = std::iter::once(sender)
+        .chain(relayed_for.filter(|p| !p.trim().is_empty()))
+        .map(norm_user)
+        .collect();
+    people.dedup();
+    people
+}
+
+/// Whose guest session a guest's turn runs in: everyone it is for, so one
+/// guest's turns never resume another's — nor what a bot relayed for someone
+/// else. A guest's background work (`relayed_for` = `""`) wakes in its own
+/// person's session.
+fn guest_key(sender: &str, relayed_for: Option<&str>) -> String {
+    turn_people(sender, relayed_for).join(">")
+}
+
 /// A guest's turns keep sessions of their own: one the owner's circle has
-/// used may hold what the owner's skills, agents or CLAUDE.md put in it.
-fn guest_session(skey: String, guest: bool) -> String {
-    if guest { format!("{skey}#guest") } else { skey }
+/// used may hold what the owner's skills, agents or CLAUDE.md put in it. And
+/// one guest's session is not the next guest's: what alice's turns put in it —
+/// a ticket of hers, a transcript she was let read — must not be in the
+/// context bob's turn resumes (until 2026-10-25 every guest of a room shared
+/// one `#guest`). `guest` is whose it is (`guest_key`; `None`: the circle's).
+fn guest_session(skey: String, guest: Option<&str>) -> String {
+    match guest {
+        Some(who) => format!("{skey}{}{}", GUEST_SESSIONS, who.trim().to_lowercase()),
+        None => skey,
+    }
+}
+
+/// What every guest session of a surface's key starts with, after the key —
+/// how the circle's `/clear` finds them all.
+const GUEST_SESSIONS: &str = "#guest:";
+
+/// `/clear` of the session `skey`. The owner's circle (`circle`) clears the
+/// room, guests' conversations included — every guest's own, and the one they
+/// all shared before each had theirs; a guest only their own. Whether anything
+/// went.
+fn clear_sessions(s: &mut HashMap<String, String>, skey: &str, circle: bool) -> bool {
+    let before = s.len();
+    s.remove(skey);
+    if circle {
+        let (shared, each) = (format!("{skey}#guest"), format!("{skey}{}", GUEST_SESSIONS));
+        s.retain(|k, _| *k != shared && !k.starts_with(&each));
+    }
+    s.len() != before
 }
 
 /// A guest's turn may not run the owner's skills as a typed command either:
@@ -796,6 +849,22 @@ impl AllowList {
         } else {
             Standing::Circle
         }
+    }
+
+    /// Whom a turn `sender` starts reads for ([`crate::chat::ReadsFor`]): the
+    /// owner's circle with the agent's own eyes — every room it sits in, every
+    /// ticket it holds — and anyone else, or anyone a bot passes on, with
+    /// their own. `*` and the paid tier open the door; they don't hand over
+    /// the owner's rooms. Members of the circle among a guest turn's people
+    /// drop out (nothing is closed to them); a turn nobody in particular
+    /// started reads for nobody.
+    fn reads_for(&self, sender: &str, relayed_for: Option<&str>) -> crate::chat::ReadsFor {
+        if self.standing(sender, relayed_for) != Standing::Guest {
+            return crate::chat::ReadsFor::All;
+        }
+        crate::chat::ReadsFor::People(
+            turn_people(sender, relayed_for).into_iter().filter(|p| !p.is_empty() && !self.circle(p)).collect(),
+        )
     }
 
     /// May this sender drive the bot? An AI sender is judged as BOTH itself and
@@ -2307,20 +2376,22 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     let my_username = me["username"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
 
-    // Export creds + install the room skill so child processes the agent spawns
-    // (`mafold room …`, run by the agent via the room skill) reuse THIS daemon's
-    // identity + base without re-reading daemons.json. MAFOLD_CONV is set
+    // Export creds so child processes the agent spawns (`mafold app call …`,
+    // `mafold state …`) reuse THIS daemon's identity + base without re-reading
+    // daemons.json. MAFOLD_CONV is set
     // per-turn on the claude child (concurrent turns can't share a global).
     std::env::set_var("MAFOLD_BOT_TOKEN", &client.token);
     std::env::set_var("MAFOLD_BASE", &client.base);
+    // Whose eyes a turn reads with is set per turn on its process
+    // (`harness::turn_env`). A daemon started from inside some turn's shell
+    // must not carry that turn's into everything else it runs.
+    std::env::remove_var(crate::chat::READS_FOR_ENV);
     // …and a character type, when the daemon was started without one, so the
     // agent's shell counts characters, not bytes (`utf8_ctype_fill`).
     if let Some(ctype) = utf8_ctype_fill(|k| std::env::var(k).ok()) {
         std::env::set_var("LC_CTYPE", ctype);
     }
-    if let Err(e) = crate::room::install_skill() {
-        eprintln!("room skill install skipped: {e}");
-    }
+    crate::installed::remove_room_skill();
     // Same channel for the video skill: shipped inside this binary, so the
     // `mafold video …` commands it names exist in exactly this version.
     if let Err(e) = crate::video::install_skill() {
@@ -2410,16 +2481,20 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     if !std::path::Path::new(&workdir).is_dir() {
         eprintln!("⚠️  working directory does not exist: {workdir} — the harness will fail. Check --workdir.");
     }
-    if !harness.available() {
+    if !harness.runs() {
+        // Never another runtime in its place (10-29: an OpenCode agent ran as
+        // Claude Code). Every turn answers with the reason instead.
+        eprintln!("⚠️  this agent's runtime `{}` isn't one Mafold can run — every reply will say so.", harness.id());
+    } else if !harness.available() {
         eprintln!("⚠️  harness `{}` CLI not found on PATH — replies will fail until it's installed.", harness.id());
         if harness.id() == "claude-code" {
             eprintln!("    install it with: mafold install claude-code");
         }
     }
-    // Show the requested id and whether it fell back (an unimplemented harness
-    // resolves to claude-code), so cloud-first selection is observable in logs.
+    // Show the requested id and the runtime it resolved to (an alias like
+    // `claude` resolves to claude-code), so cloud-first selection is observable in logs.
     let harness_label = if harness.id() != harness_id {
-        format!("{harness_id} (→ {} fallback)", harness.id())
+        format!("{harness_id} (→ {})", harness.id())
     } else {
         harness_id.clone()
     };
@@ -2600,10 +2675,12 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
                 }
             }
             println!("↻ re-arming background-task wakeup for {tag} ({n} registration(s))");
-            // A guest's tasks (`guest_tag`) wake as a guest — nobody in
-            // particular, since the registry doesn't say which one — never as
-            // the owner, whose own Claude Code that would put them on.
-            let guest = surface_split(&tag).is_some_and(|(_, _, b)| b != me);
+            // A guest's tasks (`guest_tag`) are watched on that guest's
+            // registry (`tag_guest`) and wake as a guest — nobody in
+            // particular, since the registry's spelling is no username
+            // (`wake_speaker`) — never as the owner, whose own Claude Code
+            // that would put them on.
+            let guest = surface_split(&tag).and_then(|(_, _, b)| tag_guest(&b, &me));
             arm_bg_wakeup(
                 client.clone(),
                 workdir.clone(),
@@ -2621,7 +2698,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
                 None,
                 None,
                 None,
-                if guest { String::new() } else { stopper.clone() },
+                if guest.is_some() { String::new() } else { stopper.clone() },
                 guest,
                 n,
                 // The card-carrying reply predates this process — wake-up only.
@@ -3385,7 +3462,7 @@ async fn intro_turn(
     peer: &str,
     answerer: &str,
     brief: String,
-    card_tags: &[String],
+    card_tags: &[OfferedCard],
     sessions: &Sessions,
     workdirs: &Workdirs,
     coord: &Arc<ExecCoord>,
@@ -3564,7 +3641,7 @@ async fn draft_group_intro(
     // The owner's "make it shorter / drop that bit", when they reply to a
     // draft instead of tapping. None on the first pass.
     correction: Option<&str>,
-    card_tags: &[String],
+    card_tags: &[OfferedCard],
     sessions: &Sessions,
     workdirs: &Workdirs,
     coord: &Arc<ExecCoord>,
@@ -3664,7 +3741,7 @@ fn arm_boot_intro(
     my_username: String,
     owner_username: String,
     harness: Arc<dyn Harness>,
-    card_tags: Vec<String>,
+    card_tags: Vec<OfferedCard>,
     sessions: Sessions,
     workdirs: Workdirs,
     coord: Arc<ExecCoord>,
@@ -3822,8 +3899,8 @@ async fn connect_and_run(
 
     // Cards this bot can embed in replies — fetched once per connection, folded
     // into the mafold preamble each turn AND used to canonicalise what the model
-    // writes back (`cardtags::qualify`): the same list that advertises the cards
-    // is the one that validates the output, so the two can't drift.
+    // writes back (`cardtags::qualify`): one `listCards` answer is both the menu
+    // and the lookup, so anything advertised can be qualified.
     //
     // Failed fetch → keep what we hold, exactly like the owner config below.
     // Empty is not a neutral default here, it is a lie with two victims: an
@@ -3835,13 +3912,13 @@ async fn connect_and_run(
     // flaky link lives there: 2026-09-15, @linsky:opus48 logged 1809
     // reconnects and 6173 connect failures in one process while `listCards`
     // itself answered 200 whenever it was actually reached.
-    let card_tags = match available_card_tags(client).await {
-        Some(fresh) => {
-            crate::cardtags::set_registry(&fresh);
-            fresh
+    let card_tags = match available_cards(client).await {
+        Some((ids, menu)) => {
+            crate::cardtags::set_registry(&ids, &menu);
+            menu
         }
         None => {
-            let held = crate::cardtags::registry_ids();
+            let held = crate::cardtags::held_menu();
             match held.len() {
                 0 => println!(
                     "⚠ listCards did not answer on connect — no card list held yet, \
@@ -5081,7 +5158,15 @@ async fn connect_and_run(
             // working, saying it to a SECOND copy of itself in the same working
             // directory is the wrong answer. Steer the one that's running —
             // and that includes a picture sent with no words.
-            if has_something_to_say(&content, &attachments) {
+            //
+            // Except a bot passing on a person outside the owner's circle: a
+            // running turn knows only the bot that started it (`owner`), not
+            // whom it was relaying, so these words could land in a turn the
+            // same bot started for someone else — one reading with THEIR eyes
+            // (`Mount::reads`) and resuming their session. Theirs is a turn of
+            // its own, the way a billed sender's is.
+            let relays_a_guest = words_guest && relayed_for.as_deref().is_some_and(|p| !p.trim().is_empty());
+            if has_something_to_say(&content, &attachments) && !relays_a_guest {
                 // In order: a message of theirs that came in just before this
                 // one and is still opening its draft is the running turn this
                 // one belongs to — it just isn't in `turns` yet.
@@ -5975,10 +6060,16 @@ async fn inject_into_live_turn<Fut: std::future::Future<Output = String>>(
         Some(g) => g,
         None => !trusted(from.lc).await,
     };
-    let mixes = match seam {
-        Seam::User(_) => !turn_guest && from_guest,
-        _ => turn_guest != from_guest,
-    };
+    // Nor does one guest's ride in another guest's: that turn reads with the
+    // first guest's eyes (`Mount::reads`) and resumes their session, so the
+    // second would be reading their tickets and leaving words in their
+    // context. Each guest gets a turn of their own.
+    let another_guest = turn_guest && from_guest && cross;
+    let mixes = another_guest
+        || match seam {
+            Seam::User(_) => !turn_guest && from_guest,
+            _ => turn_guest != from_guest,
+        };
     if mixes {
         return None;
     }
@@ -6242,7 +6333,9 @@ async fn handle_control(
         let cc = TurnConfig::fetch(client, chat_id, None, &owner).await;
         let surface_cwd = workdirs.lock().await.get(&base_key).cloned();
         let (dir, ns) = resolve_turn_workdir(surface_cwd.as_deref(), cc.cwd.as_deref(), None, workdir);
-        let k = guest_session(turn_session_key(chat_id, channel_id, ns, &dir), guest);
+        // A guest's `/clear` or `/compact` is of their own session (`guest_key`).
+        let theirs = guest.then(|| guest_key(sender, None));
+        let k = guest_session(turn_session_key(chat_id, channel_id, ns, &dir), theirs.as_deref());
         (dir, k, cc.account)
     } else {
         (workdir.to_string(), base_key.clone(), owner.account.clone())
@@ -6256,12 +6349,7 @@ async fn handle_control(
         "clear" | "new" => {
             {
                 let mut s = sessions.lock().await;
-                let mut gone = s.remove(&skey).is_some();
-                // The owner's circle clears the room, guests' conversation included.
-                if !guest {
-                    gone |= s.remove(&guest_session(skey.clone(), true)).is_some();
-                }
-                if gone { save_sessions(&s); }
+                if clear_sessions(&mut s, &skey, !guest) { save_sessions(&s); }
             }
             let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "🧹 Context cleared — starting fresh.").await;
         }
@@ -6958,9 +7046,9 @@ fn seed_pins(states: &mut HashMap<String, ChatState>, pins: HashMap<String, Stri
     }
 }
 
-/// Interactive `/login`: drive `claude auth login`, post the sign-in URL to the
-/// chat (host browser suppressed), then write the Authentication Code the user
-/// pastes back into the login process's stdin.
+/// Interactive `/login`: the shared sign-in (`runtime_login::sign_in`, the
+/// same one `mafold runtime login claude-code` runs) — the sign-in link posted
+/// to the chat, the Authentication Code the user pastes back handed to it.
 ///
 /// With a NAME (`/login work`) it signs in an ADDITIONAL account instead of
 /// replacing this machine's: the login lands in its own credential directory
@@ -6983,103 +7071,20 @@ async fn login_flow(
     my_username: String,
     owner_username: Option<String>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let dest = || Dest::chat(&chat_id).channel(channel_id.as_deref());
     // `console` picks the Anthropic Console door; any OTHER word is the name
     // of the account being signed in.
-    let mode = if arg.split_whitespace().any(|w| w == "console") { "--console" } else { "--claudeai" };
-    let wanted: Option<String> = arg
+    let console = arg.split_whitespace().any(|w| w == "console");
+    let mut name = arg
         .split_whitespace()
         .find(|w| *w != "console")
-        .map(|w| w.trim().to_ascii_lowercase());
-    // Register it BEFORE the login runs: the directory has to exist for
-    // `claude` to write the credential into it, and a half-finished sign-in
-    // leaving a named-but-empty seat is harmless — it probes as "not logged
-    // in" and a turn steps over it.
-    let mut added = false;
-    let account = match (&wanted, harness.id()) {
-        (Some(n), "claude-code") if n != crate::accounts::DEFAULT => {
-            let recorded = crate::accounts::update_registry(|reg| {
-                let existed = reg.get(n).is_some();
-                reg.add(n).map(|a| (a, !existed))
-            });
-            match recorded {
-                Ok(Ok((a, is_new))) => {
-                    added = is_new;
-                    Some(a)
-                }
-                Ok(Err(e)) => {
-                    let _ = client.send_to(dest(), &e).await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = client.send_to(dest(), &format!("Couldn't record the account: {e}")).await;
-                    return;
-                }
-            }
-        }
-        (Some(n), _) if n != crate::accounts::DEFAULT => {
-            let _ = client.send_to(dest(),
-                "Only the Claude Code agent can hold several logins on one machine — signing in without a name instead.").await;
-            None
-        }
-        _ => None,
-    };
-    let seat_env = account.as_ref().map(|a| a.env()).unwrap_or_default();
-    // Who holds this slot BEFORE the sign-in overwrites it — the receipt has
-    // to be able to say "replaced X", not just "signed in".
-    let before = crate::commands::login_identity(&seat_env).await;
-    let opening = match &account {
-        Some(a) => format!(
-            "🔐 Starting Anthropic sign-in for a SECOND account, `{}`… I'll post the link here; approve it, then paste the Authentication Code back to me.\n⚠️ Sign in with the OTHER Anthropic account — your browser is probably still holding the first one, so use a private window.\nThis machine's existing login is untouched, and so are memory, skills and sessions: only the subscription is separate.",
-            a.name
-        ),
-        None => "🔐 Starting Anthropic sign-in… I'll post the link here; approve it, then paste the Authentication Code back to me. (This also re-authenticates the agent's own `claude`.)".to_string(),
-    };
-    let _ = client.send_to(dest(), &opening).await;
-
-    // Suppress the host browser pop-up (macOS opens via `open <url>`): prepend a
-    // no-op `open` to PATH + neutralize $BROWSER. COLUMNS keeps the URL unwrapped.
-    let noop = noop_open_dir();
-    let path = std::env::join_paths(
-        std::iter::once(noop.clone())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
-    )
-    .map(|p| p.to_string_lossy().into_owned())
-    .unwrap_or_else(|_| std::env::var("PATH").unwrap_or_default());
-    // Resolved, not bare: the child's PATH is overridden below (the no-op `open`
-    // shim), and on Windows only the resolved `claude.cmd` is spawnable at all.
-    let mut cmd = crate::platform::command(crate::harness::program("claude"));
-    cmd.args(["auth", "login", mode])
-        .env("PATH", path)
-        .env("COLUMNS", "4096")
-        .env("NO_COLOR", "1")
-        // WHICH login this signs in: empty for the machine's own, a
-        // credential directory for a named second account.
-        .envs(seat_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    cmd.env("BROWSER", "/usr/bin/true"); // a real no-op binary only exists on Unix
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => { let _ = client.send_to(dest(), &format!("Couldn't start `claude auth login`: {e}")).await; return; }
-    };
-    let mut stdin = child.stdin.take();
-
-    // Merge stdout + stderr into one line channel.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    if let Some(o) = child.stdout.take() {
-        let tx = tx.clone();
-        tokio::spawn(async move { let mut l = BufReader::new(o).lines(); while let Ok(Some(line)) = l.next_line().await { let _ = tx.send(line); } });
+        .map(|w| w.trim().to_ascii_lowercase())
+        .filter(|n| n != crate::accounts::DEFAULT);
+    if name.is_some() && harness.id() != "claude-code" {
+        let _ = client.send_to(dest(),
+            "Only the Claude Code agent can hold several logins on one machine — signing in without a name instead.").await;
+        name = None;
     }
-    if let Some(e) = child.stderr.take() {
-        let tx = tx.clone();
-        tokio::spawn(async move { let mut l = BufReader::new(e).lines(); while let Ok(Some(line)) = l.next_line().await { let _ = tx.send(line); } });
-    }
-    drop(tx);
-
     // Register the code channel so a pasted message reaches this flow — bound to
     // the sender who started the sign-in (only they may relay the code).
     let (code_tx, mut code_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -7090,93 +7095,35 @@ async fn login_flow(
         st.login_owner = Some(login_owner.clone());
         st.login_channel = channel_id.clone();
     }
-
-    // Phase 1: read output until we find + post the sign-in URL (60s budget).
-    let post_url = async {
-        while let Some(line) = rx.recv().await {
-            if let Some(url) = extract_auth_url(&crate::commands::strip_ansi(&line)) {
-                let _ = client.send_to(dest(), &format!("🔗 Open this to sign in (any device works):\n{url}\n\nAfter you approve, paste the Authentication Code here.")).await;
-                return true;
+    // The sign-in itself is the one `mafold runtime login claude-code` runs
+    // (`runtime_login`); here, each step it takes is said in the chat, in order.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::runtime_login::Event>();
+    let said = {
+        let (client, chat_id, channel_id) = (client.clone(), chat_id.clone(), channel_id.clone());
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id.as_deref()), &login_line(&ev)).await;
             }
-        }
-        false
+        })
     };
-    if !tokio::time::timeout(Duration::from_secs(60), post_url).await.unwrap_or(false) {
-        let _ = child.start_kill();
-        clear_login(&chat_states, &chat_id).await;
-        let _ = client.send_to(dest(), "Couldn't get a sign-in link — this environment may need a TTY. Run `claude auth login` on the host.").await;
-        return;
-    }
-
-    // Phase 2: wait for the pasted code (5 min), feed it to stdin, close stdin.
-    match tokio::time::timeout(Duration::from_secs(300), code_rx.recv()).await {
-        Ok(Some(code)) => {
-            if let Some(mut si) = stdin.take() {
-                let _ = si.write_all(format!("{}\n", code.trim()).as_bytes()).await;
-                let _ = si.flush().await;
-                // si drops here → stdin closes → claude proceeds with the code
+    let ask = crate::runtime_login::Ask { name, console };
+    let res = crate::runtime_login::sign_in(&ask, async move { code_rx.recv().await }, &tx).await;
+    drop(tx);
+    let _ = said.await;
+    clear_login(&chat_states, &chat_id).await;
+    let o = match res {
+        Ok(o) => o,
+        Err(f) => {
+            if let Some(line) = login_failure_line(&f) {
+                let _ = client.send_to(dest(), &line).await;
             }
-        }
-        Ok(None) => { let _ = child.start_kill(); clear_login(&chat_states, &chat_id).await; return; } // cancelled
-        Err(_) => {
-            let _ = child.start_kill();
-            clear_login(&chat_states, &chat_id).await;
-            let _ = client.send_to(dest(), "Sign-in timed out — no code within 5 min. Try `/login` again.").await;
             return;
         }
-    }
-
-    // Phase 3: drain remaining output, await exit, report.
-    while rx.recv().await.is_some() {}
-    let ok = matches!(child.wait().await, Ok(st) if st.success());
-    clear_login(&chat_states, &chat_id).await;
-    if !ok {
-        let _ = client.send_to(dest(), "Sign-in didn't complete — the code may have been wrong or expired. Try `/login` again.").await;
-        return;
-    }
-    // Whatever this seat's health was, it is stale now.
-    let name = account.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| crate::accounts::DEFAULT.into());
-    crate::accounts::forget_seat(&name);
-    {
-        // A fresh sign-in lifts a remembered refusal outright.
-        if let Err(e) = crate::accounts::update_registry(|reg| {
-            reg.signed_out.remove(&name);
-            reg.clear_exhausted(&name);
-        }) {
-            let _ = client.send_to(dest(), &format!("Signed in, but couldn't clear the old account status: {e}")).await;
-        }
-    }
-    let after = crate::commands::login_identity(&seat_env).await;
-    let status = match &after {
-        crate::commands::WhoProbe::Known(_) => String::new(),
-        _ => crate::commands::auth_status_line(&seat_env).await,
     };
-    let reg = crate::accounts::load();
-    let names: Vec<String> = reg.accounts.iter().map(|a| a.name.clone()).collect();
-    // The other slots, asked who they hold: signing a second slot into the
-    // SAME subscription (the browser quietly reused the first account) looks
-    // like success and leaves nothing to switch to.
-    let twin = match &after {
-        crate::commands::WhoProbe::Known(me) => {
-            let others: Vec<&crate::accounts::Account> = reg.accounts.iter().filter(|a| a.name != name).collect();
-            let envs: Vec<Vec<(String, String)>> = others.iter().map(|a| a.env()).collect();
-            let who = futures_util::future::join_all(envs.iter().map(|e| crate::commands::login_identity(e))).await;
-            others
-                .iter()
-                .zip(who)
-                .find(|(_, w)| matches!(w, crate::commands::WhoProbe::Known(id) if id.same_as(me)))
-                .map(|(a, _)| a.name.clone())
-        }
-        _ => None,
-    };
-    if let (Some(a), crate::commands::WhoProbe::Known(id)) = (&account, &after) {
-        // Remember the email so the account is identifiable everywhere it is
-        // listed — `/account`, `/status`, the Customize menu. From the seat's
-        // own profile: `claude auth status` under a seat env reports the
-        // shared file's identity, i.e. the default login's.
-        crate::accounts::set_email(&a.name, id.email.clone());
+    if let Some(note) = &o.note {
+        let _ = client.send_to(dest(), note).await;
     }
-    if account.is_some() {
+    if o.named.is_some() {
         // The sheet's account menu is built from the registry, so a new login has
         // to re-publish it or the owner can see the account in chat and not in
         // the Customize sheet — "in effect but invisible", the exact failure the
@@ -7184,15 +7131,42 @@ async fn login_flow(
         ensure_customize_fields(&client, &my_username, owner_username.as_deref(), harness.id()).await;
     }
     let receipt = login_receipt(&LoginOutcome {
-        named: account.as_ref().map(|a| a.name.as_str()),
-        added,
-        before: &before,
-        after: &after,
-        names: &names,
-        twin: twin.as_deref(),
-        status: &status,
+        named: o.named.as_deref(),
+        added: o.added,
+        before: &o.before,
+        after: &o.after,
+        names: &o.names,
+        twin: o.twin.as_deref(),
+        status: &o.status,
     });
     let _ = client.send_to(dest(), &receipt).await;
+}
+
+/// A step of the shared sign-in, as `/login` says it in the chat.
+fn login_line(ev: &crate::runtime_login::Event) -> String {
+    use crate::runtime_login::Event;
+    match ev {
+        Event::Started { account, .. } if account == crate::accounts::DEFAULT => {
+            "🔐 Starting Anthropic sign-in… I'll post the link here; approve it, then paste the Authentication Code back to me. (This also re-authenticates the agent's own `claude`.)".to_string()
+        }
+        Event::Started { account, .. } => format!(
+            "🔐 Starting Anthropic sign-in for a SECOND account, `{account}`… I'll post the link here; approve it, then paste the Authentication Code back to me.\n⚠️ Sign in with the OTHER Anthropic account — your browser is probably still holding the first one, so use a private window.\nThis machine's existing login is untouched, and so are memory, skills and sessions: only the subscription is separate."
+        ),
+        Event::Link { url } => {
+            format!("🔗 Open this to sign in (any device works):\n{url}\n\nAfter you approve, paste the Authentication Code here.")
+        }
+    }
+}
+
+/// Why the shared sign-in stopped, as `/login` says it — nothing when the code
+/// channel went away (the flow was cancelled).
+fn login_failure_line(f: &crate::runtime_login::Failure) -> Option<String> {
+    match f.code {
+        "cancelled" => None,
+        "no_code" => Some("Sign-in timed out — no code within 5 min. Try `/login` again.".into()),
+        "rejected" => Some("Sign-in didn't complete — the code may have been wrong or expired. Try `/login` again.".into()),
+        _ => Some(f.detail.clone()),
+    }
 }
 
 /// The line under a usage wall no other login could take over: what each
@@ -7277,15 +7251,6 @@ pub(crate) fn remember_account_issues(all: &mut Vec<AccountIssue>, issues: impl 
     }
 }
 
-/// Which account a turn runs on, said to the bot's owner only: the card
-/// `{% mafold/only for="owner" sid=… /%}` in the reply, the note itself as the
-/// owner's state item, written onto the reply when the turn ends.
-fn private_account_note(note: &str, private: &Private) -> String {
-    let (card, item) = mafold_transcript::only::private_note("owner", note);
-    private.lock().unwrap().push(item);
-    format!("\n{card}\n\n")
-}
-
 /// The parts of a turn's cards only some readers may read, gathered while it
 /// runs (`render::PrivateItem`).
 type Private = Arc<std::sync::Mutex<Vec<mafold_transcript::render::PrivateItem>>>;
@@ -7300,6 +7265,25 @@ pub(crate) async fn write_private(client: &Client, message_id: &str, items: Vec<
     for item in items {
         if let Err(e) = client.set_card_state(message_id, &item.key, &item.v, &item.read, &["sender".to_string()]).await {
             eprintln!("card state {} on {message_id} not written: {e:#}", item.key);
+        }
+    }
+}
+
+/// The fields a message's cards declare everybody may write (`shared="…"`,
+/// `.docs/card-state-v1.md` §3.7), created now that it is finished: empty,
+/// read and written by all — and only if not there yet, so a retried turn or
+/// an edit never empties a list people have filled. Until they exist the card
+/// stays read-only.
+pub(crate) async fn write_declared(client: &Client, message_id: &str, content: &str) {
+    let all = ["all".to_string()];
+    for d in mafold_transcript::scopes::declared_state(content) {
+        if let Err(e) = client.set_card_state_with(message_id, &d.key, &Value::Null, Some(&all), Some(&all), Some(0)).await {
+            eprintln!("shared field {} on {message_id} not created: {e:#}", d.key);
+            // A server without revisions writes `null` over whatever is there:
+            // the rest would empty filled lists on a retried turn. Stop here.
+            if format!("{e:#}").contains(crate::client::IF_REV_UNSUPPORTED) {
+                return;
+            }
         }
     }
 }
@@ -7466,48 +7450,6 @@ async fn clear_login(chat_states: &ChatStates, chat_id: &str) {
     }
 }
 
-/// Extract the OAuth sign-in URL from a line of `claude auth login` output —
-/// only real `https://` links (NOT url-encoded `https%3A…` param values),
-/// preferring the actual authorize endpoint so the relayed link is clickable.
-fn extract_auth_url(line: &str) -> Option<String> {
-    let mut best: Option<String> = None;
-    let mut from = 0usize;
-    while let Some(rel) = line[from..].find("https://") {
-        let start = from + rel;
-        let tok: String = line[start..].chars().take_while(|c| !c.is_whitespace()).collect();
-        let tok = tok.trim_end_matches(|c: char| matches!(c, '.' | ',' | ')' | '"' | '\'' | '>')).to_string();
-        from = start + "https://".len();
-        if tok.contains("authorize") || tok.contains("oauth") { return Some(tok); }
-        if best.as_ref().map(|b| b.len() < tok.len()).unwrap_or(true) { best = Some(tok); }
-    }
-    best.filter(|u| u.len() > 24)
-}
-
-/// A directory holding a no-op `open` shim — stops the host browser from
-/// launching during `/login` (the link is relayed to chat instead).
-fn noop_open_dir() -> PathBuf {
-    let dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".mafold/noopbin");
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        let open = dir.join("open");
-        if !open.exists() && std::fs::write(&open, "#!/bin/sh\nexit 0\n").is_ok() {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-    #[cfg(windows)]
-    {
-        // Windows browser-launch doesn't shell out to an `open` binary, but
-        // shadow one anyway as a harmless no-op for anything that does.
-        let open = dir.join("open.cmd");
-        if !open.exists() {
-            let _ = std::fs::write(&open, "@echo off\r\nexit /b 0\r\n");
-        }
-    }
-    dir
-}
-
 /// Card ids this bot can embed in replies, as the FULLY QUALIFIED `owner/slug`
 /// the renderer now requires. `listCards` returns `tag` (the slug) and `scope`
 /// (the owner) as separate fields, so they must be rejoined here — handing the
@@ -7519,27 +7461,43 @@ fn noop_open_dir() -> PathBuf {
 /// account that genuinely publishes nothing, and the caller must not conflate
 /// them: see `connect_and_run`. This used to return a bare `Vec` and the
 /// distinction had nowhere to live.
-async fn available_card_tags(client: &Client) -> Option<Vec<String>> {
-    let v = client.list_cards().await.ok()?;
+///
+/// Two lists from one answer: every id (what `cardtags::qualify` may splice
+/// an owner into) and the MENU — the cards an agent of this bot may write,
+/// with each manifest's notes (`mafold_transcript::catalog`, the same builder
+/// a hosted bot's prompt uses). A card's flag is the server's to read, so the
+/// menu takes its `offered`; an api from before that field offers no flagged
+/// card rather than one it can't vouch for.
+async fn available_cards(client: &Client) -> Option<(Vec<String>, Vec<OfferedCard>)> {
+    cards_from_list(&client.list_cards().await.ok()?)
+}
+
+/// [`available_cards`] once the answer is in hand.
+fn cards_from_list(v: &Value) -> Option<(Vec<String>, Vec<OfferedCard>)> {
     let items = v["items"].as_array()?;
-    Some(
-        items
-            .iter()
-            .filter_map(|c| {
-                let tag = c["tag"].as_str()?;
-                Some(match c["scope"].as_str() {
-                    Some(scope) if !scope.is_empty() => format!("{scope}/{tag}"),
-                    _ => tag.to_string(),
-                })
-            })
-            .collect(),
-    )
+    let mut ids = Vec::new();
+    let mut menu = Vec::new();
+    for c in items {
+        let Some(tag) = c["tag"].as_str() else { continue };
+        let id = match c["scope"].as_str() {
+            Some(scope) if !scope.is_empty() => format!("{scope}/{tag}"),
+            _ => tag.to_string(),
+        };
+        let offered = c["offered"].as_bool();
+        if offered != Some(false) {
+            let flag_on = |_: &str| offered == Some(true);
+            menu.extend(mafold_transcript::catalog::offer(&id, c.get("agent"), flag_on));
+        }
+        ids.push(id);
+    }
+    Some((ids, menu))
 }
 
 /// The mafold-awareness system prompt appended each turn (`--append-system-prompt`):
 /// who the bot is, the conversation it's replying in, and that it can embed cards
 /// inline — so a "pure" coding agent knows it's acting as a Mafold bot.
-fn mafold_preamble(bot: &str, peer: &str, cards: &[String]) -> String {
+fn mafold_preamble(bot: &str, peer: &str, cards: &[OfferedCard]) -> String {
+    use mafold_transcript::catalog;
     let mut s = format!(
         "You are an AI agent running as a Mafold bot — your Mafold username is @{bot}. \
 You are replying inside a Mafold conversation with @{peer}; your output this turn is \
@@ -7553,11 +7511,8 @@ A card reference is ALWAYS `owner/slug` — a bare name renders as \"Unsupported
     if cards.is_empty() {
         s.push_str("(No custom cards are published for you yet — plain text/Markdown is fine.)");
     } else {
-        s.push_str("Cards available to embed here (each takes its own attributes):\n");
-        for tag in cards {
-            s.push_str(&format!("  • {{% {tag} … /%}}\n"));
-        }
-        s.push_str("Use a card when it communicates better than prose; otherwise reply normally.");
+        s.push_str(&catalog::render(cards));
+        s.push_str("\nUse a card when it communicates better than prose; otherwise reply normally.");
     }
     // The two interactive cards worth reaching for constantly — write the tag
     // yourself, inline, rather than relying on a tool. They beat plain-text
@@ -7571,9 +7526,13 @@ their next message and you continue. Example:\n\
 {% mafold/ask %}\nq|Deploy|0|Ship to prod now?\no|Yes|blue-green, ~2 min\no|Hold|I'll review first\n{% /mafold/ask %}\n\
 \n• {% mafold/html %} — a sandboxed mini-UI (charts, demos, small games, rich layouts, dashboards). Put \
 your HTML between the tags and CLOSE with {% /mafold/html %} (NOT a second {% mafold/html %} — a common mistake \
-that breaks the card). Scripts run in an isolated origin — no access to the app, its cookies or storage — \
-but the network is reachable, so a chart library from a CDN or a picture by URL loads. Reach for it whenever \
-something visual communicates better than text.\n\
+that breaks the card). ",
+    );
+    s.push_str(catalog::HTML_NETWORK);
+    s.push(' ');
+    s.push_str(catalog::PICTURES_BY_URL);
+    s.push_str(
+        " Reach for it whenever something visual communicates better than text.\n\
   COLOURS: the frame hands you the READER'S OWN theme as CSS variables. Use them and your card is \
 correct in light and dark without a single media query:\n\
     --mf-text  --mf-muted  --mf-subtle      (foreground, in three weights)\n\
@@ -7584,6 +7543,19 @@ TRANSPARENT — the bubble shows through, so don't paint your own page backgroun
 DON'T hardcode a palette and DON'T write `@media (prefers-color-scheme: …)`: that follows the \
 reader's OPERATING SYSTEM, while the app has its own appearance setting, and the two disagree often \
 enough that it is the single most common way one of these cards comes out unreadable.\n\
+  SHARED STATE — a poll, a shared checklist, a two-player game: the page gets `window.mafold`, data \
+that lives with THIS message, read and written by everyone in the chat as themselves (the server \
+checks every write). `await mafold.ready` → `{available}`; `mafold.viewer` → `{username,name}` or \
+null; `mafold.writable` (signed in, message finished, online). Each person writes their OWN \
+fields — `mafold.state.setMine(\"vote\", 2)`; `mafold.state.mine(\"vote\")`; \
+`mafold.state.all(\"vote\")` lists everyone's as `{v,by,at,rev,user}` in write order (`rev` orders \
+writes: first to take a seat wins). Nobody can write as someone else. `setMine(f, v, \
+{readers:\"sender\"})` lets only you, the sender, see it — an anonymous vote you tally. A field \
+everyone edits together is declared on the tag, `{% mafold/html shared=\"items\" %}`, and changed \
+with `mafold.state.update(\"items\", list => [...(list||[]), x])` — concurrent edits all land. \
+Repaint on `mafold.state.on(fn)` and `mafold.on(\"writable\", fn)`. You read and write the same \
+state with `mafold state get|set <message id> …` (`mafold msg` lists it). Data that only lives as \
+long as the card — this poll, this game — belongs here, not in an app.\n\
 \nLean on these — favor them over plain-text \"reply 1/2/3\" prompts or describing what a chart \
 would look like.\n\
 \nCARDS ARE THE NATIVE MEDIUM HERE, not a garnish. This is a chat client that renders live \
@@ -7600,6 +7572,13 @@ So: describing what a chart would look like, or drawing one in ASCII, when you c
 the chart — that is the habit to break. Default to showing; drop to prose only when the answer \
 genuinely is a sentence.",
     );
+    // The paragraph above is the loudest thing this prompt says about cards,
+    // and a card made for the job (pictures from a page) lost to it: one
+    // sentence, only when there is such a card on the menu.
+    if let Some(rule) = catalog::noted_cards_beat_html(cards) {
+        s.push(' ');
+        s.push_str(rule);
+    }
     // Delivering an artifact. Two failure modes, one section. (1) Agents
     // reliably ANNOUNCE a picture they made and then send nothing, because
     // producing the file and delivering it are separate acts and only the first
@@ -7711,23 +7690,6 @@ cannot be kept and the user is left waiting. Run the work to completion in the F
 it means a long single turn; if it genuinely cannot finish in one turn, say so plainly and tell the \
 user to ask you again later."
     });
-    // Generic room mechanism (NOT any specific app). A conversation may have
-    // mini-apps installed whose shared state lives in a co-edited CRDT "room";
-    // the bot is a peer that can read and write it. Which apps/rooms exist is
-    // injected per-turn into the prompt (dynamic), so this only teaches the tool.
-    s.push_str(
-        "\n\nAPP ROOMS: a conversation can have mini-apps installed (a board, a todo list, a \
-counter…). Each keeps shared state in a co-edited **room** — variables that the app AND \
-everyone here, including you, edit together. You touch a room with the `mafold room` CLI \
-(the current conversation is preset in MAFOLD_CONV, so never pass it):\n\
-  • `mafold room list` — the installed apps' rooms + each variable's read/write mode\n\
-  • `mafold room get <app>` — an app's room state as JSON\n\
-  • `mafold room set <app> <key> <json>` — change a `write` variable (read-only keys are refused)\n\
-Only variables the schema marks `write` are editable; a `key:*` schema entry is a wildcard \
-(e.g. `issue:*` ⇒ any `issue:<id>` key). To edit an item: `get` it, change the JSON, `set` it \
-back. When the user asks to view or change an installed app's data, use this — a per-turn \
-block below lists exactly which apps + rooms are available right now.",
-    );
     // Connections used to be deliberately left OUT of this preamble, on the
     // grounds that a granted agent calls `mafold connection call` and what it may
     // reach is answered by the grant check server-side — so a prompt block would
@@ -8837,7 +8799,16 @@ async fn handle(
     // (A bot whose memory once lived in its drive, cli 0.9.130–0.9.133, kept
     // those conversations under `<key>#drive`. The plain key is the session
     // from before — the one that uses the agent's own memory folder.)
-    let skey = guest_session(turn_session_key(chat_id, channel_id, workdir_ns, workdir), guest);
+    // A guest's session is theirs alone (`guest_key`): one guest's turns never
+    // resume what another's read.
+    let guest_of = guest.then(|| guest_key(turn_sender, relayed_for));
+    let skey = guest_session(turn_session_key(chat_id, channel_id, workdir_ns, workdir), guest_of.as_deref());
+    // What this turn may open beyond its own room: the tickets the prompt
+    // names, and what `mafold read` will open in the agent's process — which
+    // carries it (`Mount::reads`), so a process started for one guest never
+    // serves another.
+    let reads = reads_for(turn_sender, relayed_for).await;
+    mount.reads = reads.clone();
     let prior = match &resumed {
         Some(r) => r.session.clone(),
         // A session past its context limit or idle too long is not resumed:
@@ -8879,7 +8850,7 @@ async fn handle(
     // session is keyed at, under the bot that owns the session. Exported to the
     // agent so any background task it detaches is registered here and reported
     // back HERE, by ME (see `surface_tag`).
-    let surface = guest_tag(surface_tag(bot, chat_id, channel_id), guest);
+    let surface = guest_tag(surface_tag(bot, chat_id, channel_id), guest_of.as_deref());
     // Choose before ANY account-dependent work, including capability probes
     // and prewarming. Known blocked accounts must not start a Claude process.
     let choice = if harness.id() == "claude-code" {
@@ -9120,8 +9091,8 @@ async fn handle(
                 Some(ctx) => format!("{ctx}\n\n{prompt}"),
                 None => prompt.to_string(),
             };
-            // Available apps + rooms in THIS conversation (dynamic, per-turn) so the bot
-            // knows what it can operate via `mafold room` — generic, reflects whatever
+            // The apps installed in THIS conversation (dynamic, per-turn), with the
+            // backend methods `mafold app call` reaches — generic, reflects whatever
             // is installed, zero per-app hardcoding. One list_installs call; None (and
             // no injection) when nothing is installed. Best-effort: a fetch error never
             // blocks the turn.
@@ -9129,14 +9100,14 @@ async fn handle(
             // These three go in only when the session hasn't been given that
             // exact text yet (`session_life::Blocks`): prepended to every turn,
             // a resumed session used to carry one copy per message.
-            if let Ok(Some(block)) = crate::room::context_block(client, chat_id).await {
+            if let Ok(Some(block)) = crate::installed::context_block(client, chat_id).await {
                 full_prompt = blocks.prepend("apps", block, full_prompt);
             }
             // Rooms this bot holds a `chat.read` ticket for (.docs/chat-record-sharing-v1.md).
             // Names and one command each — never the transcripts, which would spend the
             // context window on rooms this turn will never open. Same best-effort rule
             // as the apps block: a fetch error is silence, not a failed turn.
-            if let Some(block) = crate::chat::context_block(client).await {
+            if let Some(block) = crate::chat::context_block(client, &reads).await {
                 full_prompt = blocks.prepend("access", block, full_prompt);
             }
             // A channel created without a name is named by the agent answering
@@ -9199,14 +9170,12 @@ async fn handle(
     // The seat this turn runs on. Only Claude Code keys logins by directory
     // (`crate::accounts`); every other harness has one login — its own env —
     // and gets no seat at all. The choice can differ from the preference (a
-    // full window, a login that isn't here): then the reply says so, up top,
-    // because "whose quota is this burning" is never something to guess at.
+    // full window, a login that isn't here): that goes to this machine's log
+    // only. It is the machine's and the logins' state, not the conversation's:
+    // it never belongs in the reply, not even folded away for the owner (ops,
+    // 10-21: «不管用任何账号的额度,都不应该出现»). `/status` names the account.
     if let Some(note) = &seat_note {
         println!("{note}");
-        // A picked-up turn's bubble already said this when it began.
-        if resumed.is_none() {
-            daemon_note(&ev_tx, private_account_note(note, &private));
-        }
     }
     // A tier the model has no dial for is said up top, like the seat — the
     // owner set something this turn can't honour, and the reply is where they
@@ -9399,10 +9368,8 @@ async fn handle(
                 cur.name, cur.name, next.name
             ),
         };
+        // To the log only, like the seat the turn began on (see there).
         println!("{note}");
-        // The seam, in the reply itself: the reader sees where the account
-        // changed, the way a steer shows where a correction landed.
-        daemon_note(&ev_keep, private_account_note(&note, &private));
         {
             let mut states = chat_states.lock().await;
             let st = states.entry(chat_id.to_string()).or_default();
@@ -9827,6 +9794,7 @@ async fn handle(
         if !items.is_empty() {
             write_private(client, &msg_id, items).await;
         }
+        write_declared(client, &msg_id, &final_content).await;
     }
 
     // Completion wakeup: the turn ended cleanly but left DETACHED tasks running.
@@ -9865,7 +9833,7 @@ async fn handle(
                 system,
                 account,
                 turn_sender.to_string(),
-                guest,
+                guest_of.clone(),
                 shells,
                 live_msg,
             );
@@ -10139,8 +10107,47 @@ fn surface_tag(bot: &str, chat_id: &str, channel_id: Option<&str>) -> String {
 /// bot component, which keeps the key's three parts and its channel intact.
 const GUEST_MARK: &str = "--guest";
 
-fn guest_tag(tag: String, guest: bool) -> String {
-    if guest { format!("{tag}{GUEST_MARK}") } else { tag }
+/// `guest` is whose guest surface it is (`guest_key`; `None`: the circle's).
+/// Each guest has their own — until 2026-10-25 every guest of a surface shared
+/// `--guest`, so one guest's background task woke in (and was reported into)
+/// whichever guest's turn rode the watcher last. `Some("")` is that shared
+/// mark, which registrations from before still carry.
+fn guest_tag(tag: String, guest: Option<&str>) -> String {
+    match guest {
+        None => tag,
+        Some(k) if k.trim().is_empty() => format!("{tag}{GUEST_MARK}"),
+        Some(k) => format!("{tag}{GUEST_MARK}-{}", tag_part(&k.trim().to_lowercase())),
+    }
+}
+
+/// Whom a background task's wrap-up speaks as, in the turn it rides or
+/// becomes: the circle's by whoever armed the watcher (`turn_sender`); a
+/// guest's by their key (`guest_key`) — the bot that relayed them and the
+/// person — with `relayed` saying it is a guest's (`""`: their own work). So
+/// the wake runs in that guest's session and surface, reading with their eyes.
+///
+/// After a restart nobody armed it (`turn_sender` is empty) and all there is
+/// to go on is the registry's spelling of the key (`tag_guest`) — lowercased,
+/// every `:` and `>` made `_`, so not a username: `alice:bob`'s tasks would
+/// wake as a real `alice_bob`. Such a wake is nobody in particular's: it
+/// reads for nobody, in a session of its own.
+fn wake_speaker(turn_sender: &str, guest: Option<&str>) -> (String, Option<String>) {
+    match guest {
+        None => (turn_sender.to_string(), None),
+        Some(_) if turn_sender.is_empty() => (String::new(), Some(String::new())),
+        Some(k) => match k.split_once('>') {
+            Some((_, person)) => (turn_sender.to_string(), Some(person.to_string())),
+            None => (turn_sender.to_string(), Some(String::new())),
+        },
+    }
+}
+
+/// The guest a registry tag's bot component was written for, as `guest_tag`
+/// spelled them (`Some("")`: the shared mark from before) — `None` when it is
+/// the circle's, or not this bot's (`me`, `tag_part`-sanitized) at all.
+fn tag_guest(bot: &str, me: &str) -> Option<String> {
+    let rest = bot.strip_prefix(me)?.strip_prefix(GUEST_MARK)?;
+    Some(rest.strip_prefix('-').unwrap_or(rest).to_string())
 }
 
 /// One component of a `surface_tag`, reduced to the filename-safe alphabet.
@@ -10182,7 +10189,7 @@ fn classify_registration(name: &str, me: &str) -> Option<Registration> {
     let stem = name.strip_suffix(".pid")?;
     let tag = stem.rsplit_once('.').map(|(t, _)| t).unwrap_or(stem);
     Some(match surface_split(tag) {
-        Some((_, _, bot)) if bot == me || bot.strip_suffix(GUEST_MARK) == Some(me) => Registration::Mine(tag.to_string()),
+        Some((_, _, bot)) if bot == me || tag_guest(&bot, me).is_some() => Registration::Mine(tag.to_string()),
         Some(_) => Registration::Theirs,
         None => Registration::Unclaimable,
     })
@@ -10455,14 +10462,15 @@ fn arm_bg_wakeup(
     system: Option<String>,
     account: Option<String>,
     turn_sender: String,
-    // Whose tasks these are: a guest's are a registry of their own (`guest_tag`).
-    guest: bool,
+    // Whose tasks these are: each guest's are a registry of their own
+    // (`guest_tag`, keyed by `guest_key`; `None`: the circle's).
+    guest: Option<String>,
     shells: u64,
     live_msg: Option<(String, String)>,
 ) {
     // Registry tag — the surface this turn ran on (conv + forum channel), the
     // same key `bash_hook` registered its detached tasks under.
-    let tag = guest_tag(surface_tag(&bot, &chat_id, channel_id.as_deref()), guest);
+    let tag = guest_tag(surface_tag(&bot, &chat_id, channel_id.as_deref()), guest.as_deref());
     // ONE watcher per surface, of whichever kind is already there: the flag
     // read differently from one arm to the next (switched on the server, or
     // not yet fetched when a restart re-armed) must not leave both watching —
@@ -10495,6 +10503,9 @@ fn arm_bg_wakeup(
         return; // rides the existing monitor (which now edits this reply too)
     }
     println!("⏳ {shells} background task(s) outlive the turn in {tag} — wakeup armed");
+    // Whom its wrap-up speaks for (`wake_speaker`), decided once.
+    let (by, relayed) = wake_speaker(&turn_sender, guest.as_deref());
+    let guests = guest.is_some();
     tokio::spawn(async move {
         // Poll cadence, when the silence starts costing a beat, and the point
         // where we stop waiting at all. (In a test that chose this watcher —
@@ -10631,17 +10642,23 @@ fn arm_bg_wakeup(
                     1 => "后台任务跑完了 —— 结果给到正在进行的这一轮。".to_string(),
                     n => format!("{n} 个后台任务跑完了 —— 结果给到正在进行的这一轮。"),
                 };
-                if let Some(outcome) = inject_into_live_turn(
-                    &chat_states, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
-                    // Free: a wrap-up is billed to nobody, so it may land in
-                    // whichever unbilled turn is running here, whoever's — of
-                    // its own kind: a guest's work only into a guest's turn.
-                    Speaker::person(&turn_sender), Some(guest), None, &prompt, Seam::Notice(line),
-                    // A wrap-up is text and only text; nothing to fetch.
-                    |t| async move { t },
-                )
-                .await
-                {
+                // (Work a bot relayed for a guest rides no running turn — see
+                // `deliver_update`.)
+                let live = if relayed.as_deref().is_some_and(|p| !p.is_empty()) {
+                    None
+                } else {
+                    inject_into_live_turn(
+                        &chat_states, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
+                        // Free: a wrap-up is billed to nobody, so it may land in
+                        // whichever unbilled turn is running here, whoever's — of
+                        // its own kind: a guest's work only into that guest's turn.
+                        Speaker::person(&by), Some(guests), None, &prompt, Seam::Notice(line),
+                        // A wrap-up is text and only text; nothing to fetch.
+                        |t| async move { t },
+                    )
+                    .await
+                };
+                if let Some(outcome) = live {
                     println!(
                         "↩︎ {} background task(s) reported into the RUNNING turn in {tag} — no second turn",
                         done.len()
@@ -10679,8 +10696,8 @@ fn arm_bg_wakeup(
                         // A background-task wrap-up isn't someone asking about a
                         // picture — no trigger message, so nothing to look back
                         // from, and nothing to bill: it runs free. A guest's
-                        // tasks wake as a guest's, whoever armed the monitor.
-                        &turn_sender, guest.then_some(""), None, &[],
+                        // tasks wake as that guest's (`wake_speaker`).
+                        &by, relayed.as_deref(), None, &[],
                         None,
                         false,
                         None,
@@ -10812,7 +10829,8 @@ struct WakeTurn {
     system: Option<String>,
     account: Option<String>,
     turn_sender: String,
-    guest: bool,
+    /// Whose guest work this is (`guest_key`; `None`: the circle's).
+    guest: Option<String>,
 }
 
 /// The old watchers running in this process, as `<tag>@<workdir>`: one per
@@ -10865,7 +10883,7 @@ fn watched_cards() -> &'static std::sync::Mutex<HashMap<String, Vec<String>>> {
 /// - its key carried the workdir, so a restart (default workdir) and a chat's
 ///   turn (its own) could both watch one registry. One watcher per surface.
 fn arm_task_watch(wake: WakeTurn, shells: u64, live_msg: Option<(String, String)>) {
-    let tag = guest_tag(surface_tag(&wake.bot, &wake.chat_id, wake.channel_id.as_deref()), wake.guest);
+    let tag = guest_tag(surface_tag(&wake.bot, &wake.chat_id, wake.channel_id.as_deref()), wake.guest.as_deref());
     if let Some((mid, _)) = live_msg {
         watched_cards().lock().unwrap().entry(tag.clone()).or_default().push(mid);
     }
@@ -11087,16 +11105,24 @@ async fn deliver_update(
         }
         crate::bgtasks::write_ledger(&t.pid_path, &l);
     };
-    if let Some(outcome) = inject_into_live_turn(
-        &w.chat_states, &w.chat_id, w.channel_id.as_deref(), w.thread_root.as_deref(),
-        // Free, like a wrap-up always was: it may land in whichever unbilled
-        // turn is running here — of its own kind: a guest's work only into a
-        // guest's turn.
-        Speaker::person(&w.turn_sender), Some(w.guest), None, &prompt, Seam::Notice(crate::bgtasks::notice(&events)),
-        |t| async move { t },
-    )
-    .await
-    {
+    let (by, relayed) = wake_speaker(&w.turn_sender, w.guest.as_deref());
+    // Work a bot relayed for a guest rides no running turn: a turn knows only
+    // the bot that started it, not whom for (see the dispatch's `relays_a_guest`).
+    let relays_a_guest = relayed.as_deref().is_some_and(|p| !p.is_empty());
+    let live = if relays_a_guest {
+        None
+    } else {
+        inject_into_live_turn(
+            &w.chat_states, &w.chat_id, w.channel_id.as_deref(), w.thread_root.as_deref(),
+            // Free, like a wrap-up always was: it may land in whichever unbilled
+            // turn is running here — of its own kind: a guest's work only into
+            // that guest's turn.
+            Speaker::person(&by), Some(w.guest.is_some()), None, &prompt, Seam::Notice(crate::bgtasks::notice(&events)),
+            |t| async move { t },
+        )
+        .await
+    };
+    if let Some(outcome) = live {
         println!("↩︎ handed to the RUNNING turn in {tag} — no turn of its own");
         let handed = Handed { mailbox: outcome.mailbox().to_string(), needle: prompt.trim().to_string() };
         for (t, k) in &events {
@@ -11128,8 +11154,9 @@ async fn deliver_update(
             &w.sessions, &w.coord, &w.chat_states, &w.harness,
             w.model.clone(), w.effort.clone(), w.thinking, w.system.clone(), w.account.clone(),
             // Nobody's message: no trigger, nothing to bill. A guest's tasks
-            // wake as a guest's, whoever's turn armed the watcher.
-            &w.turn_sender, w.guest.then_some(""), None, &[],
+            // wake as that guest's (`relayed` is `""` — their own work — or
+            // the person a bot relayed), in their session and their surface.
+            &by, relayed.as_deref(), None, &[],
             None,
             false,
             None,
@@ -11617,7 +11644,9 @@ async fn render_loop(
     // (`RunStats::context_used_tokens`) — see `session_life`.
     context_seen: Arc<std::sync::atomic::AtomicU64>,
     // Out-param: the parts of cards drawn this turn that only some readers may
-    // read — controlled state `handle()` writes onto the reply at the end.
+    // read, still to be written as the reply's state — those drawn while the
+    // bubble was held (the rest are written the moment their card is drawn);
+    // `handle()` writes them onto the reply at the end.
     private: Private,
     // An update turn's held bubble (`Quiet`); None for every other turn.
     quiet: Option<Quiet>,
@@ -12091,9 +12120,19 @@ async fn render_loop(
 
                 let advance = tx.push(&ev);
                 // A card this event drew keeps part of itself for some readers
-                // only (a compaction's summary): that part is state the turn
-                // writes onto its reply once it is finished (`write_private`).
-                private.lock().unwrap().extend(tx.take_private());
+                // only (a compaction's summary): that part is the reply's state
+                // (`write_private`), written NOW, while the card is on screen.
+                // Kept for the turn's end, its reader saw a bare «only for …»
+                // stub for as long as the reply took (10-21). A bubble still
+                // held has no row to write on yet: those wait for the end.
+                let parts = tx.take_private();
+                if !parts.is_empty() {
+                    if held {
+                        private.lock().unwrap().extend(parts);
+                    } else {
+                        write_private(&client, &msg_id, parts).await;
+                    }
+                }
                 open_if_due!(false);
                 // Something reached the bubble: the journal learns whether it
                 // was the agent's own work, in a session a restart can continue,
@@ -12219,15 +12258,31 @@ mod skill_gate_tests {
     #[test]
     fn a_guests_tasks_have_a_registry_key_of_their_own() {
         let mine = surface_tag("opsdu:claude-code", "c1", Some("ch"));
-        let guests = guest_tag(mine.clone(), true);
+        let guests = guest_tag(mine.clone(), Some("alice"));
         assert_ne!(mine, guests);
-        assert_eq!(guest_tag(mine.clone(), false), mine);
+        assert_eq!(guest_tag(mine.clone(), None), mine);
         assert_eq!(crate::harness::forum_channel_of(&guests).as_deref(), Some("ch"), "the channel stays readable");
         let me = tag_part("opsdu:claude-code");
         assert_eq!(classify_registration(&format!("{guests}.123.pid"), &me), Some(Registration::Mine(guests.clone())));
         assert_eq!(classify_registration(&format!("{mine}.123.pid"), &me), Some(Registration::Mine(mine.clone())));
-        let theirs = guest_tag(surface_tag("linsky:opus48", "c1", Some("ch")), true);
+        let theirs = guest_tag(surface_tag("linsky:opus48", "c1", Some("ch")), Some("alice"));
         assert_eq!(classify_registration(&format!("{theirs}.1.pid"), &me), Some(Registration::Theirs));
+        // One guest's registry is not the next one's — and a restart still
+        // reads back whose each is, including the one they all shared before.
+        let bobs = guest_tag(mine.clone(), Some("bob"));
+        assert_ne!(guests, bobs, "two guests, one registry");
+        let relayed = guest_tag(mine.clone(), Some(&guest_key("opsdu:public", Some("stranger"))));
+        assert_eq!(crate::harness::forum_channel_of(&relayed).as_deref(), Some("ch"), "a relay's key keeps the tag in three parts");
+        let shared = guest_tag(mine.clone(), Some(""));
+        let bot = |t: &str| surface_split(t).unwrap().2;
+        assert_eq!(tag_guest(&bot(&guests), &me).as_deref(), Some("alice"));
+        assert_eq!(tag_guest(&bot(&relayed), &me).as_deref(), Some("opsdu_public_stranger"));
+        assert_eq!(tag_guest(&bot(&shared), &me).as_deref(), Some(""), "the shared mark from before");
+        assert_eq!(tag_guest(&bot(&mine), &me), None, "the circle's");
+        assert_eq!(classify_registration(&format!("{shared}.9.pid"), &me), Some(Registration::Mine(shared.clone())));
+        // Whatever the restart reads back names the same registry again.
+        assert_eq!(guest_tag(mine.clone(), tag_guest(&bot(&relayed), &me).as_deref()), relayed);
+        assert_eq!(guest_tag(mine.clone(), tag_guest(&bot(&shared), &me).as_deref()), shared);
     }
 
     #[test]
@@ -12257,8 +12312,102 @@ mod skill_gate_tests {
         for g in ["stranger", "stranger:bot", "gate-foe", "gate-foe:bot", ""] {
             assert!(!trusted(g).await, "{g}");
         }
-        assert_eq!(guest_session("c1#ch".into(), true), "c1#ch#guest");
-        assert_eq!(guest_session("c1#ch".into(), false), "c1#ch");
+        assert_ne!(guest_session("c1#ch".into(), Some("stranger")), "c1#ch");
+        assert_eq!(guest_session("c1#ch".into(), None), "c1#ch");
+    }
+
+    /// …and one guest's session is not the next guest's. What alice's turns
+    /// put in it — a ticket of hers, a transcript she had read — must not be
+    /// in the context bob's turn resumes.
+    #[test]
+    fn every_guest_keeps_a_session_of_their_own() {
+        let k = || "c1#ch".to_string();
+        let (alice, bob) = (guest_session(k(), Some("alice")), guest_session(k(), Some("bob")));
+        assert_ne!(alice, bob, "two guests, one context");
+        assert_ne!(alice, k());
+        assert_eq!(guest_session(k(), Some("Alice")), alice, "one person, one session");
+    }
+
+    /// Whose guest session a turn runs in: the person, the bot and whom it
+    /// relays (never just one of them), and a guest's background work in the
+    /// session of the guest whose work it is.
+    #[test]
+    fn a_guest_turn_is_keyed_by_everyone_it_is_for() {
+        assert_eq!(guest_key("Alice", None), "alice");
+        assert_eq!(guest_key("@alice ", Some("")), "alice", "her background work wakes in her session");
+        assert_eq!(guest_key("ops:claude", Some("stranger")), "ops:claude>stranger");
+        assert_ne!(guest_key("ops:claude", Some("stranger")), guest_key("ops:claude", Some("other")));
+        assert_ne!(guest_key("ops:claude", Some("stranger")), guest_key("stranger", None));
+        assert_eq!(guest_key("", None), "", "nobody in particular is nobody's");
+    }
+
+    /// A guest's background work wakes as that guest — in their session, on
+    /// their registry — not as whichever guest's turn happened to arm it.
+    #[test]
+    fn a_guests_background_work_wakes_as_that_guest() {
+        assert_eq!(wake_speaker("ops", None), ("ops".to_string(), None));
+        assert_eq!(wake_speaker("alice", Some("alice")), ("alice".to_string(), Some(String::new())));
+        assert_eq!(
+            wake_speaker("ops:claude", Some("ops:claude>stranger")),
+            ("ops:claude".to_string(), Some("stranger".to_string()))
+        );
+        for (sender, key) in [("alice", "alice"), ("ops:claude", "ops:claude>stranger")] {
+            let (by, relayed) = wake_speaker(sender, Some(key));
+            assert_eq!(guest_key(&by, relayed.as_deref()), key, "the wake keys the guest's own session");
+        }
+        // After a restart the registry's spelling is all there is, and it is
+        // not a username (`alice:bob` → `alice_bob`, somebody else's name):
+        // nobody in particular, reading for nobody.
+        for spelled in ["alice", "alice_bob", "ops_claude_stranger"] {
+            let (by, relayed) = wake_speaker("", Some(spelled));
+            assert_eq!((by.as_str(), relayed.as_deref()), ("", Some("")), "{spelled}");
+            let a = AllowList::build(Some("ops"), &["*".to_string()], &[], false);
+            assert_eq!(a.reads_for(&by, relayed.as_deref()), crate::chat::ReadsFor::People(vec![]), "{spelled}");
+        }
+    }
+
+    /// The circle's `/clear` empties the room — every guest's session with
+    /// it, and the one they all shared before each had theirs. A guest's
+    /// clears only their own. Other surfaces are left alone.
+    #[test]
+    fn the_circles_clear_takes_every_guests_session_and_a_guests_only_theirs() {
+        let mk = || -> HashMap<String, String> {
+            ["c1#ch", "c1#ch#guest", "c1#ch#guest:alice", "c1#ch#guest:bob", "c1", "c1#ch2#guest:alice"]
+                .iter()
+                .map(|k| (k.to_string(), format!("sid-{k}")))
+                .collect()
+        };
+        let keys = |s: &HashMap<String, String>| {
+            let mut v: Vec<String> = s.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        let mut s = mk();
+        assert!(clear_sessions(&mut s, &guest_session("c1#ch".into(), Some("alice")), false));
+        assert_eq!(keys(&s), ["c1", "c1#ch", "c1#ch#guest", "c1#ch#guest:bob", "c1#ch2#guest:alice"]);
+        let mut s = mk();
+        assert!(clear_sessions(&mut s, "c1#ch", true));
+        assert_eq!(keys(&s), ["c1", "c1#ch2#guest:alice"]);
+        assert!(!clear_sessions(&mut s, "c1#ch", true), "nothing left to clear");
+    }
+
+    /// Who a turn reads for, through relays and background work: a circle
+    /// member a guest relays (or who relays a guest) drops out, and work that
+    /// nobody in particular started reads for nobody.
+    #[test]
+    fn a_relay_reads_for_the_people_outside_the_circle() {
+        use crate::chat::ReadsFor;
+        let a = AllowList::build(Some("ops"), &["ann".to_string(), "*".to_string()], &[], false);
+        let people = |p: &[&str]| ReadsFor::People(p.iter().map(|s| s.to_string()).collect());
+        assert_eq!(a.reads_for("ops", None), ReadsFor::All);
+        assert_eq!(a.reads_for("ann:helper", Some("ops")), ReadsFor::All);
+        assert_eq!(a.reads_for("Stranger", None), people(&["stranger"]));
+        assert_eq!(a.reads_for("stranger", Some("ann")), people(&["stranger"]), "a stranger relaying the circle");
+        assert_eq!(a.reads_for("ops:claude", Some("stranger")), people(&["stranger"]));
+        assert_eq!(a.reads_for("other:bot", Some("stranger")), people(&["other:bot", "stranger"]));
+        assert_eq!(a.reads_for("ops:claude", Some("")), people(&[]), "the circle's bot passing nobody in particular on");
+        assert_eq!(a.reads_for("stranger", Some("")), people(&["stranger"]), "the stranger's own background work");
+        assert_eq!(a.reads_for("", None), people(&[]), "a wake-up nobody started");
     }
 
     /// The owner's own bot passing someone on is that someone asking: the
@@ -12902,10 +13051,34 @@ mod surface_tag_tests {
         let ch = "11111111-1111-1111-1111-111111111111";
         assert_eq!(crate::harness::forum_channel_of(&surface_tag(BOT, CONV, Some(ch))).as_deref(), Some(ch));
         assert_eq!(crate::harness::forum_channel_of(&surface_tag(BOT, CONV, None)), None);
-        let env = crate::harness::turn_env(CONV, &surface_tag(BOT, CONV, Some(ch)));
-        assert_eq!(env, [("MAFOLD_CONV", CONV.to_string()), ("MAFOLD_FORUM_CHANNEL", ch.to_string())]);
-        let env = crate::harness::turn_env(CONV, &surface_tag(BOT, CONV, None));
+        let all = crate::chat::ReadsFor::All;
+        let env = crate::harness::turn_env(CONV, &surface_tag(BOT, CONV, Some(ch)), &all);
+        assert_eq!(
+            env,
+            [("MAFOLD_CONV", CONV.to_string()), ("MAFOLD_FORUM_CHANNEL", ch.to_string()), ("MAFOLD_READS_FOR", "*".to_string())]
+        );
+        let env = crate::harness::turn_env(CONV, &surface_tag(BOT, CONV, None), &all);
         assert_eq!(env[1], ("MAFOLD_FORUM_CHANNEL", String::new()), "exported empty on #all, never left to inherit");
+    }
+
+    /// Whose eyes the turn reads with rides the same door, every time — a
+    /// guest's turn says so, and nobody-in-particular is said as such rather
+    /// than left for an inherited value to fill in.
+    #[test]
+    fn the_agent_is_told_whom_it_reads_for() {
+        use crate::chat::ReadsFor;
+        let env = |r: &ReadsFor| crate::harness::turn_env(CONV, &surface_tag(BOT, CONV, None), r)[2].1.clone();
+        let people = |p: &[&str]| ReadsFor::People(p.iter().map(|s| s.to_string()).collect());
+        assert_eq!(env(&ReadsFor::All), "*");
+        assert_eq!(env(&people(&["alice"])), "alice");
+        assert_eq!(env(&people(&["ops:claude", "alice"])), "ops:claude,alice");
+        assert_eq!(env(&people(&[])), "-");
+        for r in [ReadsFor::All, people(&["alice"]), people(&["ops:claude", "alice"]), people(&[])] {
+            assert_eq!(ReadsFor::parse(&env(&r)), r, "{r:?} must read back as itself");
+        }
+        assert_eq!(ReadsFor::parse(" @Alice , "), people(&["alice"]));
+        assert_eq!(ReadsFor::parse(""), people(&[]), "an empty value is nobody, not everybody");
+        assert_eq!(ReadsFor::default(), people(&[]), "a mount nobody set reads for nobody");
     }
 
     /// The restart re-arm only has filenames to go on: whatever the hook wrote
@@ -13270,10 +13443,10 @@ mod bgtasks_tests {
 #[cfg(test)]
 mod inbound_file_tests {
     use super::{
-        account_options, attachment_label, expression_label, expression_note, expression_tag, file_cache_name,
-        flatten_body_records, human_size, mafold_preamble, topped_up,
+        account_options, attachment_label, cards_from_list, expression_label, expression_note, expression_tag,
+        file_cache_name, flatten_body_records, human_size, mafold_preamble, topped_up,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     /// An owner-authored sheet is preserved, but the fields the DAEMON reads
     /// are topped up — otherwise the value is applied-but-invisible, and the
@@ -13519,6 +13692,51 @@ mod inbound_file_tests {
         assert!(p.contains("the network is reachable"), "{p}");
         assert!(p.contains("OPENS INSIDE"), "{p}");
         assert!(p.contains("better sent as a file"), "{p}");
+        // 2026-10-29: a picture written into a reply as base64 kept @claude
+        // typing for eleven minutes.
+        assert!(p.contains("Never write its bytes into a reply"), "{p}");
+    }
+
+    /// 2026-10-29: asked for pictures of something, @claude hand-built a logo
+    /// grid in `mafold/html` — every catalog listed `mafold/media` by name
+    /// only, though its manifest carries notes for agents. The menu comes from
+    /// `listCards` as the api answers it (real manifest, `offered` read by
+    /// the server for the flag), and the notes reach the preamble.
+    #[test]
+    fn a_cards_own_notes_reach_the_preamble_and_the_server_decides_its_flag() {
+        let manifest: Value = serde_json::from_str(include_str!("../../cards/media/mafold.card.json")).unwrap();
+        let entry = |tag: &str, agent: &Value, offered: Option<bool>| {
+            let mut e = json!({ "tag": tag, "scope": "mafold", "agent": agent });
+            if let Some(o) = offered {
+                e["offered"] = json!(o);
+            }
+            e
+        };
+        let host = json!({ "offer": false, "doc": "The activity center's tab." });
+        let list = json!({ "items": [
+            entry("media", &manifest["agent"], Some(true)),
+            entry("receipts", &host, Some(false)),
+            entry("run", &Value::Null, Some(false)),
+            entry("kline", &Value::Null, Some(true)),
+        ]});
+        let (ids, menu) = cards_from_list(&list).unwrap();
+        assert_eq!(ids, ["mafold/media", "mafold/receipts", "mafold/run", "mafold/kline"], "the lookup knows every id");
+        assert_eq!(menu.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["mafold/media", "mafold/kline"]);
+
+        let p = mafold_preamble("ops:claude", "ops", &menu);
+        assert!(p.contains("• mafold/media — Rows of pictures from web pages"), "{p}");
+        assert!(p.contains(" Example:\n{% mafold/media %}\nrow|"), "{p}");
+        assert!(p.contains("Also here (each takes its own attributes): mafold/kline."), "{p}");
+        assert!(p.contains("rather than building the same thing in HTML"), "{p}");
+        assert!(!p.contains("mafold/receipts") && !p.contains("{% mafold/run … /%}"), "{p}");
+
+        // The flag shut for this bot, or an api too old to say: not offered.
+        for offered in [Some(false), None] {
+            let list = json!({ "items": [entry("media", &manifest["agent"], offered)] });
+            let (_, menu) = cards_from_list(&list).unwrap();
+            assert!(menu.is_empty(), "{offered:?}");
+            assert!(!mafold_preamble("ops:claude", "ops", &menu).contains("Rows of pictures"));
+        }
     }
 
     /// A client that renders live components should not be answered with an
@@ -14020,6 +14238,36 @@ mod gate_tests {
         assert_eq!(a.standing("ops:claude", Some("ops")), S::Circle);
         let paid = AllowList { paid: true, anyone: false, ..al(Some("ops"), &[], &[], false) };
         assert_eq!(paid.standing("payer", None), S::Guest);
+    }
+
+    /// The hole (DEV #agent内记录转发, 10-25): every ticket the agent held went
+    /// into every turn, in whatever room and whoever was talking — so in a
+    /// 28-person group anyone it takes orders from could have it read two DMs
+    /// it had tickets for. A stranger let in by `*` (or the paid tier) gets
+    /// none of them: not named in the prompt, not to `mafold read`. The
+    /// owner's circle keeps them all.
+    #[test]
+    fn a_strangers_turn_is_handed_no_ticket() {
+        use crate::chat::{access_block, lender_for};
+        let a = al(Some("ops"), &["ann"], &[], true);
+        let grants = serde_json::json!({"held": [{
+            "conversation_id": "dm-linsky", "title": "linsky, ops", "kind": "direct",
+            "participant_count": 2, "account": "ops", "expires_at": 0,
+        }]});
+        let stranger = a.reads_for("stranger", None);
+        assert!(access_block(&grants, &stranger).is_none(), "the stranger's prompt names the ticket");
+        assert!(lender_for(&grants, "dm-linsky", &stranger).is_none(), "the stranger's `mafold read` reads on it");
+        let paid = AllowList { paid: true, anyone: false, ..al(Some("ops"), &[], &[], false) };
+        assert!(lender_for(&grants, "dm-linsky", &paid.reads_for("payer", None)).is_none(), "the paid tier is no circle");
+        // The owner's own bot passing a stranger on is the stranger asking.
+        let relayed = a.reads_for("ops:claude", Some("stranger"));
+        assert!(access_block(&grants, &relayed).is_none(), "relaying a stranger");
+        assert!(lender_for(&grants, "dm-linsky", &relayed).is_none());
+        for circle in ["ops", "ann", "ops:claude", "ann:helper"] {
+            let r = a.reads_for(circle, None);
+            assert!(access_block(&grants, &r).is_some_and(|b| b.contains("dm-linsky")), "{circle}");
+            assert_eq!(lender_for(&grants, "dm-linsky", &r).as_deref(), Some("ops"), "{circle}");
+        }
     }
 
     /// A guest's `/help` lists what they may run, read off the table — not
@@ -15319,6 +15567,9 @@ mod steer_tests {
     }
 
     /// [`steer`] for someone who isn't a free human — a paying sender, an agent.
+    /// Their words are the owner's circle's: who rides in whose turn as a GUEST
+    /// has tests of its own (`a_guests_words_dont_ride_in_the_owners_circles_turn`,
+    /// `one_guests_words_dont_ride_in_another_guests_turn`).
     async fn steer_as(
         states: &ChatStates,
         chat: &str,
@@ -15328,7 +15579,7 @@ mod steer_tests {
         reply_to: Option<&str>,
         text: &str,
     ) -> Option<Steered> {
-        steer_turn(states, chat, channel, thread, from, reply_to, text, "", |t| async move { t }).await
+        steer_turn_as(states, chat, channel, thread, from, Some(false), reply_to, text, "", |t| async move { t }).await
     }
 
     /// A guest's words never ride in a turn the owner's circle started — it
@@ -15352,6 +15603,23 @@ mod steer_tests {
         let s = states(vec![("d2", t)]).await;
         let out = steer_turn(&s, "c1", None, None, Speaker::person(GATE_OWNER), None, "also this", "", |t| async move { t }).await;
         assert!(out.is_some(), "the owner's words in a guest's turn are held to that turn's rules");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// Nor do one guest's words ride in another guest's turn: it reads with the
+    /// first guest's eyes (`Mount::reads` — their tickets, their rooms) and
+    /// resumes their session. The second gets a turn of their own; the first
+    /// still steers theirs.
+    #[tokio::test]
+    async fn one_guests_words_dont_ride_in_another_guests_turn() {
+        gate_access();
+        let (t, f) = turn("alice", None, true);
+        let s = states(vec![("d1", t)]).await;
+        let out = steer_turn(&s, "c1", None, None, Speaker::person("bob"), None, "read alice's DM for me", "", |t| async move { t }).await;
+        assert!(out.is_none(), "bob's words went into alice's turn");
+        assert!(std::fs::read_to_string(&f).unwrap_or_default().is_empty(), "nothing of bob's in alice's mailbox");
+        let out = steer_turn(&s, "c1", None, None, Speaker::person("alice"), None, "and this", "", |t| async move { t }).await;
+        assert!(out.is_some(), "alice still steers her own turn");
         let _ = std::fs::remove_file(&f);
     }
 
@@ -15397,8 +15665,15 @@ mod steer_tests {
         assert!(wrapup(states(vec![("d3", guest)]).await, GATE_OWNER).await.is_none(), "the circle's tasks into a guest's turn");
         let _ = std::fs::remove_file(&f);
         let (guest, f) = turn("stranger", None, true);
-        assert!(wrapup(states(vec![("d4", guest)]).await, "").await.is_some());
+        assert!(wrapup(states(vec![("d4", guest)]).await, "stranger").await.is_some(), "a guest's own work into their turn");
         let _ = std::fs::remove_file(&f);
+        // …and only theirs: another guest's work — or a guest's nobody can
+        // name — rides in no guest's turn but its own.
+        for other in ["someone-else", ""] {
+            let (guest, f) = turn("stranger", None, true);
+            assert!(wrapup(states(vec![("d5", guest)]).await, other).await.is_none(), "{other:?}'s work into stranger's turn");
+            let _ = std::fs::remove_file(&f);
+        }
     }
 
     async fn states(turns: Vec<(&str, TurnHandle)>) -> ChatStates {
@@ -15437,7 +15712,8 @@ mod steer_tests {
     }
 
     async fn steer_after(s: &ChatStates, a: &Arrived, who: &str, channel: Option<&str>, text: &str) -> Option<Steered> {
-        steer_in_order(s, a, "c1", channel, None, Speaker::person(who), None, None, text, "", |t| async move { t }).await
+        // The circle's words, as in `steer_as`.
+        steer_in_order(s, a, "c1", channel, None, Speaker::person(who), Some(false), None, text, "", |t| async move { t }).await
     }
 
     /// 2026-09-27 #失败不可见, the whole incident in one test. Two @s from the
@@ -15686,11 +15962,13 @@ mod steer_tests {
     /// carries no "From @…" frame.
     #[tokio::test]
     async fn a_wrapup_goes_into_whoevers_turn_is_running_here() {
+        // Both the circle's: whose turn rides whose as a guest is
+        // `a_wrapup_only_reports_into_a_turn_of_its_own_kind`.
         let (t, f) = turn("eons", None, true);
-        let s = states(vec![("d1", t)]).await;
+        let s = states(vec![("d1", TurnHandle { guest: false, ..t })]).await;
         let prompt = "(background task(s) you started earlier have finished.)";
         let out = inject_into_live_turn(
-            &s, "c1", None, None, Speaker::person("ops"), None, None, prompt,
+            &s, "c1", None, None, Speaker::person("ops"), Some(false), None, prompt,
             Seam::Notice("后台任务跑完了".into()), |t| async move { t },
         )
         .await;
@@ -16181,6 +16459,38 @@ mod steer_tests {
 }
 
 #[cfg(test)]
+mod login_chat_door_tests {
+    use super::{login_failure_line, login_line};
+    use crate::runtime_login::{Event, Failure};
+
+    /// `/login` says each step of the shared sign-in in the chat, the words it
+    /// always used: the opening (own login / a second one), then the link.
+    #[test]
+    fn each_step_of_the_shared_sign_in_is_said_in_the_chat() {
+        let own = login_line(&Event::Started { account: "default".into(), adding: false });
+        assert!(own.starts_with("🔐 Starting Anthropic sign-in…") && own.contains("re-authenticates the agent's own `claude`"), "{own}");
+        let second = login_line(&Event::Started { account: "work".into(), adding: true });
+        assert!(second.contains("for a SECOND account, `work`") && second.contains("use a private window"), "{second}");
+        let link = login_line(&Event::Link { url: "https://claude.ai/oauth/authorize?x=1".into() });
+        assert_eq!(
+            link,
+            "🔗 Open this to sign in (any device works):\nhttps://claude.ai/oauth/authorize?x=1\n\nAfter you approve, paste the Authentication Code here."
+        );
+    }
+
+    #[test]
+    fn a_stopped_sign_in_says_try_login_again_and_a_cancelled_one_says_nothing() {
+        let f = |code: &'static str| Failure { code, detail: format!("detail of {code}") };
+        assert_eq!(login_failure_line(&f("cancelled")), None);
+        assert!(login_failure_line(&f("no_code")).unwrap().ends_with("Try `/login` again."));
+        assert!(login_failure_line(&f("rejected")).unwrap().ends_with("Try `/login` again."));
+        // What the engine says itself is what the chat says.
+        assert_eq!(login_failure_line(&f("no_link")).as_deref(), Some("detail of no_link"));
+        assert_eq!(login_failure_line(&f("account")).as_deref(), Some("detail of account"));
+    }
+}
+
+#[cfg(test)]
 mod login_receipt_tests {
     use super::{login_receipt, LoginOutcome};
     use crate::commands::{LoginIdentity, WhoProbe};
@@ -16394,21 +16704,6 @@ mod wall_footer_tests {
         assert!(!detail.contains("old refusal"));
     }
 
-    /// Which account a turn runs on, and where its login lives, are the
-    /// owner's: none of it is in the reply's body, all of it in their state —
-    /// so nothing the note says can open or close a card in the body either.
-    #[test]
-    fn switch_notes_keep_storage_details_out_of_the_body() {
-        let private = super::Private::default();
-        let note = super::private_account_note("Keychain path {% /mafold/only %} must stay private", &private);
-        let items = private.lock().unwrap().clone();
-        assert_eq!(items.len(), 1);
-        let sid = super::failure_card_tests::sid(&items[0].key);
-        assert_eq!(note, format!("\n{{% mafold/only for=\"owner\" sid=\"{sid}\" /%}}\n\n"));
-        assert_eq!(items[0].v, "Keychain path {% /mafold/only %} must stay private");
-        assert_eq!(items[0].read, ["owner"]);
-    }
-
     #[test]
     fn zero_output_account_and_network_failures_never_discard_context() {
         for error in [
@@ -16428,6 +16723,13 @@ mod wall_footer_tests {
             ..Default::default()
         };
         assert!(super::broken_resume(&out));
+        // The same death said on the stream: claude 2.1.280's `result.errors`,
+        // as `harness::claude_code::result_error` passes it on.
+        let streamed = crate::harness::TurnOutcome {
+            error: Some("No conversation found with session ID: bd681c70-93c8-45d0-8c03-0bfd11daa4ec".into()),
+            ..Default::default()
+        };
+        assert!(super::broken_resume(&streamed));
         out.produced = true;
         assert!(!super::broken_resume(&out));
         out.produced = false;
@@ -16674,7 +16976,7 @@ mod windows_background_tests {
             "test".into(), "ci".into(), None, Some("windows".into()),
             Default::default(), ExecCoord::new(None, None), states,
             Arc::new(crate::harness::claude_code::ClaudeCode),
-            None, None, None, None, None, GATE_OWNER.into(), false, 1, None,
+            None, None, None, None, None, GATE_OWNER.into(), None, 1, None,
         );
         let notice = tokio::time::timeout(Duration::from_secs(20), notices.recv()).await.unwrap().unwrap();
         assert!(matches!(notice, AgentEvent::Notice(_)), "completion must dispatch a report notice");
@@ -17078,7 +17380,7 @@ mod bgtask_watch_tests {
                 self.client.clone(), "/tmp".into(), false, BOT.into(), self.conv.clone(), None, Some("ch".into()),
                 Default::default(), ExecCoord::new(None, None), self.states.clone(),
                 Arc::new(crate::harness::claude_code::ClaudeCode),
-                None, None, None, None, None, GATE_OWNER.into(), false, n,
+                None, None, None, None, None, GATE_OWNER.into(), None, n,
                 card.map(|id| (id.to_string(), String::new())),
             );
         }
@@ -17543,6 +17845,50 @@ mod bgtask_watch_tests {
 
     fn tool() -> AgentEvent {
         AgentEvent::ToolCall { id: "t1".into(), name: "Read".into(), input: serde_json::json!({ "file_path": "/tmp/x.log" }) }
+    }
+
+    /// A compaction mid-turn draws its card with the summary as the owner's
+    /// state. That state is written while the reply is still being written —
+    /// not at the turn's end, which left the owner a bare «only for …» stub
+    /// for as long as the reply took (10-21).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cards_private_part_is_written_while_the_reply_is_still_being_written() {
+        let (base, api) = fake_api().await;
+        let client = Client::new(base, "test".into());
+        let conv = uuid::Uuid::new_v4().to_string();
+        let draft = uuid::Uuid::new_v4().to_string();
+        let live = Arc::new(std::sync::Mutex::new(draft.clone()));
+        let private = Private::default();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = tokio::spawn(render_loop(
+            rx, client, draft.clone(), None, None, live, Default::default(), conv,
+            "live-surface".into(), "/nonexistent-ask".into(), Default::default(), Default::default(),
+            crate::bgtasks::now_ms(), Default::default(), String::new(), Default::default(), private.clone(), None,
+        ));
+        let compacted = AgentEvent::Compacted {
+            pre_tokens: Some(180_000),
+            post_tokens: Some(20_000),
+            summary: Some("SUMMARY-FOR-THE-OWNER".into()),
+            flagged: vec![],
+        };
+        tx.send(compacted).unwrap();
+        tx.send(AgentEvent::Text("still working".into())).unwrap();
+        // The turn is not over (no Done yet), and the owner's part is already there.
+        let mut written = Vec::new();
+        for _ in 0..100 {
+            written = api.lock().unwrap().calls.iter().filter(|(m, _)| m == "setCardState").map(|(_, b)| b.clone()).collect();
+            if !written.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(written.len(), 1, "{:?}", api.lock().unwrap().calls);
+        assert_eq!(written[0]["message_id"], draft.as_str());
+        assert!(written[0]["v"].to_string().contains("SUMMARY-FOR-THE-OWNER"), "{}", written[0]);
+        tx.send(done()).unwrap();
+        drop(tx);
+        r.await.unwrap();
+        assert!(private.lock().unwrap().is_empty(), "nothing left for the end to write twice");
     }
 
     /// The agent reads the log and judges there is nothing to say: nothing
