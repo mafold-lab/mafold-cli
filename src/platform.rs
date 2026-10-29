@@ -979,6 +979,34 @@ mod tests {
         assert_eq!(on_disk(p("/x (deleted)/mafold")), p("/x (deleted)/mafold"));
     }
 
+    /// Only [`current_exe`] asks the OS for this binary's path. Every other
+    /// place hands that path to a child — a hook, the permission server, a
+    /// daemon — and one that asked `std::env::current_exe` itself got Linux's
+    /// `… (deleted)` after an update: the old daemon, still answering while
+    /// the supervisor waited to restart it, started a turn whose Claude Code
+    /// found no permission tool and failed its first command (10-29, DEV).
+    #[test]
+    fn only_current_exe_asks_for_this_binarys_path() {
+        fn scan(dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    scan(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") && !path.ends_with("src/platform.rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for (i, line) in text.lines().enumerate() {
+                        if line.contains(concat!("std::env::", "current_exe(")) {
+                            out.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        scan(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
+        assert!(found.is_empty(), "use crate::platform::current_exe() instead: {found:#?}");
+    }
+
     /// `console_window_of`'s console-less half: asks about
     /// `MAFOLD_CONSOLE_PROBE_PID` and prints the answer for the caller.
     #[cfg(windows)]

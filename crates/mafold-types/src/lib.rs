@@ -43,6 +43,9 @@ pub mod steer;
 /// the Rust half of `client-shared/units.ts`, tested against the same table
 /// (`units.rs`).
 pub mod units;
+/// What may sign a new agent in, by where it runs and its runtime — the Rust
+/// half of `client-shared/newAgent.ts`, tested against the same table.
+pub mod agent_setup;
 pub use connections::{
     provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
     PROVIDERS,

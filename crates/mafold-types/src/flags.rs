@@ -456,6 +456,25 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // New Agent in three steps (ops 10-29, DEV #新建agent流程). It replaces
+    // the New Agent editor for everyone, so it waits behind this until ops
+    // says ship to all; the old editor stays whole for flag-off and is removed
+    // only then. createBot's `sign_in` is optional and only the panel sends
+    // it, so the server needs no gate of its own.
+    FlagMeta {
+        key: "newAgentFlow",
+        default: false,
+        dev_default: true,
+        label: "New Agent in three steps",
+        description: "New Message's ✦ mode is New Agent in three steps, in the same modal (web: its \
+                      460 × ≤680 card; phone: its full-screen sheet): ① who (avatar, name, username) \
+                      ② where (Mafold Cloud or one of your computers, online or not) ③ runtime and \
+                      what it signs in with. Off = the old editor (web) / the New Bot form (phone).",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
     // The update pill and its loading screen (owner 10-22, demo upd-demo v4:
     // copy 「A 说清楚」, loading screen 「A 回到徽章」). Two flags, not one: the
     // loading screen is seen on every open and may go out on its own, ahead
@@ -603,6 +622,17 @@ mod tests {
             assert_eq!(m.server, NotRead, "{k}: gates the panel only");
             assert!(!server_default(k), "{k}: nothing server-side opens without a record");
         }
+    }
+
+    #[test]
+    fn new_agent_in_three_steps_ships_dark() {
+        // It replaces New Agent for everyone: off in production until ops says
+        // ship to all, on in dev; read by both clients, nothing server-side.
+        let m = meta("newAgentFlow").expect("newAgentFlow registered");
+        assert!(!m.default && m.dev_default, "off in production, on in dev");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "web and phone read it");
+        assert_eq!(m.server, NotRead, "gates the clients only");
+        assert!(!server_default("newAgentFlow"), "nothing server-side opens without a record");
     }
 
     #[test]

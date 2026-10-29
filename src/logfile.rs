@@ -540,7 +540,7 @@ mod tests {
     /// the log: what re-points stdout must do it in a process of its own, or
     /// it swallows the test harness's.
     fn child(test: &str, var: &str, log: &Path) -> std::process::Command {
-        let mut c = crate::platform::std_command(std::env::current_exe().unwrap());
+        let mut c = crate::platform::std_command(crate::platform::current_exe().unwrap());
         c.args(["--exact", &format!("logfile::tests::{test}"), "--nocapture", "--test-threads=1"]).env(var, log);
         c
     }

@@ -54,7 +54,7 @@ pub fn start_detached(
             anyhow::bail!("agent already running (pid {pid}) — run `mafold stop` first");
         }
     }
-    let exe = std::env::current_exe()?;
+    let exe = crate::platform::current_exe()?;
     // The log it takes over and rotates itself (`agent::run` → `logfile::keep`),
     // the way a bot the supervisor runs does.
     let log = log_path()?;

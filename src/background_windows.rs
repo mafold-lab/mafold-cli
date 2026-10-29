@@ -143,7 +143,7 @@ pub fn start(task: &Task, env: Option<&HashMap<String, String>>) -> Result<u32> 
         .create(true)
         .append(true)
         .open(&task.log)?;
-    let mut cmd = crate::platform::std_command(std::env::current_exe()?);
+    let mut cmd = crate::platform::std_command(crate::platform::current_exe()?);
     #[cfg(not(test))]
     cmd.arg("background-worker").arg(&config);
     #[cfg(test)]

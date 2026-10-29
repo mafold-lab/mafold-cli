@@ -181,7 +181,7 @@ pub fn run(print_settings: bool) -> anyhow::Result<()> {
         // hook up outside the daemon (the e2e rig). A hand-copied blob drifted
         // once: its PostCompact timeout stayed at 90s after the check's own
         // deadline went to 120s, and Claude Code cancelled the hook mid-check.
-        let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+        let exe = crate::platform::current_exe()?.to_string_lossy().into_owned();
         println!("{}", json!({ "hooks": settings(&exe) }));
         return Ok(());
     }

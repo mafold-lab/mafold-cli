@@ -1573,7 +1573,7 @@ fn child_env(client: &Client, me: &str, journal: &Path, seen: &Path, dry: bool) 
         env.push(("MAFOLD_BOT_TOKEN".into(), client.token.clone()));
         env.push(("MAFOLD_ACCOUNT".into(), String::new()));
     }
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+    if let Some(dir) = crate::platform::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
         let mut paths = vec![dir];
         if let Some(p) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&p));

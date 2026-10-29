@@ -66,7 +66,7 @@ impl Harness for ClaudeCode {
         tokio::spawn(async move {
             let _release = cc_conn::PrewarmGuard(key.clone());
             let began = std::time::Instant::now();
-            let exe = std::env::current_exe()
+            let exe = crate::platform::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "mafold".into());
@@ -130,7 +130,12 @@ impl Harness for ClaudeCode {
             &env,
         )
         .with_mount(&mount);
-        let exe = std::env::current_exe()
+        // Every hook and the permission server run as `<exe> …`. By the path on
+        // disk: after an update on Linux, the binary this daemon still runs as
+        // is `<path> (deleted)`, and a turn it starts before the supervisor
+        // restarts it would find no permission tool and fail its first command
+        // (10-29, DEV, the first turn after cli@0.9.150).
+        let exe = crate::platform::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "mafold".into());
@@ -1333,7 +1338,7 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         // PATH, or none at all (a daemon started from a GUI or a service often
         // has no install dir on PATH, and then every `mafold` call in the turn
         // fails with "command not found").
-        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Some(dir) = crate::platform::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
             let joined = std::env::join_paths(
                 std::iter::once(dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
             );
@@ -2417,7 +2422,7 @@ mod tests {
         // holds this test's output pipes until it exits.
         std::fs::write(dir.join("claude.cmd"), "@ping -n 12 127.0.0.1 >nul\r\n").unwrap();
         let path = format!("{};{}", dir.display(), std::env::var("PATH").unwrap_or_default());
-        let mut cmd = crate::platform::std_command(std::env::current_exe().unwrap());
+        let mut cmd = crate::platform::std_command(crate::platform::current_exe().unwrap());
         cmd.args(["--exact", "harness::claude_code::tests::win_console_daemon_side"])
             .args(["--include-ignored", "--test-threads=1", "--nocapture"])
             .env("MAFOLD_CONSOLE_PROBE_DIR", &dir)

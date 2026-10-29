@@ -6678,7 +6678,7 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
     let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), "🗜️ Compacting the conversation…").await;
     // The compaction guard, the same one a turn carries: this is the other way a
     // summary gets written. See `compact_hook`.
-    let exe = std::env::current_exe()
+    let exe = crate::platform::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "mafold".into());
