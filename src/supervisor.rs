@@ -1497,8 +1497,9 @@ pub async fn supervise(base: String, auto_update: bool) {
     // account, spawned from the loop below so an account that logs in later
     // gets served without restarting the supervisor. Quiet: each only serves
     // when that account's vault key is already cached here (see
-    // `connection::supervise_listener`).
-    let mut listening: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // `connection::supervise_listener`). A listener never returns, so one
+    // whose task has finished panicked; the loop starts it again.
+    let mut listening: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
     let http = reqwest::Client::new();
     // A busy mark left by the process this one replaced (an update re-execs
     // in place, mid-«waiting for turns») is not true of this one.
@@ -1656,11 +1657,16 @@ pub async fn supervise(base: String, auto_update: bool) {
             }
             // Accounts are re-read every tick, so a login added while the
             // supervisor is already up gets its vault listener right here.
-            if listening.insert(sess.username.to_lowercase()) {
-                tokio::spawn(crate::connection::supervise_listener(
-                    base.clone(),
-                    sess.username.clone(),
-                ));
+            let key = sess.username.to_lowercase();
+            let ended = listening.get(&key).map(|l| l.is_finished());
+            if ended != Some(false) {
+                if ended == Some(true) {
+                    eprintln!("✗ the connections listener for @{} stopped — starting it again", sess.username);
+                }
+                listening.insert(
+                    key,
+                    tokio::spawn(crate::connection::supervise_listener(base.clone(), sess.username.clone())),
+                );
             }
         }
         // Or sooner, when a command asks it to move onto a new binary.
@@ -2013,16 +2019,28 @@ async fn heartbeat(http: reqwest::Client, base: String, sessions: fn() -> Vec<cr
 
 /// Run `beat` now and then every `every`; a beat that overruns pushes the
 /// next one back rather than firing a burst to catch up.
+///
+/// Each beat is a task of its own, so one that panics ends only itself. In
+/// line here, a panic ended the heartbeat for good while the supervisor
+/// went on: 10-29 a fork bomb left mafold.cicd no thread to start, one
+/// beat's `spawn_blocking` panicked, and the machine read silent until the
+/// supervisor was restarted by hand.
 async fn beat_every<F, Fut>(every: std::time::Duration, mut beat: F)
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let mut ticks = tokio::time::interval(every);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
-        beat().await;
+        if let Err(e) = tokio::spawn(beat()).await {
+            if e.is_panic() {
+                // Not `eprintln!`: it panics when the write fails (a full
+                // disk under supervisor.log), and this loop must not.
+                let _ = writeln!(std::io::stderr(), "✗ a heartbeat panicked — the next one goes out on time");
+            }
+        }
     }
 }
 
@@ -3576,6 +3594,31 @@ mod busy_tests {
         task.abort();
         let n = beats.load(std::sync::atomic::Ordering::SeqCst);
         assert!(n >= 15, "about 20 beats during a 2-second install, got {n}");
+    }
+
+    /// 10-29 22:26Z a fork bomb on mafold.cicd left no thread to start: the
+    /// `spawn_blocking` in one beat (`harness::report_rows`) panicked "OS
+    /// can't spawn worker thread", the panic ended the heartbeat task, and
+    /// the computers card read the machine silent for hours while every bot
+    /// on it kept replying. A beat that panics costs that beat, not the rest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_beat_that_panics_does_not_end_the_heartbeat() {
+        let beats = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = beats.clone();
+        let task = tokio::spawn(beat_every(std::time::Duration::from_millis(50), move || {
+            let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n == 1 {
+                    panic!("OS can't spawn worker thread: Resource temporarily unavailable (os error 11)");
+                }
+            }
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let ended = task.is_finished();
+        task.abort();
+        let n = beats.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(!ended, "the heartbeat ended with the beat that panicked (after {n} beats)");
+        assert!(n >= 6, "about 12 beats in 600 ms, the second one panicking, got {n}");
     }
 
     #[test]

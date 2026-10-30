@@ -283,6 +283,23 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // The wallet re-laid (ops 10-29, #钱包页改版 demo v3.2). Implies the
+    // auto-convert-first behaviour above whatever that flag says.
+    FlagMeta {
+        key: "walletV2",
+        default: false,
+        dev_default: false,
+        label: "Wallet: re-laid page",
+        description: "A top row (Search, Model prices, How it works), the balance with provider pills \
+                      instead of the slider, four round buttons (Deposit, Transfer, Details, Convert), \
+                      an Activity card that opens with the auto-convert switch and shows each auto \
+                      convert under the payment it funded, then Holdings and Authorized to spend as \
+                      cards; on web one band across the top and 2–3 card columns. Off = today's page.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
     // The re-laid profile page (RN + web Profile). Its tab bar asks the api
     // `getProfileTabs`; an api without the route just means no tab is left out.
     FlagMeta {
@@ -475,6 +492,27 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // Onboarding step 3 (ops 10-29 "Build it"): @mafold sets up a newcomer's
+    // first AI. Behind this until ops has seen it work end to end on dev; it
+    // is separate from newAgentFlow, which ops opens to everyone on his own
+    // call. Only the api reads it: it decides whether @mafold has the tool
+    // and the instructions, and the card's tap re-checks it. The card's
+    // «Set it up myself» door opens whatever New Agent the reader has.
+    FlagMeta {
+        key: "onboardingAgent",
+        default: false,
+        dev_default: false,
+        label: "@mafold sets up your first AI",
+        description: "@mafold can propose an AI for the person it is talking to — name, persona, \
+                      Run on Mafold paid from their wallet — as a card. One tap on Create builds it \
+                      in their namespace (bot_plans: one approval, used once); «Set it up myself» \
+                      opens New Agent with Run on Mafold picked. Off = @mafold points at New Agent \
+                      in words.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     // The update pill and its loading screen (owner 10-22, demo upd-demo v4:
     // copy 「A 说清楚」, loading screen 「A 回到徽章」). Two flags, not one: the
     // loading screen is seen on every open and may go out on its own, ahead
@@ -550,6 +588,95 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       new people who don't qualify can't start a chat with them or add them to groups. \
                       An AI account is judged by its owner. Off = the setting isn't offered and any \
                       stored one is not enforced.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // The Settings ▸ Connections redesign (ops 10-29 "Build it", demo v3: tiles
+    // under category tabs, search, every supported service, several accounts
+    // per service). Server-read because the page brings two routes no other
+    // surface has — giving one of your agents access from your own page and
+    // choosing which account it uses first — and those answer only where this
+    // is on, so nothing can call them before the owner opens the page.
+    FlagMeta {
+        key: "connectionsPage",
+        default: false,
+        dev_default: true,
+        label: "Connections: the new page",
+        description: "Settings > Connections becomes one page of tiles: every supported service under \
+                      tabs (All, Agent logins, Model keys, Apps, Computers, Secrets) with a search box, \
+                      what needs you first, several accounts per service, and per account which of \
+                      your agents may use it, until when, and which account each agent uses first. \
+                      The phone gets the same page. The api answers grantConnectionAccess and \
+                      setConnectionOrder only where this is on. Off = the old Connections list.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // Channels in every conversation (ops 2026-10-29: "let the discussion
+    // forums be a default feature open at every conversation (even human to
+    // human)"). Nothing to switch on: the first channel a flag holder makes
+    // turns channels on for that chat, for everyone in it — `is_forum` keeps
+    // meaning "this chat has channels", so people without the flag (and older
+    // apps) see exactly the forums that really have channels. Server-read:
+    // `createChannel` takes a chat that isn't a forum yet only from a caller
+    // this is on for.
+    FlagMeta {
+        key: "forumEverywhere",
+        default: false,
+        dev_default: false,
+        label: "Channels in every chat",
+        description: "Every conversation (groups, DMs with people and with agents, your saved notes) \
+                      shows the #general pill from the start; tapping it lists #general and New \
+                      channel. The first channel you make turns channels on for that chat, for \
+                      everyone in it — no Open discussion switch. The api lets createChannel turn a \
+                      chat into a forum only where this is on, and an agent it is on for is told \
+                      any chat can hold channels. Off = channels only where someone opened \
+                      discussion.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone, Daemon],
+        server: ClosedWithoutRecord,
+    },
+    // The model switch on the usage card (ops 2026-10-29: "the usage card
+    // needs a place to switch model"). No client reads it: the card asks the
+    // api for its menu (`model|menu`), and the answer says whether the switch
+    // is there for this reader — a card can't read flags, and the same card
+    // goes to every app at once.
+    FlagMeta {
+        key: "usageModelSwitch",
+        default: false,
+        dev_default: false,
+        label: "Usage card: switch model",
+        description: "Run details (tap the usage chip at the end of an agent's reply) gets a Change \
+                      link on its Model row: pick the agent's model and effort right there, saved \
+                      from the next reply. The owner picks for this chat (default) or every chat; \
+                      anyone else only for their own replies, and only where the owner lets them. \
+                      The api answers the card's model| taps only where this is on.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    // The 新朋友 card (ops 10-24 design, built 10-30): a new account's way to
+    // its first AI and its first friend, at the end of the chat list. Gone for
+    // good once closed, once both are done, or once the list holds 9 chats —
+    // that bit is a mark in the account's first-run record
+    // (`recordTutorialEvent` `friends.closed`), which this opens on its own.
+    FlagMeta {
+        key: "newFriends",
+        default: false,
+        dev_default: false,
+        label: "Chat list: New friends card",
+        description: "A card after the last chat (2.5 rows tall) with two tiles: Create your AI \
+                      (opens New Agent) and Add a friend (opens New Message's search; its link \
+                      copies your invite link). A tile turns into a ✓ once you have a chat with \
+                      your own AI / with a person. ✕ closes it; it also goes by itself once both \
+                      are done or once you have 9 chats, and never comes back on any device. The \
+                      api lets `recordTutorialEvent` take `friends.closed`, and `getTutorial` \
+                      answer, where this is on.",
         owner: "ops",
         added: "2026-10",
         clients: &[Web, Phone],
@@ -636,6 +763,31 @@ mod tests {
     }
 
     #[test]
+    fn mafold_setting_up_your_first_ai_is_shut_without_a_record() {
+        // A new way to make an agent that spends the person's wallet: opened on
+        // purpose, account by account, never by a missing record.
+        let m = meta("onboardingAgent").expect("onboardingAgent registered");
+        assert!(!m.default && !m.dev_default);
+        assert!(m.clients.is_empty(), "the api decides; no client reads it");
+        assert_eq!(m.server, ClosedWithoutRecord);
+        assert!(!server_default("onboardingAgent"));
+        assert_eq!(server_key("onboardingAgent"), "onboardingAgent");
+    }
+
+    #[test]
+    fn new_friends_card_ships_dark_everywhere() {
+        // Off in production until ops opens it, and off in dev builds too:
+        // the api reads it (it opens the card's one mark), and a dev client
+        // drawing a card the dev api won't let it close would be a lie.
+        let m = meta("newFriends").expect("newFriends registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev builds");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "web and phone draw it");
+        assert_eq!(m.server, ClosedWithoutRecord, "the api keeps its mark shut without a record");
+        assert!(!server_default("newFriends"));
+        assert_eq!(server_key("newFriends"), "newFriends");
+    }
+
+    #[test]
     fn update_pill_and_boot_curtain_ship_dark_and_separately() {
         // Two keys, so the loading screen (seen on every open) can go out
         // without the pill and the pill without it; off in production until
@@ -677,6 +829,59 @@ mod tests {
         assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
         assert!(!server_default(k), "{k}: shut without a record");
         assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn connections_page_is_a_server_gate_that_ships_dark() {
+        // The page's two new routes answer only where this resolves on.
+        let k = "connectionsPage";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn usage_model_switch_is_a_server_gate_no_client_reads() {
+        // The card learns it from the api's answer to `model|menu`; a client
+        // resolving it would be a second source that can disagree.
+        let k = "usageModelSwitch";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.is_empty(), "{k}: only the api reads it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn forum_everywhere_is_a_server_gate_that_ships_dark() {
+        // createChannel turns a chat into a forum only where this resolves on;
+        // a dev build doesn't show the pill everywhere while dev's server
+        // still says "not a forum".
+        let k = "forumEverywhere";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert!(m.clients.contains(&Daemon), "{k}: the daemon words its agents' channel advice on it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn wallet_v2_ships_dark_on_both_clients() {
+        // ops 10-29: "Build it behind a flag". Off everywhere, dev included,
+        // until a record opens it for named accounts; the server sends the
+        // payment link (`funds`) to every client either way.
+        let k = "walletV2";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, NotRead, "{k}: gates the page only");
+        assert!(!server_default(k), "{k}: nothing server-side opens without a record");
     }
 
     #[test]

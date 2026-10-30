@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::client::{Client, Dest};
-use crate::harness::{AgentEvent, Harness, Turn, Who};
+use crate::harness::{AgentEvent, Harness, Takes, Turn, Who};
 
 #[derive(Deserialize)]
 struct Sender {
@@ -685,10 +685,20 @@ async fn standing(sender: &str, relayed_for: Option<&str>) -> Standing {
     }
 }
 
+/// The chat a `botConfigUpdated` says a model was picked in, from the usage
+/// card's switch (`model|set` on the api) — and only that: the event also
+/// fires for every other config save, which leaves `/model` alone.
+fn model_switched_in(params: &serde_json::Value) -> Option<&str> {
+    (params["switched"].as_str() == Some("model"))
+        .then(|| params["chat_id"].as_str())
+        .flatten()
+        .filter(|c| !c.is_empty())
+}
+
 /// What someone hears when a command isn't theirs to run.
 fn not_yours(name: &str, who: Who) -> String {
     match who {
-        Who::Owner => format!("`/{name}` changes the Claude sign-ins on this agent's machine, so only its owner can use it."),
+        Who::Owner => format!("`/{name}` changes this agent's setup on its owner's machine, so only its owner can use it."),
         _ => format!("`/{name}` reads this agent's machine or changes how it runs for everyone in the chat, so only its owner and people they've whitelisted can use it."),
     }
 }
@@ -1324,16 +1334,10 @@ fn directed_at_me(content: &str, is_forward: bool, my_username: &str, ai: bool) 
     !is_forward && mafold_transcript::mention::summons(content, my_username, ai)
 }
 
-/// A `/command` the sender TYPED, split into `(name, arg)` — `None` when this
-/// isn't one. Forwards are never commands: relaying someone's `/clear` or
-/// `/cwd …` is quoting them, not issuing it, and the daemon used to run it.
-/// The pending-`/login` CODE relay upstream stays deliberately outside this
-/// rule — forwarding a pasted auth code in from another chat is a real way
-/// people relay one, so there a forward IS the sender's own input.
 /// `@me /clear` → `/clear`. What a DM says as `/clear`, a group has to say to
 /// ONE bot by name: a bare slash command there is run by every daemon that
 /// lets the sender drive it (control commands need no mention — see the block
-/// that calls `slash_command`), so the inline picker sends `@bot /clear`.
+/// that calls `slash`), so the inline picker sends `@bot /clear`.
 /// Only a leading `@me` followed by a `/…` is peeled; anything else comes back
 /// untouched.
 fn strip_self_address<'a>(text: &'a str, my_username: &str) -> &'a str {
@@ -1357,11 +1361,58 @@ fn strip_self_address<'a>(text: &'a str, my_username: &str) -> &'a str {
     }
 }
 
-fn slash_command<'a>(trimmed: &'a str, is_forward: bool, my_username: &str) -> Option<(String, &'a str)> {
-    let rest = strip_self_address(trimmed, my_username).strip_prefix('/').filter(|_| !is_forward)?;
+/// A message, read as a slash command.
+#[derive(Debug, PartialEq, Eq)]
+enum Slash<'a> {
+    /// Not one: no leading `/`, or a forward.
+    No,
+    /// `/name arg`, and `arg` fits what `name` takes.
+    Command { name: String, arg: &'a str },
+    /// Begins with `/name`, but what follows doesn't fit it (`Takes`): words
+    /// for the agent, and nothing runs. 10-29, `@bot /model → owner only,
+    /// same rule as the card…` was `/model` with that sentence for a model.
+    Words { name: String },
+}
+
+/// The ONE parser every command the sender typed goes through — the daemon's
+/// own, a harness's emulated ones, a skill's — so none of them reads a
+/// command out of a sentence that only begins with one. `takes` says what a
+/// name takes (`takes`, below).
+///
+/// Forwards are never commands: relaying someone's `/clear` or `/cwd …` is
+/// quoting them, not issuing it, and the daemon used to run it. The
+/// pending-`/login` CODE relay upstream stays deliberately outside this rule —
+/// forwarding a pasted auth code in from another chat is a real way people
+/// relay one, so there a forward IS the sender's own input.
+fn slash<'a>(text: &'a str, is_forward: bool, my_username: &str, takes: impl Fn(&str) -> crate::harness::Takes) -> Slash<'a> {
+    let Some(rest) = strip_self_address(text.trim(), my_username).strip_prefix('/').filter(|_| !is_forward) else {
+        return Slash::No;
+    };
     let mut it = rest.splitn(2, char::is_whitespace);
     let name = it.next().unwrap_or("").to_lowercase();
-    Some((name, it.next().unwrap_or("").trim()))
+    let arg = it.next().unwrap_or("").trim();
+    if takes(&name).fits(arg) {
+        Slash::Command { name, arg }
+    } else {
+        Slash::Words { name }
+    }
+}
+
+/// What `name` takes: the daemon's own row, else the harness's own command,
+/// else whatever follows — it goes to the harness as a prompt, where a skill
+/// gets it as its arguments.
+fn takes(name: &str, harness: &dyn Harness) -> crate::harness::Takes {
+    control_command(name)
+        .map(|c| c.takes)
+        .or_else(|| harness.command_takes(name))
+        .unwrap_or(crate::harness::Takes::Text)
+}
+
+/// A message that only begins with a command ([`Slash::Words`]), as the agent
+/// gets it: said so, and never opening with the `/` a harness would run as a
+/// command of that name.
+fn not_a_command(content: &str, name: &str) -> String {
+    format!("(This message begins with `/{name}`, but what follows isn't what `/{name}` takes, so nothing ran — it's a message to you.)\n{content}")
 }
 
 /// Group reply gate. In a group the daemon answers only when @-mentioned or set
@@ -2861,6 +2912,9 @@ struct ControlCommand {
     effect: Effect,
     /// Who may run it (`Who`): asked before it runs, whoever typed it.
     who: Who,
+    /// What may follow its name (`Takes`): anything else makes the message
+    /// words, not this command (`slash`).
+    takes: Takes,
 }
 
 /// The daemon's own control commands — handled locally, never forwarded to the
@@ -2868,23 +2922,25 @@ struct ControlCommand {
 /// the menu is rendered from it, the group gate reads each row's `effect`, and
 /// every road a command arrives by reads its `who`.
 const CONTROL: &[ControlCommand] = &[
-    ControlCommand { name: "clear", description: "Start a fresh conversation (clear context)", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible, who: Who::Anyone },
-    ControlCommand { name: "new", description: "Alias for /clear", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible, who: Who::Anyone },
-    ControlCommand { name: "stop", description: "Stop the reply that's currently running", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone },
-    ControlCommand { name: "model", description: "Switch the model for this chat", arg_hint: Some("name | reset"), menu: Menu::All, effect: Effect::Reversible, who: Who::Circle },
+    ControlCommand { name: "clear", description: "Start a fresh conversation (clear context)", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible, who: Who::Anyone, takes: Takes::Nothing },
+    ControlCommand { name: "new", description: "Alias for /clear", arg_hint: None, menu: Menu::All, effect: Effect::Irreversible, who: Who::Anyone, takes: Takes::Nothing },
+    ControlCommand { name: "stop", description: "Stop the reply that's currently running", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone, takes: Takes::Nothing },
+    // The whole chat's model: the owner's, as the usage card's switch is.
+    ControlCommand { name: "model", description: "Switch the model for this chat", arg_hint: Some("name | reset"), menu: Menu::All, effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
     // A Claude Code budget (MAX_THINKING_TOKENS); codex's depth is the owner-set effort.
-    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except("codex"), effect: Effect::Reversible, who: Who::Circle },
-    ControlCommand { name: "resume", description: "Resume an earlier session (terminal ones pick up their live state)", arg_hint: Some("id | last"), menu: Menu::Only("claude-code"), effect: Effect::Reversible, who: Who::Circle },
+    // The whole chat's thinking, so the owner's, as its model is.
+    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except("codex"), effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
+    ControlCommand { name: "resume", description: "Resume an earlier session (terminal ones pick up their live state)", arg_hint: Some("id | last"), menu: Menu::Only("claude-code"), effect: Effect::Reversible, who: Who::Circle, takes: Takes::Words(1) },
     // Irreversible by its worst form: `forget` drops a saved login from the machine.
-    ControlCommand { name: "account", description: "Which Claude account this chat runs on — list, pin, forget", arg_hint: Some("name | reset | forget <name>"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner },
+    ControlCommand { name: "account", description: "Which Claude account this chat runs on — list, pin, forget", arg_hint: Some("name | reset | forget <name>"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner, takes: Takes::Words(2) },
     // A sign-in replaces the seat's stored token.
-    ControlCommand { name: "login", description: "Sign in to Anthropic — with a name, add a second Claude account", arg_hint: Some("[name]"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner },
-    ControlCommand { name: "compact", description: "Summarize this conversation's context to free tokens", arg_hint: None, menu: Menu::Hidden, effect: Effect::Irreversible, who: Who::Anyone },
+    ControlCommand { name: "login", description: "Sign in to Anthropic — with a name, add a second Claude account", arg_hint: Some("[name]"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner, takes: Takes::Words(1) },
+    ControlCommand { name: "compact", description: "Summarize this conversation's context to free tokens", arg_hint: None, menu: Menu::Hidden, effect: Effect::Irreversible, who: Who::Anyone, takes: Takes::Text },
     // The account line names the owner's Claude login; the workdir is a path on their disk.
-    ControlCommand { name: "status", description: "Agent, session, account & daemon info", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle },
-    ControlCommand { name: "cwd", description: "Show the working directory", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle },
-    ControlCommand { name: "access", description: "Who may use this bot, and who pays", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone },
-    ControlCommand { name: "help", description: "What this agent can do", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone },
+    ControlCommand { name: "status", description: "Agent, session, account & daemon info", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle, takes: Takes::Nothing },
+    ControlCommand { name: "cwd", description: "Show the working directory", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle, takes: Takes::Path },
+    ControlCommand { name: "access", description: "Who may use this bot, and who pays", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone, takes: Takes::Words(1) },
+    ControlCommand { name: "help", description: "What this agent can do", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone, takes: Takes::Nothing },
 ];
 
 /// The row for a control command, if `name` is one.
@@ -4374,10 +4430,14 @@ async fn connect_and_run(
                 } else if let Some(command) = action.strip_prefix("refresh|") {
                     // `refresh|<command>` is a contract between the card and THIS
                     // daemon; the server relayed it without knowing what it meant.
-                    let rest = command.trim().trim_start_matches('/');
-                    let mut it = rest.splitn(2, char::is_whitespace);
-                    let name = it.next().unwrap_or("").to_lowercase();
-                    let arg = it.next().unwrap_or("").trim().to_string();
+                    // Read as a typed one is (`slash`).
+                    let command = format!("/{}", command.trim().trim_start_matches('/'));
+                    let Slash::Command { name, arg } = slash(&command, false, "", |n| takes(n, &*harness)) else {
+                        let message = format!("`{command}` isn't a command this agent takes.");
+                        let _ = client.answer_card_action(&action_id, serde_json::json!({ "kind": "error", "message": message })).await;
+                        return;
+                    };
+                    let arg = arg.to_string();
                     // The same command typed would be asked this; a tap on its
                     // card is no back door around it.
                     let who = harness.command_who(&name);
@@ -4451,6 +4511,16 @@ async fn connect_and_run(
         // system prompt / …). The server relays it to us; re-fetch and hot-swap
         // the OwnerConfig so the NEXT turn uses it — no daemon restart needed.
         if method == "events.botConfigUpdated" {
+            // A model picked on the usage card names its chat: a `/model`
+            // typed there earlier stops winning, or the card's pick would be
+            // saved, shown everywhere, and not be what runs.
+            if let Some(chat) = model_switched_in(&env["params"]) {
+                if let Some(st) = chat_states.lock().await.get_mut(chat) {
+                    if let Some(typed) = st.model.take() {
+                        println!("↻ /model {typed} in {chat} dropped — a model was picked on the usage card");
+                    }
+                }
+            }
             // try_fetch, NOT fetch: on a failed refetch keep the config we
             // hold — swapping in an empty default here would wipe the owner's
             // model/prompt/whitelist over one bad HTTP round-trip.
@@ -4848,9 +4918,11 @@ async fn connect_and_run(
         // locally and never reach claude. `/login` runs an interactive flow.
         // Any OTHER `/name …` falls through (emulated, mocked, or to claude).
         // (All reachable only by an allow-listed sender — gated above.)
-        if let Some((name, arg, cmd)) = slash_command(trimmed, is_forward, my_username)
-            .and_then(|(name, arg)| control_command(&name).map(|cmd| (name, arg, cmd)))
-        {
+        let typed = slash(trimmed, is_forward, my_username, |n| takes(n, &**harness));
+        if let Some((name, arg, cmd)) = match &typed {
+            Slash::Command { name, arg } => control_command(name).map(|cmd| (name.clone(), *arg, cmd)),
+            _ => None,
+        } {
             // They skip the reply gate, which is what keeps a bare `/stop` a
             // brake in a group. The irreversible ones don't get that pass: in
             // a group they must name this bot — an @ in what the sender typed,
@@ -5090,12 +5162,14 @@ async fn connect_and_run(
             // Claude Code (`/memory`, `/skills`, `/config`, `/logout` …) — a
             // guest's `/…` goes through as words (`unslash`). Inside the circle
             // each is still asked its `Who`: `/logout` is the owner's alone.
-            let trimmed = content.trim();
+            // Read by the same parser as the daemon's own (`slash`): one that
+            // only begins with a command is words, and runs nothing.
+            let typed = slash(&content, is_forward, &me_user, |n| takes(n, &*harness));
             let as_guest = words_guest;
-            if let Some(rest) = trimmed.strip_prefix('/').filter(|_| !as_guest) {
-                let mut it = rest.splitn(2, char::is_whitespace);
-                let name = it.next().unwrap_or("").to_lowercase();
-                let arg = it.next().unwrap_or("").trim();
+            if let Some((name, arg)) = match &typed {
+                Slash::Command { name, arg } if !as_guest => Some((name.clone(), *arg)),
+                _ => None,
+            } {
                 let who = harness.command_who(&name);
                 if !words_standing.may(who) {
                     println!("  (/{name} isn't @{sender_username}'s to run → refused)");
@@ -5165,6 +5239,14 @@ async fn connect_and_run(
             // same bot started for someone else — one reading with THEIR eyes
             // (`Mount::reads`) and resuming their session. Theirs is a turn of
             // its own, the way a billed sender's is.
+            //
+            // A message that only begins with a command (`Slash::Words`) is said
+            // to the agent as words — to the running turn and a new one alike —
+            // never opening with the `/` the harness would run as a command.
+            let said_as: std::borrow::Cow<str> = match &typed {
+                Slash::Words { name } => not_a_command(&content, name).into(),
+                _ => content.as_str().into(),
+            };
             let relays_a_guest = words_guest && relayed_for.as_deref().is_some_and(|p| !p.trim().is_empty());
             if has_something_to_say(&content, &attachments) && !relays_a_guest {
                 // In order: a message of theirs that came in just before this
@@ -5183,7 +5265,7 @@ async fn connect_and_run(
                     &chat_states, &arrived, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
                     // A bot passing on someone outside the owner's circle is
                     // that someone: only into a guest's turn (`trusted_turn`).
-                    from, Some(words_guest), reply_to_id.as_deref(), &content, &carried,
+                    from, Some(words_guest), reply_to_id.as_deref(), &said_as, &carried,
                     // Borrows only — the normal-turn path below still owns both,
                     // and re-downloads nothing: whatever this fetched is already
                     // in `~/.mafold/attachments` under the same content name.
@@ -5274,7 +5356,7 @@ async fn connect_and_run(
             // hosted brains read a trigger): an AI sender's message is a
             // finished transcript, and its run groups, tool output and usage
             // stamp are how it got there, not what it is asking.
-            let said = mafold_transcript::render::strip_transcript_cards(&content);
+            let said = mafold_transcript::render::strip_transcript_cards(&said_as);
             let prompt = if sender_is_bot {
                 format!(
                     "[该消息来自已授权的 AI 账户 @{sender_username}。直接回复即可;只有当你需要对方再回应时才 @ 他。若对话可以收尾,回复中不要 @ 任何 AI 账户。]\n{}",
@@ -6365,9 +6447,11 @@ async fn handle_control(
                 // Genuinely compact this conversation's Claude session (summarize the
                 // prior context to free tokens, keeping continuity). Spawned so the
                 // (slow) claude run never blocks the message loop.
-                let (client, workdir, chat_id, skey, channel, sessions, env) =
-                    (client.clone(), turn_workdir.clone(), chat_id.to_string(), skey.clone(), channel_id.map(str::to_string), sessions.clone(), seat_env.clone());
-                tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions, env, guest).await; });
+                // What follows `/compact` is what Claude Code's own takes: what
+                // the summary should keep (`Takes::Text`).
+                let (client, workdir, chat_id, skey, channel, sessions, env, focus) =
+                    (client.clone(), turn_workdir.clone(), chat_id.to_string(), skey.clone(), channel_id.map(str::to_string), sessions.clone(), seat_env.clone(), arg.to_string());
+                tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions, env, guest, focus).await; });
             }
         }
         "resume" => {
@@ -6541,10 +6625,7 @@ async fn handle_control(
                     format!("Nothing pinned here — {here} already runs in {turn_workdir}.")
                 }
             } else {
-                let want = match a.strip_prefix("~/") {
-                    Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "~".into())),
-                    None => a.to_string(),
-                };
+                let want = crate::harness::expand_home(a);
                 match std::fs::canonicalize(&want) {
                     Ok(p) if p.is_dir() => {
                         let dir = crate::commands::strip_extended_prefix(&p.to_string_lossy()).to_string();
@@ -6651,9 +6732,9 @@ async fn handle_control(
             // Harness-aware: codex has no /compact, no /think, and its headless
             // menu carries no discovered skills — so its help omits all three.
             let text = if harness.id() == "codex" {
-                "I'm a Codex agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nReasoning depth is set by the **Reasoning effort** field in this bot's Customize sheet."
+                "I'm a Codex agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nReasoning depth is set by the **Reasoning effort** field in this bot's Customize sheet."
             } else {
-                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /account [name] — owner only: which Claude account this chat runs on (I move to another one by myself when a usage window fills up)\n• /login [name] — owner only: sign in to Anthropic; with a name, add a second account on this machine\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
+                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /think on|off|<tokens> — owner only: toggle extended thinking for this chat\n• /account [name] — owner only: which Claude account this chat runs on (I move to another one by myself when a usage window fills up)\n• /login [name] — owner only: sign in to Anthropic; with a name, add a second account on this machine\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
             };
             let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), text).await;
         }
@@ -6666,7 +6747,7 @@ async fn handle_control(
 /// keep resuming the compacted session, and post a card. Best-effort: on any
 /// failure it tells the user and leaves the existing session untouched.
 #[allow(clippy::too_many_arguments)]
-async fn compact_session(client: Client, workdir: String, chat_id: String, skey: String, channel: Option<String>, sessions: Sessions, env: Vec<(String, String)>, guest: bool) {
+async fn compact_session(client: Client, workdir: String, chat_id: String, skey: String, channel: Option<String>, sessions: Sessions, env: Vec<(String, String)>, guest: bool, focus: String) {
     let channel_id = channel.as_deref();
     let prior = sessions.lock().await.get(&skey).cloned();
     let Some(sid) = prior else {
@@ -6691,7 +6772,11 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
     if guest {
         cmd.arg("--setting-sources").arg("project,local");
     }
-    cmd.arg("-p").arg("/compact")
+    let compact = match focus.trim() {
+        "" => "/compact".to_string(),
+        f => format!("/compact {f}"),
+    };
+    cmd.arg("-p").arg(&compact)
         .arg("--resume").arg(&sid)
         .arg("--output-format").arg("json")
         .arg("--dangerously-skip-permissions")
@@ -7779,19 +7864,34 @@ chat, not a side channel: the humans here read every turn and can cut in at any 
     // and none can be followed. Same discovery gap as connections and A2A above
     // — name the command, and say where the work goes when the room won't allow
     // it (`createChannel` answers "only managers may create channels here").
-    s.push_str(
-        "\n\nFORUM CHANNELS — ONE PIECE OF WORK, ONE CHANNEL: a group (or a DM with forum on) can \
-hold a `#channel` per topic. When you start a new topic there or hand work to someone, run \
-`mafold channels list <chat>` first; if no channel fits, open one — `mafold channels create <chat> \
+    s.push_str(&forum_channels_advice(crate::flags::enabled("forumEverywhere")));
+    s
+}
+
+/// The FORUM CHANNELS paragraph of the preamble. With channels in every chat
+/// (flag `forumEverywhere`, evaluated as this bot — its owner's record covers
+/// it) any conversation can hold them and the first one opened turns them on;
+/// otherwise only a group, or a DM someone opened discussion in — and telling
+/// an agent otherwise sends it into "not a forum" errors.
+fn forum_channels_advice(everywhere: bool) -> String {
+    let wherever = if everywhere {
+        "every conversation — a group, a DM with a person or an agent, your owner's own notes — can \
+hold a `#channel` per topic; the first one opened in a chat turns channels on there for everyone \
+in it"
+    } else {
+        "a group (or a DM with forum on) can hold a `#channel` per topic"
+    };
+    format!(
+        "\n\nFORUM CHANNELS — ONE PIECE OF WORK, ONE CHANNEL: {wherever}. When you start a new topic \
+there or hand work to someone, run `mafold channels list <chat>` first; if no channel fits, open one — `mafold channels create <chat> \
 <short name>` — and do the work in it (`mafold send <chat> --channel <id or #name> …`, @-ing \
 whoever you hand it to). Inside a channel turn, `mafold send` / `mafold read` for THIS \
 conversation already go to this turn's channel; add `--main` only when something truly belongs in \
 #all. Don't pile unrelated work into the main timeline or a DM, where every \
 thread interleaves and none can be followed. If only managers may open channels in that room, use \
 the closest existing one and say so. When the work is done and accepted, `mafold channels close \
-<chat> <channel>` — only channels you opened.",
-    );
-    s
+<chat> <channel>` — only channels you opened."
+    )
 }
 
 /// Recent conversation context for a turn. The access gate (RCE guard) drops
@@ -13444,7 +13544,7 @@ mod bgtasks_tests {
 mod inbound_file_tests {
     use super::{
         account_options, attachment_label, cards_from_list, expression_label, expression_note, expression_tag,
-        file_cache_name, flatten_body_records, human_size, mafold_preamble, topped_up,
+        file_cache_name, flatten_body_records, forum_channels_advice, human_size, mafold_preamble, topped_up,
     };
     use serde_json::{json, Value};
 
@@ -13668,6 +13768,26 @@ mod inbound_file_tests {
         assert!(p.contains("--channel <id or #name>"));
         assert!(p.contains("only managers may open channels"), "no fallback when the room refuses");
         assert!(p.contains("only channels you opened"), "an agent must not close other people's channels");
+    }
+
+    /// Channels in every chat (flag `forumEverywhere`): an agent the flag is
+    /// on for is told any conversation can hold them; one it isn't on for
+    /// keeps today's words, since its `channels create` in a plain DM still
+    /// answers "not a forum".
+    #[test]
+    fn where_channels_live_follows_the_flag() {
+        let shut = forum_channels_advice(false);
+        assert!(shut.contains("a group (or a DM with forum on)"), "{shut}");
+        assert!(!shut.contains("every conversation"), "{shut}");
+        let open = forum_channels_advice(true);
+        assert!(open.contains("every conversation"), "{open}");
+        assert!(open.contains("turns channels on there"), "{open}");
+        assert!(!open.contains("DM with forum on"), "{open}");
+        for p in [&shut, &open] {
+            assert!(p.contains("mafold channels create <chat>") && p.contains("only channels you opened"), "{p}");
+        }
+        // No server record: the registry default, which is off.
+        assert_eq!(mafold_preamble("ops:claude", "ops", &[]).contains("DM with forum on"), !crate::flags::enabled("forumEverywhere"));
     }
 
     #[test]
@@ -13979,8 +14099,8 @@ mod gate_tests {
     use super::{
         answers_own_request,
         directed_at_me, floor_roster, gap_fill, is_durable_event, machine_authored,
-        resolve_turn_workdir,
-        inline_results, sanitize_attachment_name, should_respond, slash_command, socket_skipped,
+        model_switched_in, resolve_turn_workdir,
+        inline_results, sanitize_attachment_name, should_respond, socket_skipped,
         strip_self_address,
         trigger_message, turn_session_key, AllowList, ChatStates, ConvGate,
     };
@@ -14202,12 +14322,15 @@ mod gate_tests {
     /// to everyone, a stranger could `/login` over the owner's sign-in,
     /// `/account forget` it, `/model` the whole chat, `/cwd` it anywhere on
     /// the disk, read `/status`'s account and paths, and `/stop` the circle's runs.
+    /// 2026-10-29 (owner call): `/model` and `/think` for the whole chat are
+    /// the owner's, as the usage card's switch is — someone whitelisted no
+    /// longer re-models or re-budgets everyone's replies by typing them.
     #[test]
     fn the_table_declares_whose_each_command_is() {
         use super::Who;
         let of = |w: Who| super::CONTROL.iter().filter(|c| c.who == w).map(|c| c.name).collect::<Vec<_>>();
-        assert_eq!(of(Who::Owner), ["account", "login"], "the machine's Claude sign-ins");
-        assert_eq!(of(Who::Circle), ["model", "think", "resume", "status", "cwd"], "the owner's machine, or the whole chat");
+        assert_eq!(of(Who::Owner), ["model", "think", "account", "login"], "the whole chat's model and thinking, the machine's Claude sign-ins");
+        assert_eq!(of(Who::Circle), ["resume", "status", "cwd"], "the owner's machine, or the whole chat");
         // What's left acts only on the guest's own: their `#guest` session,
         // their runs, or reads what anyone let in may know.
         assert_eq!(of(Who::Anyone), ["clear", "new", "stop", "compact", "access", "help"]);
@@ -14289,8 +14412,10 @@ mod gate_tests {
     fn a_refusal_says_who_may() {
         use super::Who;
         assert!(super::not_yours("login", Who::Owner).contains("only its owner can"));
-        let c = super::not_yours("model", Who::Circle);
-        assert!(c.starts_with("`/model`") && c.contains("people they've whitelisted"), "{c}");
+        let m = super::not_yours("model", Who::Owner);
+        assert!(m.starts_with("`/model`") && m.contains("only its owner can") && !m.contains("sign-in"), "{m}");
+        let c = super::not_yours("cwd", Who::Circle);
+        assert!(c.starts_with("`/cwd`") && c.contains("people they've whitelisted"), "{c}");
     }
 
     /// Build an AllowList directly (bypassing the env var) so the `allows` logic
@@ -14594,6 +14719,103 @@ mod gate_tests {
         assert_eq!(slash_command("не команда", false, "mybot"), None);
     }
 
+    /// `slash` as a Claude Code daemon reads it: `(name, arg)` for a command,
+    /// `None` for anything else.
+    fn slash_command<'a>(text: &'a str, is_forward: bool, me: &str) -> Option<(String, &'a str)> {
+        let cc = crate::harness::select("claude-code");
+        match super::slash(text, is_forward, me, |n| super::takes(n, &*cc)) {
+            super::Slash::Command { name, arg } => Some((name, arg)),
+            _ => None,
+        }
+    }
+
+    /// A command only counts when what follows fits it (`Takes`, declared by
+    /// whoever runs it) — one parser for the daemon's commands, a harness's
+    /// and a skill's. 10-29 (DEV #usage卡换模型): `@opsdu:claude-code /model →
+    /// owner only, same rule as the card. One thing before #1274 merges: …`
+    /// was `/model` with that whole sentence for the model: refused for the
+    /// person who sent it — so their request never reached the agent — and,
+    /// from the owner, the chat's model would have been set to the sentence.
+    #[test]
+    fn a_command_counts_only_when_what_follows_fits_it() {
+        use super::Slash::{self, Command, No, Words};
+        fn read(t: &str) -> Slash<'_> {
+            let cc = crate::harness::select("claude-code");
+            super::slash(t, false, "ops:cc", |n| super::takes(n, &*cc))
+        }
+        fn words(n: &str) -> Slash<'static> {
+            Words { name: n.into() }
+        }
+        fn cmd(n: &str, a: &'static str) -> Slash<'static> {
+            Command { name: n.into(), arg: a }
+        }
+        let cc = crate::harness::select("claude-code");
+
+        // The message that found it.
+        assert_eq!(read("@ops:cc /model → owner only, same rule as the card. One thing before #1274 merges"), words("model"));
+        // One word, or none, is the command.
+        assert_eq!(read("/model fable"), cmd("model", "fable"));
+        assert_eq!(read("/model"), cmd("model", ""));
+        assert_eq!(read("/think 20000"), cmd("think", "20000"));
+        assert_eq!(read("/think on and make it deep"), words("think"));
+        assert_eq!(read("/resume last"), cmd("resume", "last"));
+        assert_eq!(read("/access paid"), cmd("access", "paid"));
+        assert_eq!(read("/login work"), cmd("login", "work"));
+        assert_eq!(read("/login with my work account please"), words("login"));
+        // `forget <name>` is two.
+        assert_eq!(read("/account forget work"), cmd("account", "forget work"));
+        assert_eq!(read("/account forget the one that expired"), words("account"));
+        // Nothing after it, or it's words: `/help me fix the build` is a task.
+        assert_eq!(read("/stop"), cmd("stop", ""));
+        assert_eq!(read("/help me fix the build"), words("help"));
+        assert_eq!(read("/clear the cache in target/ first"), words("clear"));
+        // A harness's own: every emulated Claude Code command takes nothing.
+        assert_eq!(read("/usage"), cmd("usage", ""));
+        assert_eq!(read("/usage looks wrong today"), words("usage"));
+        assert_eq!(read("/logout"), cmd("logout", ""));
+        // `/compact`'s instructions are Claude Code's to take.
+        assert_eq!(read("/compact keep the api notes"), cmd("compact", "keep the api notes"));
+        // A skill takes whatever follows.
+        assert_eq!(read("/review-pr 1274 focus on the lock"), cmd("review-pr", "1274 focus on the lock"));
+        // Not a command at all.
+        assert_eq!(read("model → owner only"), No);
+        assert_eq!(super::slash("/model → owner only", true, "ops:cc", |n| super::takes(n, &*cc)), No, "a forward");
+
+        // A path: one word, or all of it naming a directory that is there.
+        let spaced = std::env::temp_dir().join(format!("mafold slash {}", std::process::id()));
+        std::fs::create_dir_all(&spaced).unwrap();
+        let typed = format!("/cwd {}", spaced.display());
+        assert!(matches!(read(&typed), Command { ref name, .. } if name == "cwd"), "{typed}");
+        assert_eq!(read("/cwd C:/somewhere"), cmd("cwd", "C:/somewhere"), "it's for /cwd to say it isn't there");
+        assert_eq!(read("/cwd should be the api repo now"), words("cwd"));
+        let _ = std::fs::remove_dir(&spaced);
+
+        // Codex answers none itself: `/usage` there is the prompt it always was.
+        let cx = crate::harness::select("codex");
+        assert_eq!(super::slash("/usage looks wrong", false, "ops:cx", |n| super::takes(n, &*cx)), cmd("usage", "looks wrong"));
+        assert_eq!(super::slash("/model gpt-5.6 is slow", false, "ops:cx", |n| super::takes(n, &*cx)), words("model"));
+    }
+
+    /// The agent gets one as words, said so, and never opening with the `/` a
+    /// harness would run as its own command.
+    #[test]
+    fn words_that_begin_with_a_command_reach_the_agent_as_words() {
+        let said = super::not_a_command("/model → owner only", "model");
+        assert!(!said.trim_start().starts_with('/'), "{said}");
+        assert!(said.contains("`/model`") && said.ends_with("\n/model → owner only"), "{said}");
+    }
+
+    /// Each `takes` is the one its handler reads.
+    #[test]
+    fn takes_fits() {
+        use crate::harness::Takes;
+        assert!(Takes::Nothing.fits("") && Takes::Nothing.fits("  ") && !Takes::Nothing.fits("x"));
+        assert!(Takes::Words(1).fits("opus") && Takes::Words(1).fits("") && !Takes::Words(1).fits("opus please"));
+        assert!(Takes::Words(2).fits("forget work") && !Takes::Words(2).fits("forget my work"));
+        assert!(Takes::Text.fits("anything at all"));
+        assert!(Takes::Path.fits("~/x") && !Takes::Path.fits("no such dir here"));
+    }
+
     /// In a group a command is ADDRESSED — `@bot /clear` — because a bare one
     /// runs on every daemon in the room that lets the sender drive it (control
     /// commands need no mention). The inline picker sends commands in exactly
@@ -14745,6 +14967,18 @@ q|Deploy|0|@mybot ship?
         assert_eq!(turn_session_key(chat, ch, true, dir), "c1#ch1@C:/proj");
         // #all keeps the bare conversation id — old sessions.json entries stay valid
         assert_eq!(turn_session_key(chat, None, false, dir), "c1");
+    }
+
+    /// Only a switch from the usage card, and only in its chat, drops a typed
+    /// `/model`; every other config save leaves it alone.
+    #[test]
+    fn only_a_card_switch_names_a_chat_whose_model_to_drop() {
+        let ev = |v: serde_json::Value| v;
+        assert_eq!(model_switched_in(&ev(serde_json::json!({ "bot": "a:b", "chat_id": "c1", "switched": "model" }))), Some("c1"));
+        assert_eq!(model_switched_in(&ev(serde_json::json!({ "bot": "a:b" }))), None, "a scoped save");
+        assert_eq!(model_switched_in(&ev(serde_json::json!({ "bot": { "username": "a:b" }, "config": {} }))), None, "a sheet save");
+        assert_eq!(model_switched_in(&ev(serde_json::json!({ "chat_id": "c1", "switched": "effort" }))), None);
+        assert_eq!(model_switched_in(&ev(serde_json::json!({ "switched": "model" }))), None, "no chat, nothing to drop");
     }
 
     /// Priority: this channel > this chat > the owner default > the process

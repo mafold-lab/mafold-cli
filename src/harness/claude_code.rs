@@ -711,6 +711,10 @@ impl Harness for ClaudeCode {
         crate::commands::who(name)
     }
 
+    fn command_takes(&self, name: &str) -> Option<super::Takes> {
+        crate::commands::takes(name)
+    }
+
     async fn status_line(&self, env: &[(String, String)]) -> String {
         crate::commands::auth_status_line(env).await
     }

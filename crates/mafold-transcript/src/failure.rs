@@ -77,6 +77,14 @@ pub fn cap_reached(payer: &str, spender: &str) -> String {
     format!("wallet_cap_reached: @{payer}'s monthly cap for @{spender} is used up")
 }
 
+/// The payer took back this agent's (`spender`'s) access to their wallet. A
+/// turn that already started finds out at its next model call and reads as
+/// [`FailureKind::Grant`]; the next turn is turned away before any
+/// (`brains::billing`, with the Authorize card).
+pub fn grant_revoked(payer: &str, spender: &str) -> String {
+    format!("wallet_grant_required: @{payer} no longer lets @{spender} spend from their wallet")
+}
+
 /// The wallet's price table hasn't loaded, so no turn can be metered yet.
 pub fn price_table_unavailable() -> String {
     "billing_unavailable: the official price table hasn't loaded yet".into()
@@ -187,6 +195,11 @@ pub enum FailureKind {
     /// The agent's monthly spending cap (a wallet grant's) is used up — the
     /// wallet may be full; the payer raises or clears the cap.
     Cap,
+    /// The payer took back this agent's authorization to spend from their
+    /// wallet while it was answering. Not a credential: the agent's key is
+    /// fine, and the wallet has nothing to re-grant it from — the agent's
+    /// next turn asks the payer again (the Authorize card).
+    Grant,
     /// The computer that has to run this turn isn't there: none of the
     /// machines holding the credential are online, or the one running it
     /// dropped off.
@@ -224,6 +237,7 @@ impl FailureKind {
             Self::Network => "network",
             Self::Interrupted => "interrupted",
             Self::Cap => "cap",
+            Self::Grant => "grant",
             Self::Offline => "offline",
             Self::Connection => "connection",
             Self::Empty => "empty",
@@ -385,6 +399,10 @@ pub fn classify(err: &str) -> Failure {
     } else if low.contains("wallet_cap_reached") {
         out.payer = handle_after(&detail, "wallet_cap_reached: @");
         Some(FailureKind::Cap)
+    } else if low.contains("wallet_grant_required") {
+        // Ahead of the 403 it arrives in, which would read as a refused key.
+        out.payer = handle_after(&detail, "wallet_grant_required: @");
+        Some(FailureKind::Grant)
     } else if has(&["no_device_online", "no device picked the call up", "no device finished the call", "the device stopped relaying"]) {
         Some(FailureKind::Offline)
     } else if low.contains("connection_unusable") {
@@ -470,7 +488,6 @@ pub fn classify(err: &str) -> Failure {
             "not logged in",
             "token has expired",
             "permission_error",
-            "wallet_grant_required",
             "insufficient_scope",
         ])
     {
@@ -746,6 +763,7 @@ mod tests {
         let cases: Vec<(String, FailureKind)> = vec![
             (model_not_offered("claude-sonnet-4-6", "mafold-router 0.1.14 · 127.0.0.1:4200"), FailureKind::Model),
             (cap_reached("ops", "ops:helper"), FailureKind::Cap),
+            (grant_revoked("ops", "ops:helper"), FailureKind::Grant),
             (price_table_unavailable(), FailureKind::Unavailable),
             (no_device("我的 Codex"), FailureKind::Offline),
             (connection_unusable("我的 Codex", "no longer exists"), FailureKind::Connection),
@@ -796,6 +814,20 @@ mod tests {
         assert_eq!((none.kind, none.payer.as_deref(), none.have), (FailureKind::Balance, Some("alice"), None));
         let cap = classify(&cap_reached("Alice", "ops:helper"));
         assert_eq!(cap.payer.as_deref(), Some("alice"), "the cap is the payer's to raise");
+    }
+
+    /// 回复到一半主人收回了钱包授权:mafold-router 把它包成 403 转回来。读成
+    /// 「授权收回了」(谁收回的也读出来),不是「凭据被拒」—— key 没坏,是主人
+    /// 自己点的;一个普通的 403 照旧是凭据。
+    #[test]
+    fn a_wallet_authorization_taken_back_is_not_a_refused_key() {
+        let routed = format!(
+            "provider error: mafold-router 403 Forbidden: {{\"error\":{{\"message\":\"{}\",\"type\":\"wallet_grant_required\"}}}}",
+            grant_revoked("Ops", "ops:cloud")
+        );
+        let f = classify(&routed);
+        assert_eq!((f.kind, f.payer.as_deref()), (FailureKind::Grant, Some("ops")), "{f:?}");
+        assert_eq!(classify("provider error: anthropic 403 Forbidden: {\"error\":{\"type\":\"permission_error\"}}").kind, FailureKind::Auth);
     }
 
     /// 限流:哪个窗口、什么时候恢复,三种来路都读出来 —— 卡片按读者时区说时间。

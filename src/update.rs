@@ -556,7 +556,7 @@ fn sha256_of_file(p: &Path) -> Option<String> {
 fn smoke_test(path: &Path) -> bool {
     let mut cmd = crate::platform::std_command(path);
     cmd.arg("--version");
-    cmd.output()
+    crate::platform::output_of_new_binary(&mut cmd)
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
 }
@@ -570,7 +570,7 @@ fn smoke_test(path: &Path) -> bool {
 fn binary_is(bin: &Path, version: &str) -> bool {
     let mut cmd = crate::platform::std_command(bin);
     cmd.arg("--version");
-    cmd.output()
+    crate::platform::output_of_new_binary(&mut cmd)
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(version))
         .unwrap_or(false)
 }
@@ -858,7 +858,7 @@ pub const CAPABILITIES: &[&str] = &[
 fn capabilities_of(bin: &Path) -> Vec<String> {
     let mut cmd = crate::platform::std_command(bin);
     cmd.arg("capabilities");
-    let Some(out) = cmd.output().ok().filter(|o| o.status.success()) else { return Vec::new() };
+    let Some(out) = crate::platform::output_of_new_binary(&mut cmd).ok().filter(|o| o.status.success()) else { return Vec::new() };
     serde_json::from_slice::<Vec<String>>(&out.stdout).unwrap_or_default()
 }
 
@@ -1239,7 +1239,7 @@ pub fn rollback(ask: RollbackAsk) -> Result<()> {
 fn version_of(bin: &Path) -> Option<String> {
     let mut cmd = crate::platform::std_command(bin);
     cmd.arg("--version");
-    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    let out = crate::platform::output_of_new_binary(&mut cmd).ok().filter(|o| o.status.success())?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().last().filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit())).map(str::to_string)
 }
@@ -1929,17 +1929,10 @@ mod rollback_skip_tests {
             let fake = d.join("mafold.old");
             std::fs::write(&fake, "#!/bin/sh\n[ \"$1\" = capabilities ] && echo '[\"update-skip\"]' && exit 0\nexit 2\n").unwrap();
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-            // A test thread forking at the moment the script was written can
-            // hold it open a moment (ETXTBSY): ask again rather than flake.
-            let mut got = Vec::new();
-            for _ in 0..10 {
-                got = capabilities_of(&fake);
-                if !got.is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
-            assert_eq!(got, vec!["update-skip".to_string()]);
+            // A test thread forking as the script was written can hold it open
+            // a moment (ETXTBSY): the probe asks again itself (platform's
+            // `output_of_new_binary`), as it must for a real `mafold.old`.
+            assert_eq!(capabilities_of(&fake), vec!["update-skip".to_string()]);
             std::fs::write(&fake, "#!/bin/sh\necho \"error: unrecognized subcommand '$1'\" >&2\nexit 2\n").unwrap();
             assert!(capabilities_of(&fake).is_empty(), "an older binary");
             let _ = std::fs::remove_dir_all(d);

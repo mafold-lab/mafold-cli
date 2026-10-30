@@ -27,6 +27,11 @@ pub enum Outcome {
 /// chat runs on (`crate::accounts`): everything here that asks `claude` or
 /// Anthropic a question asks it about THAT login.
 pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>, env: &[(String, String)]) -> Outcome {
+    // The list is the gate: what `takes` doesn't declare never runs here, so
+    // the parser and this match can't disagree about what is emulated.
+    if takes(name).is_none() {
+        return Outcome::Forward;
+    }
     match name {
         // ── usage stats (rich card): local transcript scan + live rate limits ──
         "stats" | "usage" | "cost" => {
@@ -66,6 +71,20 @@ pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>
         n if mock_desc(n).is_some() => Outcome::Reply(mock_reply(n)),
         _ => Outcome::Forward,
     }
+}
+
+/// Every command [`handle`] answers itself (the mocks aside).
+const EMULATED: &[&str] = &[
+    "stats", "usage", "cost", "logout", "config", "settings", "memory", "mcp", "agents", "sessions", "skills",
+    "hooks", "permissions", "plugin", "plugins", "keybindings", "statusline", "privacy-settings", "privacy", "doctor",
+];
+
+/// What `name` takes here (`crate::harness::Takes`): nothing — every command
+/// [`handle`] answers ignores what follows it, so `/usage is wrong today` is a
+/// message, not `/usage`. `None` = not emulated: it goes to `claude -p`, which
+/// hands a skill or command whatever follows.
+pub fn takes(name: &str) -> Option<crate::harness::Takes> {
+    (EMULATED.contains(&name) || mock_desc(name).is_some()).then_some(crate::harness::Takes::Nothing)
 }
 
 /// Who may run `name` here (`crate::harness::Who`). Everything above reads or

@@ -1218,6 +1218,22 @@ impl ProviderSpec {
             && !self.oauth_capable
             && !self.device_bound
     }
+
+    /// A coding agent's OWN login (Claude Code, Codex): an agent runs ON this
+    /// credential rather than calling some service with it.
+    ///
+    /// Derived, not a new column, from the two facts that already say so: an
+    /// OAuth token bag ([`ProviderKind::OAuth`] — "produced by an OAuth login
+    /// the harness already performed") that is lifted from the vendor CLI's own
+    /// file (`import_path`). No other row has both: GitHub, Google and Figma
+    /// are consented to in a browser, keys are pasted.
+    ///
+    /// What it changes: an owner may give a login only to an agent whose
+    /// sheet has a slot for that provider (`grantConnectionAccess`) — anything
+    /// else would list an agent under "uses this login" that never runs on it.
+    pub fn is_agent_login(&self) -> bool {
+        self.kind == ProviderKind::OAuth && self.import_path.is_some()
+    }
 }
 
 /// The registry as a client sees it — display-ready, so a UI renders it
@@ -1676,6 +1692,14 @@ mod tests {
                 "mcp",
             ]
         );
+    }
+
+    /// Exactly the two coding-agent logins count as one — a GitHub or Google
+    /// consent, a pasted key, a machine, a secret do not.
+    #[test]
+    fn only_coding_agent_logins_are_agent_logins() {
+        let logins: Vec<&str> = PROVIDERS.iter().filter(|p| p.is_agent_login()).map(|p| p.id).collect();
+        assert_eq!(logins, vec!["claude-code-oauth", "codex-oauth"]);
     }
 
     /// The `mcp` row is the first provider whose SERVER is chosen by the user,
@@ -2397,5 +2421,42 @@ mod tests {
         let oc = provider("google").unwrap().oauth_client.unwrap();
         assert!(oc.extra_params.contains(&("access_type", "offline")));
         assert!(oc.extra_params.contains(&("prompt", "consent")));
+    }
+
+    /// The Connections page's table (`client-shared/connections.cases.json`):
+    /// the registry exactly as clients receive it, and which tab each
+    /// provider's tile sits under. The page derives that tab from these rows
+    /// alone (client-shared/connections.ts `categoryOf`, no provider names), and
+    /// the twin specs hold it to `category`; this keeps `providers` the real
+    /// registry, so a new or changed row can't slip past them — and makes
+    /// whoever adds a provider say where it goes.
+    ///
+    /// Stale after a registry edit? `MAFOLD_WRITE_CASES=1 cargo test -p
+    /// mafold-types connections_page_table` rewrites `providers`; then put the
+    /// new id in `category` and run the web spec.
+    #[test]
+    fn connections_page_table_is_the_registry() {
+        const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../client-shared/connections.cases.json");
+        let raw = std::fs::read_to_string(PATH).expect("connections.cases.json");
+        let mut table: serde_json::Value = serde_json::from_str(&raw).expect("connections.cases.json parses");
+        let live = serde_json::to_value(provider_infos()).unwrap();
+        if table["providers"] != live {
+            if std::env::var_os("MAFOLD_WRITE_CASES").is_some() {
+                table["providers"] = live.clone();
+                std::fs::write(PATH, serde_json::to_string_pretty(&table).unwrap() + "\n").unwrap();
+            } else {
+                panic!("client-shared/connections.cases.json is not the registry — rerun with MAFOLD_WRITE_CASES=1");
+            }
+        }
+        let tabs = ["logins", "models", "apps", "computers", "secrets"];
+        let cat = table["category"].as_object().expect("category");
+        let ids: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
+        for id in &ids {
+            let c = cat.get(*id).and_then(|v| v.as_str()).unwrap_or_else(|| panic!("{id}: say which tab it sits under in `category`"));
+            assert!(tabs.contains(&c), "{id}: {c} is not a tab");
+        }
+        for id in cat.keys() {
+            assert!(ids.contains(&id.as_str()), "`category` names {id}, which the registry doesn't have");
+        }
     }
 }

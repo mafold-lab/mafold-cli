@@ -663,6 +663,27 @@ pub fn std_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
+/// `cmd.output()` for a program this process may have JUST WRITTEN (a
+/// downloaded update, `mafold.old`): asked again while it is `Text file busy`.
+/// Linux won't exec a file anything still has open for writing, and a child
+/// another thread forked while we wrote it holds our descriptor until it
+/// execs. The supervisor forks all the time, and so do parallel tests: main's
+/// cli tests went red on 10-30 when `capabilities` of a fresh `mafold.old` hit
+/// it, read as "too old" (`update_cli.rs:408`). Up to a second, then the error.
+pub fn output_of_new_binary(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    let step = std::time::Duration::from_millis(20);
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        match cmd.output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && waited < std::time::Duration::from_secs(1) => {
+                std::thread::sleep(step);
+                waited += step;
+            }
+            r => return r,
+        }
+    }
+}
+
 /// For a program that talks to the person at this terminal: it reads what they
 /// type or prints straight to it (`connection run`'s stdin, the installer,
 /// `stty`, esbuild's watch). It shares OUR console, which is the point. When
@@ -962,6 +983,44 @@ pub fn console_window_of(pid: u32) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program still open for writing somewhere (here: by this test, as a
+    /// forked child holds it on CI) is asked again until it isn't, not
+    /// reported as failed: the writer lets go 150 ms in. One that never stops
+    /// being written still errors, after the second. (Linux: macOS execs a
+    /// file open for writing.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_new_binary_still_being_written_is_asked_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mafold-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("mafold.old");
+        std::fs::write(&bin, "#!/bin/sh\necho mafold 0.9.1\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let writer = std::fs::OpenOptions::new().append(true).open(&bin).unwrap();
+        let busy = std_command(&bin).output().expect_err("exec of a file open for writing");
+        assert_eq!(busy.kind(), std::io::ErrorKind::ExecutableFileBusy, "{busy}");
+        let t0 = std::time::Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(writer);
+        });
+        let out = output_of_new_binary(&mut std_command(&bin)).expect("asked again once the writer let go");
+        release.join().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mafold 0.9.1");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(140), "it waited for the writer: {:?}", t0.elapsed());
+
+        let held = std::fs::OpenOptions::new().append(true).open(&bin).unwrap();
+        let t0 = std::time::Instant::now();
+        let e = output_of_new_binary(&mut std_command(&bin)).expect_err("still being written");
+        assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3), "gives up: {:?}", t0.elapsed());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A binary replaced under a running process is named by its path on disk
     /// — the new binary — not Linux's `… (deleted)`; anywhere else, and any

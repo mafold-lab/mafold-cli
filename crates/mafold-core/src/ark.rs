@@ -13,13 +13,19 @@
 //! the two paths never disagree about a model; a direct `connection call`
 //! gets the vendor's own refusal, quoted.
 //!
-//! Three methods, all one HTTP round trip, no streaming:
+//! Four methods, all one HTTP round trip, no streaming:
 //!   `video.submit`  {model, prompt, resolution?, ratio?, duration?, refs?,
-//!                    generate_audio?, watermark?, draft?}  → the task as the
-//!                    vendor returns it (`id` is the job id)
+//!                    generate_audio?, watermark?, draft?, seed?}  → the task
+//!                    as the vendor returns it (`id` is the job id)
 //!   `video.status`  {job_id} → the task; on `succeeded` it carries
 //!                    `content.video_url` (24 h) and `usage.completion_tokens`
 //!   `video.cancel`  {job_id} → the vendor's answer (only queued tasks cancel)
+//!   `video.list`    {seed?, model?, since?} → `items`: the key's newest tasks
+//!                    (one page), narrowed here to the ones that match. A task
+//!                    carries the `seed` it was sent with, so a submit whose
+//!                    reply was lost on the way back is found by the seed it
+//!                    went out with — ModelArk takes no idempotency key, and
+//!                    a blind resubmit is a second bill (2026-10-30).
 
 use serde_json::{json, Value};
 
@@ -54,7 +60,8 @@ pub fn catalog() -> Value {
                         "url": { "type": "string" } } } },
                     "generate_audio": { "type": "boolean", "default": false },
                     "watermark": { "type": "boolean", "default": false },
-                    "draft": { "type": "boolean", "description": "cheap draft render where the model supports it" }
+                    "draft": { "type": "boolean", "description": "cheap draft render where the model supports it" },
+                    "seed": { "type": "integer", "description": "-1 (random) … 4294967295; the task echoes it, so `video.list` finds a submit whose reply was lost" }
                 }
             },
             "readOnly": false
@@ -72,6 +79,16 @@ pub fn catalog() -> Value {
             "description": "Only a queued task can be cancelled; the vendor's refusal is quoted otherwise.",
             "inputSchema": { "type": "object", "required": ["job_id"], "properties": { "job_id": { "type": "string" } } },
             "readOnly": false
+        },
+        {
+            "name": "video.list",
+            "title": "Find recent video jobs",
+            "description": "This key's newest tasks (one page, newest first), narrowed to those matching `seed` / `model` / created at or after `since` (unix seconds). How to find out whether a submit whose reply never came back started a job: look for its seed before sending it again.",
+            "inputSchema": { "type": "object", "properties": {
+                "seed": { "type": "integer" },
+                "model": { "type": "string" },
+                "since": { "type": "integer", "description": "unix seconds" } } },
+            "readOnly": true
         }
     ]})
 }
@@ -131,8 +148,20 @@ pub(crate) async fn run(
             }
             Ok(v)
         }
+        "video.list" => {
+            let want = ListFilter::from(params)?;
+            let reply = net::http_request(
+                "GET",
+                &format!("{base}{TASKS}?page_num=1&page_size={LIST_PAGE}"),
+                &headers,
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(want.apply(answer(reply)?))
+        }
         other => Err(format!(
-            "{} offers `video.submit`, `video.status` and `video.cancel` — `{other}` is not one of them",
+            "{} offers `video.submit`, `video.status`, `video.cancel` and `video.list` — `{other}` is not one of them",
             spec.display
         )),
     }
@@ -166,6 +195,43 @@ fn job_id(params: &Value) -> Result<String, String> {
         return Err("job_id: unexpected characters".into());
     }
     Ok(job.to_string())
+}
+
+/// How many of the key's newest tasks `video.list` reads: a submit whose reply
+/// was lost is seconds old, so one page is plenty even on a busy key.
+const LIST_PAGE: u32 = 50;
+
+/// What `video.list` keeps of the page ModelArk answers: every given field
+/// must match. Narrowed here, not by the vendor's own filters, so the one
+/// thing this relies on is what a task already says about itself.
+struct ListFilter {
+    seed: Option<i64>,
+    model: Option<String>,
+    since: Option<i64>,
+}
+
+impl ListFilter {
+    fn from(params: &Value) -> Result<Self, String> {
+        let int = |k: &str| -> Result<Option<i64>, String> {
+            match params.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v.as_i64().map(Some).ok_or_else(|| format!("{k} must be an integer")),
+            }
+        };
+        let model = params.get("model").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty());
+        Ok(Self { seed: int("seed")?, model: model.map(str::to_string), since: int("since")? })
+    }
+
+    fn apply(&self, page: Value) -> Value {
+        let keep = |t: &&Value| {
+            self.seed.map_or(true, |s| t["seed"].as_i64() == Some(s))
+                && self.model.as_deref().map_or(true, |m| t["model"].as_str() == Some(m))
+                && self.since.map_or(true, |s| t["created_at"].as_i64().is_some_and(|at| at >= s))
+        };
+        let all = page["items"].as_array();
+        let items: Vec<Value> = all.map(|a| a.iter().filter(keep).cloned().collect()).unwrap_or_default();
+        json!({ "items": items, "looked_at": all.map_or(0, Vec::len) })
+    }
 }
 
 /// Build the vendor request. Shapes only; the model table's judgement (known
@@ -228,6 +294,13 @@ fn submit_body(params: &Value) -> Result<Value, String> {
     if params.get("draft").and_then(Value::as_bool) == Some(true) {
         body["draft"] = json!(true);
     }
+    match params.get("seed") {
+        None | Some(Value::Null) => {}
+        Some(v) => match v.as_i64().filter(|s| (-1..=u32::MAX as i64).contains(s)) {
+            Some(seed) => body["seed"] = json!(seed),
+            None => return Err("seed must be an integer from -1 to 4294967295".into()),
+        },
+    }
     Ok(body)
 }
 
@@ -286,9 +359,46 @@ mod tests {
     }
 
     #[test]
-    fn catalog_lists_three_tools() {
+    fn catalog_lists_four_tools() {
         let c = catalog();
         let names: Vec<&str> = c["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["video.submit", "video.status", "video.cancel"]);
+        assert_eq!(names, vec!["video.submit", "video.status", "video.cancel", "video.list"]);
+    }
+
+    /// The seed goes out as given — it is what finds a submit whose reply was
+    /// lost — and one ModelArk wouldn't take is refused before anything is sent.
+    #[test]
+    fn a_seed_goes_out_as_given() {
+        let b = submit_body(&json!({ "model": "m", "prompt": "p", "seed": 1_234_567_890 })).unwrap();
+        assert_eq!(b["seed"], 1_234_567_890);
+        assert!(submit_body(&json!({ "model": "m", "prompt": "p" })).unwrap().get("seed").is_none());
+        for bad in [json!(-2), json!(4_294_967_296_i64), json!("7"), json!(1.5)] {
+            let e = submit_body(&json!({ "model": "m", "prompt": "p", "seed": bad })).unwrap_err();
+            assert!(e.contains("seed"), "{bad}: {e}");
+        }
+    }
+
+    /// A page as ModelArk answers it (fields as a real list returned them,
+    /// 2026-10-30), narrowed by every field given.
+    #[test]
+    fn list_keeps_only_the_tasks_that_match() {
+        let page = json!({ "total": 3, "items": [
+            { "id": "cgt-c", "model": "dreamina-seedance-2-0-260128", "status": "queued", "seed": 42, "created_at": 1_793_351_041 },
+            { "id": "cgt-b", "model": "dreamina-seedance-2-5-260628", "status": "running", "seed": 42, "created_at": 1_793_350_667 },
+            { "id": "cgt-a", "model": "dreamina-seedance-2-0-260128", "status": "succeeded", "seed": 7, "created_at": 1_793_350_301 },
+        ]});
+        let ids = |p: Value| -> Vec<String> {
+            let v = ListFilter::from(&p).unwrap().apply(page.clone());
+            assert_eq!(v["looked_at"], 3);
+            v["items"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(ids(json!({})), ["cgt-c", "cgt-b", "cgt-a"]);
+        assert_eq!(ids(json!({ "seed": 42 })), ["cgt-c", "cgt-b"]);
+        assert_eq!(ids(json!({ "seed": 42, "model": "dreamina-seedance-2-0-260128" })), ["cgt-c"]);
+        assert_eq!(ids(json!({ "seed": 42, "since": 1_793_351_000 })), ["cgt-c"]);
+        assert!(ids(json!({ "seed": 99 })).is_empty());
+        assert!(ListFilter::from(&json!({ "seed": "42" })).is_err());
+        // A page with no `items` (an odd answer) narrows to nothing, never to "everything".
+        assert_eq!(ListFilter::from(&json!({ "seed": 42 })).unwrap().apply(json!({}))["items"], json!([]));
     }
 }

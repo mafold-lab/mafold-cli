@@ -428,8 +428,50 @@ pub enum Who {
     /// The owner's circle (`agent::trusted`): it reads the owner's machine, or
     /// changes how the agent runs for everyone in the chat.
     Circle,
-    /// The owner alone: the Claude sign-ins the machine holds.
+    /// The owner alone: the Claude sign-ins the machine holds, and the model
+    /// and thinking a whole chat runs on — as on the usage card's switch,
+    /// where anyone else picks only for their own replies and only where the
+    /// owner opens the lock (owner call 2026-10-29).
     Owner,
+}
+
+/// What a slash command takes after its name — declared by whoever runs it
+/// (the daemon's table, a harness's own), and asked by the one parser every
+/// typed command goes through (`agent::slash`). A message that only BEGINS
+/// with a command is words: 10-29, `@bot /model → owner only, same rule as
+/// the card…` was read as `/model` with the whole sentence for a model name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Takes {
+    /// Nothing: `/stop`, `/usage`.
+    Nothing,
+    /// At most this many words: one model name, `forget <name>`.
+    Words(usize),
+    /// A directory, which may have spaces in it: one word, or the whole of
+    /// what follows naming a directory that exists.
+    Path,
+    /// Whatever follows: a skill's arguments, `/compact`'s instructions.
+    Text,
+}
+
+impl Takes {
+    pub fn fits(self, arg: &str) -> bool {
+        let arg = arg.trim();
+        match self {
+            Takes::Nothing => arg.is_empty(),
+            Takes::Words(n) => arg.split_whitespace().count() <= n,
+            Takes::Path => !arg.contains(char::is_whitespace) || std::path::Path::new(&expand_home(arg)).is_dir(),
+            Takes::Text => true,
+        }
+    }
+}
+
+/// `~/x` as the path it names — what `/cwd` was given, and what [`Takes::Path`]
+/// asks of it.
+pub fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "~".into())),
+        None => path.to_string(),
+    }
 }
 
 /// What a harness's CLI on THIS machine turned out to accept, as [`Harness::caps`]
@@ -701,6 +743,14 @@ pub trait Harness: Send + Sync {
     fn command_who(&self, name: &str) -> Who {
         let _ = name;
         Who::Circle
+    }
+
+    /// What `name` takes ([`Takes`]), when [`Self::command`] answers it
+    /// itself. `None` = not one of its own: it goes to the CLI as a prompt,
+    /// where a skill or command gets whatever follows it.
+    fn command_takes(&self, name: &str) -> Option<Takes> {
+        let _ = name;
+        None
     }
 
     /// One-line status (e.g. auth account) appended to `/status`, for the seat

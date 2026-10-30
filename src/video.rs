@@ -494,9 +494,12 @@ fn own_priced(mut checked: Value, billing: Value) -> Value {
 /// held on anyone's wallet. Then the owner's vault on this machine opens the
 /// key and the driver sends it. `--dry-run` stops after the check.
 ///
-/// The send itself is not retried: ModelArk takes no idempotency key, so a
-/// reply lost on the way back may still have started a job — the skill says
-/// to look (`status`, the owner's ModelArk console) before sending again.
+/// The send itself is never repeated: ModelArk takes no idempotency key, and
+/// a reply lost on the way back may still have started a job — sending again
+/// is a second bill (2026-10-30: `video.submit failed` on a blink, the task
+/// already at ModelArk). So each submit goes out with a fresh `seed`, which the
+/// task keeps, and a send that may have landed is looked for by it
+/// ([`find_lost`]): found, it is this submit's job; not there, nothing started.
 async fn own_submit(client: &Client, key: KeyHolder, mut body: Value, dry_run: bool) -> Result<Value> {
     body["dry_run"] = json!(true);
     let checked = client.call("videoSubmit", body.clone()).await?;
@@ -524,15 +527,55 @@ async fn own_submit(client: &Client, key: KeyHolder, mut body: Value, dry_run: b
     if body["draft"] == true {
         args["draft"] = json!(true);
     }
-    let task = vault
-        .call("video.submit", &args)
-        .await
-        .map_err(|e| own_failure(e, "video.submit"))?;
+    let seed = fresh_seed();
+    args["seed"] = json!(seed);
+    let sent_at = unix_now();
+    let (task, recovered) = match vault.call("video.submit", &args).await {
+        Ok(task) => (task, None),
+        Err(e) => {
+            let e = own_failure(e, "video.submit");
+            if !may_have_landed(&e) {
+                return Err(e);
+            }
+            eprintln!("  the submit's reply was lost ({e:#}) — looking for it at ModelArk by its seed {seed}");
+            let want = json!({ "seed": seed, "model": args["model"].clone(), "since": sent_at - LOST_CLOCK_SLACK });
+            let (vault, want) = (&vault, &want);
+            let look = move || async move {
+                vault.call("video.list", want).await.map_err(|e| own_failure(e, "video.list"))
+            };
+            match find_lost(look, tokio::time::sleep).await {
+                Lost::Found(task) => {
+                    let note = format!(
+                        "the reply to this submit was lost on the way back, but ModelArk had started it (found by \
+                         its seed {seed}) — this is that job; nothing was sent twice"
+                    );
+                    (task, Some(note))
+                }
+                Lost::NotThere => {
+                    return Err(e.context(format!(
+                        "ModelArk has no job from this submit: its seed ({seed}) is on none of the key's newest \
+                         tasks, looked for {} times over {}s. Nothing was started and nothing will be billed — it \
+                         is safe to submit again",
+                        LOST_PAUSES.len() + 1,
+                        LOST_PAUSES.iter().map(|d| d.as_secs()).sum::<u64>()
+                    )));
+                }
+                Lost::Unknown(why) => {
+                    return Err(e.context(format!(
+                        "couldn't tell whether ModelArk started it ({why:#}). Don't submit again yet — it may be \
+                         running, and billing. Look first: `mafold connection call {name} video.list --params \
+                         '{{\"seed\":{seed}}}'` — a task there is this submit (`mafold video status \
+                         own:{name}:<its id>`); none there means nothing started"
+                    )));
+                }
+            }
+        }
+    };
     let id = task["id"]
         .as_str()
         .filter(|id| !id.is_empty())
         .with_context(|| format!("ModelArk answered without a task id: {task}"))?;
-    Ok(json!({
+    let mut v = json!({
         "job_id": own_job_id(&name, id),
         "model": checked["model"].clone(),
         "vendor": checked["vendor"].clone(),
@@ -542,7 +585,96 @@ async fn own_submit(client: &Client, key: KeyHolder, mut body: Value, dry_run: b
         "status": task["status"].clone(),
         "estimate": estimate,
         "billing": billing,
-    }))
+    });
+    if let Some(note) = recovered {
+        v["recovered"] = json!(note);
+    }
+    Ok(v)
+}
+
+/// A submit's `seed` on the owner's key: random, so it changes nothing about
+/// the clip (ModelArk draws one at random when none is given), and the mark
+/// [`find_lost`] knows the job by. 1 … 2³¹−1: inside every range ModelArk
+/// takes, never `-1` ("pick one") or `0`.
+fn fresh_seed() -> i64 {
+    let n = u32::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().expect("4 bytes"));
+    i64::from(n % (i32::MAX as u32)) + 1
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// How far ModelArk's `created_at` may sit before this machine's clock at the
+/// send and still be this submit's — the two clocks are not the same clock.
+const LOST_CLOCK_SLACK: i64 = 300;
+
+/// The pauses between [`find_lost`]'s looks: the first right away, then after
+/// 10 s and 30 s more — a send the vendor was still taking in when the reply
+/// broke shows up by then.
+const LOST_PAUSES: [std::time::Duration; 2] =
+    [std::time::Duration::from_secs(10), std::time::Duration::from_secs(30)];
+
+/// A submit that failed in a way that may still have reached ModelArk: the
+/// request died after it was on its way (`transport`), or the vendor's side
+/// broke (a 5xx, read as 502/503/504). Not a connect failure — nothing left
+/// this machine — nor a 429 or any other answer: ModelArk refused it, and a
+/// refused task is never created.
+fn may_have_landed(e: &anyhow::Error) -> bool {
+    match e.downcast_ref::<mafold_core::RpcError>() {
+        Some(mafold_core::RpcError::Transport(_)) => true,
+        Some(mafold_core::RpcError::Api(env)) => serde_json::from_str::<Value>(env)
+            .ok()
+            .and_then(|v| v["error_code"].as_u64())
+            .is_some_and(|c| matches!(c, 502 | 503 | 504)),
+        _ => false,
+    }
+}
+
+/// What [`find_lost`] learned about a submit whose reply was lost.
+#[derive(Debug)]
+enum Lost {
+    /// ModelArk has it: the task, as `video.list` answered it.
+    Found(Value),
+    /// Every look got an answer and none had it: nothing started.
+    NotThere,
+    /// A look never got an answer — or the key is driven by a core without
+    /// `video.list`, whose `video.submit` didn't send the seed either. Can't
+    /// tell, so nobody may say "nothing started".
+    Unknown(anyhow::Error),
+}
+
+/// Look for a lost submit by its seed (`look` = `video.list` narrowed to it):
+/// right away, then after each of [`LOST_PAUSES`]. Each look rides blinks with
+/// [`patiently`]; one that still doesn't get through, or a refusal, ends it as
+/// [`Lost::Unknown`]. "Not there" only when every look was answered.
+async fn find_lost<L, LF, S, SF>(mut look: L, mut sleep: S) -> Lost
+where
+    L: FnMut() -> LF,
+    LF: std::future::Future<Output = Result<Value>>,
+    S: FnMut(std::time::Duration) -> SF,
+    SF: std::future::Future<Output = ()>,
+{
+    let mut pauses = LOST_PAUSES.iter();
+    loop {
+        match patiently(OPEN_TRIES, &mut look, &mut sleep).await {
+            Ok(v) => {
+                if let Some(task) = v["items"].as_array().and_then(|a| a.first()) {
+                    return Lost::Found(task.clone());
+                }
+                if !v["items"].is_array() {
+                    return Lost::Unknown(anyhow!("video.list answered without `items`: {v}"));
+                }
+            }
+            Err(e) => return Lost::Unknown(e),
+        }
+        match pauses.next() {
+            Some(p) => sleep(*p).await,
+            None => return Lost::NotThere,
+        }
+    }
 }
 
 /// What ModelArk is handed for each `--ref` on the own-key path: where the
@@ -1134,8 +1266,11 @@ pub fn install_skill() -> Result<()> {
 
 fn install_into(plugin: &std::path::Path, home: Option<&std::path::Path>) -> Result<()> {
     let dir = plugin.join("skills").join("mafold-video");
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(dir.join("director"))?;
     std::fs::write(dir.join("SKILL.md"), SKILL_MD)?;
+    for (name, body) in DIRECTOR {
+        std::fs::write(dir.join("director").join(name), body)?;
+    }
     let manifest = plugin.join(".claude-plugin");
     std::fs::create_dir_all(&manifest)?;
     std::fs::write(manifest.join("plugin.json"), r#"{"name":"mafold"}"#)?;
@@ -1150,6 +1285,17 @@ fn install_into(plugin: &std::path::Path, home: Option<&std::path::Path>) -> Res
 }
 
 pub const SKILL_MD: &str = include_str!("video_skill.md");
+
+/// The director stage the skill sends the agent to (`director/` next to
+/// SKILL.md): a blocking file → a grey-box animatic of jointed mannequins, which
+/// goes to the model as `reference_video`. Rendered by node + headless Chrome on
+/// the agent's machine; nothing here runs it.
+pub const DIRECTOR: [(&str, &str); 4] = [
+    ("README.md", include_str!("video_director/README.md")),
+    ("render.mjs", include_str!("video_director/render.mjs")),
+    ("stage.html", include_str!("video_director/stage.html")),
+    ("example.json", include_str!("video_director/example.json")),
+];
 
 #[cfg(test)]
 mod tests {
@@ -1234,6 +1380,89 @@ mod tests {
         assert!(msg.contains("mafold video status job-1"), "says how to look later: {msg}");
         assert!(msg.contains("down"), "keeps the cause: {msg}");
         assert_eq!(slept, vec![10, 20, 40, 60, 60, 60, 60], "backoff, capped at 60 s");
+    }
+
+    /// Runs `find_lost` over a scripted sequence of `video.list` answers;
+    /// returns the outcome, every pause, and how many answers were left over.
+    async fn find_over(looks: Vec<Result<Value>>) -> (Lost, Vec<u64>, usize) {
+        let left = RefCell::new(VecDeque::from(looks));
+        let slept = RefCell::new(Vec::new());
+        let out = find_lost(
+            || std::future::ready(left.borrow_mut().pop_front().expect("looked more often than scripted")),
+            |d: Duration| {
+                slept.borrow_mut().push(d.as_secs());
+                std::future::ready(())
+            },
+        )
+        .await;
+        let unread = left.borrow().len();
+        (out, slept.into_inner(), unread)
+    }
+    fn items(ids: &[&str]) -> Result<Value> {
+        Ok(json!({ "items": ids.iter().map(|id| json!({ "id": id, "status": "queued", "seed": 42 })).collect::<Vec<_>>() }))
+    }
+
+    /// The 2026-10-30 run: `video.submit failed` on a blink, the task already
+    /// at ModelArk. Found by its seed — that job is the answer, not an error.
+    #[tokio::test]
+    async fn a_lost_submit_is_found_by_its_seed() {
+        let (out, slept, _) = find_over(vec![items(&["cgt-1"])]).await;
+        assert!(matches!(out, Lost::Found(ref t) if t["id"] == "cgt-1"), "{out:?}");
+        assert!(slept.is_empty());
+        // Still being taken in when the reply broke: there on a later look.
+        let (out, slept, _) = find_over(vec![items(&[]), items(&[]), items(&["cgt-2"])]).await;
+        assert!(matches!(out, Lost::Found(ref t) if t["id"] == "cgt-2"), "{out:?}");
+        assert_eq!(slept, vec![10, 30]);
+        // A blink while looking is ridden out, not taken for "not there".
+        let (out, slept, _) =
+            find_over(vec![Err(failed(RpcError::Transport("reset".into()))), items(&["cgt-3"])]).await;
+        assert!(matches!(out, Lost::Found(ref t) if t["id"] == "cgt-3"), "{out:?}");
+        assert_eq!(slept, vec![10]);
+    }
+
+    #[tokio::test]
+    async fn not_there_only_when_every_look_was_answered() {
+        let (out, slept, unread) = find_over(vec![items(&[]), items(&[]), items(&[])]).await;
+        assert!(matches!(out, Lost::NotThere), "{out:?}");
+        assert_eq!(slept, vec![10, 30]);
+        assert_eq!(unread, 0);
+        // The network never came back: can't tell — never "nothing started".
+        let (out, _, _) = find_over((0..OPEN_TRIES).map(|_| Err(api(503))).collect()).await;
+        assert!(matches!(out, Lost::Unknown(_)), "{out:?}");
+        let (out, _, _) =
+            find_over(vec![items(&[]), Err(failed(RpcError::Connect("down".into()))), Err(api(502)), Err(api(502))])
+                .await;
+        assert!(matches!(out, Lost::Unknown(_)), "a later look that never got through: {out:?}");
+        // A core without `video.list` (a key driven elsewhere, older) sent no
+        // seed either — its refusal is "can't tell", at once.
+        let (out, _, unread) = find_over(vec![
+            Err(anyhow::anyhow!("BytePlus ModelArk offers `video.submit`, `video.status` and `video.cancel` — `video.list` is not one of them")),
+            items(&[]),
+        ])
+        .await;
+        assert!(matches!(out, Lost::Unknown(_)), "{out:?}");
+        assert_eq!(unread, 1, "no look after the refusal");
+        let (out, _, _) = find_over(vec![Ok(json!({ "error": "odd" }))]).await;
+        assert!(matches!(out, Lost::Unknown(_)), "an answer without items says nothing: {out:?}");
+    }
+
+    #[test]
+    fn what_may_have_reached_modelark() {
+        let submit = |e: anyhow::Error| own_failure(e, "video.submit");
+        assert!(may_have_landed(&submit(anyhow::anyhow!("transport failed: connection reset"))));
+        assert!(may_have_landed(&submit(anyhow::anyhow!("ark 500: InternalServiceError oops"))));
+        assert!(may_have_landed(&submit(anyhow::anyhow!("ark 502: bad gateway"))));
+        assert!(!may_have_landed(&submit(anyhow::anyhow!("connect failed: refused"))), "nothing left this machine");
+        assert!(!may_have_landed(&submit(anyhow::anyhow!("ark 429: RateLimitExceeded slow down"))), "refused");
+        assert!(!may_have_landed(&submit(anyhow::anyhow!("ark 400: InvalidParameter bad"))), "refused");
+        assert!(!may_have_landed(&submit(anyhow::anyhow!("ark 401: AuthenticationError"))), "refused");
+    }
+
+    #[test]
+    fn a_fresh_seed_is_a_real_one() {
+        let seeds: std::collections::HashSet<i64> = (0..200).map(|_| fresh_seed()).collect();
+        assert!(seeds.iter().all(|s| (1..=i64::from(i32::MAX)).contains(s)));
+        assert!(seeds.len() > 190, "random, not a constant");
     }
 
     #[tokio::test]
@@ -1589,6 +1818,13 @@ mod tests {
         std::fs::write(old.join("SKILL.md"), SKILL_MD).unwrap();
         install_into(&plugin, Some(&home)).unwrap();
         assert_eq!(std::fs::read_to_string(plugin.join("skills/mafold-video/SKILL.md")).unwrap(), SKILL_MD);
+        for (name, body) in DIRECTOR {
+            let got = std::fs::read_to_string(plugin.join("skills/mafold-video/director").join(name)).unwrap();
+            assert_eq!(got, body, "director/{name} is installed beside the skill");
+        }
+        for name in ["README.md", "example.json", "render.mjs"] {
+            assert!(SKILL_MD.contains(&format!("director/{name}")), "the skill sends the agent to director/{name}");
+        }
         assert_eq!(crate::drive::plugin_name(&plugin).as_deref(), Some("mafold"));
         assert!(!old.exists(), "our own copy is gone");
 
