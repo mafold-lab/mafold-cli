@@ -428,6 +428,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "walletPacketClaim",
     "walletPacketCreate",
     "walletPacketGet",
+    "walletPassIssue",
     "walletRates",
     "walletRatesSet",
     "walletSettings",

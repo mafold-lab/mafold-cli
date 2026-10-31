@@ -705,6 +705,29 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // Passes (ops 10-30, "build it now"): credit only its holder can spend.
+    // The api reads it on the SUBSCRIBER: where it's on, a paid Premium
+    // period lands as a Premium Pass instead of ordinary, sendable credit
+    // (a subscription that already minted ordinary credit keeps doing so).
+    // Web and phone read it to show the Passes card, the Pass sheet and the
+    // "Passes can't be sent" lines. Spending a Pass needs no flag: no Pass
+    // exists until this or `walletPassIssue` makes one.
+    FlagMeta {
+        key: "passes",
+        default: false,
+        dev_default: false,
+        label: "Wallet: Passes",
+        description: "Premium's monthly credit lands as a Premium Pass: only you can spend it, on \
+                      @claude, @gemini, @chatgpt, your own agents, images and video — not on other \
+                      people's paid agents. It can't be sent, converted or put in a red packet, and \
+                      it resets when the next month's Pass lands. The wallet shows Passes above \
+                      Holdings. The api mints Premium as a Pass only where this is on for the \
+                      subscriber.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
     // Mafold Mail phase 1 (ops 10-30): `username@mafold.com`, receive only.
     // The api gates every part of it on the MAILBOX's handle — the rcpt hook,
     // the inbound hook, the mail* methods, @mail's commands — so a record of

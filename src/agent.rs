@@ -1026,10 +1026,59 @@ struct Arrival {
     /// Dead once the task has ended, whether or not it ever opened a turn — a
     /// slash command, a floor seat that stayed quiet, a refused draft, a panic.
     alive: std::sync::Weak<()>,
+    /// Where it is on its way (see [`Stage`]).
+    stage: Stage,
+}
+
+/// Where an [`Arrival`] is on its way to a turn.
+#[derive(Clone, Debug, PartialEq)]
+enum Stage {
+    /// Finding a turn to go into, or opening its own — seconds of round trips.
+    /// Since then: one that never resolves stops counting after `ARRIVAL_WAIT`.
+    Deciding(tokio::time::Instant),
+    /// Waiting in line (`steer_in_order`): a reply it may not go into is
+    /// running here, so its own opens when that one has ended. Carries the
+    /// replies it has already tried (`surface_turns`).
+    Waiting(Vec<usize>),
+    /// Its turn is registered, and its task — follow-up rounds included — is
+    /// still running it. Holds the surface for the gap between two rounds,
+    /// when `turns` has none.
+    Settled,
 }
 
 impl Arrival {
-    fn blocks(&self, order: u64, channel: Option<&str>, thread: Option<&str>) -> bool {
+    /// The next message waits for this one to find its turn before it looks
+    /// for one itself, so what one person said twice lands in order: while
+    /// this one is deciding, and while it waits in line with a reply running
+    /// here (`here`) it hasn't tried yet — the second message must not go into
+    /// a reply that just opened ahead of the first.
+    fn blocks(&self, order: u64, channel: Option<&str>, thread: Option<&str>, here: &[usize]) -> bool {
+        self.ahead(order, channel, thread)
+            && match &self.stage {
+                Stage::Deciding(since) => since.elapsed() < ARRIVAL_WAIT,
+                Stage::Waiting(tried) => tried.as_slice() != here,
+                Stage::Settled => false,
+            }
+    }
+
+    /// Deciding for longer than anything should take: a lookup that hangs.
+    fn stale(&self, order: u64, channel: Option<&str>, thread: Option<&str>) -> bool {
+        self.ahead(order, channel, thread) && matches!(self.stage, Stage::Deciding(since) if since.elapsed() >= ARRIVAL_WAIT)
+    }
+
+    /// The surface is this one's before it is a later message's: it is opening
+    /// its reply, waiting in line for one, or still running one. One that has
+    /// been deciding past `ARRIVAL_WAIT` doesn't count — a hung lookup must
+    /// not mute the surface for good.
+    fn holds_line(&self, order: u64, channel: Option<&str>, thread: Option<&str>) -> bool {
+        self.ahead(order, channel, thread)
+            && match self.stage {
+                Stage::Deciding(since) => since.elapsed() < ARRIVAL_WAIT,
+                Stage::Waiting(_) | Stage::Settled => true,
+            }
+    }
+
+    fn ahead(&self, order: u64, channel: Option<&str>, thread: Option<&str>) -> bool {
         self.order < order
             && self.channel.as_deref() == channel
             && self.thread.as_deref() == thread
@@ -5085,6 +5134,8 @@ async fn connect_and_run(
         let chat_states = chat_states.clone();
         let harness = harness.clone();
         let attachments = m.attachments.clone();
+        // For the line the running reply hears while this one waits for its own.
+        let raw_attachments = raw_attachments.clone();
         let chat_id = m.conversation_id.clone();
         // `@me /usage` in a group is `/usage` in a DM — for the emulated
         // commands below and for the harness's own (`strip_self_address`).
@@ -5294,7 +5345,8 @@ async fn connect_and_run(
             // whom it was relaying, so these words could land in a turn the
             // same bot started for someone else — one reading with THEIR eyes
             // (`Mount::reads`) and resuming their session. Theirs is a turn of
-            // its own, the way a billed sender's is.
+            // its own, the way a billed sender's is — after the running one,
+            // in line (`steer_in_order`), never beside it.
             //
             // A message that only begins with a command (`Slash::Words`) is said
             // to the agent as words — to the running turn and a new one alike —
@@ -5312,12 +5364,17 @@ async fn connect_and_run(
             let wallet_here = on_wallet().await;
             let not_the_wallets = wallet_here
                 && crate::fuel::gate(bot_owner().await.as_deref(), &turn_sender, relayed_for.as_deref(), true).is_err();
-            if has_something_to_say(&content, &attachments) && !relays_a_guest && !not_the_wallets {
+            // Everything below opens a reply — so first, the one running here.
+            // Not the wallet's refusal: that is a sentence, not a reply, and it
+            // is owed now.
+            if !not_the_wallets {
                 // In order: a message of theirs that came in just before this
                 // one and is still opening its draft is the running turn this
                 // one belongs to — it just isn't in `turns` yet.
                 // Someone else's turn may take it too (`pick_turn`), so who is
                 // asking — and whether they pay — travels with the words.
+                // And when none may take it, it waits in line for its own
+                // (`steer_in_order`): never a second reply beside the first.
                 let from = Speaker {
                     lc: &turn_sender,
                     handle: &sender_username,
@@ -5325,15 +5382,43 @@ async fn connect_and_run(
                     pays: sender_pays,
                 };
                 let carried = steering::carried(attachments.iter().map(|a| a.kind.as_str()));
+                // Once, on going into the line: the running reply hears that
+                // it is coming — so it neither answers it nor tells the room
+                // somebody else has it (10-30 22:42Z) — and the room hears it waits.
+                let waiting = |running: Option<String>| {
+                    let (client, chat_states) = (client.clone(), chat_states.clone());
+                    let (chat_id, channel_id, thread_root) = (chat_id.clone(), channel_id.clone(), thread_root.clone());
+                    let line = steering::background_line(
+                        &sender_username,
+                        &model_view(&said_as, &trigger_id),
+                        &attachment_label(&raw_attachments),
+                        reply_to_sender.as_deref(),
+                        is_forward,
+                    )
+                    .map(|l| steering::waiting_line(&with_msg_id(&trigger_id, l)));
+                    let note = match running.filter(|o| *o != turn_sender) {
+                        Some(o) => format!("⏳ 我还在跑 {o} 的那一条,这条排在它后面 —— 它一收尾我就回。"),
+                        None => "⏳ 我还在跑上一条,这条排在它后面 —— 它一收尾我就回。".to_string(),
+                    };
+                    async move {
+                        if let Some(line) = line {
+                            note_in_running_turns(&chat_states, &chat_id, channel_id.as_deref(), thread_root.as_deref(), &line).await;
+                        }
+                        let dest = Dest::chat(&chat_id).channel(channel_id.as_deref()).thread(thread_root.as_deref());
+                        let _ = client.send_to(dest, &note).await;
+                    }
+                };
                 let steered = steer_in_order(
                     &chat_states, &arrived, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
                     // A bot passing on someone outside the owner's circle is
                     // that someone: only into a guest's turn (`trusted_turn`).
                     from, Some(words_guest), reply_to_id.as_deref(), &said_as, &carried,
+                    has_something_to_say(&content, &attachments) && !relays_a_guest,
                     // Borrows only — the normal-turn path below still owns both,
                     // and re-downloads nothing: whatever this fetched is already
                     // in `~/.mafold/attachments` under the same content name.
                     |t| attach_context(&client, t, &attachments, &[]),
+                    waiting,
                 ).await;
                 // The turn it went into, when that is somebody else's.
                 let into = steered
@@ -6092,11 +6177,17 @@ async fn arrive(
     channel: Option<&str>,
     thread: Option<&str>,
 ) -> Arrived {
-    static ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let order = ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let alive = Arc::new(());
     let mut states = chat_states.lock().await;
     let st = states.entry(chat_id.to_string()).or_default();
+    push_arrival(st, trigger, channel, thread, Stage::Deciding(tokio::time::Instant::now()))
+}
+
+/// Dispatch order, shared by every way onto a surface.
+static ARRIVAL_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn push_arrival(st: &mut ChatState, trigger: &str, channel: Option<&str>, thread: Option<&str>, stage: Stage) -> Arrived {
+    let order = ARRIVAL_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let alive = Arc::new(());
     // Tasks that ended without a turn leave a dead entry; sweep them here, the
     // one place entries are added, so the list never outgrows what's in flight.
     st.arriving.retain(|a| a.alive.strong_count() > 0);
@@ -6106,19 +6197,95 @@ async fn arrive(
         channel: channel.map(str::to_string),
         thread: thread.map(str::to_string),
         alive: Arc::downgrade(&alive),
+        stage,
     });
     Arrived { order, _alive: alive }
 }
 
-/// The arrival's turn is registered: take it out (called with the map locked).
-fn settle_arrival(st: &mut ChatState, trigger: &str) {
-    st.arriving.retain(|a| a.trigger != trigger);
+/// Take a free surface for a reply nobody's message opened — a background
+/// task's update — or `None` while it is someone else's (`line_ahead`). Looked
+/// at and taken under one lock, so a message arriving the same instant either
+/// counts against this or finds it there ahead of it, settled: it waits for
+/// this reply to open and goes into it if it may, or in line behind it. Held
+/// for as long as the reply runs, rounds and all.
+async fn reserve_surface(chat_states: &ChatStates, chat_id: &str, channel: Option<&str>, thread: Option<&str>) -> Option<Arrived> {
+    let mut states = chat_states.lock().await;
+    let st = states.entry(chat_id.to_string()).or_default();
+    if line_ahead(st, u64::MAX, channel, thread).is_some() {
+        return None;
+    }
+    Some(push_arrival(st, "", channel, thread, Stage::Settled))
 }
 
+/// The arrival's turn is registered (called with the map locked). It stays in
+/// the list, settled, until its task ends: the turn itself is what later
+/// messages go into, and between its rounds the arrival is what still holds
+/// the surface (`Arrival::holds_line`).
+fn settle_arrival(st: &mut ChatState, trigger: &str) {
+    for a in st.arriving.iter_mut().filter(|a| a.trigger == trigger) {
+        a.stage = Stage::Settled;
+    }
+}
+
+/// Is the surface someone else's first — a reply running on it, or an earlier
+/// message opening one, waiting for one, or between the rounds of one? `Some`
+/// = yes, carrying whose reply is running there, if one is. `None` = it's
+/// this message's to open its own reply on.
+fn line_ahead(st: &ChatState, order: u64, channel: Option<&str>, thread: Option<&str>) -> Option<Option<String>> {
+    if let Some(t) = st.turns.values().find(|t| listens(t, channel, thread)) {
+        return Some(Some(t.owner.clone()));
+    }
+    st.arriving.iter().any(|a| a.holds_line(order, channel, thread)).then_some(None)
+}
+
+/// The replies running on this surface, by identity (the turn's `cancel`,
+/// shared by its retries and kept across a steer's re-key) — what a message
+/// waiting in line has tried, compared with what is running now.
+fn surface_turns(st: &ChatState, channel: Option<&str>, thread: Option<&str>) -> Vec<usize> {
+    let mut ids: Vec<usize> = st
+        .turns
+        .values()
+        .filter(|t| listens(t, channel, thread))
+        .map(|t| Arc::as_ptr(&t.cancel) as usize)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Set where this message's own arrival is (called with the map locked).
+fn set_stage(st: &mut ChatState, order: u64, stage: Stage) {
+    if let Some(a) = st.arriving.iter_mut().find(|a| a.order == order) {
+        a.stage = stage;
+    }
+}
+
+/// How often a message waiting in line looks again. Polled for the reason the
+/// arrival wait is: a reply ends in one of a dozen places.
+const LINE_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// [`steer_turn`], after every earlier message on this surface has settled into
-/// a turn or out of needing one.
+/// a turn or out of needing one — and, when no running reply may take it, in
+/// LINE: `None` only once the surface is this message's, to open its own.
+///
+/// One reply per surface at a time. Words that may go into the reply running
+/// here go in (`pick_turn`, `inject_into_live_turn`). Words that may not — a
+/// guest's into the owner's circle's (the 10-07 wall), one guest's into
+/// another's, a payer's into anyone's, anyone's into a billed one, a bot
+/// passing a guest on (`may_join` false) — used to be given straight back, and
+/// the caller opened a second reply beside the running one: 2026-10-30 22:42Z,
+/// DEV #Premium额度不可转, ops's reply was running when realopsdu (a guest on a
+/// bot open to `*`) spoke, and two of us worked the same channel at once, one
+/// telling the room the other had it after the other was stopped. realopsdu
+/// 10-30: keep the wall, and payers wait in line — so they WAIT here, first
+/// come first served, and open their own reply the moment the surface is
+/// free. While they wait, a reply of theirs that one of them may go into
+/// (their own, once it opens) still takes the rest of what they say.
+///
+/// `waiting` runs once, when the message first waits behind a running reply
+/// it may not go into, with whose reply that is: the caller tells the room,
+/// and the running reply, that it is coming.
 #[allow(clippy::too_many_arguments)]
-async fn steer_in_order<Fut: std::future::Future<Output = String>>(
+async fn steer_in_order<Fut, W, WFut>(
     chat_states: &ChatStates,
     arrived: &Arrived,
     chat_id: &str,
@@ -6131,33 +6298,92 @@ async fn steer_in_order<Fut: std::future::Future<Output = String>>(
     reply_to: Option<&str>,
     text: &str,
     carried: &str,
-    body: impl FnOnce(String) -> Fut,
-) -> Option<Steered> {
+    // False: these words go into no running reply, whatever is running (a bot
+    // passing a guest on, words that are nothing) — they only take their place
+    // in line.
+    may_join: bool,
+    body: impl Fn(String) -> Fut,
+    waiting: W,
+) -> Option<Steered>
+where
+    Fut: std::future::Future<Output = String>,
+    W: FnOnce(Option<String>) -> WFut,
+    WFut: std::future::Future<Output = ()>,
+{
     // Polled, not signalled: an arrival resolves in one of two places (its turn
     // registers, or its task ends — by any of a dozen returns, or a panic), and
     // a tick over a map this small costs nothing next to the round trips it is
     // waiting out. Tokio's clock, so the tests can fast-forward it.
-    let started = tokio::time::Instant::now();
+    let mut waiting = Some(waiting);
     loop {
-        let held = chat_states.lock().await.get(chat_id).is_some_and(|st| {
-            st.arriving
-                .iter()
-                .any(|a| a.blocks(arrived.order, channel, thread))
-        });
-        if !held {
-            break;
+        // Its turn to look: nothing earlier on this surface is still deciding,
+        // or waiting in line with a reply here it hasn't tried yet — what one
+        // person said twice reaches a reply in the order they said it, the
+        // second time round as much as the first.
+        let mut warned = false;
+        let here = loop {
+            let (held, stale, here) = {
+                let states = chat_states.lock().await;
+                match states.get(chat_id) {
+                    None => (false, false, Vec::new()),
+                    Some(st) => {
+                        let here = surface_turns(st, channel, thread);
+                        let held = st.arriving.iter().any(|a| a.blocks(arrived.order, channel, thread, &here));
+                        let stale = st.arriving.iter().any(|a| a.stale(arrived.order, channel, thread));
+                        (held, stale, here)
+                    }
+                }
+            };
+            if stale && !warned {
+                warned = true;
+                eprintln!(
+                    "⚠ an earlier message in {chat_id} still hasn't opened its turn after {}s — @{}'s stops waiting on it",
+                    ARRIVAL_WAIT.as_secs(),
+                    from.lc
+                );
+            }
+            if !held {
+                break here;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        if may_join {
+            if let Some(s) = steer_turn_as(chat_states, chat_id, channel, thread, from, from_guest, reply_to, text, carried, &body).await {
+                return Some(s);
+            }
         }
-        if started.elapsed() >= ARRIVAL_WAIT {
-            eprintln!(
-                "⚠ an earlier message in {chat_id} still hasn't opened its turn after {}s — running @{}'s on its own",
-                ARRIVAL_WAIT.as_secs(),
-                from.lc
+        // Looked at and claimed under one lock: two messages can't both find
+        // the surface free, because the earlier one is in the list, deciding,
+        // the instant it takes it.
+        let joined_line = {
+            let mut states = chat_states.lock().await;
+            let st = states.entry(chat_id.to_string()).or_default();
+            match line_ahead(st, arrived.order, channel, thread) {
+                None => {
+                    set_stage(st, arrived.order, Stage::Deciding(tokio::time::Instant::now()));
+                    return None;
+                }
+                // What it tried is what was running BEFORE it tried: a reply
+                // that opened meanwhile is one it still owes a try. Said once
+                // a reply is running that it may not go into — not for the
+                // seconds between one reply and the next opening, which it
+                // most likely goes into.
+                Some(running) => {
+                    set_stage(st, arrived.order, Stage::Waiting(here));
+                    if running.is_some() { waiting.take().map(|w| (w, running)) } else { None }
+                }
+            }
+        };
+        if let Some((w, running)) = joined_line {
+            println!(
+                "⏳ @{}'s message waits in line in {chat_id}{} — its own reply opens when that one ends",
+                from.lc,
+                running.as_deref().map(|o| format!(" behind @{o}'s running reply")).unwrap_or_default()
             );
-            break;
+            w(running).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(LINE_TICK).await;
     }
-    steer_turn_as(chat_states, chat_id, channel, thread, from, from_guest, reply_to, text, carried, body).await
 }
 
 /// The body of the above, with the SEAM left open.
@@ -11454,6 +11680,13 @@ async fn deliver_update(
         }
         return;
     }
+    // A reply is running here that this may not ride in (someone else's kind
+    // of turn), or a message is on its way to one: never a second reply
+    // beside it (`steer_in_order`). Nothing is told, so the next tick finds
+    // the same events due and tries again — until the surface is free.
+    let Some(_held) = reserve_surface(&w.chat_states, &w.chat_id, w.channel_id.as_deref(), w.thread_root.as_deref()).await else {
+        return;
+    };
     // Nobody running here: a turn of its own. «Quiet» and «long» are said
     // once whatever becomes of it: retried until they land, they would be
     // the very noise this replaces.
@@ -16220,7 +16453,12 @@ mod steer_tests {
 
     async fn steer_after(s: &ChatStates, a: &Arrived, who: &str, channel: Option<&str>, text: &str) -> Option<Steered> {
         // The circle's words, as in `steer_as`.
-        steer_in_order(s, a, "c1", channel, None, Speaker::person(who), Some(false), None, text, "", |t| async move { t }).await
+        steer_after_as(s, a, Speaker::person(who), false, channel, text).await
+    }
+
+    /// [`steer_after`] for anyone: a guest (`guest`), a payer (`from.pays`).
+    async fn steer_after_as(s: &ChatStates, a: &Arrived, from: Speaker<'_>, guest: bool, channel: Option<&str>, text: &str) -> Option<Steered> {
+        steer_in_order(s, a, "c1", channel, None, from, Some(guest), None, text, "", true, |t| async move { t }, |_| async {}).await
     }
 
     /// 2026-09-27 #失败不可见, the whole incident in one test. Two @s from the
@@ -16306,7 +16544,7 @@ mod steer_tests {
         assert!(steer_after(&s, &a, "ops", None, "first").await.is_none());
         assert!(steer_after(&s, &elsewhere, "ops", Some("ch2"), "another channel").await.is_none());
         assert!(
-            steer_in_order(&s, &threaded, "c1", None, Some("root-9"), Speaker::person("eons"), None, None, "in a thread", "", |t| async move { t })
+            steer_in_order(&s, &threaded, "c1", None, Some("root-9"), Speaker::person("eons"), None, None, "in a thread", "", true, |t| async move { t }, |_| async {})
                 .await
                 .is_none()
         );
@@ -16338,6 +16576,181 @@ mod steer_tests {
         let mail = std::fs::read_to_string(&f).unwrap();
         assert!(mail.contains("From @eons — NOT @ops") && mail.contains("顺便看下 README"), "{mail}");
         drop(a);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 2026-10-30 22:42Z, DEV #Premium额度不可转 — the report this fixes. ops's
+    /// reply is running; they say one more thing into it, and realopsdu speaks
+    /// right behind them. On a bot open to `*`, whoever the whitelist doesn't
+    /// name is a guest, and a guest's words don't ride in the circle's reply
+    /// (the 10-07 wall) — so they were handed straight back, and opened a
+    /// SECOND reply beside ops's. realopsdu 10-30: keep the wall, one reply at
+    /// a time — the guest's waits in line and opens once ops's has ended.
+    #[tokio::test(start_paused = true)]
+    async fn two_people_steer_back_to_back_and_one_reply_runs_at_a_time() {
+        let s: ChatStates = Default::default();
+        // ops's card answer opens the reply.
+        let a = arrive(&s, "c1", "mA", None, None).await;
+        assert!(steer_after(&s, &a, "ops", None, "D1 D2 D3").await.is_none());
+        let (t, f) = turn("ops", None, true);
+        let t = TurnHandle { guest: false, ..t };
+        let ops_reply = t.cancel.clone();
+        register(&s, "dA", t, "mA").await;
+        // ops steers it — and realopsdu, a guest here, right behind them.
+        let b = arrive(&s, "c1", "mB", None, None).await;
+        let c = arrive(&s, "c1", "mC", None, None).await;
+        let (sb, sc) = (s.clone(), s.clone());
+        let ops = tokio::spawn(async move { steer_after(&sb, &b, "ops", None, "the demo is so beautiful").await });
+        let guest = tokio::spawn(async move {
+            steer_after_as(&sc, &c, Speaker::person("realopsdu"), true, None, "Side fixes now as one small PR").await
+        });
+        assert!(matches!(ops.await.unwrap(), Some(Steered::Now { .. })), "ops's own words go into their reply");
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(!guest.is_finished(), "the guest's message opened a second reply beside ops's");
+        let mail = std::fs::read_to_string(&f).unwrap_or_default();
+        assert!(!mail.contains("Side fixes now"), "a guest's words rode in the circle's reply: {mail}");
+        // ops's reply ends — the turn, then its task.
+        drop_turn(&s, "c1", &ops_reply).await;
+        drop(a);
+        assert!(guest.await.unwrap().is_none(), "and now the guest's opens, on its own");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// The line, all the way through: two guests and a follow-up behind the
+    /// circle's reply. First come first served, one reply at a time; the
+    /// first guest's second message goes into the first guest's reply once
+    /// it opens — ahead of the other guest, who still can't ride in it — and
+    /// each message tells the room it waits exactly once, naming whose reply
+    /// is running.
+    #[tokio::test(start_paused = true)]
+    async fn guests_behind_the_circles_reply_wait_their_turn_and_join_their_own() {
+        let s: ChatStates = Default::default();
+        let a = arrive(&s, "c1", "mA", None, None).await;
+        assert!(steer_after(&s, &a, "ops", None, "build it").await.is_none());
+        let (t, f0) = turn("ops", None, true);
+        let t = TurnHandle { guest: false, ..t };
+        let ops_reply = t.cancel.clone();
+        register(&s, "dA", t, "mA").await;
+
+        let told: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> = Default::default();
+        // The arrival comes back with the answer: a dispatch task holds it
+        // while it opens and runs its reply, and so does this test.
+        let wait_for = |a: Arrived, who: &'static str, text: &'static str| {
+            let (s, told) = (s.clone(), told.clone());
+            tokio::spawn(async move {
+                let waiting = |running: Option<String>| {
+                    told.lock().unwrap().push((who.to_string(), running));
+                    async {}
+                };
+                let got = steer_in_order(&s, &a, "c1", None, None, Speaker::person(who), Some(true), None, text, "", true, |t| async move { t }, waiting).await;
+                (got, a)
+            })
+        };
+        let r1 = wait_for(arrive(&s, "c1", "mR1", None, None).await, "realopsdu", "R1 side-fix PR");
+        let b1 = wait_for(arrive(&s, "c1", "mB1", None, None).await, "bob", "B1 a question");
+        let r2 = wait_for(arrive(&s, "c1", "mR2", None, None).await, "realopsdu", "R2 and the timeline");
+        let r3 = wait_for(arrive(&s, "c1", "mR3", None, None).await, "realopsdu", "R3 one more thing");
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert!(!r1.is_finished() && !b1.is_finished() && !r2.is_finished() && !r3.is_finished(), "someone got a second reply");
+        let mut seen = told.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [("bob", "ops"), ("realopsdu", "ops"), ("realopsdu", "ops"), ("realopsdu", "ops")]
+                .map(|(w, r)| (w.to_string(), Some(r.to_string()))),
+            "each waiting message says so once, naming the reply it waits behind"
+        );
+
+        // ops's reply ends: the head of the line opens its own, nobody else.
+        drop_turn(&s, "c1", &ops_reply).await;
+        drop(a);
+        let (got, r1_task) = r1.await.unwrap();
+        assert!(got.is_none(), "realopsdu's first message opens its reply");
+        // Opening it takes seconds (config, context, the draft): nobody else
+        // opens one meanwhile.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(!b1.is_finished() && !r2.is_finished() && !r3.is_finished(), "a second reply opened beside realopsdu's");
+        let (t, f1) = turn("realopsdu", None, true);
+        let realops_reply = t.cancel.clone();
+        register(&s, "dR", t, "mR1").await;
+        // Their own reply takes the rest of what they said, in the order said.
+        assert!(matches!(r2.await.unwrap().0, Some(Steered::Now { owner, .. }) if owner == "realopsdu"));
+        assert!(matches!(r3.await.unwrap().0, Some(Steered::Now { owner, .. }) if owner == "realopsdu"));
+        let mail = std::fs::read_to_string(&f1).unwrap();
+        assert!(mail.find("R2 and").unwrap() < mail.find("R3 one").unwrap(), "out of order: {mail}");
+        // bob is a guest too, and not realopsdu: still in line.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert!(!b1.is_finished(), "one guest's words rode in another's reply, or beside it");
+        // realopsdu's reply ends; between its rounds the surface stays theirs.
+        drop_turn(&s, "c1", &realops_reply).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(!b1.is_finished(), "bob's opened between two rounds of realopsdu's reply");
+        drop(r1_task);
+        assert!(b1.await.unwrap().0.is_none(), "bob's opens last");
+        assert_eq!(told.lock().unwrap().len(), 4, "a waiting message announced itself twice");
+        for f in [f0, f1] {
+            let _ = std::fs::remove_file(&f);
+        }
+    }
+
+    /// Payers wait in line too (realopsdu 10-30): a payer's words never ride
+    /// in someone else's reply, where they'd be served free — nor anyone's in
+    /// a billed one, its payer buying someone else's answer — and neither
+    /// opens a reply beside the running one any more.
+    #[tokio::test(start_paused = true)]
+    async fn payers_wait_in_line_both_ways() {
+        let s: ChatStates = Default::default();
+        let a = arrive(&s, "c1", "mA", None, None).await;
+        assert!(steer_after(&s, &a, "ops", None, "free turn").await.is_none());
+        let (t, f0) = turn("ops", None, true);
+        let ops_reply = t.cancel.clone();
+        register(&s, "dA", TurnHandle { guest: false, ..t }, "mA").await;
+        let buyer = Speaker { pays: true, ..Speaker::person("buyer") };
+        let p = arrive(&s, "c1", "mP", None, None).await;
+        let s2 = s.clone();
+        let paid = tokio::spawn(async move { steer_after_as(&s2, &p, buyer, true, None, "a paid question").await });
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert!(!paid.is_finished(), "a payer's reply opened beside a free one");
+        drop_turn(&s, "c1", &ops_reply).await;
+        drop(a);
+        assert!(paid.await.unwrap().is_none());
+        // Its reply is billed: ops's own words wait for it to end.
+        let (t, f1) = turn("buyer", None, true);
+        let paid_reply = t.cancel.clone();
+        register(&s, "dP", TurnHandle { pays: true, ..t }, "mP").await;
+        let o = arrive(&s, "c1", "mO", None, None).await;
+        let s3 = s.clone();
+        let ops = tokio::spawn(async move { steer_after(&s3, &o, "ops", None, "my turn?").await });
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert!(!ops.is_finished(), "a free reply opened beside a billed one");
+        assert!(!std::fs::read_to_string(&f1).unwrap_or_default().contains("my turn?"), "the payer bought ops's answer");
+        drop_turn(&s, "c1", &paid_reply).await;
+        s.lock().await.get_mut("c1").unwrap().arriving.retain(|a| a.trigger != "mP");
+        assert!(ops.await.unwrap().is_none());
+        for f in [f0, f1] {
+            let _ = std::fs::remove_file(&f);
+        }
+    }
+
+    /// A reply nobody's message opened — a background task's update — takes
+    /// the surface the same way: not while one is running there (it is told
+    /// again on the next tick), and once it holds it, a message arriving the
+    /// same instant waits for it instead of opening a second beside it.
+    #[tokio::test(start_paused = true)]
+    async fn an_update_reply_takes_its_place_in_the_line_too() {
+        let (t, f) = turn("ops", None, true);
+        let ops_reply = t.cancel.clone();
+        let s = states(vec![("d1", TurnHandle { guest: false, ..t })]).await;
+        assert!(reserve_surface(&s, "c1", None, None).await.is_none(), "an update reply beside a running one");
+        drop_turn(&s, "c1", &ops_reply).await;
+        let held = reserve_surface(&s, "c1", None, None).await.expect("the surface is free");
+        let m = arrive(&s, "c1", "mG", None, None).await;
+        let s2 = s.clone();
+        let guest = tokio::spawn(async move { steer_after_as(&s2, &m, Speaker::person("stranger"), true, None, "hi").await });
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert!(!guest.is_finished(), "a message opened a reply beside the update's");
+        drop(held);
+        assert!(guest.await.unwrap().is_none());
         let _ = std::fs::remove_file(&f);
     }
 

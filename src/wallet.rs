@@ -98,6 +98,33 @@ fn items(v: &Value) -> Vec<Value> {
     v["items"].as_array().cloned().unwrap_or_default()
 }
 
+/// `walletBalances.passes` that can still pay: active, something left. An
+/// older api sends none.
+fn live_passes(v: &Value) -> Vec<Value> {
+    v["passes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p["state"].as_str() == Some("active") && p["left"].as_i64().unwrap_or(0) > 0)
+        .collect()
+}
+
+/// One Pass as a line: "Premium Pass  $8.40 of $10.00 left" when it was sold
+/// at a face value, else what's left in its own units.
+fn pass_line(p: &Value) -> String {
+    let title = p["title"].as_str().unwrap_or("Pass");
+    let money = |c: i64| format!("${}.{:02}", c / 100, c % 100);
+    match (p["left_usd_cents"].as_i64(), p["face_usd_cents"].as_i64()) {
+        (Some(left), Some(face)) => format!("{title:<14}  {} of {} left", money(left), money(face)),
+        _ => format!(
+            "{title:<14}  {} {} left",
+            fmt(p["left"].as_i64().unwrap_or(0)),
+            p["currency"].as_str().unwrap_or("?")
+        ),
+    }
+}
+
 /// Each currency's own unit ("token", "second"), from `walletRates`. A failed
 /// call is no units, and every amount then reads as tokens.
 async fn units_of(client: &Client) -> std::collections::HashMap<String, String> {
@@ -135,7 +162,8 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
         WalletCmd::Balance => {
             let r = client.call("walletBalances", json!({})).await?;
             let rows = items(&r);
-            if rows.is_empty() {
+            let passes = live_passes(&r);
+            if rows.is_empty() && passes.is_empty() {
                 println!("(empty — ask a friend for a transfer, e.g. `mafold wallet transfer @you 1M claude-fable-5`)");
                 return Ok(());
             }
@@ -145,6 +173,14 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                     fmt(b["amount"].as_i64().unwrap_or(0)),
                     b["currency"].as_str().unwrap_or("?")
                 );
+            }
+            // Passes after the balances, apart: only you can spend them, and
+            // `transfer` / `convert` never see them.
+            if !passes.is_empty() {
+                println!("\n  Passes (only you can spend them; they pay first and can't be sent)");
+                for p in passes {
+                    println!("  {}", pass_line(&p));
+                }
             }
         }
         WalletCmd::Transfer {
@@ -294,6 +330,23 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wallet holding only a Pass isn't empty, and a Pass reads in the
+    /// dollars it was sold for.
+    #[test]
+    fn passes_print_apart_and_at_their_face() {
+        let r = json!({ "items": [], "passes": [
+            { "title": "Premium Pass", "state": "active", "left": 700000, "currency": "gpt-5.6-terra", "left_usd_cents": 840, "face_usd_cents": 1000 },
+            { "title": "Kimi Pass", "state": "active", "left": 47600, "currency": "kimi-k3" },
+            { "title": "Premium Pass", "state": "ended", "left": 0, "currency": "gpt-5.6-terra" },
+        ]});
+        let live = live_passes(&r);
+        assert_eq!(live.len(), 2);
+        assert_eq!(pass_line(&live[0]), "Premium Pass    $8.40 of $10.00 left");
+        assert!(pass_line(&live[1]).starts_with("Kimi Pass       "), "{}", pass_line(&live[1]));
+        assert!(pass_line(&live[1]).ends_with("kimi-k3 left"));
+        assert!(live_passes(&json!({ "items": [] })).is_empty(), "an older api sends none");
+    }
 
     #[test]
     fn amounts_read_exactly_what_the_wallet_prints() {

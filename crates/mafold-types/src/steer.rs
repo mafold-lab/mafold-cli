@@ -64,7 +64,10 @@ pub fn on_surface<K: PartialEq + ?Sized>(
     turn_thread == thread && (turn_thread.is_some() || turn_channel == channel)
 }
 
-/// The running turn a message belongs in, or None for a turn of its own.
+/// The running turn a message belongs in, or None for a turn of its own —
+/// which never runs BESIDE one on its surface: it waits in line and opens
+/// when the surface is free (the daemon's `steer_in_order`, the api's
+/// `LiveTurns::route`; realopsdu 10-30 — one reply per surface at a time).
 ///
 /// 1. The turn it REPLIES to, when that is the sender's own — explicit, and
 ///    the only way to pick between two of their own turns. From any surface.
@@ -210,6 +213,20 @@ pub fn background_line(
         (None, false) => String::new(),
     };
     Some(format!("@{who}{note}: {body}"))
+}
+
+/// A message addressed TO the agent that waits in line for a reply of its own
+/// — one [`pick`] keeps out of the running turn (someone outside the owner's
+/// circle, a payer, anyone's into a billed turn). The running turn hears it as
+/// background, saying so: it must not answer it or act on it, and must not
+/// tell the room that somebody else has it either — its reply is next, and
+/// it is this agent's. `line` is its [`background_line`].
+pub fn waiting_line(line: &str) -> String {
+    format!(
+        "{}\n[↑ Addressed to you, but waiting in line: it gets a reply of its own, from you, as soon as \
+this one ends. Leave it for that reply — don't answer it or act on it here.]",
+        line.trim()
+    )
 }
 
 /// The room's background block. Worded like the RECENT CONVERSATION block a
