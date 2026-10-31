@@ -651,6 +651,18 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
 
 async fn providers(client: &Client) -> Result<()> {
     let rows = registry(client).await?;
+    // A row behind a flag, only where that flag is on for this account — what
+    // the web and the phone offer (`offeredProviders`), and what
+    // `putConnection` takes. No answer ⇒ the flags' defaults.
+    let flags = client
+        .call("getFlags", json!({}))
+        .await
+        .ok()
+        .and_then(|v| serde_json::from_value::<mafold_core::mafold_types::FlagState>(v).ok())
+        .map(|s| s.values)
+        .unwrap_or_default();
+    let on = |f: &str| flags.get(f).copied().unwrap_or_else(|| mafold_core::flags::prod_default(f));
+    let rows: Vec<ProviderInfo> = rows.into_iter().filter(|p| p.flag.as_deref().is_none_or(on)).collect();
     println!("{:<20} {:<26} {:<8} {}", "ID", "PROVIDER", "AUTH", "LINK VIA");
     for p in &rows {
         let how = match (p.import_path.as_deref(), p.env_var.as_deref()) {

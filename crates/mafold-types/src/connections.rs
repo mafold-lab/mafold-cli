@@ -210,8 +210,9 @@ pub struct ProviderSpec {
     /// A flag that must be on for the account before any surface offers this
     /// provider (`mafold_types::flags`). The pack goes live on every client the
     /// moment it is published — no release in between — so a provider still
-    /// behind a flag rides in it named, and the clients and `putConnection`
-    /// hold it back. `None` for everything shipped to all.
+    /// behind a flag rides in pack 2 named, and the clients and `putConnection`
+    /// hold it back. Pack 1 leaves it out: the clients that read it can't
+    /// ([`PACK_V1`]). `None` for everything shipped to all.
     pub flag: Option<&'static str>,
 }
 
@@ -907,6 +908,30 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         flag: None,
         oauth_client: None,
     },
+    // The key to someone's OpenCode Go plan. Mafold Harness and their own
+    // OpenCode run on it: the computer opens it for each reply
+    // (`connection::open_owner_key` reads `api_key`). Go has no sign-in a
+    // browser or a machine could run, so this is a paste — once, here.
+    ProviderSpec {
+        id: "opencode-go",
+        display: "OpenCode Go",
+        blurb: "Your OpenCode Go plan, for Mafold Harness and OpenCode agents",
+        badge: "opencode",
+        kind: ProviderKind::ApiKey,
+        fields: API_KEY,
+        import_path: None,
+        // What OpenCode itself reads the key from (models.dev, `opencode-go`).
+        env_var: Some("OPENCODE_API_KEY"),
+        auth: BEARER_API_KEY,
+        oauth_capable: false,
+        // Where Go's own docs send you for the key: sign in, subscribe, copy it.
+        help_url: Some("https://opencode.ai/console"),
+        mcp_url: None,
+        native_api: None,
+        device_bound: false,
+        flag: Some("openCodeGo"),
+        oauth_client: None,
+    },
     ProviderSpec {
         id: "codex-oauth",
         display: "Codex (OAuth)",
@@ -1416,18 +1441,88 @@ impl ProviderInfo {
 /// one that sends a device's decrypted credential somewhere new.
 pub const PACK_PUBLIC_KEY_B64: &str = "5p8gk69DfUBrwm4TYeisbc86ZqfjplSsfSZcL5HVbBU=";
 
+/// The two shapes a pack is published in. Every publish signs both, under one
+/// version; a client says which it reads (`getConnectionProviders { pack }`).
+///
+/// **Pack 1 is what every client before 10-31 reads, and it never changes
+/// shape.** Those clients check the signature over their OWN re-serialisation
+/// of the rows, so a row carrying a key their `ProviderInfo` doesn't have comes
+/// out different, the check fails, and they refuse the whole registry — every
+/// connection on the device stops, not just the new row. `flag` (#1364) was the
+/// first such key. Pack 1 therefore carries only the rows [`v1_can_carry`]
+/// passes, which also keeps a row behind a flag away from clients that could
+/// not hold it back.
+///
+/// **Pack 2 carries every row, checked over the JSON exactly as it arrived**
+/// ([`pack_digest`] over the raw rows), and the reader then takes the fields it
+/// knows. A key added later costs a pack-2 client nothing.
+pub const PACK_V1: u32 = 1;
+pub const PACK_V2: u32 = 2;
+
 /// A published registry, exactly as it travels and is stored.
 ///
 /// The signature belongs to the pack rather than to the transport, so the same
-/// three fields are what CI signs, what the api keeps, and what a client
-/// verifies. A server that stored the rows without the signature would have to
-/// be trusted to re-attest them, which is the trust this design removes.
+/// fields are what CI signs, what the api keeps, and what a client verifies. A
+/// server that stored the rows without the signature would have to be trusted
+/// to re-attest them, which is the trust this design removes.
+///
+/// The rows are RAW JSON: the api stores and serves them byte for byte, so a
+/// key its own build doesn't know yet still reaches the clients that do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderPack {
+    /// [`PACK_V1`] or [`PACK_V2`]. Absent ⇒ 1: every pack stored or served
+    /// before pack 2 existed was written without it.
+    #[serde(default = "pack_v1", skip_serializing_if = "is_pack_v1")]
+    pub pack: u32,
     pub version: u32,
-    pub providers: Vec<ProviderInfo>,
-    /// Base64 raw Ed25519 over [`providers_digest`].
+    pub providers: Vec<serde_json::Value>,
+    /// Base64 raw Ed25519 over [`pack_digest`].
     pub signature: String,
+}
+
+fn pack_v1() -> u32 {
+    PACK_V1
+}
+
+fn is_pack_v1(p: &u32) -> bool {
+    *p == PACK_V1
+}
+
+/// The registry's rows as the JSON a pack carries.
+pub fn provider_rows(providers: &[ProviderInfo]) -> Vec<serde_json::Value> {
+    providers.iter().map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null)).collect()
+}
+
+/// The rows pack 1 carries: the ones a client from before pack 2 takes whole.
+pub fn v1_rows(providers: &[ProviderInfo]) -> Vec<ProviderInfo> {
+    providers.iter().filter(|p| serde_json::to_value(p).is_ok_and(|row| v1_can_carry(&row))).cloned().collect()
+}
+
+/// Every key a client from before pack 2 knows, as `ProviderInfo` and its parts
+/// stood when `flag` was added (d708fe36) — minus `flag`.
+const V1_ROW_KEYS: &[&str] = &[
+    "id", "display", "blurb", "badge", "kind", "fields", "payload_keys", "help_url", "oauth", "mcp_url",
+    "browser_linkable", "device_link", "oauth_fixed", "auth", "import_path", "env_var", "native_api",
+];
+const V1_FIELD_KEYS: &[&str] = &["key", "label", "required"];
+const V1_AUTH_KEYS: &[&str] = &["header", "prefix", "field"];
+const V1_FIXED_KEYS: &[&str] = &["client_id", "authorize_url", "token_endpoint", "redirect_uri", "scopes", "extra_params"];
+const V1_KINDS: &[&str] = &["api-key", "o-auth"];
+
+/// Whether a row can ride in pack 1: every key in it, at every level, is one a
+/// client from before pack 2 re-serialises, and its `kind` is one it can parse.
+/// A row behind a flag never can (`flag` is not such a key), which is what
+/// keeps it away from clients that would show it to everyone.
+pub fn v1_can_carry(row: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    fn only(v: &Value, keys: &[&str]) -> bool {
+        v.as_object().is_some_and(|o| o.keys().all(|k| keys.contains(&k.as_str())))
+    }
+    only(row, V1_ROW_KEYS)
+        && row["kind"].as_str().is_some_and(|k| V1_KINDS.contains(&k))
+        && only(&row["auth"], V1_AUTH_KEYS)
+        && row["fields"].as_array().is_some_and(|fs| fs.iter().all(|f| only(f, V1_FIELD_KEYS)))
+        && row.get("oauth_fixed").map_or(true, |f| only(f, V1_FIXED_KEYS))
 }
 
 /// A content hash of the whole provider pack.
@@ -1437,7 +1532,13 @@ pub struct ProviderPack {
 /// prove it changed something. Canonicalised by hand for the same reason —
 /// `serde_json`'s `preserve_order` is a build-graph-wide flag we do not control.
 pub fn providers_checksum(providers: &[ProviderInfo]) -> String {
-    crate::fnv1a_hex(providers_canonical(providers).as_bytes())
+    rows_checksum(&provider_rows(providers))
+}
+
+/// [`providers_checksum`] over rows as they arrived — what a pack-2 reader,
+/// which may hold keys its build doesn't know, asks "still current?" with.
+pub fn rows_checksum(rows: &[serde_json::Value]) -> String {
+    crate::fnv1a_hex(rows_canonical(rows).as_bytes())
 }
 
 /// The exact bytes every party agrees the pack "is".
@@ -1447,13 +1548,17 @@ pub fn providers_checksum(providers: &[ProviderInfo]) -> String {
 /// would produce a pack that verifies nowhere and a bug that looks like key
 /// mismatch.
 pub fn providers_canonical(providers: &[ProviderInfo]) -> String {
-    let value = serde_json::to_value(providers).unwrap_or(serde_json::Value::Null);
+    rows_canonical(&provider_rows(providers))
+}
+
+fn rows_canonical(rows: &[serde_json::Value]) -> String {
     let mut canonical = String::new();
-    crate::canon_json(&value, &mut canonical);
+    crate::canon_json(&serde_json::Value::Array(rows.to_vec()), &mut canonical);
     canonical
 }
 
-/// What a publish SIGNS: SHA-256 over the version and the canonical pack.
+/// What a publish SIGNS: SHA-256 over the pack's shape, its version and its
+/// canonical rows.
 ///
 /// Deliberately not [`providers_checksum`], which is FNV — fine for "did this
 /// change?", useless against someone choosing what it changes to. A pack tells
@@ -1461,15 +1566,22 @@ pub fn providers_canonical(providers: &[ProviderInfo]) -> String {
 /// signature has to be one an attacker cannot aim.
 ///
 /// The version is inside the digest so a valid old signature cannot be replayed
-/// over a newer pack number to make a downgrade look current.
-pub fn providers_digest(version: u32, providers: &[ProviderInfo]) -> [u8; 32] {
+/// over a newer pack number to make a downgrade look current; the shape is in
+/// its first line, so a signature never passes for the other pack.
+pub fn pack_digest(pack: u32, version: u32, rows: &[serde_json::Value]) -> [u8; 32] {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    h.update(b"mafold-provider-pack-v1\n");
+    h.update(format!("mafold-provider-pack-v{pack}\n").as_bytes());
     h.update(version.to_string().as_bytes());
     h.update(b"\n");
-    h.update(providers_canonical(providers).as_bytes());
+    h.update(rows_canonical(rows).as_bytes());
     h.finalize().into()
+}
+
+/// [`pack_digest`] of pack 1, over typed rows — the check every client before
+/// pack 2 makes, kept so tests can make it too.
+pub fn providers_digest(version: u32, providers: &[ProviderInfo]) -> [u8; 32] {
+    pack_digest(PACK_V1, version, &provider_rows(providers))
 }
 
 /// [`AuthStyle`], owned — the form that survives a trip through the cloud.
@@ -1706,6 +1818,7 @@ mod tests {
                 "openai-api",
                 "secret",
                 "dashscope",
+                "opencode-go",
                 "codex-oauth",
                 "notion",
                 "figma",
@@ -2247,6 +2360,131 @@ mod tests {
         assert_ne!(rehomed[0].auth.header, "X-Exfiltrate", "pick a header it does not already use");
         rehomed[0].auth.header = "X-Exfiltrate".into();
         assert_ne!(sum, providers_checksum(&rehomed), "an auth swap must change the digest too");
+    }
+
+    /// `ProviderInfo` as every client from before pack 2 has it: d708fe36's,
+    /// minus `flag` — what such a client parses a pack into and re-serialises
+    /// to check the signature.
+    #[derive(Serialize, Deserialize)]
+    struct ClientBeforePack2 {
+        id: String,
+        display: String,
+        blurb: String,
+        badge: String,
+        kind: ProviderKind,
+        fields: Vec<SecretFieldInfo>,
+        payload_keys: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        help_url: Option<String>,
+        oauth: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mcp_url: Option<String>,
+        browser_linkable: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        device_link: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oauth_fixed: Option<FixedClientInfo>,
+        auth: AuthInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_api: Option<String>,
+    }
+
+    /// The digest such a client computes over the rows it was sent.
+    fn digest_before_pack2(version: u32, rows: &[serde_json::Value]) -> [u8; 32] {
+        let reread: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| serde_json::to_value(serde_json::from_value::<ClientBeforePack2>(r.clone()).unwrap()).unwrap())
+            .collect();
+        pack_digest(PACK_V1, version, &reread)
+    }
+
+    /// The 10-31 bug, as a test: one row behind a flag in the pack, and a
+    /// client from before pack 2 computes a different digest — so it refuses
+    /// the whole registry. Pack 1 is what it reads, and pack 1 verifies for it.
+    #[test]
+    fn pack_1_is_one_a_client_before_pack_2_verifies() {
+        let all = provider_infos();
+        let rows = provider_rows(&all);
+        assert!(all.iter().any(|p| p.flag.is_some()), "the positive control needs a row behind a flag");
+        assert_ne!(
+            digest_before_pack2(7, &rows),
+            pack_digest(PACK_V1, 7, &rows),
+            "every row in one pack: an old client's check fails (the bug pack 1 exists for)"
+        );
+        let v1 = provider_rows(&v1_rows(&all));
+        assert_eq!(digest_before_pack2(7, &v1), pack_digest(PACK_V1, 7, &v1), "pack 1 verifies for it");
+        assert_eq!(providers_digest(7, &v1_rows(&all)), pack_digest(PACK_V1, 7, &v1));
+    }
+
+    /// Pack 1 leaves out a row only because an old client couldn't take it:
+    /// today that is exactly the rows behind a flag. A key added to a row that
+    /// is open to all would make pack 1 drop that row, and every client before
+    /// pack 2 lose the provider — so it fails here first. Keep new keys off
+    /// such rows (`skip_serializing_if`), or show why losing it is right.
+    #[test]
+    fn pack_1_leaves_out_exactly_the_rows_behind_a_flag() {
+        let all = provider_infos();
+        let kept: Vec<String> = v1_rows(&all).into_iter().map(|p| p.id).collect();
+        let open: Vec<String> = all.iter().filter(|p| p.flag.is_none()).map(|p| p.id.clone()).collect();
+        assert_eq!(kept, open);
+        assert!(!kept.contains(&"opencode-go".to_string()), "the Go row waits behind openCodeGo");
+    }
+
+    /// The digest pack 1 has always been signed with, spelled out: if this
+    /// moved, every pack CI signs would fail on every client in the field.
+    #[test]
+    fn pack_1_digest_is_the_one_clients_already_check() {
+        use sha2::Digest;
+        let v1 = v1_rows(&provider_infos());
+        let mut h = sha2::Sha256::new();
+        h.update(format!("mafold-provider-pack-v1\n42\n{}", providers_canonical(&v1)).as_bytes());
+        let then: [u8; 32] = h.finalize().into();
+        assert_eq!(providers_digest(42, &v1), then);
+    }
+
+    /// A signature is over one shape: pack 1's never passes for pack 2's, or
+    /// the other way round, even over the same rows.
+    #[test]
+    fn a_signature_belongs_to_one_pack() {
+        let rows = provider_rows(&v1_rows(&provider_infos()));
+        assert_ne!(pack_digest(PACK_V1, 3, &rows), pack_digest(PACK_V2, 3, &rows));
+    }
+
+    #[test]
+    fn what_pack_1_can_carry() {
+        let row = serde_json::to_value(provider_infos().into_iter().find(|p| p.id == "notion").unwrap()).unwrap();
+        assert!(v1_can_carry(&row));
+        let with = |path: &[&str], v: serde_json::Value| {
+            let mut r = row.clone();
+            let mut at = &mut r;
+            for p in &path[..path.len() - 1] {
+                at = &mut at[*p];
+            }
+            at[path[path.len() - 1]] = v;
+            r
+        };
+        assert!(!v1_can_carry(&with(&["flag"], "openCodeGo".into())), "a flag: an old client would offer it to all");
+        assert!(!v1_can_carry(&with(&["transport"], "sse".into())), "a key old clients don't know");
+        assert!(!v1_can_carry(&with(&["auth", "scheme"], "x".into())), "nested ones too");
+        assert!(!v1_can_carry(&with(&["kind"], "device".into())), "a kind old clients can't parse");
+        let mut field = row.clone();
+        field["fields"] = serde_json::json!([{ "key": "k", "label": "K", "required": true, "secret": true }]);
+        assert!(!v1_can_carry(&field), "a field's keys too");
+    }
+
+    /// Stored and served packs from before pack 2 have no `pack`: they are 1.
+    /// Pack 1 is still written without it; pack 2 says so.
+    #[test]
+    fn a_pack_without_a_shape_is_pack_1() {
+        let old: ProviderPack = serde_json::from_str(r#"{"version":9,"providers":[],"signature":"s"}"#).unwrap();
+        assert_eq!(old.pack, PACK_V1);
+        assert!(serde_json::to_value(&old).unwrap().get("pack").is_none());
+        let two = ProviderPack { pack: PACK_V2, ..old };
+        assert_eq!(serde_json::to_value(&two).unwrap()["pack"], 2);
     }
 
     /// `client_id` is the only key the broker has to find a row by, because the
