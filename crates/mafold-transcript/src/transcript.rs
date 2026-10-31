@@ -189,6 +189,52 @@ mod stats_tests {
         assert!(data["input_tokens"].is_null());
         assert!(data["captured_at_ms"].as_u64().unwrap() > 0);
     }
+    /// A wallet reply's card carries what the ledger charged, per currency,
+    /// and no dollar figure of the runtime's own — not one it streamed, not
+    /// one it reported at Done (PR 4c, 10-31).
+    #[test]
+    fn a_wallet_reply_carries_the_ledgers_charge_and_no_runtime_price() {
+        use crate::WalletCharge;
+        let mut tx = Transcript::new();
+        tx.push(&AgentEvent::Stats(RunStats {
+            cost_usd: Some(0.42),
+            cost_kind: Some("estimated".into()),
+            total_tokens: Some(9000),
+            ..Default::default()
+        }));
+        tx.push(&AgentEvent::Stats(RunStats {
+            wallet: Some(vec![
+                WalletCharge { currency: "deepseek-v4-flash".into(), charged: 1234 },
+                WalletCharge { currency: "deepseek-v4-pro".into(), charged: 56 },
+            ]),
+            wallet_partial: Some(true),
+            ..Default::default()
+        }));
+        tx.push(&AgentEvent::Done { duration_ms: Some(1000.0), cost_usd: Some(0.5), tokens: None });
+        let md = tx.snapshot();
+        let result = &md[md.rfind("{% mafold/result").unwrap()..];
+        let (tag, rest) = result.split_once("%}").unwrap();
+        assert!(!tag.contains("cost="), "no dollar attribute: {tag}");
+        let data: Value = serde_json::from_str(rest.split("{% /mafold/result %}").next().unwrap()).unwrap();
+        assert_eq!(
+            data["wallet"],
+            json!([{"currency":"deepseek-v4-flash","charged":1234},{"currency":"deepseek-v4-pro","charged":56}])
+        );
+        assert_eq!(data["wallet_partial"], true);
+        assert!(data["cost_usd"].is_null() && data["cost_kind"].is_null(), "{data}");
+        assert_eq!(data["total_tokens"], 9000, "the rest of the stats are untouched");
+    }
+
+    /// Every other turn's body reads exactly as before: no wallet keys at all.
+    #[test]
+    fn a_turn_off_the_wallet_has_no_wallet_keys() {
+        let mut tx = Transcript::new();
+        tx.push(&AgentEvent::Stats(RunStats { cost_usd: Some(0.42), ..Default::default() }));
+        let data = details(&mut tx);
+        assert!(data.get("wallet").is_none() && data.get("wallet_partial").is_none(), "{data}");
+        assert_eq!(data["cost_usd"], 0.42);
+    }
+
     #[test]
     fn unknown_tool_outcome_does_not_claim_zero_failures() {
         let mut tx = Transcript::new();
@@ -487,6 +533,13 @@ impl Transcript {
                     stats.cost_usd = cost_usd.or(stats.cost_usd);
                     if stats.cost_usd.is_some() && stats.cost_kind.is_none() {
                         stats.cost_kind = Some("reported".into());
+                    }
+                    // A wallet reply's bill is `wallet`, the ledger's figure. The
+                    // runtime's own dollar estimate would be a second, different
+                    // price for the same reply, so it isn't written at all.
+                    if stats.wallet.is_some() {
+                        stats.cost_usd = None;
+                        stats.cost_kind = None;
                     }
                     stats.total_tokens = stats.total_tokens.or(*tokens);
                     stats.first_text_ms = stats.first_text_ms.or(self.first_text_ms);

@@ -59,6 +59,62 @@ pub struct MessageOrigin {
     pub open: bool,
 }
 
+/// A wallet agent's key for ONE reply (`mintReplyKey`, PR 4b/4c 10-31): a
+/// router key scoped to the reply's draft, to `models` and to six hours, and
+/// dead once the reply is finalized. It reaches the harness through the turn's
+/// env and nowhere else, so its Debug never prints it: one `{:?}` in a log
+/// line would put the owner's wallet in a file.
+#[derive(Clone, serde::Deserialize)]
+pub struct ReplyKey {
+    pub key: String,
+    /// Unix seconds; the router refuses it from then on.
+    #[serde(default)]
+    pub expires_at: i64,
+    /// The models it may call — what the router serves on chat completions
+    /// and the wallet prices; the server says, never a list kept here.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// The OpenAI-compatible router base, ending in `/v1`.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl std::fmt::Debug for ReplyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyKey")
+            .field("key", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("models", &self.models)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+/// What a reply has charged its owner's wallet so far (`getReplyCost`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct ReplyCost {
+    /// Settled charges, per currency.
+    pub totals: Vec<mafold_transcript::WalletCharge>,
+    /// Settled calls.
+    pub calls: u64,
+    /// Holds not settled or released yet: the router's settle can land a few
+    /// seconds after the stream ends, so the final figure waits for 0.
+    pub in_flight: u64,
+}
+
+/// The server's own words for a refusal — the envelope's `description`,
+/// without the `"<method> failed"` wrapper `post` puts round every error. The
+/// wallet calls' refusals are written for the error card
+/// (`mafold_transcript::failure`: grant / cap / owner-only), so they go into it
+/// as they came. A transport failure keeps its whole chain.
+fn server_words(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<mafold_core::RpcError>() {
+        Some(re @ mafold_core::RpcError::Api(_)) => anyhow::anyhow!("{re}"),
+        _ => e,
+    }
+}
+
 /// Where a message goes. In a forum the conversation is only HALF an address:
 /// the channel, the thread it hangs under and the message it answers each narrow
 /// it further, and every one of them is part of "reply where you were asked".
@@ -296,6 +352,36 @@ impl Client {
     pub async fn message_origin(&self, message_id: &str) -> Result<MessageOrigin> {
         let v = self.post("messageOrigin", json!({ "message_id": message_id })).await?;
         Ok(MessageOrigin { person: v["origin"].as_str().map(str::to_lowercase), open: v["open"].as_bool().unwrap_or(false) })
+    }
+
+    /// The one-reply wallet key for `draft` ([`ReplyKey`]), asked with the bot
+    /// token. Retried on transport failures only: the server answers the same
+    /// draft with the same live key, so a repeat is harmless, and a refusal
+    /// (guest, no grant, cap, flag) is a verdict that comes back in the
+    /// server's words ([`server_words`]).
+    pub async fn mint_reply_key(&self, draft: &str) -> Result<ReplyKey> {
+        let v = self
+            .post_idempotent("mintReplyKey", json!({ "message_id": draft }))
+            .await
+            .map_err(server_words)?;
+        // Not serde's message: a wrong-typed field is quoted in it, and the
+        // field could be the key.
+        let key: ReplyKey = serde_json::from_value(v)
+            .map_err(|_| anyhow::anyhow!("mintReplyKey answered in a shape this client can't read"))?;
+        if key.key.trim().is_empty() || key.base_url.trim().is_empty() {
+            anyhow::bail!("mintReplyKey answered without a key or a router base");
+        }
+        Ok(key)
+    }
+
+    /// What `draft`'s wallet calls have charged so far ([`ReplyCost`]). One
+    /// attempt: the caller polls.
+    pub async fn reply_cost(&self, draft: &str) -> Result<ReplyCost> {
+        let v = self
+            .post("getReplyCost", json!({ "message_id": draft }))
+            .await
+            .map_err(server_words)?;
+        serde_json::from_value(v).context("getReplyCost answered in a shape this client can't read")
     }
 
     /// `getMe`, but with an AUTH REJECTION (401/403 — token revoked / bot

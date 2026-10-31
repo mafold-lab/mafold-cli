@@ -106,6 +106,42 @@ mod imp {
         None
     }
 
+    /// [`pid_start`] — what a journal keeps of a process it names, to tell it
+    /// from a later one handed the same pid.
+    pub fn start_token(pid: u32) -> Option<u64> {
+        pid_start(pid)
+    }
+
+    /// The program `pid` is running, when this process may ask. A binary
+    /// replaced on disk since it started still names its old path.
+    #[cfg(target_os = "linux")]
+    pub fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
+        let p = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(was) => Some(std::path::PathBuf::from(was)),
+            None => Some(p),
+        }
+    }
+
+    /// The program `pid` is running, when this process may ask.
+    #[cfg(target_os = "macos")]
+    pub fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the kernel writes at most `buf.len()` bytes and returns how many.
+        let n = unsafe { libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if n <= 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn exe_of(_pid: u32) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// When this machine last booted, epoch seconds.
     #[cfg(target_os = "linux")]
     pub fn boot_time() -> Option<i64> {
@@ -253,6 +289,39 @@ mod imp {
     /// exit receipt, and that answers before any pid is asked.
     pub fn pid_start(_pid: u32) -> Option<u64> {
         None
+    }
+
+    /// When `pid` started (FILETIME ticks) — what a journal keeps of a
+    /// process it names, to tell it from a later one handed the same pid,
+    /// which Windows does soon and often.
+    pub fn start_token(pid: u32) -> Option<u64> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let t = started_of(h);
+            CloseHandle(h);
+            (t != 0).then_some(t)
+        }
+    }
+
+    /// The program `pid` is running, when this process may ask.
+    pub fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = vec![0u16; 32 * 1024];
+            let mut len = buf.len() as u32;
+            // 0 = PROCESS_NAME_WIN32: a `C:\…` path, not a device path.
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0;
+            CloseHandle(h);
+            ok.then(|| std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize])))
+        }
     }
 
     /// No process groups to ask: as above, the receipt answers.

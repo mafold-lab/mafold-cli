@@ -1,7 +1,8 @@
 //! Harness abstraction — the pluggable coding-agent backend a daemon drives.
 //!
-//! Implemented harnesses: **Claude Code**, **Codex**, and **Kimi Code**; planned:
-//! `opencode`, `openclaw`. Each harness knows how to invoke its CLI headlessly and
+//! Implemented harnesses: **Claude Code**, **Codex**, **Kimi Code**, and
+//! **OpenCode** (Mafold Harness, on the wallet); planned: `openclaw`. Each
+//! harness knows how to invoke its CLI headlessly and
 //! normalize that CLI's output into [`AgentEvent`]s. The renderer (`crate::render`) turns
 //! those events into chat text + cards, so card rendering is identical across
 //! harnesses — a new harness only has to emit the common event stream.
@@ -18,6 +19,8 @@ mod codex_stats;
 #[allow(dead_code)]
 pub mod codex_app_server;
 pub mod kimi_code;
+pub mod opencode;
+pub mod opencode_pin;
 pub mod unsupported;
 
 use async_trait::async_trait;
@@ -829,16 +832,17 @@ pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw", "ki
 pub const DEFAULT: &str = "claude-code";
 
 /// Resolve a harness by id (case/alias tolerant). No id means the default,
-/// Claude Code. Any other id this build can't drive — `opencode` and
-/// `openclaw` today, or a name it has never heard of — gets
-/// [`unsupported::Unsupported`], which keeps the id and refuses every turn.
-/// It used to get Claude Code: an agent set to OpenCode then answered as
-/// Claude Code on the machine's Claude login, and nobody could tell (10-29).
+/// Claude Code. Any other id this build can't drive — `openclaw` today, or a
+/// name it has never heard of — gets [`unsupported::Unsupported`], which
+/// keeps the id and refuses every turn. It used to get Claude Code: an agent
+/// set to OpenCode then answered as Claude Code on the machine's Claude
+/// login, and nobody could tell (10-29).
 pub fn select(id: &str) -> Arc<dyn Harness> {
     match id.trim().to_lowercase().as_str() {
         "claude-code" | "claude" | "claudecode" | "" => Arc::new(claude_code::ClaudeCode),
         "codex" | "codex-cli" => Arc::new(codex::Codex),
         "kimi-code" | "kimi" | "kimi-cli" | "kimicode" => Arc::new(kimi_code::KimiCode),
+        "opencode" | "open-code" => Arc::new(opencode::OpenCode),
         other => Arc::new(unsupported::Unsupported { id: intern(other) }),
     }
 }
@@ -860,20 +864,51 @@ fn intern(id: &str) -> &'static str {
     k
 }
 
+/// Where a harness's CLI is looked for when asking whether it's installed.
+#[derive(Clone, Copy)]
+enum Bin {
+    /// The vendor's own install, on `$PATH` under this name.
+    OnPath(&'static str),
+    /// A build Mafold pins and installs itself, at the one path it installs
+    /// to — so a same-named CLI the user put on PATH, any version, never
+    /// passes for it. Its version is the pin's: only a build that matched
+    /// the pinned hash and said so is ever put there (`opencode_pin`).
+    Pinned { path: fn() -> PathBuf, version: &'static str },
+}
+
+impl Bin {
+    /// What [`resolve`] / [`program`] are handed: the name, or the path.
+    fn program(self) -> String {
+        match self {
+            Bin::OnPath(bin) => bin.to_string(),
+            Bin::Pinned { path, .. } => path().to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Its version, for an installed one.
+    fn version(self) -> Option<String> {
+        match self {
+            Bin::OnPath(bin) => bin_version(bin),
+            Bin::Pinned { version, .. } => Some(version.to_string()),
+        }
+    }
+}
+
 // (harness id, the CLI binary whose presence signals it's installed)
-const BINS: &[(&str, &str)] = &[
-    ("claude-code", "claude"),
-    ("opencode", "opencode"),
-    ("codex", "codex"),
-    ("openclaw", "openclaw"),
-    ("kimi-code", "kimi"),
+const BINS: &[(&str, Bin)] = &[
+    ("claude-code", Bin::OnPath("claude")),
+    ("opencode", Bin::Pinned { path: opencode_pin::binary, version: opencode_pin::VERSION }),
+    ("codex", Bin::OnPath("codex")),
+    ("openclaw", Bin::OnPath("openclaw")),
+    ("kimi-code", Bin::OnPath("kimi")),
 ];
 
 /// Probe which known harnesses are installed on THIS machine (their CLI is on
-/// PATH) — the control plane's capability report for New-Bot recommendation.
-/// Returns `(id, available)`. Extend `BINS` as more harness impls land.
+/// PATH, or Mafold's pinned build is in place) — the control plane's
+/// capability report for New-Bot recommendation. Returns `(id, available)`.
+/// Extend `BINS` as more harness impls land.
 pub fn probe() -> Vec<(&'static str, bool)> {
-    BINS.iter().map(|(id, bin)| (*id, on_path(bin))).collect()
+    BINS.iter().map(|(id, bin)| (*id, on_path(&bin.program()))).collect()
 }
 
 /// `probe_with_versions` cache: version probes spawn subprocesses, so results
@@ -898,7 +933,7 @@ pub fn probe_with_versions() -> Vec<(&'static str, bool, Option<String>)> {
     if !fresh {
         let mut m = std::collections::HashMap::new();
         for ((id, bin), (_, ok)) in BINS.iter().zip(&avail) {
-            m.insert(*id, if *ok { bin_version(bin) } else { None });
+            m.insert(*id, if *ok { bin.version() } else { None });
         }
         *guard = Some((std::time::Instant::now(), m));
     }
@@ -1567,10 +1602,10 @@ mod select_tests {
     /// which is what `reportHarnesses` sends as `runs`.
     #[test]
     fn a_runtime_says_whether_mafold_can_run_it() {
-        for id in ["claude-code", "codex", "kimi-code"] {
+        for id in ["claude-code", "codex", "kimi-code", "opencode"] {
             assert!(select(id).runs(), "{id}");
         }
-        for id in ["opencode", "openclaw", "some-new-thing"] {
+        for id in ["openclaw", "some-new-thing"] {
             assert!(!select(id).runs(), "{id}");
             assert!(!select(id).available(), "{id}: nothing here can run it, installed or not");
         }
@@ -1578,6 +1613,22 @@ mod select_tests {
         assert_eq!(select("").id(), "claude-code");
         assert_eq!(select(" Claude ").id(), "claude-code");
         assert_eq!(select("kimi").id(), "kimi-code");
+        assert_eq!(select("open-code").id(), "opencode");
+    }
+
+    /// OpenCode is installed when Mafold's pinned build is — the binary the
+    /// harness starts, reported at the pin's version — and an `opencode` the
+    /// user has on PATH never counts.
+    #[test]
+    fn opencode_is_probed_at_its_pinned_path_not_on_path() {
+        let (_, bin) = BINS.iter().find(|(id, _)| *id == "opencode").expect("a row");
+        assert!(matches!(bin, Bin::Pinned { version: "1.19.5", .. }));
+        assert_eq!(bin.version().as_deref(), Some(opencode_pin::VERSION));
+        let at = bin.program();
+        assert_eq!(PathBuf::from(&at), opencode_pin::binary());
+        assert!(PathBuf::from(&at).is_absolute() || at.contains(std::path::MAIN_SEPARATOR));
+        assert_eq!(on_path(&at), opencode_pin::installed());
+        assert_eq!(select("opencode").available(), opencode_pin::installed());
     }
 
     /// The person talking to the agent is told what happened and what to do,
@@ -1585,9 +1636,9 @@ mod select_tests {
     #[test]
     fn a_turn_on_a_runtime_mafold_cant_run_is_refused_in_words() {
         assert_eq!(
-            unsupported::refusal("opencode"),
-            "This agent is set to run OpenCode, which Mafold on this computer can't run, so nothing ran. \
-             Mafold runs Claude Code, Codex and Kimi Code: make a new agent on one of them."
+            unsupported::refusal("openclaw"),
+            "This agent is set to run OpenClaw, which Mafold on this computer can't run, so nothing ran. \
+             Mafold runs Claude Code, OpenCode, Codex and Kimi Code: make a new agent on one of them."
         );
     }
 
@@ -1611,6 +1662,7 @@ mod path_resolution_tests {
     #[test]
     fn availability_implies_a_resolved_program() {
         for (_, bin) in BINS {
+            let Bin::OnPath(bin) = bin else { continue };
             if on_path(bin) {
                 assert_ne!(
                     program(bin),

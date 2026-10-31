@@ -3,7 +3,11 @@
 //!
 //! Each runtime: detect an existing install, otherwise run its OFFICIAL
 //! installer (with confirmation; `--yes` for headless), re-verify, and point at
-//! the next onboarding step. `mafold install` with no argument lists the
+//! the next onboarding step. OpenCode is the exception: Mafold runs its own
+//! pinned build of it on the wallet (`harness::opencode_pin`), so that is what
+//! gets installed, checked against its pinned hash, under `~/.mafold/runtimes`
+//! — whatever `opencode` the user may have on PATH is left alone and never
+//! counts. `mafold install` with no argument lists the
 //! runtimes + their install state. The web New-Bot modal's one-click install
 //! rides this too: the supervisor claims a queued install (`claimProvisions`
 //! → `installs`) and calls [`run`] with `yes = true`. @mafold teaches this
@@ -21,16 +25,30 @@ struct Tool {
     aliases: &'static [&'static str],
     /// Human name for prints.
     name: &'static str,
-    /// The binary whose presence on PATH means "installed".
+    /// The binary whose presence on PATH means "installed" (an official
+    /// install; a pinned one is its own path, [`How::Pinned`]).
     bin: &'static str,
-    /// The official installer, run via `bash -c` (macOS, Linux).
-    install_cmd: &'static str,
+    /// How it gets onto this machine.
+    how: How,
     /// Manual fallback shown when the installer fails.
     fallback: &'static str,
-    /// On Windows: the vendor's own installer, or why there is none to run.
-    windows: Win,
     /// Post-install auth step (every runtime authenticates on this machine).
     auth_hint: &'static str,
+}
+
+/// Where a runtime's install comes from.
+#[derive(Clone, Copy)]
+enum How {
+    /// The vendor's own installer: `unix` run via `bash -c` (macOS, Linux),
+    /// and on Windows the vendor's own one, or why there is none to run.
+    Official { unix: &'static str, windows: Win },
+    /// A build Mafold pins: `install` fetches and checks it, `path` is where
+    /// it lives. The PATH is never consulted for it.
+    Pinned {
+        version: &'static str,
+        path: fn() -> std::path::PathBuf,
+        install: fn(Option<std::time::Duration>) -> Result<std::path::PathBuf>,
+    },
 }
 
 const TOOLS: &[Tool] = &[
@@ -39,11 +57,13 @@ const TOOLS: &[Tool] = &[
         aliases: &["claude-code", "claude", "claudecode"],
         name: "Claude Code",
         bin: "claude",
-        install_cmd: "curl -fsSL https://claude.ai/install.sh | bash",
+        how: How::Official {
+            unix: "curl -fsSL https://claude.ai/install.sh | bash",
+            // Anthropic's PowerShell installer (claude.com/claude-code): the
+            // native build into %USERPROFILE%\.local\bin.
+            windows: Win::PowerShell("irm https://claude.ai/install.ps1 | iex"),
+        },
         fallback: "try `npm install -g @anthropic-ai/claude-code` or see https://claude.com/claude-code",
-        // Anthropic's PowerShell installer (claude.com/claude-code): the
-        // native build into %USERPROFILE%\.local\bin.
-        windows: Win::PowerShell("irm https://claude.ai/install.ps1 | iex"),
         auth_hint: "run `claude` once in a project folder to sign in to Anthropic",
     },
     Tool {
@@ -51,10 +71,12 @@ const TOOLS: &[Tool] = &[
         aliases: &["codex", "codex-cli"],
         name: "Codex",
         bin: "codex",
-        install_cmd: "npm install -g @openai/codex",
+        how: How::Official {
+            unix: "npm install -g @openai/codex",
+            // OpenAI ships Codex for Windows as the same npm package.
+            windows: Win::PowerShell("npm install -g @openai/codex"),
+        },
         fallback: "needs Node/npm on PATH — `brew install node` first, or see https://developers.openai.com/codex/cli",
-        // OpenAI ships Codex for Windows as the same npm package.
-        windows: Win::PowerShell("npm install -g @openai/codex"),
         auth_hint: "run `codex` once to sign in to OpenAI",
     },
     Tool {
@@ -62,14 +84,16 @@ const TOOLS: &[Tool] = &[
         aliases: &["kimi-code", "kimi", "kimi-cli", "kimicode"],
         name: "Kimi Code",
         bin: "kimi",
-        install_cmd: "curl -LsSf https://code.kimi.com/install.sh | bash",
+        how: How::Official {
+            unix: "curl -LsSf https://code.kimi.com/install.sh | bash",
+            // Its PowerShell installer (code.kimi.com/install.ps1) now installs
+            // the deprecated Python kimi-cli only when told to, and otherwise
+            // hands over to the next-generation Kimi Code — not this runtime.
+            windows: Win::Unsupported(
+                "Kimi's Windows installer is moving from kimi-cli to its next-generation Kimi Code, so Mafold doesn't install it here",
+            ),
+        },
         fallback: "see https://moonshotai.github.io/kimi-cli/",
-        // Its PowerShell installer (code.kimi.com/install.ps1) now installs
-        // the deprecated Python kimi-cli only when told to, and otherwise
-        // hands over to the next-generation Kimi Code — not this runtime.
-        windows: Win::Unsupported(
-            "Kimi's Windows installer is moving from kimi-cli to its next-generation Kimi Code, so Mafold doesn't install it here",
-        ),
         auth_hint: "run `kimi login` to sign in to Moonshot",
     },
     Tool {
@@ -77,12 +101,15 @@ const TOOLS: &[Tool] = &[
         aliases: &["opencode", "open-code"],
         name: "OpenCode",
         bin: "opencode",
-        install_cmd: "curl -fsSL https://opencode.ai/install | bash",
-        fallback: "try `npm install -g opencode-ai` or see https://opencode.ai",
-        // opencode.ai/install is bash only; on Windows its own docs give the
-        // npm package.
-        windows: Win::PowerShell("npm install -g opencode-ai"),
-        auth_hint: "run `opencode auth login` to connect a provider",
+        // Mafold Harness: the one build its event mapping was measured
+        // against, never `curl | bash` of whatever is newest.
+        how: How::Pinned {
+            version: crate::harness::opencode_pin::VERSION,
+            path: crate::harness::opencode_pin::binary,
+            install: crate::harness::opencode_pin::ensure_blocking,
+        },
+        fallback: "check that this computer can reach registry.npmjs.org or registry.npmmirror.com, then run `mafold install opencode` again",
+        auth_hint: "nothing to sign in to — Mafold runs it on your Mafold wallet",
     },
 ];
 
@@ -104,10 +131,32 @@ enum Installer {
 
 /// `t`'s installer on this platform; `Err` = why there's none.
 fn installer(t: &Tool, windows: bool) -> std::result::Result<Installer, &'static str> {
-    match (windows, t.windows) {
-        (false, _) => Ok(Installer::Bash(t.install_cmd)),
+    let How::Official { unix, windows: win } = t.how else {
+        return Err("Mafold installs its own pinned build of it");
+    };
+    match (windows, win) {
+        (false, _) => Ok(Installer::Bash(unix)),
         (true, Win::PowerShell(cmd)) => Ok(Installer::PowerShell(cmd)),
         (true, Win::Unsupported(why)) => Err(why),
+    }
+}
+
+/// What to look for to call `t` installed: its name on PATH, or the path of
+/// Mafold's pinned build.
+fn program_of(t: &Tool) -> String {
+    match t.how {
+        How::Official { .. } => t.bin.to_string(),
+        How::Pinned { path, .. } => path().to_string_lossy().into_owned(),
+    }
+}
+
+/// An installed `t`'s version: what its CLI says, or the pin's — which is
+/// what a pinned build is by construction, and asking it would make
+/// OpenCode's folders in the user's home (`harness::opencode_pin`).
+fn installed_version(t: &Tool) -> Option<String> {
+    match t.how {
+        How::Official { .. } => version_of(t.bin),
+        How::Pinned { version, .. } => Some(version.to_string()),
     }
 }
 
@@ -171,12 +220,13 @@ pub fn run_within(tool: &str, yes: bool, limit: Option<std::time::Duration>) -> 
 fn list() -> Result<()> {
     println!("runtimes:");
     for t in TOOLS {
-        let state = if crate::harness::on_path(t.bin) {
+        let state = if crate::harness::on_path(&program_of(t)) {
             format!(
-                "✓ installed{}",
-                version_of(t.bin)
+                "✓ installed{}{}",
+                installed_version(t)
                     .map(|v| format!(" ({v})"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                if matches!(t.how, How::Pinned { .. }) { ", pinned by Mafold" } else { "" }
             )
         } else {
             format!("· not installed — `mafold install {}`", t.id)
@@ -187,12 +237,24 @@ fn list() -> Result<()> {
 }
 
 fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()> {
-    if crate::harness::on_path(t.bin) {
+    if crate::harness::on_path(&program_of(t)) {
         println!(
             "✓ {} already installed ({})",
             t.name,
-            version_of(t.bin).unwrap_or_else(|| "version unknown".into())
+            installed_version(t).unwrap_or_else(|| "version unknown".into())
         );
+        next_steps(t);
+        return Ok(());
+    }
+    if let How::Pinned { version, path, install } = t.how {
+        println!("Mafold runs its own pinned build of {} ({version}).", t.name);
+        println!("About to download it from npm (whichever of registry.npmjs.org and registry.npmmirror.com delivers first), check it");
+        println!("against its pinned SHA-512, and install it to {}.", path().display());
+        if !yes && !confirmed()? {
+            return Ok(());
+        }
+        let bin = install(limit).map_err(|e| anyhow::anyhow!("{e:#} — {}", t.fallback))?;
+        println!("✓ {} {version} installed ({})", t.name, bin.display());
         next_steps(t);
         return Ok(());
     }
@@ -208,16 +270,8 @@ fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()
     println!("  {}", match &how {
         Installer::Bash(c) | Installer::PowerShell(c) => c,
     });
-    if !yes {
-        use std::io::IsTerminal;
-        if !std::io::stdin().is_terminal() {
-            bail!("not a terminal — re-run with --yes to install non-interactively");
-        }
-        let answer = crate::prompt("Proceed? [y/N] ");
-        if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
-            println!("aborted — nothing installed.");
-            return Ok(());
-        }
+    if !yes && !confirmed()? {
+        return Ok(());
     }
 
     // A shell that won't start leaves the manual route in `fallback` as the
@@ -254,6 +308,21 @@ fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()
     }
     next_steps(t);
     Ok(())
+}
+
+/// Asked at a terminal before anything is installed; `false` = they said no
+/// (and were told nothing was installed).
+fn confirmed() -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        bail!("not a terminal — re-run with --yes to install non-interactively");
+    }
+    let answer = crate::prompt("Proceed? [y/N] ");
+    if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
+        println!("aborted — nothing installed.");
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Run the installer — `bash -c`, or Windows PowerShell by its full path (a
@@ -390,12 +459,27 @@ mod windows_installer_tests {
         find(id).expect(id)
     }
 
-    /// Every runtime still installs with its bash line on macOS and Linux.
+    /// Every runtime with an official installer still installs with its bash
+    /// line on macOS and Linux.
     #[test]
     fn unix_runs_each_official_installer_under_bash() {
         for t in TOOLS {
-            assert_eq!(installer(t, false), Ok(Installer::Bash(t.install_cmd)), "{}", t.id);
+            if let How::Official { unix, .. } = t.how {
+                assert_eq!(installer(t, false), Ok(Installer::Bash(unix)), "{}", t.id);
+            }
         }
+    }
+
+    /// OpenCode is Mafold's pinned build on every OS: no vendor installer,
+    /// no npm -g, nothing found on PATH standing in for it.
+    #[test]
+    fn opencode_installs_the_pinned_build_on_every_os() {
+        let t = tool("open-code");
+        let How::Pinned { version, path, .. } = t.how else { panic!("opencode is pinned") };
+        assert_eq!(version, crate::harness::opencode_pin::VERSION);
+        assert_eq!(path(), crate::harness::opencode_pin::binary());
+        assert_eq!(program_of(t), crate::harness::opencode_pin::binary().to_string_lossy());
+        assert!(installer(t, false).is_err() && installer(t, true).is_err(), "no official installer is run for it");
     }
 
     /// Windows runs the vendor's own installer — never bash, which a stock
@@ -404,7 +488,6 @@ mod windows_installer_tests {
     fn windows_runs_each_vendors_own_installer_or_says_why_not() {
         assert_eq!(installer(tool("claude-code"), true), Ok(Installer::PowerShell("irm https://claude.ai/install.ps1 | iex")));
         assert_eq!(installer(tool("codex"), true), Ok(Installer::PowerShell("npm install -g @openai/codex")));
-        assert_eq!(installer(tool("opencode"), true), Ok(Installer::PowerShell("npm install -g opencode-ai")));
         let why = installer(tool("kimi"), true).expect_err("no Windows install for Kimi");
         assert!(why.contains("Kimi Code"), "{why}");
         for t in TOOLS {
@@ -417,8 +500,9 @@ mod windows_installer_tests {
     /// The same npm package on both: Windows doesn't install something else.
     #[test]
     fn the_npm_routes_install_the_package_the_unix_side_names() {
-        assert_eq!(tool("codex").install_cmd, "npm install -g @openai/codex");
-        assert!(tool("opencode").fallback.contains("npm install -g opencode-ai"));
+        let How::Official { unix, windows } = tool("codex").how else { panic!("codex is official") };
+        assert_eq!(unix, "npm install -g @openai/codex");
+        assert!(matches!(windows, Win::PowerShell(cmd) if cmd == unix));
     }
 
     /// A failure is an exit code: an error stops the script, a native

@@ -87,6 +87,10 @@ pub struct Journal {
     /// processes writing one session, in one working tree, is the one outcome
     /// worse than a reply cut short.
     pub child: Option<u32>,
+    /// [`Self::child`]'s start (`platform::start_token`), so a restart can
+    /// tell that process from a later one handed the same pid before it ends
+    /// one (`harness::opencode::end_orphan`).
+    pub child_start: Option<u64>,
     /// When the turn began, so the generating card's clock runs on instead of
     /// starting over.
     pub started_ms: u64,
@@ -192,6 +196,9 @@ pub struct Outbox {
     /// What the dead turns this process is now delivering settle — taken once,
     /// at startup, before anything decides whether it still needs saying.
     settled: Mutex<Vec<String>>,
+    /// The processes the dead turns this process took over were running in
+    /// (`Journal::child`, with its start) — taken once, at startup.
+    orphans: Mutex<Vec<(u32, Option<u64>)>>,
 }
 
 impl Outbox {
@@ -213,6 +220,7 @@ impl Outbox {
         let mut entries = HashMap::new();
         let mut resumable = Vec::new();
         let mut settled = Vec::new();
+        let mut orphans = Vec::new();
         for file in std::fs::read_dir(&dir)? {
             let path = file?.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -242,6 +250,11 @@ impl Outbox {
                 continue;
             }
             entry.pid = std::process::id();
+            // The process it was running in may have outlived its daemon:
+            // handed to the daemon to look at, however the turn is judged.
+            if let Some(child) = entry.turn.as_ref().and_then(|t| t.child.map(|c| (c, t.child_start))) {
+                orphans.push(child);
+            }
             // A finished turn whose delivery didn't get through is just
             // delivered. A turn that was still running is the one to judge.
             if !entry.ready {
@@ -282,6 +295,7 @@ impl Outbox {
             entries: Mutex::new(entries),
             resumable: Mutex::new(resumable),
             settled: Mutex::new(settled),
+            orphans: Mutex::new(orphans),
         };
         for (id, entry) in outbox.entries.lock().unwrap().iter() {
             outbox.persist(id, entry)?;
@@ -380,6 +394,14 @@ impl Outbox {
         std::mem::take(&mut *self.settled.lock().unwrap())
     }
 
+    /// The processes the dead turns this process took over were running in,
+    /// each with its start — whether each turn is picked back up or finalized
+    /// as it stands. Taken once, at startup, by the daemon: one of them may
+    /// have outlived its daemon and still be at work on a reply nobody reads.
+    pub fn take_orphans(&self) -> Vec<(u32, Option<u64>)> {
+        std::mem::take(&mut *self.orphans.lock().unwrap())
+    }
+
     /// The dead turns this process is to pick back up, each with its draft id.
     /// Taken once: a second call returns nothing.
     pub fn take_resumable(&self) -> Vec<(String, Journal)> {
@@ -410,7 +432,11 @@ impl Outbox {
         let entry = Entry {
             pid: std::process::id(),
             ready: true,
-            content: Some(content.into()),
+            // Masked now, while the turn still holds its live secrets (a
+            // wallet reply's key): a delivery that fails is retried after the
+            // turn has ended, when nothing masks it on the way out any more —
+            // and this is also what goes to disk.
+            content: Some(crate::conceal::conceal_live(content)),
             success_for: success_for.map(str::to_string),
             outcome,
             turn: None,
@@ -550,6 +576,64 @@ mod tests {
         settled.sort();
         assert_eq!(settled, vec!["boot".to_string(), "cut".to_string()]);
         assert!(next.take_settled().is_empty(), "taken once");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The processes a dead daemon's turns were running in are handed to the
+    /// next start, once — whichever way each turn is judged (picked back up,
+    /// or finalized as it stands) — with the start that tells each from a
+    /// later process given the same pid. Another live daemon's are its own.
+    #[test]
+    fn a_dead_processs_journaled_children_are_handed_over_once() {
+        let dir = dir("orphans");
+        let old = Outbox::load(dir.clone(), |_| false).unwrap();
+        let resumed = "00000000-0000-0000-0000-000000000011";
+        let cut = "00000000-0000-0000-0000-000000000012";
+        let none = "00000000-0000-0000-0000-000000000013";
+        let live = "00000000-0000-0000-0000-000000000014";
+        for id in [resumed, cut, none, live] {
+            old.track(id).unwrap();
+        }
+        let p = || Some("p".to_string());
+        old.journal(resumed, Journal { prompt: p(), trigger: p(), session_first: true, child: Some(111), child_start: Some(7), ..Default::default() });
+        old.journal(cut, Journal { prompt: p(), produced: true, child: Some(222), child_start: Some(8), ..Default::default() });
+        old.journal(none, Journal { prompt: p(), ..Default::default() });
+        old.journal(live, Journal { prompt: p(), child: Some(444), child_start: Some(9), ..Default::default() });
+        let (dead_owner, live_owner) = (std::process::id() + 1, std::process::id() + 2);
+        for (id, entry) in old.entries.lock().unwrap().iter_mut() {
+            entry.pid = if id == live { live_owner } else { dead_owner };
+            old.persist(id, entry).unwrap();
+        }
+        let next = Outbox::load(dir.clone(), |pid| pid == live_owner).unwrap();
+        assert_eq!(next.take_resumable().len(), 1, "one of them is picked back up");
+        let mut orphans = next.take_orphans();
+        orphans.sort();
+        assert_eq!(orphans, vec![(111, Some(7)), (222, Some(8))]);
+        assert!(next.take_orphans().is_empty(), "taken once");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A wallet reply's key is masked out of what a turn writes only while the
+    /// turn holds it (`conceal::hide_while_live`). A completion whose delivery
+    /// failed is retried by the outbox after the turn is over — so it is
+    /// masked when it is queued, on disk as well as in memory, or the retry
+    /// would post a key that is still live until the finalize lands.
+    #[test]
+    fn a_completion_queued_for_retry_keeps_a_live_key_masked_after_its_turn() {
+        let dir = dir("live-key");
+        let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
+        let id = "00000000-0000-0000-0000-00000000000a";
+        outbox.track(id).unwrap();
+        let key = format!("mrk_live_{}", uuid::Uuid::new_v4().simple());
+        {
+            let _live = crate::conceal::hide_while_live(&key);
+            outbox.complete(id, &format!("ran env:\nMAFOLD_WALLET_KEY={key}\nPATH=/usr/bin"), None, None).unwrap();
+        }
+        let queued = outbox.entries.lock().unwrap()[id].content.clone().unwrap();
+        assert!(!queued.contains(&key), "{queued}");
+        assert!(queued.contains("MAFOLD_WALLET_KEY=") && queued.contains("PATH=/usr/bin"), "the rest is kept: {queued}");
+        let on_disk = std::fs::read_to_string(dir.join(format!("{id}.json"))).unwrap();
+        assert!(!on_disk.contains(&key), "nor on disk: {on_disk}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

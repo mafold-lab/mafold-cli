@@ -297,8 +297,6 @@ async fn forum_hint(client: &Client, chat: &Room) {
 /// reader the other forty, and the row still prints its name.
 async fn fetch_media(client: &Client, page: &Value) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    let dir = crate::agent::attachments_dir();
-    let _ = std::fs::create_dir_all(&dir);
     for m in page["items"].as_array().into_iter().flatten() {
         for a in m["attachments"].as_array().into_iter().flatten() {
             let Some(f) = a.get("file") else { continue };
@@ -313,22 +311,33 @@ async fn fetch_media(client: &Client, page: &Value) -> std::collections::HashMap
                 Some(n) => format!("{id}-{}", crate::agent::sanitize_attachment_name(n)),
                 None => crate::agent::sanitize_attachment_name(id),
             };
-            let path = dir.join(&name);
-            if path.is_file() {
-                out.insert(id.to_string(), path.to_string_lossy().into_owned());
-                continue;
-            }
-            match client.download(&format!("/media/{id}")).await {
-                Ok(bytes) => {
-                    if std::fs::write(&path, &bytes).is_ok() {
-                        out.insert(id.to_string(), path.to_string_lossy().into_owned());
-                    }
+            match save_attachment(client, &format!("/media/{id}"), &name).await {
+                Ok(path) => {
+                    out.insert(id.to_string(), path.to_string_lossy().into_owned());
                 }
                 Err(e) => eprintln!("· 取不到附件 {name}: {e}"),
             }
         }
     }
     out
+}
+
+/// One attachment into `~/.mafold/attachments/<name>`, and where it landed.
+/// `name` is the caller's, already unique and already through
+/// `sanitize_attachment_name` — it is joined as it is. A file already there is
+/// not fetched again. `src` goes through `Client::download`: a Mafold path or a
+/// Mafold media origin, never anywhere else. Shared by `mafold read --media`
+/// and `mafold mail read --media`.
+pub(crate) async fn save_attachment(client: &Client, src: &str, name: &str) -> Result<std::path::PathBuf> {
+    let dir = crate::agent::attachments_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(name);
+    if path.is_file() {
+        return Ok(path);
+    }
+    let bytes = client.download(src).await?;
+    std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 /// No live ticket this turn may use: say what is already in flight, or ask —

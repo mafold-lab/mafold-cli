@@ -5,8 +5,8 @@
 //!
 //! On Mafold Cloud only the wallet. On a computer a login runs only its own
 //! runtime (a Claude login runs Claude Code, a Codex login runs Codex, …), and
-//! the wallet fuels any runtime but Kimi Code — once the router can
-//! (`wallet_on_computers`).
+//! the wallet fuels only Mafold Harness (OpenCode) — where the owner has
+//! `walletOnComputers` on (`wallet_on_computers`).
 
 /// The runtimes New Agent offers, each with the one login that runs it.
 pub const RUNTIME_LOGINS: &[(&str, &str)] = &[
@@ -29,7 +29,11 @@ pub fn sign_in_runs(cloud: bool, runtime: Option<&str>, sign_in: &str, wallet_on
         return false;
     };
     if sign_in == "wallet" {
-        return wallet_on_computers && runtime != "kimi-code";
+        // OpenCode alone for now (PR 4b, 10-31): the router serves the wallet
+        // on /v1/chat/completions only, which OpenCode speaks. Claude Code
+        // needs /v1/messages and Codex /v1/responses (PR 4d / 4e); Kimi Code
+        // signs in with Kimi only.
+        return wallet_on_computers && runtime == "opencode";
     }
     RUNTIME_LOGINS.iter().any(|(id, login)| *id == runtime && *login == sign_in)
 }

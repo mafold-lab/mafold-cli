@@ -1,0 +1,28 @@
+data: {"id":"evt_18e35a9af001fuwD26m0ta6RUC","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35a9a6001sVACeqnchGsWWR","role":"user","sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","time":{"created":1793387243942},"agent":"build","model":{"providerID":"mafold","modelID":"deepseek-v4-flash"}}}}
+
+data: {"id":"evt_18e35a9b20017dvvoN2R4i5Gs2","type":"message.part.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","part":{"type":"text","text":"FAIL401 now","messageID":"msg_18e35a9a6001sVACeqnchGsWWR","sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","id":"prt_18e35a9ab001uZdqdFD4IHDDWq"},"time":1793387243954}}
+
+data: {"id":"evt_18e35a9b7001r6BnbBvAuOaokl","type":"session.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"ses_e71ca68a0ffeNhiKRmSypfL25K","slug":"clever-knight","projectID":"global","directory":"/tmp/oc-h4c/exp/rec7/w","path":"tmp/oc-h4c/exp/rec7/w","title":"Mafold","agent":"build","model":{"id":"deepseek-v4-flash","providerID":"mafold","variant":"default"},"version":"1.19.5","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":860,"output":70,"reasoning":4,"cache":{"read":1200,"write":0}},"time":{"created":1793387239264,"updated":1793387243957}}}}
+
+data: {"id":"evt_18e35a9c0001lSdvIJcFo0zZAF","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35a9c60014rtP4Hl4Rd1h7p","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35a9c6001733zbvfmZHwMVG","parentID":"msg_18e35a9a6001sVACeqnchGsWWR","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oc-h4c/exp/rec7/w","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"deepseek-v4-flash","providerID":"mafold","time":{"created":1793387243974},"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K"}}}
+
+data: {"id":"evt_18e35a9e2001U4EpbmkuDp8ll5","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35a9f7001SKhq0kUypaoeVD","type":"session.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"ses_e71ca68a0ffeNhiKRmSypfL25K","slug":"clever-knight","projectID":"global","directory":"/tmp/oc-h4c/exp/rec7/w","path":"tmp/oc-h4c/exp/rec7/w","title":"Mafold","agent":"build","model":{"id":"deepseek-v4-flash","providerID":"mafold","variant":"default"},"version":"1.19.5","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":860,"output":70,"reasoning":4,"cache":{"read":1200,"write":0}},"time":{"created":1793387239264,"updated":1793387244022}}}}
+
+data: {"id":"evt_18e35a9fd001URpkffZfWeuMk9","type":"session.diff","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","diff":[]}}
+
+data: {"id":"evt_18e35aa00001QTWRJiEt7M3iDf","type":"session.error","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","error":{"name":"APIError","data":{"message":"router says 401","statusCode":401,"isRetryable":false,"responseHeaders":{"content-length":"68","content-type":"application/json","date":"Fri, 30 Oct 2026 19:07:24 GMT","server":"BaseHTTP/0.6 Python/3.12.3"},"responseBody":"{\"error\": {\"message\": \"router says 401\", \"type\": \"invalid_api_key\"}}","metadata":{"url":"http://127.0.0.1:46189/v1/chat/completions"}}}}}
+
+data: {"id":"evt_18e35aa01001Oy6Npt6dWNjrDr","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"idle"}}}
+
+data: {"id":"evt_18e35aa030011T0degMK13nK7S","type":"session.idle","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K"}}
+
+data: {"id":"evt_18e35aa03002wXRh84DZQ6DDFm","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35a9c6001733zbvfmZHwMVG","parentID":"msg_18e35a9a6001sVACeqnchGsWWR","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oc-h4c/exp/rec7/w","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"deepseek-v4-flash","providerID":"mafold","time":{"created":1793387243974,"completed":1793387244035},"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","error":{"name":"APIError","data":{"message":"router says 401","statusCode":401,"isRetryable":false,"responseHeaders":{"content-length":"68","content-type":"application/json","date":"Fri, 30 Oct 2026 19:07:24 GMT","server":"BaseHTTP/0.6 Python/3.12.3"},"responseBody":"{\"error\": {\"message\": \"router says 401\", \"type\": \"invalid_api_key\"}}","metadata":{"url":"http://127.0.0.1:46189/v1/chat/completions"}}}}}}
+
+data: {"id":"evt_18e35aa0b001VMOPpkhCQ1csN3","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"idle"}}}
+
+data: {"id":"evt_18e35aa0c001v6zqjzkfL9SIjP","type":"session.idle","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K"}}
+

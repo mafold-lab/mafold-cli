@@ -85,6 +85,21 @@ pub fn grant_revoked(payer: &str, spender: &str) -> String {
     format!("wallet_grant_required: @{payer} no longer lets @{spender} spend from their wallet")
 }
 
+/// A wallet agent on its owner's computer (PR 4b, 10-31) was asked to reply by
+/// someone other than its owner: its replies spend the owner's wallet, so only
+/// the owner starts them. The api refuses the reply's key with it and the
+/// daemon turns the guest away with the same words.
+pub fn wallet_owner_only(owner: &str) -> String {
+    format!("wallet_owner_only: This agent runs on @{owner}'s wallet. Only @{owner} can start its replies.")
+}
+
+/// A reply key was asked for where the wallet doesn't fuel this agent (`why`:
+/// the owner's `walletOnComputers` is off, or the agent signs in some other
+/// way).
+pub fn wallet_fuel_off(bot: &str, why: &str) -> String {
+    format!("wallet_fuel_off: @{bot} can't spend from the wallet here — {why}")
+}
+
 /// The wallet's price table hasn't loaded, so no turn can be metered yet.
 pub fn price_table_unavailable() -> String {
     "billing_unavailable: the official price table hasn't loaded yet".into()
@@ -212,6 +227,14 @@ pub enum FailureKind {
     /// A paid bot whose paid use isn't switched on: no wait fixes it — its
     /// owner has to.
     NotOpen,
+    /// The agent runs on its owner's wallet, and someone else's message asked
+    /// for this reply ([`wallet_owner_only`]). Said to whoever asked: nothing
+    /// they can do changes it.
+    OwnerOnly,
+    /// The wallet doesn't fuel this agent here ([`wallet_fuel_off`]): the
+    /// owner's `walletOnComputers` is off, or the agent signs in another way.
+    /// The owner's to change, and said to them.
+    FuelOff,
     /// The model's maker refused the content on policy (a safety filter on
     /// the prompt or on what it produced). Not an outage and not the wallet:
     /// rewording is what helps.
@@ -242,6 +265,8 @@ impl FailureKind {
             Self::Connection => "connection",
             Self::Empty => "empty",
             Self::NotOpen => "not_open",
+            Self::OwnerOnly => "owner_only",
+            Self::FuelOff => "fuel_off",
             Self::Blocked => "blocked",
             Self::Unknown => "unknown",
         }
@@ -413,6 +438,10 @@ pub fn classify(err: &str) -> Failure {
         Some(FailureKind::Unavailable)
     } else if low.contains("paid_use_not_enabled") {
         Some(FailureKind::NotOpen)
+    } else if low.contains("wallet_owner_only") {
+        Some(FailureKind::OwnerOnly)
+    } else if low.contains("wallet_fuel_off") {
+        Some(FailureKind::FuelOff)
     } else if has(&["turn_interrupted", "hit its 15-minute ceiling"]) {
         Some(FailureKind::Interrupted)
     } else {
@@ -769,6 +798,12 @@ mod tests {
             (connection_unusable("我的 Codex", "no longer exists"), FailureKind::Connection),
             (no_supplier("gpt-5.5", "every supplier is offline"), FailureKind::Unavailable),
             (paid_use_not_enabled("ops:cc"), FailureKind::NotOpen),
+            (wallet_owner_only("ops"), FailureKind::OwnerOnly),
+            // As the api's 403 reaches the daemon, envelope description and all.
+            (format!("403 Forbidden: {}", wallet_owner_only("ops")), FailureKind::OwnerOnly),
+            (wallet_fuel_off("ops:oc", "walletOnComputers is off for @ops"), FailureKind::FuelOff),
+            // As mintReplyKey's 403 reaches the daemon (ApiError's prefix).
+            (format!("permission denied: {}", wallet_fuel_off("ops:oc", "its fuel is claude")), FailureKind::FuelOff),
             (empty_reply("anthropic"), FailureKind::Empty),
             (turn_interrupted(), FailureKind::Interrupted),
             (no_payer(), FailureKind::Unknown),

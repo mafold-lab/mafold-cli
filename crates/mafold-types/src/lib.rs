@@ -25,6 +25,9 @@ pub mod drive;
 /// The feature-flag registry — keys, defaults, who reads each, and what the
 /// server decides without a record (`flags.rs`, `.docs/feature-flags.md`).
 pub mod flags;
+/// A handle's address at mafold.com and back — the one mapping the rcpt hook,
+/// the mail methods, @mail and the cli share (`mail.rs`).
+pub mod mail;
 /// What a document's name says it is — the one extension → type table the cli
 /// declares from and the api guesses from (`mime.rs`).
 pub mod mime;

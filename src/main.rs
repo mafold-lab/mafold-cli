@@ -29,12 +29,15 @@ mod connection;
 mod control;
 mod d1;
 mod daemon;
+#[cfg(debug_assertions)]
+mod dev_wallet_turn;
 mod diagnose;
 mod discover;
 mod drafts;
 mod drive;
 mod flagcmd;
 mod flags;
+mod fuel;
 mod harness;
 mod inbox;
 mod install;
@@ -43,6 +46,7 @@ mod langpack;
 mod lifecycle;
 mod logfile;
 mod machine;
+mod mail;
 mod mcp_link;
 mod msgops;
 mod pair;
@@ -405,6 +409,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: wallet::WalletCmd,
     },
+    /// Your mailbox at mafold.com: address / list / read / wait / raw /
+    /// block / blocks / delete. Receive only. An agent's address is
+    /// `owner.label@mafold.com`, and `--as` lets its owner read it. Mail is
+    /// an outside sender's words, so `read` and `wait` print it marked as such.
+    Mail {
+        #[command(subcommand)]
+        cmd: mail::MailCmd,
+    },
     /// Author, preview, and publish developer cards.
     Cards {
         #[command(subcommand)]
@@ -441,6 +453,12 @@ enum Cmd {
         /// pins it to one Claude login (see `/login <name>` for adding logins)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Create the agent first if you have none by this name, signed in with this (e.g. `--harness opencode --fuel wallet` runs it on your wallet); an existing agent keeps its own.
+        #[arg(long)]
+        fuel: Option<String>,
+        /// With --fuel: the model the new agent starts on.
+        #[arg(long, requires = "fuel")]
+        model: Option<String>,
     },
     /// Remove a bot daemon from the local config (stops it too).
     Rm { name: String },
@@ -602,6 +620,32 @@ enum Cmd {
     /// ask card and blocks on the tap. Not for humans.
     #[command(hide = true)]
     PermissionMcp,
+    /// (internal, debug builds) One wallet reply through the daemon's own
+    /// wallet steps — mint the draft's key, the OpenCode harness, the reply's
+    /// total onto the result card — printed as one JSON line. What the billing
+    /// table (`mafold-api` harness_table_tests) drives. Not for humans.
+    #[cfg(debug_assertions)]
+    #[command(hide = true)]
+    DevWalletTurn {
+        /// The reply's draft (opened by the agent, its trigger the owner's).
+        #[arg(long)]
+        draft: String,
+        #[arg(long)]
+        workdir: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// Stop the turn this many ms after its first words arrive.
+        #[arg(long)]
+        stop_after_ms: Option<u64>,
+        /// The agent's handle and the conversation: the turn's surface, so
+        /// OpenCode runs in that agent's home.
+        #[arg(long)]
+        bot: Option<String>,
+        #[arg(long)]
+        chat: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -890,12 +934,29 @@ async fn main() -> Result<()> {
             workdir,
             harness,
             env,
+            fuel,
+            model,
         } => {
             let env = supervisor::parse_env(&env)?;
-            // A token given wins. Without one, this machine's login for the
+            // `--fuel`: the agent may not exist yet — this machine's login
+            // creates it as its owner first (`bot_token::create_if_missing`),
+            // then it is registered like any other. It needs the login, not
+            // a token: a bot's token can't make bots.
+            let (name, created) = match fuel.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+                Some(fuel) => {
+                    let logins = session::all();
+                    let login = bot_token::login_for(&name, cli.account.as_deref(), &logins).context(
+                        "`--fuel` creates the agent as you — run `mafold login` (approve it on the web) first",
+                    )?;
+                    bot_token::create_if_missing(&cli.base, &name, harness.as_deref(), fuel, model.as_deref(), login).await?
+                }
+                None => (name, None),
+            };
+            // The token of an agent just created is its own; otherwise a
+            // token given wins. Without one, this machine's login for the
             // bot's owner asks the server for it — nothing to paste, and
             // nothing that ever went through a chat (`bot_token`).
-            let token = match cli.token.clone().filter(|t| !t.trim().is_empty()) {
+            let token = match created.or_else(|| cli.token.clone().filter(|t| !t.trim().is_empty())) {
                 Some(t) => t,
                 None => {
                     let logins = session::all();
@@ -912,6 +973,9 @@ async fn main() -> Result<()> {
                     .to_string_lossy()
                     .into_owned(),
             };
+            // Mafold Harness's pinned OpenCode goes in here, with its
+            // progress on this terminal — not on the agent's first reply.
+            crate::harness::opencode_pin::install_before_add(harness.as_deref());
             supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
         Cmd::Chats => chats(&Client::new(cli.base, token?)).await?,
@@ -981,7 +1045,13 @@ async fn main() -> Result<()> {
             msgops::edit(&Client::new(cli.base, token?), &message, text.as_deref(), file.as_deref()).await?
         }
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Mail { cmd } => mail::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Flags { cmd } => flagcmd::run(cmd.unwrap_or(flagcmd::FlagsCmd::List), &Client::new(cli.base, token?)).await?,
+        #[cfg(debug_assertions)]
+        Cmd::DevWalletTurn { draft, workdir, prompt, model, stop_after_ms, bot, chat } => {
+            let ask = dev_wallet_turn::Ask { draft, workdir, prompt, model, stop_after_ms, bot, chat };
+            dev_wallet_turn::run(Client::new(cli.base, bot_token?), ask).await?
+        }
         Cmd::Stop | Cmd::Status { .. } | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Connection { .. } | Cmd::Runtime { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }

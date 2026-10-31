@@ -682,6 +682,72 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // The wallet fuelling an agent on your own computer (PR 4b, 10-31): New
+    // Agent offers "From your tokens" for Mafold Harness (OpenCode), and each
+    // reply spends through a one-reply router key the api mints for it.
+    // Server-read on the owner: createBot takes `sign_in: wallet` on a
+    // computer, and `mintReplyKey` answers, only where this is on — so a
+    // client showing the row early can't make an agent nothing can fuel.
+    FlagMeta {
+        key: "walletOnComputers",
+        default: false,
+        dev_default: false,
+        label: "New Agent: the wallet on a computer",
+        description: "New Agent on one of your computers offers From your tokens as the sign-in for \
+                      Mafold Harness (OpenCode). Each reply the agent starts for you gets its own \
+                      router key (DeepSeek chat models only, dead when the reply ends, on Stop, or \
+                      after 6 h); what it spends comes off your wallet under the agent's monthly \
+                      cap and shows on the reply's result card. Only you start its wallet replies. \
+                      The api takes createBot with the wallet on a computer, and answers \
+                      mintReplyKey, only where this is on for the owner.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // Mafold Mail phase 1 (ops 10-30): `username@mafold.com`, receive only.
+    // The api gates every part of it on the MAILBOX's handle — the rcpt hook,
+    // the inbound hook, the mail* methods, @mail's commands — so a record of
+    // `Accounts[opsdu]` opens opsdu and every `opsdu:*` agent at once. The
+    // daemon reads it too: an agent it is on for gets the `mafold mail` line
+    // in its tool list. Web and phone don't — the mail lands as cards, and a
+    // card can't read flags.
+    FlagMeta {
+        key: "mailbox",
+        default: false,
+        dev_default: false,
+        label: "Mail: username@mafold.com",
+        description: "Mail sent to your handle at mafold.com (an agent's is owner.label@mafold.com, \
+                      +tag allowed) is accepted and lands from @mail as a card in your chat with it; \
+                      an agent's mail also lands in its owner's chat with @mail. Receive only. Off = \
+                      the address is refused at the door and the mail methods answer not available.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Daemon],
+        server: ClosedWithoutRecord,
+    },
+    // The profile opens out of the chat's own top pill (ops 10-31): the pill
+    // grows down to the composer's bottom at the composer's width, its back
+    // button (or, with none, its avatar) turns into the ✕, and the page is the
+    // plain page colour. New Message / Group / Agent open and close in under
+    // 250ms with it — on phones in-app, no longer the system's slide-up sheet.
+    // Behind this until both are live; client-only.
+    FlagMeta {
+        key: "pillOpen",
+        default: false,
+        dev_default: true,
+        label: "Profile opens from the top pill",
+        description: "Tapping a chat's top pill grows the pill itself into the profile (top pill's \
+                      top → composer's bottom, composer's width; a phone's shrunk composer counts \
+                      at full size), on the page colour; the back button — or the avatar where \
+                      there is none — becomes ✕. 200ms open / 180ms close. New Message / Group / \
+                      Agent: 200ms / 180ms genie on every client, in-app on phones (back gesture, \
+                      keyboard, safe areas). Off = the 620/600ms genie and the phone's system sheet.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -844,6 +910,19 @@ mod tests {
     }
 
     #[test]
+    fn wallet_on_computers_is_a_server_gate_that_ships_dark() {
+        // createBot and mintReplyKey read it on the owner; dev too stays off
+        // until a record opens it, since a dev wallet call spends a real seat.
+        let k = "walletOnComputers";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
     fn usage_model_switch_is_a_server_gate_no_client_reads() {
         // The card learns it from the api's answer to `model|menu`; a client
         // resolving it would be a second source that can disagree.
@@ -882,6 +961,20 @@ mod tests {
         assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
         assert_eq!(m.server, NotRead, "{k}: gates the page only");
         assert!(!server_default(k), "{k}: nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn mailbox_is_a_server_gate_that_ships_dark() {
+        // Who gets whose mail is the mapping's and the ACL's to decide; the
+        // flag only hides it — and with no record it hides it from everyone,
+        // dev included, until ops opens it account by account.
+        let k = "mailbox";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert_eq!(m.clients, &[Daemon], "{k}: the daemon words its agents' tool list on it; web and phone see only cards");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
     }
 
     #[test]

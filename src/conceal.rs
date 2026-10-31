@@ -243,7 +243,48 @@ pub fn scrub_outgoing(method: &str, body: &mut serde_json::Value, own: &str) -> 
     if own.len() >= MIN_LOCAL {
         values.push(own.to_string());
     }
+    values.extend(LIVE.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned());
     scrub_value(body, &values)
+}
+
+/// Credentials this process holds only in memory, for a child: a wallet
+/// agent's one-reply key (`crate::fuel`) lives in no file and in no variable
+/// of the daemon's own environment — only in the harness child's — so no sweep
+/// finds it, and an agent that runs `env` would put it in its trace card.
+static LIVE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// `value` is masked out of every visible write until the guard drops.
+pub fn hide_while_live(value: &str) -> LiveSecret {
+    if value.len() >= MIN_LOCAL {
+        LIVE.lock().unwrap_or_else(|p| p.into_inner()).push(value.to_string());
+    }
+    LiveSecret(value.to_string())
+}
+
+/// `text` with every value [`hide_while_live`] holds right now masked — for
+/// something written now but sent later, when the guard may be gone: a
+/// reply's completion queued for the outbox's retry (`drafts::Outbox::complete`)
+/// goes out after its turn has ended, and the key it may quote is still live
+/// until that very finalize lands.
+pub fn conceal_live(text: &str) -> String {
+    let live = LIVE.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if live.is_empty() {
+        return text.to_string();
+    }
+    Concealer::new(live.iter().map(String::as_str)).conceal_str(text).unwrap_or_else(|| text.to_string())
+}
+
+/// See [`hide_while_live`]. Two turns can hold the same value (a resumed
+/// reply re-mints the same key): each guard takes back its own copy only.
+pub struct LiveSecret(String);
+
+impl Drop for LiveSecret {
+    fn drop(&mut self) {
+        let mut live = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(i) = live.iter().position(|v| *v == self.0) {
+            live.remove(i);
+        }
+    }
 }
 
 /// Every string in `v`, in place — `mafold diagnose` runs its whole bundle
@@ -488,8 +529,11 @@ fn collect_named(v: &serde_json::Value, inside: bool, out: &mut Vec<String>) {
 /// public key, which is published on purpose.
 fn secret_name(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
+    // `WALLET_KEY`: the one-reply key a wallet agent's harness child carries
+    // (`MAFOLD_WALLET_KEY`, `crate::fuel`) — a `mafold send` the agent runs
+    // inherits it, and that process's sweep is all that stands in its way.
     !n.contains("PUBLIC")
-        && ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "PRIVATE_KEY", "ACCESS_KEY", "CREDENTIAL"]
+        && ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "PRIVATE_KEY", "ACCESS_KEY", "CREDENTIAL", "WALLET_KEY"]
             .iter()
             .any(|w| n.contains(w))
 }
@@ -892,5 +936,28 @@ mod tests {
             assert_eq!(body["content"], format!("token={MASK}"), "{method}");
             assert_eq!(body["text"], MASK, "{method}");
         }
+    }
+
+    /// A wallet reply's key is in no file and not in the daemon's env, only in
+    /// the harness child's: it is masked while its turn holds it, and an
+    /// agent's own `mafold send` (which inherits `MAFOLD_WALLET_KEY`) sweeps it
+    /// by name (PR 4c, 10-31).
+    #[test]
+    fn a_live_reply_key_is_masked_while_its_turn_holds_it() {
+        let key = "mk_reply_0123456789abcdef0123";
+        let draft = |k: &str| serde_json::json!({"content": format!("$ env\nMAFOLD_WALLET_KEY={k}\n")});
+        {
+            let _held = hide_while_live(key);
+            let _twin = hide_while_live(key);
+            let mut body = draft(key);
+            assert_eq!(scrub_outgoing("botEditDraft", &mut body, "mb_x"), 1);
+            assert_eq!(body["content"], format!("$ env\nMAFOLD_WALLET_KEY={MASK}\n"));
+            drop(_twin);
+            let mut body = draft(key);
+            assert_eq!(scrub_outgoing("botEditDraft", &mut body, "mb_x"), 1, "the other turn still holds it");
+        }
+        let mut body = draft(key);
+        assert_eq!(scrub_outgoing("botEditDraft", &mut body, "mb_x"), 0, "gone with its turn");
+        assert!(secret_name("MAFOLD_WALLET_KEY"));
     }
 }
