@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::platform;
 
@@ -21,6 +21,12 @@ fn pid_path() -> Result<PathBuf> {
 }
 fn log_path() -> Result<PathBuf> {
     Ok(dir()?.join("agent.log"))
+}
+
+/// Where `agent --detach` writes, without making `~/.mafold` to find out
+/// (`mafold diagnose`).
+pub(crate) fn log_file() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".mafold").join("agent.log"))
 }
 
 fn read_pid() -> Option<u32> {
@@ -48,14 +54,14 @@ pub fn start_detached(
             anyhow::bail!("agent already running (pid {pid}) — run `mafold stop` first");
         }
     }
-    let exe = std::env::current_exe()?;
-    let out = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path()?)?;
+    let exe = crate::platform::current_exe()?;
+    // The log it takes over and rotates itself (`agent::run` → `logfile::keep`),
+    // the way a bot the supervisor runs does.
+    let log = log_path()?;
+    let out = crate::logfile::open_for_child(&log)?;
     let err = out.try_clone()?;
 
-    let mut cmd = Command::new(exe);
+    let mut cmd = platform::std_command(exe);
     cmd.arg("agent");
     // The child re-parses its own CLI, so a parent-only --no-auto-update used to
     // vanish here (the flag isn't in the env set below) — the detached agent then
@@ -67,6 +73,7 @@ pub fn start_detached(
     cmd.env("MAFOLD_BASE", base)
         .env("MAFOLD_BOT_TOKEN", token)
         .env("MAFOLD_HARNESS", harness)
+        .env(crate::logfile::LOG_ENV, &log)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
@@ -85,10 +92,22 @@ pub fn start_detached(
 
 pub fn stop() -> Result<()> {
     match read_pid() {
-        Some(pid) if alive(pid) => {
-            // Plain SIGTERM — the daemon's shutdown handler kills its in-flight
-            // claude children precisely; background tasks survive.
-            platform::terminate(pid);
+        Some(pid) if platform::pid_running(pid) => {
+            // Stopped the way the supervisor stops a daemon — on unix a plain
+            // SIGTERM, whose handler kills the in-flight claude children
+            // precisely; on Windows with everything it started — background
+            // tasks surviving either way. "Stopped" is said once it's gone,
+            // not when the signal went out.
+            let wait = std::time::Duration::from_secs(10);
+            if !crate::supervisor::end_daemon(pid, &pid_path()?) {
+                // A process that took its pid since: no agent of ours runs.
+                let _ = fs::remove_file(pid_path()?);
+                println!("no running agent");
+                return Ok(());
+            }
+            if !platform::wait_until(wait, || !platform::pid_running(pid)) {
+                anyhow::bail!("the agent (pid {pid}) is still running {}s after being asked to stop", wait.as_secs());
+            }
             let _ = fs::remove_file(pid_path()?);
             println!("✓ stopped agent (pid {pid})");
         }

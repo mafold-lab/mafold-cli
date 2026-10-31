@@ -30,7 +30,8 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{AgentEvent, CommandOutcome, Harness, Turn, TurnOutcome};
+use super::codex_app_server::{CodexAppServer, CodexAppServerOptions};
+use super::{AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModelCap, Turn, TurnOutcome};
 use mafold_transcript::RunStats;
 use crate::client::Client;
 
@@ -44,6 +45,11 @@ impl Harness for Codex {
 
     fn available(&self) -> bool {
         super::on_path("codex")
+    }
+
+    /// Yes: `thread.started` is the first thing `codex exec --json` says.
+    fn names_session_first(&self) -> bool {
+        true
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
@@ -71,8 +77,16 @@ impl Harness for Codex {
             // thing today (`crate::accounts`).
             env: _,
             conv,
-            surface: _,
+            surface,
             draft,
+            // The drive mount is Claude Code's today (`--plugin-dir`); how
+            // Codex takes an outside skills folder is measured before it is
+            // wired (`.docs/bot-drive-v1.md` §5.5). Whose eyes the turn reads
+            // with is every harness's (`turn_env`).
+            mount,
+            // No PreToolUse hook to hold it with (`crate::drive::skill_gate`).
+            skill_plugins: _,
+            proc,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
@@ -93,19 +107,14 @@ impl Harness for Codex {
             model: model.as_deref(),
             effort: effort.as_deref(),
             conv: &conv,
+            surface: &surface,
+            reads: &mount.reads,
             draft: &draft,
             cancel: &cancel,
             sink: &sink,
+            proc: &proc,
         };
-        match run_once(&p, session.as_deref()).await {
-            // The stored thread id can be stale or foreign — Codex expires
-            // rollouts, and a conversation may carry a session written by a
-            // DIFFERENT harness (a bot switched to codex mid-conversation).
-            // Retry once WITHOUT resume: the failed attempt exits before
-            // emitting any event, so the fresh run streams into a clean turn.
-            Err(e) if session.is_some() && is_stale_thread(&e) => run_once(&p, None).await,
-            r => r,
-        }
+        run_turn(&p, session.as_deref()).await
     }
 
     fn discover(&self, _workdir: &str) -> Value {
@@ -130,6 +139,119 @@ impl Harness for Codex {
     async fn cli_version(&self) -> String {
         codex_version().await
     }
+
+    /// Ask THIS `codex` what it takes: App Server's `model/list` names every
+    /// model the login can pick and, per model, the reasoning tiers it accepts
+    /// (`supportedReasoningEfforts`) — the same list codex's own model picker
+    /// draws, `ultra` included where a model has it. `account/read` says which
+    /// login answered. Neither opens a thread, so neither costs a turn.
+    ///
+    /// `env` doesn't apply: codex keys its login by `CODEX_HOME`, which the
+    /// daemon's own environment already carries (see [`Harness::run`]).
+    async fn caps(&self, _env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
+        let server = CodexAppServer::spawn(CodexAppServerOptions::default()).await.ok()?;
+        let models = list_models(&server).await;
+        let account = server
+            .request("account/read", json!({}))
+            .await
+            .ok()
+            .and_then(|r| r["account"]["email"].as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+        let _ = server.shutdown().await;
+        let models = models?;
+        Some(HarnessProbe {
+            account,
+            source: CapsSource::Handshake,
+            models,
+            ..Default::default()
+        })
+    }
+
+    /// Codex keys its login by `CODEX_HOME` — the daemon's own (a supervisor
+    /// can pin one per bot), or `~/.codex` when unset — so that is the seat a
+    /// roster belongs to. Two codex bots on two logins must not read each
+    /// other's answer off the same file.
+    fn seat_key(&self, env: &[(String, String)]) -> String {
+        env.iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("CODEX_HOME").ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(|home| format!("home-{home}"))
+            .unwrap_or_else(|| "default".into())
+    }
+}
+
+/// Most `model/list` pages to follow. The roster is a dozen models on one
+/// page today; the cap only keeps a server that never stops paging from
+/// holding the probe forever.
+const MODEL_PAGES: usize = 20;
+
+/// Every visible model, across pages. `None` unless the list ENDED: a page
+/// that fails, a cursor that doesn't move, or more pages than any roster has
+/// would all leave a list missing its tail — which drops real models from the
+/// sheet and judges tiers against the wrong roster, worse than keeping what
+/// it already has.
+async fn list_models(server: &CodexAppServer) -> Option<Vec<ModelCap>> {
+    let mut models: Vec<ModelCap> = Vec::new();
+    let mut cursor = Value::Null;
+    for _ in 0..MODEL_PAGES {
+        let mut params = json!({ "includeHidden": false });
+        if !cursor.is_null() {
+            params["cursor"] = cursor.clone();
+        }
+        let page = server.request("model/list", params).await.ok()?;
+        for m in models_of(&page) {
+            if !models.iter().any(|x| x.id == m.id) {
+                models.push(m);
+            }
+        }
+        let next = match &page["nextCursor"] {
+            Value::String(s) if s.is_empty() => Value::Null,
+            v => v.clone(),
+        };
+        if next.is_null() {
+            return Some(models);
+        }
+        if next == cursor {
+            return None;
+        }
+        cursor = next;
+    }
+    None
+}
+
+/// One `model/list` page as [`ModelCap`]s, in codex's order. `model` is what
+/// `--model` takes; `id` (the preset) is the same string today and an alias
+/// when it isn't. Every field but the slug is optional-tolerant — the shape has
+/// grown between builds, and a missing key means "this build didn't say".
+fn models_of(page: &Value) -> Vec<ModelCap> {
+    let s = |v: &Value, k: &str| v[k].as_str().map(str::to_string).filter(|x| !x.is_empty());
+    page["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["hidden"].as_bool() != Some(true))
+        .filter_map(|m| {
+            let id = s(m, "model").or_else(|| s(m, "id"))?;
+            let aliases = s(m, "id").filter(|alias| *alias != id).into_iter().collect();
+            Some(ModelCap {
+                display: s(m, "displayName").unwrap_or_else(|| id.clone()),
+                resolved: None,
+                aliases,
+                description: s(m, "description"),
+                efforts: m["supportedReasoningEfforts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["reasoningEffort"].as_str().or_else(|| e.as_str()))
+                    .map(str::to_string)
+                    .collect(),
+                id,
+            })
+        })
+        .collect()
 }
 
 /// Borrowed per-turn invocation parameters shared by the resume attempt and its
@@ -145,9 +267,14 @@ struct RunParams<'a> {
     model: Option<&'a str>,
     effort: Option<&'a str>,
     conv: &'a str,
+    /// The turn's surface tag — where its forum channel comes from (`turn_env`).
+    surface: &'a str,
+    /// Whose eyes the turn reads with (`Mount::reads`, exported by `turn_env`).
+    reads: &'a crate::chat::ReadsFor,
     draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
+    proc: &'a super::TurnProc,
 }
 
 /// A resume failure that means "this thread id is unusable" (expired rollout, or
@@ -198,12 +325,14 @@ fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -
         args.push("--model".into());
         args.push(m.into());
     }
-    // Reasoning effort (owner-set via Customization) → Codex's config key.
-    // Codex supports minimal/low/medium/high; the higher mafold tiers clamp to
-    // high. No mapping = Codex's own default.
-    if let Some(eff) = effort.and_then(map_effort) {
+    // Reasoning effort (owner-set via Customization) → Codex's config key, AS
+    // GIVEN. Which tiers exist is codex's to say (`model/list`, see `caps`) and
+    // the daemon's to check before the turn (`harness::effort_for_turn`); a
+    // table here clamped xhigh/max to high and dropped ultra on the floor, so
+    // the run took `~/.codex/config.toml`'s tier instead. None = codex's own.
+    if let Some(eff) = effort.map(str::trim).filter(|e| !e.is_empty()) {
         args.push("-c".into());
-        args.push(format!("model_reasoning_effort=\"{eff}\""));
+        args.push(format!("model_reasoning_effort={}", toml_string(eff)));
     }
     // `--` stops flag parsing so the `-` after it is read as the prompt argument.
     args.push("--".into());
@@ -211,30 +340,155 @@ fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -
     args
 }
 
+/// One turn: a `codex exec`, and — when it ends without an answer — one more
+/// on the same thread asking for it.
+///
+/// Codex ends a turn the moment the model makes no tool call, whatever it
+/// said: a model that ran its commands and stopped without a word completes
+/// cleanly (`turn.completed`, an empty or absent final message — Codex's own
+/// `last_agent_message: null`), and the bubble used to be stamped ✓ with tool
+/// cards and no answer in it. Claude Code 2.1.294 asks once more in that spot,
+/// and so does the api's hosted harness (#909); this is the same rule for the
+/// codex driver: [`NO_VISIBLE_OUTPUT`], verbatim, on the thread that just
+/// went quiet, streaming into the same reply. Still nothing after that, and
+/// the turn fails as the shared `empty_reply` — the `{% mafold/error %}` card
+/// says so, with no ✓ result card over nothing.
+///
+/// Not asked when the turn showed nothing at all: that is the daemon's
+/// empty-turn path (`agent.rs`), which re-carries the whole message. Nor when
+/// the turn has no reply to answer in (`draft` empty — `mafold agent
+/// --inbox`, where what the model writes is never seen and a turn that only
+/// ran `mafold send` is exactly how it should end).
+///
+/// [`NO_VISIBLE_OUTPUT`]: mafold_transcript::failure::NO_VISIBLE_OUTPUT
+async fn run_turn(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
+    let started_ms = mafold_transcript::stats::now_ms();
+    let may_ask = !p.draft.is_empty();
+    let mut items = super::codex_stats::ItemStats::default();
+    let first = match run_once(p, session, Leg::first(started_ms, may_ask), &mut items).await {
+        // The stored thread id can be stale or foreign — Codex expires
+        // rollouts, and a conversation may carry a session written by a
+        // DIFFERENT harness (a bot switched to codex mid-conversation).
+        // Retry once WITHOUT resume: the failed attempt exits before
+        // emitting any event, so the fresh run streams into a clean turn.
+        Err(e) if session.is_some() && is_stale_thread(&e) => {
+            run_once(p, None, Leg::first(started_ms, may_ask), &mut items).await
+        }
+        r => r,
+    }?;
+    let (Some(usage), Some(thread)) = (first.held, first.outcome.session.clone()) else {
+        return Ok(first.outcome);
+    };
+    println!("↻ codex: the turn ended without an answer — asking once more on thread {thread}");
+    let ask = RunParams { full_prompt: mafold_transcript::failure::NO_VISIBLE_OUTPUT, ..*p };
+    let mut outcome = match run_once(&ask, Some(&thread), Leg::follow_up(started_ms, usage), &mut items).await {
+        Ok(more) => {
+            let mut o = more.outcome;
+            if o.stopped || o.error.is_some() {
+                // Ended like any stopped or failed turn: no result card.
+            } else if !more.answered {
+                o.error = Some(mafold_transcript::failure::empty_reply("codex"));
+            } else if let Some(stats) = more.held {
+                // The turn's one `Done`, after everything both runs said.
+                close(p.sink, stats, &items, Some(&thread), started_ms).await;
+            }
+            o
+        }
+        Err(e) => TurnOutcome { error: Some(format!("{e:#}")), ..Default::default() },
+    };
+    outcome.produced |= first.outcome.produced;
+    outcome.session = outcome.session.or(Some(thread));
+    Ok(outcome)
+}
+
+/// Which `codex exec` of a turn this is ([`run_turn`]).
+struct Leg {
+    /// When the turn started: the rollout's measurements from then on are
+    /// this turn's, across both runs.
+    started_ms: u64,
+    /// A first run whose silence may be asked about (the turn has a reply).
+    may_ask: bool,
+    /// The first run's usage, when this one IS the ask — what it reports is
+    /// the two together, one turn. The ask never closes the turn itself:
+    /// [`run_turn`] does, once, knowing how it ended.
+    before: Option<RunStats>,
+}
+
+impl Leg {
+    fn first(started_ms: u64, may_ask: bool) -> Self {
+        Self { started_ms, may_ask, before: None }
+    }
+
+    fn follow_up(started_ms: u64, before: RunStats) -> Self {
+        Self { started_ms, may_ask: false, before: Some(before) }
+    }
+}
+
+/// How one `codex exec` ended.
+struct LegEnd {
+    outcome: TurnOutcome,
+    /// Something was said (or drawn) since its last tool call.
+    answered: bool,
+    /// Its usage, when it completed without closing the turn: a first run
+    /// that went quiet (held for the ask), or the ask itself.
+    held: Option<RunStats>,
+}
+
+/// Whether `item` says something about the answer: a non-empty
+/// `agent_message` is one (`Some(true)`); a tool call means anything said
+/// before it was not the end (`Some(false)`); everything else says nothing.
+fn answers(phase: &str, item: &Value) -> Option<bool> {
+    if super::codex_stats::is_tool(item) {
+        return Some(false);
+    }
+    (phase == "item.completed"
+        && item["type"] == "agent_message"
+        && item["text"].as_str().is_some_and(|t| !t.trim().is_empty()))
+    .then_some(true)
+}
+
+/// Two runs' usage as one turn's: the token counts add up, and a count either
+/// run didn't report makes the total unknown rather than half of it.
+fn add_usage(before: &RunStats, now: &RunStats) -> RunStats {
+    let sum = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a.saturating_add(b));
+    RunStats {
+        input_tokens: sum(before.input_tokens, now.input_tokens),
+        output_tokens: sum(before.output_tokens, now.output_tokens),
+        cache_read_tokens: sum(before.cache_read_tokens, now.cache_read_tokens),
+        cache_write_tokens: sum(before.cache_write_tokens, now.cache_write_tokens),
+        total_tokens: sum(before.total_tokens, now.total_tokens),
+        ..Default::default()
+    }
+}
+
 /// One `codex exec` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
-async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { program, full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
-    let stats_started_ms = mafold_transcript::stats::now_ms();
-    let mut item_stats = super::codex_stats::ItemStats::default();
+async fn run_once(
+    p: &RunParams<'_>,
+    session: Option<&str>,
+    leg: Leg,
+    item_stats: &mut super::codex_stats::ItemStats,
+) -> Result<LegEnd> {
+    let RunParams { program, full_prompt, workdir, model, effort, conv, surface, reads, draft, cancel, sink, proc } = *p;
+    let stats_started_ms = leg.started_ms;
     let _ = sink.send(AgentEvent::Stats(RunStats {
         model: model.map(str::to_string),
-        effort: effort.and_then(map_effort).map(str::to_string),
+        effort: effort.map(str::trim).filter(|e| !e.is_empty()).map(str::to_string),
         ..Default::default()
     }));
 
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = crate::platform::command(program);
         cmd.args(exec_args(session, model, effort));
-        // Export the current conversation so `mafold room …` targets THIS room
-        // (harmless for Codex, which has no room skill today — kept for parity).
-        cmd.env("MAFOLD_CONV", conv);
+        // Export the current conversation and forum channel, so `mafold send`
+        // and `read` default to THIS room and channel (`turn_env`).
+        for (k, v) in super::turn_env(conv, surface, reads) {
+            cmd.env(k, v);
+        }
         // The reply being streamed right now — `mafold attach <file>` hangs
         // media on it. Codex's own generated images are swept up automatically
         // (see ImageSweep); this is the door for everything else it draws.
         cmd.env("MAFOLD_DRAFT", draft);
         cmd.kill_on_drop(true);
-        // Don't let the console child flash a window (the agent runs detached).
-        crate::platform::no_window(&mut cmd);
 
         let mut child = cmd
             .current_dir(workdir)
@@ -250,6 +504,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         // exactly THIS process (see harness::live_children) — same contract as
         // the Claude harness; RAII deregisters on every exit path.
         let _child_guard = crate::harness::ChildGuard::new(child.id());
+        // …and as the process running this turn, for the heartbeat
+        // (`TurnProc`): a silent tool call in here is work, not a dead turn.
+        let _serving = proc.serve(child.id());
 
         // Feed the prompt in its OWN task (same shape as the Claude harness): a
         // prompt past the pipe buffer (~64KB — and this one holds the conversation)
@@ -281,10 +538,17 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         });
 
         let mut produced = false;
+        // Something was said since the last tool call (`answers`), or drawn.
+        let mut answered = false;
+        let mut held: Option<RunStats> = None;
         let mut stopped = false;
         let mut session_id: Option<String> = None;
         let mut error: Option<String> = None;
         let mut images: Option<ImageSweep> = None;
+        // Codex has no stall watchdog, so before this a codex killed while a
+        // process it started held its stdout left the turn open until someone
+        // typed /stop. Its exit is the one sign that is always there.
+        let mut exit = super::ExitWatch::new(child.id());
 
         // Emit whatever `image_gen` has written since the last check. Called
         // after every completed item (so a picture reaches the bubble while the
@@ -296,6 +560,8 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                     for path in sw.take_new() {
                         let _ = sink.send(AgentEvent::Image { path });
                         produced = true;
+                        // A picture in the reply is something to look at.
+                        answered = true;
                     }
                 }
             };
@@ -305,6 +571,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
             let line = tokio::select! {
                 line = lines.next_line() => match line? { Some(l) => l, None => break },
                 _ = cancel.notified() => { stopped = true; let _ = child.start_kill(); break; }
+                _ = exit.gone() => { error = Some(super::EXITED_MID_TURN.to_string()); break; }
             };
             let line = line.trim();
             if line.is_empty() {
@@ -337,24 +604,20 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                     // survive on the way — drop any retry notice taken below.
                     error = None;
                     sweep_images!(); // must precede Done — the renderer stops there
-                    let u = &v["usage"];
-                    let mut stats = RunStats::codex(u);
-                    stats.merge(&item_stats.snapshot());
-                    if let Some(thread) = session_id.as_deref() {
-                        let home = codex_home();
-                        let thread = thread.to_string();
-                        let metadata = tokio::task::spawn_blocking(move ||
-                            super::codex_stats::metadata(&home, &thread, stats_started_ms)
-                        ).await.unwrap_or_default();
-                        stats.merge(&metadata);
+                    let usage = match &leg.before {
+                        Some(before) => add_usage(before, &RunStats::codex(&v["usage"])),
+                        None => RunStats::codex(&v["usage"]),
+                    };
+                    // Not closed here when the turn may go on — no answer and
+                    // it can still be asked for — or when this run IS the ask:
+                    // `Done` stamps the result card, which goes last, once
+                    // (`run_turn`).
+                    let ask = leg.may_ask && produced && !answered && session_id.is_some();
+                    if ask || leg.before.is_some() {
+                        held = Some(usage);
+                    } else {
+                        close(sink, usage, item_stats, session_id.as_deref(), stats_started_ms).await;
                     }
-                    let toks = stats.total_tokens;
-                    let _ = sink.send(AgentEvent::Stats(stats));
-                    let _ = sink.send(AgentEvent::Done {
-                        duration_ms: None,
-                        cost_usd: None,
-                        tokens: toks,
-                    });
                     break;
                 }
                 // Model gave up mid-turn (stream ended, etc.) — surface + stop.
@@ -390,6 +653,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                     );
                 }
                 phase @ ("item.started" | "item.updated" | "item.completed") => {
+                    if let Some(a) = answers(phase, &v["item"]) {
+                        answered = a;
+                    }
                     handle_item(phase, &v["item"], sink, &mut produced);
                     if phase == "item.completed" {
                         sweep_images!();
@@ -407,40 +673,65 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
             if let Some(t) = stderr_task {
                 t.abort();
             }
-            return Ok(TurnOutcome {
-                produced,
-                stopped,
-                session: session_id,
-                error,
-                limit: None,
+            return Ok(LegEnd {
+                outcome: TurnOutcome { produced, stopped, session: session_id, error, limit: None },
+                answered,
+                held: None,
             });
         }
         let status = child.wait().await?;
         if !status.success() {
+            // It completed, then exited badly: no ask follows an `Err`, so a
+            // run that did answer closes the turn it held here — the way a
+            // run that never held anything already has.
+            if let Some(usage) = held.take().filter(|_| answered) {
+                close(sink, usage, item_stats, session_id.as_deref(), stats_started_ms).await;
+            }
             let err = match stderr_task {
                 Some(t) => t.await.unwrap_or_default(),
                 None => String::new(),
             };
             let err = err.trim();
-            bail!(
-                "codex exited unsuccessfully{}",
-                if err.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {err}")
-                }
-            );
+            // After `logfile::EXITED`, like claude's: a diagnostics file keeps
+            // its length, not codex's words.
+            if err.is_empty() {
+                bail!("codex exited unsuccessfully");
+            }
+            bail!("codex{}{err}", crate::logfile::EXITED);
         }
         if let Some(t) = stderr_task {
             t.abort();
         }
-        Ok(TurnOutcome {
-            produced,
-            stopped,
-            session: session_id,
-            error: None,
-            limit: None,
+        Ok(LegEnd {
+            outcome: TurnOutcome { produced, stopped, session: session_id, error: None, limit: None },
+            answered,
+            held,
         })
+}
+
+/// Close the turn's transcript: its numbers (`usage`, the tool tally, and
+/// what the thread's rollout adds since `started_ms`), then `Done` — which
+/// stamps the result card, so nothing may follow it.
+async fn close(
+    sink: &UnboundedSender<AgentEvent>,
+    usage: RunStats,
+    items: &super::codex_stats::ItemStats,
+    thread: Option<&str>,
+    started_ms: u64,
+) {
+    let mut stats = usage;
+    stats.merge(&items.snapshot());
+    if let Some(thread) = thread {
+        let home = codex_home();
+        let thread = thread.to_string();
+        let metadata = tokio::task::spawn_blocking(move || super::codex_stats::metadata(&home, &thread, started_ms))
+            .await
+            .unwrap_or_default();
+        stats.merge(&metadata);
+    }
+    let tokens = stats.total_tokens;
+    let _ = sink.send(AgentEvent::Stats(stats));
+    let _ = sink.send(AgentEvent::Done { duration_ms: None, cost_usd: None, tokens });
 }
 
 /// Where Codex keeps its state (`CODEX_HOME`, else `~/.codex`) — the same
@@ -509,17 +800,9 @@ impl ImageSweep {
     }
 }
 
-/// Map a mafold effort level (`low`…`max`) to Codex's `model_reasoning_effort`
-/// (`minimal`/`low`/`medium`/`high`). `None` = use Codex's own default.
-fn map_effort(effort: &str) -> Option<&'static str> {
-    match effort.trim().to_lowercase().as_str() {
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        // Codex tops out at `high`; the higher mafold tiers clamp to it.
-        "high" | "xhigh" | "max" => Some("high"),
-        _ => None, // "default"/unknown → Codex default
-    }
+/// `s` as a TOML basic string — `-c key=value` parses its value as TOML.
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Normalize a Codex `item` event into `AgentEvent`s. `phase` is the outer
@@ -711,9 +994,8 @@ async fn auth_status_line() -> String {
 /// `codex --version` → "0.5.0" (first numeric-ish token; "" if the CLI is missing).
 async fn codex_version() -> String {
     use std::time::Duration;
-    let mut cmd = tokio::process::Command::new(super::program("codex"));
+    let mut cmd = crate::platform::command(super::program("codex"));
     cmd.arg("--version").stdin(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     match tokio::time::timeout(Duration::from_secs(8), cmd.output()).await {
         Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout)
             .split_whitespace()
@@ -768,16 +1050,37 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let path = dir.join("codex.sh");
-            let mut s = String::from("#!/bin/sh\n");
-            for line in stream {
-                s.push_str(&format!("cat <<'MAFOLD_JSON'\n{line}\nMAFOLD_JSON\n"));
-            }
-            std::fs::write(&path, s).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
+            scripted_legs(dir, &[stream])
         }
+    }
+
+    /// A `codex` stand-in that prints `legs[n]` on its n-th run (nothing past
+    /// the last) and keeps what run n was given: `argv.n`, and the prompt it
+    /// read on stdin as `stdin.n`. A line `exit N` exits there with N.
+    #[cfg(unix)]
+    fn scripted_legs(dir: &std::path::Path, legs: &[&[&str]]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("codex.sh");
+        let d = dir.display();
+        let mut s = format!(
+            "#!/bin/sh\nn=$(cat '{d}/runs' 2>/dev/null || echo 0)\necho $((n + 1)) > '{d}/runs'\n\
+             printf '%s\\n' \"$*\" > \"{d}/argv.$n\"\ncat > \"{d}/stdin.$n\"\ncase $n in\n"
+        );
+        for (i, stream) in legs.iter().enumerate() {
+            s.push_str(&format!("{i})\n"));
+            for line in *stream {
+                if line.starts_with("exit ") {
+                    s.push_str(&format!("{line}\n"));
+                } else {
+                    s.push_str(&format!("cat <<'MAFOLD_JSON'\n{line}\nMAFOLD_JSON\n"));
+                }
+            }
+            s.push_str(";;\n");
+        }
+        s.push_str("esac\n");
+        std::fs::write(&path, s).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
     }
 
     /// Drive one turn against a scripted stream.
@@ -785,15 +1088,57 @@ mod tests {
         run_scripted_events(tag, stream).await.0
     }
 
+    /// The agent process is told its conversation AND its forum channel, through
+    /// the real spawn path — `mafold send` / `read` default to the channel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_agent_process_is_told_its_conversation_and_channel() {
+        let dir = std::env::temp_dir().join(format!("mafold-codex-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (program, record) = crate::harness::env_probe::script(&dir);
+        let workdir = dir.to_string_lossy().to_string();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (sink, _rx) = tokio::sync::mpsc::unbounded_channel();
+        for (surface, want) in [("c1__ch-0001__opsdu_codex", "c1|ch-0001"), ("c1____opsdu_codex", "c1|")] {
+            let _ = std::fs::remove_file(&record);
+            let p = RunParams {
+                program: program.as_os_str(),
+                full_prompt: "hi",
+                workdir: &workdir,
+                model: None,
+                effort: None,
+                conv: "c1",
+                surface,
+                reads: &crate::chat::ReadsFor::All,
+                draft: "draft",
+                cancel: &cancel,
+                sink: &sink,
+                proc: &crate::harness::TurnProc::default(),
+            };
+            let _ = run_turn(&p, None).await; // the probe says nothing; only what it was given counts
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), want, "{surface}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     async fn run_scripted_events(tag: &str, stream: &[&str]) -> (TurnOutcome, Vec<AgentEvent>) {
         let dir = std::env::temp_dir().join(format!("mafold-codex-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let program = scripted_codex(&dir, stream);
+        let (out, events) = drive(&dir, &program, "draft").await;
+        let _ = std::fs::remove_dir_all(&dir);
+        (out.unwrap(), events)
+    }
+
+    /// One turn through the real entry ([`run_turn`]) against `program`, as
+    /// a reply to `draft` (empty: a turn with no reply, like the inbox's).
+    async fn drive(dir: &std::path::Path, program: &std::path::Path, draft: &str) -> (Result<TurnOutcome>, Vec<AgentEvent>) {
         let workdir = dir.to_string_lossy().to_string();
         let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
         let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let out = run_once(
+        let out = run_turn(
             &RunParams {
                 program: program.as_os_str(),
                 full_prompt: "hi",
@@ -801,18 +1146,284 @@ mod tests {
                 model: None,
                 effort: None,
                 conv: "conv",
-                draft: "draft",
+                surface: "",
+                reads: &crate::chat::ReadsFor::All,
+                draft,
                 cancel: &cancel,
                 sink: &sink,
+                proc: &crate::harness::TurnProc::default(),
             },
             None,
         )
-        .await
-        .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        .await;
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() { events.push(ev); }
         (out, events)
+    }
+
+    /// The legs of one scripted turn: what each run was given, and what came
+    /// out of the whole turn.
+    #[cfg(unix)]
+    struct Legs {
+        result: Result<TurnOutcome>,
+        events: Vec<AgentEvent>,
+        /// `(argv, stdin)` of each run, in order.
+        runs: Vec<(String, String)>,
+    }
+
+    #[cfg(unix)]
+    impl Legs {
+        fn out(&self) -> &TurnOutcome {
+            self.result.as_ref().expect("an outcome, not an Err")
+        }
+
+        fn dones(&self) -> usize {
+            self.events.iter().filter(|e| matches!(e, AgentEvent::Done { .. })).count()
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_legs(tag: &str, legs: &[&[&str]]) -> Legs {
+        run_legs_as(tag, legs, "draft").await
+    }
+
+    #[cfg(unix)]
+    async fn run_legs_as(tag: &str, legs: &[&[&str]], draft: &str) -> Legs {
+        let dir = std::env::temp_dir().join(format!("mafold-codex-legs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = scripted_legs(&dir, legs);
+        let (result, events) = drive(&dir, &program, draft).await;
+        let runs = (0..)
+            .map_while(|n| {
+                let argv = std::fs::read_to_string(dir.join(format!("argv.{n}"))).ok()?;
+                Some((argv, std::fs::read_to_string(dir.join(format!("stdin.{n}"))).unwrap_or_default()))
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        Legs { result, events, runs }
+    }
+
+    /// The reply the renderer would build from `events`.
+    #[cfg(unix)]
+    fn transcript_of(events: &[AgentEvent]) -> String {
+        let mut tx = mafold_transcript::Transcript::new();
+        for event in events {
+            tx.push(event);
+        }
+        tx.finish()
+    }
+
+    #[cfg(unix)]
+    const THREAD: &str = r#"{"type":"thread.started","thread_id":"01a1f0aa-0000-7000-8000-000000000001"}"#;
+    #[cfg(unix)]
+    const RENAME_STARTED: &str = r#"{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"mafold channels rename 民调","status":"in_progress"}}"#;
+    #[cfg(unix)]
+    const RENAME_DONE: &str = r#"{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"mafold channels rename 民调","aggregated_output":"renamed","exit_code":0,"status":"completed"}}"#;
+
+    /// conv df712566's shape on the codex driver: commands ran, then the model
+    /// stopped without a word (an empty final message, what a local rollout of
+    /// 2026-10-05 holds). The turn used to be stamped ✓ over tool cards alone;
+    /// now the same thread is asked once — Claude Code's line, verbatim — and
+    /// the answer lands in the SAME reply, before the one result card, with the
+    /// two runs' tokens added up.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_that_ends_after_its_tools_without_a_word_is_asked_once_more() {
+        let r = run_legs(
+            "asked",
+            &[
+                &[
+                    THREAD,
+                    r#"{"type":"item.completed","item":{"id":"m0","type":"agent_message","text":"I'll look it up."}}"#,
+                    RENAME_STARTED,
+                    RENAME_DONE,
+                    r#"{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":""}}"#,
+                    r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20}}"#,
+                ],
+                &[
+                    THREAD,
+                    r#"{"type":"item.completed","item":{"id":"m2","type":"agent_message","text":"The latest poll has 42%."}}"#,
+                    r#"{"type":"turn.completed","usage":{"input_tokens":130,"cached_input_tokens":0,"output_tokens":10}}"#,
+                ],
+            ],
+        )
+        .await;
+        assert_eq!(r.runs.len(), 2, "asked exactly once more");
+        let (argv, stdin) = &r.runs[1];
+        assert!(argv.contains("resume 01a1f0aa-0000-7000-8000-000000000001"), "on the same thread: {argv}");
+        assert_eq!(stdin, mafold_transcript::failure::NO_VISIBLE_OUTPUT, "Claude Code's line, nothing else");
+        assert_eq!(r.out().error, None);
+        assert!(r.out().produced);
+        assert_eq!(r.out().session.as_deref(), Some("01a1f0aa-0000-7000-8000-000000000001"));
+        assert_eq!(r.dones(), 1, "one turn, one result card");
+        let md = transcript_of(&r.events);
+        let answer = md.find("The latest poll has 42%.").expect("the answer is in the reply");
+        let result = md.find("mafold/result").expect("the result card");
+        assert!(answer < result, "the result card goes last:\n{md}");
+        assert!(md.contains("\"total_tokens\":260"), "both runs' tokens, one turn:\n{md}");
+        assert!(md.contains("\"tool_calls\":1"), "{md}");
+    }
+
+    /// Still nothing after the ask: the turn fails as the shared `empty_reply`
+    /// — the `{% mafold/error %}` card's "empty", with no ✓ result card over
+    /// nothing — and is not asked again. Same for an ask that never even
+    /// completes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn still_silent_after_the_ask_fails_as_an_empty_reply() {
+        let quiet: &[&str] = &[THREAD, RENAME_STARTED, RENAME_DONE, r#"{"type":"turn.completed","usage":{"output_tokens":3}}"#];
+        let never_asked: &[&str] = &[THREAD, r#"{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"never asked"}}"#];
+        for (tag, ask) in [
+            ("silent", &[THREAD, r#"{"type":"turn.completed","usage":{"output_tokens":2}}"#][..]),
+            ("eof", &[THREAD][..]),
+        ] {
+            let r = run_legs(tag, &[quiet, ask, never_asked]).await;
+            assert_eq!(r.runs.len(), 2, "{tag}: one ask, never a second");
+            let err = r.out().error.clone().expect("a turn with no answer is not a success");
+            assert!(
+                matches!(mafold_transcript::failure::classify(&err).kind, mafold_transcript::failure::FailureKind::Empty),
+                "{tag}: {err}"
+            );
+            assert!(r.out().produced, "{tag}: its tool cards are on screen — not the daemon's empty-turn path");
+            assert_eq!(r.dones(), 0, "{tag}: no result card on a turn that failed");
+        }
+    }
+
+    /// An ask that answers and then exits badly still closes the turn — once,
+    /// after the answer — and the exit is the turn's error, as it would be
+    /// for any run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ask_that_answers_then_exits_badly_closes_the_turn_once() {
+        let r = run_legs(
+            "exit",
+            &[
+                &[THREAD, RENAME_STARTED, RENAME_DONE, r#"{"type":"turn.completed","usage":{"output_tokens":3}}"#],
+                &[
+                    THREAD,
+                    r#"{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"Here it is."}}"#,
+                    r#"{"type":"turn.completed","usage":{"output_tokens":2}}"#,
+                    "exit 1",
+                ],
+            ],
+        )
+        .await;
+        assert_eq!(r.runs.len(), 2);
+        let err = r.out().error.clone().expect("the bad exit is reported");
+        assert!(err.contains("exited unsuccessfully"), "{err}");
+        assert_eq!(r.dones(), 1, "closed once, not once per run");
+        let md = transcript_of(&r.events);
+        assert!(md.find("Here it is.").unwrap() < md.find("mafold/result").unwrap(), "{md}");
+    }
+
+    /// A turn with no reply to answer in — the inbox's (`draft` empty), where
+    /// what the model writes is never seen and a turn that only ran `mafold
+    /// send` is done — is never asked about its silence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_with_no_reply_is_not_asked() {
+        let sending = r#"{"type":"item.started","item":{"id":"s","type":"command_execution","command":"mafold send c 好的","status":"in_progress"}}"#;
+        let sent = r#"{"type":"item.completed","item":{"id":"s","type":"command_execution","command":"mafold send c 好的","aggregated_output":"sent","exit_code":0,"status":"completed"}}"#;
+        let r = run_legs_as(
+            "inbox",
+            &[
+                &[THREAD, sending, sent, r#"{"type":"turn.completed","usage":{"output_tokens":3}}"#],
+                &[THREAD, r#"{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"never asked"}}"#],
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(r.runs.len(), 1, "the inbox's silence is its answer");
+        assert_eq!(r.out().error, None);
+        assert_eq!(r.dones(), 1);
+    }
+
+    /// What is NOT asked again: a turn that answered after its last command; a
+    /// plain answer; an answer followed only by the plan codex completes at the
+    /// end of the turn; a turn that showed nothing at all (the daemon's own
+    /// empty-turn retry re-carries the message); and a stopped or failed one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answered_or_unfinished_turn_is_not_asked_again() {
+        let answer = r#"{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"Done: renamed it."}}"#;
+        let plan = r#"{"type":"item.completed","item":{"id":"p","type":"todo_list","items":[{"text":"rename","completed":true}]}}"#;
+        let completed = r#"{"type":"turn.completed","usage":{"output_tokens":5}}"#;
+        let failed = r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#;
+        let cases: [(&str, Vec<&str>); 5] = [
+            ("after-tools", vec![THREAD, RENAME_STARTED, RENAME_DONE, answer, completed]),
+            ("plain", vec![THREAD, answer, completed]),
+            ("plan-last", vec![THREAD, RENAME_STARTED, RENAME_DONE, answer, plan, completed]),
+            ("nothing", vec![THREAD, completed]),
+            ("failed", vec![THREAD, RENAME_STARTED, RENAME_DONE, failed]),
+        ];
+        for (tag, stream) in cases {
+            let r = run_legs(tag, &[&stream, &[THREAD, answer, completed]]).await;
+            assert_eq!(r.runs.len(), 1, "{tag}: asked again");
+            assert_eq!(r.dones(), usize::from(tag != "failed"), "{tag}");
+        }
+    }
+
+    /// Which items speak to the answer.
+    #[test]
+    fn what_counts_as_an_answer() {
+        let msg = |t: &str| json!({ "type": "agent_message", "text": t });
+        assert_eq!(answers("item.completed", &msg("hi")), Some(true));
+        assert_eq!(answers("item.completed", &msg("  \n")), None, "whitespace says nothing");
+        assert_eq!(answers("item.completed", &msg("")), None, "codex's empty final message");
+        assert_eq!(answers("item.started", &json!({ "type": "command_execution" })), Some(false));
+        assert_eq!(answers("item.completed", &json!({ "type": "web_search" })), Some(false));
+        assert_eq!(answers("item.completed", &json!({ "type": "reasoning", "text": "hmm" })), None);
+        assert_eq!(answers("item.completed", &json!({ "type": "todo_list" })), None, "the plan closes at turn end");
+    }
+
+    /// Codex killed mid-turn while a process it started still holds its stdout:
+    /// no EOF ever comes, and before this the turn simply never ended — codex
+    /// has no stall watchdog, so it sat there until someone typed /stop. The
+    /// process being gone has to end it, with what was in the pipe read first.
+    #[tokio::test]
+    async fn harness_exit_ends_the_turn_even_if_a_child_holds_the_pipe() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("mafold-codex-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = crate::harness::orphan_fixture::script(&dir, r#"{"type":"thread.started","thread_id":"t-orphan"}"#);
+        let workdir = dir.to_string_lossy().to_string();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let proc = crate::harness::TurnProc::default();
+        let p = RunParams {
+            program: program.as_os_str(),
+            full_prompt: "hi",
+            workdir: &workdir,
+            model: None,
+            effort: None,
+            conv: "conv",
+            surface: "",
+            reads: &crate::chat::ReadsFor::All,
+            draft: "draft",
+            cancel: &cancel,
+            sink: &sink,
+            proc: &proc,
+        };
+        let (out, after) =
+            crate::harness::orphan_fixture::kill_mid_turn(run_turn(&p, None), &proc, &dir, Duration::from_secs(20)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let out = out
+            .expect("the turn was still open 20s after its process died — a child of it holds the pipe")
+            .expect("an outcome, not an Err");
+        assert!(
+            after < crate::harness::EXIT_DRAIN + Duration::from_secs(2),
+            "ended {after:?} after the kill — one {:?} drain, not more",
+            crate::harness::EXIT_DRAIN
+        );
+        assert!(out.error.is_some(), "a turn whose agent died must say so");
+        let mut saw_session = false;
+        while let Ok(ev) = rx.try_recv() {
+            saw_session |= matches!(ev, AgentEvent::Session(ref s) if s == "t-orphan");
+        }
+        assert!(saw_session, "what the process wrote before it died was still read");
     }
 
     #[tokio::test]
@@ -927,7 +1538,7 @@ mod tests {
         // to `-c model_reasoning_effort="high"` on the way through.
         std::fs::write(&bat, "@echo off\r\necho %*\r\n").unwrap();
 
-        let out = std::process::Command::new(&bat)
+        let out = crate::platform::std_command(&bat)
             .args(exec_args(None, None, Some("high")))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -945,16 +1556,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The tier rides to codex exactly as the turn carries it — the field bug
+    /// was `ultra` vanishing from argv (and xhigh/max arriving as `high`), so
+    /// codex ran `~/.codex/config.toml`'s medium. Which tiers are real is
+    /// checked before the turn (`harness::effort_for_turn`), not here.
     #[test]
-    fn effort_mapping() {
-        assert_eq!(map_effort("low"), Some("low"));
-        assert_eq!(map_effort("Medium"), Some("medium"));
-        assert_eq!(map_effort("high"), Some("high"));
-        assert_eq!(map_effort("xhigh"), Some("high"));
-        assert_eq!(map_effort("max"), Some("high"));
-        assert_eq!(map_effort("minimal"), Some("minimal"));
-        assert_eq!(map_effort("default"), None);
-        assert_eq!(map_effort("wat"), None);
+    fn effort_reaches_codex_verbatim() {
+        let effort_arg = |e: Option<&str>| {
+            let args = exec_args(None, Some("gpt-6.1-sol"), e);
+            args.iter()
+                .position(|a| a == "-c")
+                .map(|i| args[i + 1].clone())
+        };
+        for tier in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+            assert_eq!(effort_arg(Some(tier)), Some(format!("model_reasoning_effort=\"{tier}\"")));
+        }
+        assert_eq!(effort_arg(None), None, "unset = codex's own default");
+        assert_eq!(effort_arg(Some("  ")), None);
+        // Still one TOML string whatever it holds.
+        assert_eq!(effort_arg(Some("a\"b")), Some(r#"model_reasoning_effort="a\"b""#.to_string()));
+    }
+
+    /// `model/list` as codex 0.161.0 answers it (trimmed): per-model tiers,
+    /// `ultra` only where the model has it, hidden models left out, and the
+    /// paging cursor ignored by the parse.
+    #[test]
+    fn model_list_becomes_per_model_tiers() {
+        let tiers = |ts: &[&str]| -> Value {
+            ts.iter().map(|t| json!({ "reasoningEffort": t, "description": "…" })).collect()
+        };
+        let page = json!({
+            "data": [
+                { "id": "gpt-6.1-sol", "model": "gpt-6.1-sol", "displayName": "GPT-6.1-Sol",
+                  "description": "Latest workhorse model.", "hidden": false, "isDefault": true,
+                  "defaultReasoningEffort": "low",
+                  "supportedReasoningEfforts": tiers(&["low", "medium", "high", "xhigh", "max", "ultra"]) },
+                { "id": "gpt-6-luna", "model": "gpt-6-luna", "displayName": "GPT-6-Luna", "hidden": false,
+                  "supportedReasoningEfforts": tiers(&["low", "medium", "high", "xhigh", "max"]) },
+                { "id": "gpt-daybreak-blue-latest", "model": "gpt-daybreak-blue-latest", "hidden": true,
+                  "supportedReasoningEfforts": tiers(&["low"]) },
+                { "id": "preset-x", "model": "gpt-x", "supportedReasoningEfforts": [] }
+            ],
+            "nextCursor": null
+        });
+        let models = models_of(&page);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["gpt-6.1-sol", "gpt-6-luna", "gpt-x"], "hidden models stay out of the sheet");
+        assert_eq!(models[0].display, "GPT-6.1-Sol");
+        assert_eq!(models[0].efforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(models[1].efforts, ["low", "medium", "high", "xhigh", "max"]);
+        // The slug is what `--model` takes; a different preset id still names it.
+        assert_eq!(models[2].display, "gpt-x");
+        assert!(models[2].matches("preset-x"));
+        assert!(models[2].efforts.is_empty());
+        assert!(models_of(&json!({})).is_empty());
+    }
+
+    /// A roster belongs to the codex login it was read from — two daemons on
+    /// two `CODEX_HOME`s keep two answers, never one shared `default`.
+    #[test]
+    fn codex_rosters_are_kept_per_codex_home() {
+        let pro = Codex.seat_key(&[("CODEX_HOME".into(), "/u/.codex-pro".into())]);
+        let plus = Codex.seat_key(&[("CODEX_HOME".into(), "/u/.codex-plus".into())]);
+        assert_ne!(pro, plus);
+        assert_ne!(pro, "default");
+        assert_ne!(
+            super::super::caps_cache_path("codex", &pro),
+            super::super::caps_cache_path("codex", &plus)
+        );
+    }
+
+    /// The real binary, when there is one: the probe must come back with the
+    /// tiers per model, and spend nothing doing it (no thread is opened).
+    #[tokio::test]
+    #[ignore = "requires an installed Codex CLI with App Server support"]
+    async fn live_codex_reports_its_tiers() {
+        if !super::super::on_path("codex") {
+            return;
+        }
+        let probe = Codex.caps(&[], "").await.expect("codex answered model/list");
+        assert!(!probe.models.is_empty());
+        assert!(probe.models.iter().all(|m| !m.efforts.is_empty()), "{:?}", probe.models);
+        for m in &probe.models {
+            println!("  {} ({}) efforts={:?}", m.id, m.display, m.efforts);
+        }
     }
 
     /// A sweep must report only what THIS turn drew. A resumed thread's

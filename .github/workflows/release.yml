@@ -68,6 +68,10 @@ jobs:
           # bolted on at publish.
           PRE=""
           case "$TAG" in *-dev.*) PRE="--prerelease"; echo "dev channel: $TAG will be a prerelease" ;; esac
+          # The monorepo release train's rehearsal: built to a draft, then
+          # deleted. Prerelease too, so even a mistaken publish could never
+          # become /releases/latest.
+          case "$TAG" in *-dry.*) PRE="--prerelease"; echo "train rehearsal: $TAG is a throwaway prerelease draft" ;; esac
           # Draft: fires no `published` webhook and stays out of /releases/latest
           # until the publish job flips it with every asset attached.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
@@ -252,7 +256,32 @@ jobs:
               echo "$HAVE" | grep -qx "$f" || { echo "::error::missing asset $f — not publishing"; exit 1; }
             done
           done
+
+      # The monorepo's release train mirrors its tag ANNOTATED with
+      # `release-train: hold`: build everything, leave the release a complete
+      # DRAFT, and let the train flip it once the api it depends on is live.
+      # A plain (lightweight) tag — every hand release — publishes here as before.
+      - name: Held by the release train?
+        id: hold
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          held=false
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '"\(.object.type) \(.object.sha)"')
+          if [ "${ref%% *}" = tag ] \
+             && gh api "repos/$GITHUB_REPOSITORY/git/tags/${ref#* }" --jq .message | grep -qx 'release-train: hold'; then
+            held=true
+          fi
+          case "$TAG" in *-dry.*) held=true ;; esac
+          echo "held=$held" >> "$GITHUB_OUTPUT"
+          if [ "$held" = true ]; then
+            echo "::notice::$TAG is held by the release train — left as a complete draft; the train publishes it"
+            echo "### $TAG held as a complete draft — the monorepo's release train publishes it" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Publish
+        if: steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -274,6 +303,7 @@ jobs:
       # downloading a dev binary — so check the exact endpoint the updater and
       # install.sh read, on every release, both channels.
       - name: /releases/latest is the stable line
+        if: steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

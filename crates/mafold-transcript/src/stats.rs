@@ -33,6 +33,28 @@ pub struct RunStats {
     pub tool_calls: Option<u64>,
     pub tool_errors: Option<u64>,
     pub compactions: Option<u64>,
+    /// What this reply charged its owner's wallet, per currency — the
+    /// ledger's own figure (`getReplyCost`), not an estimate, for an agent
+    /// whose fuel is the wallet (PR 4c, 10-31). Amounts are wallet units of
+    /// the currency (a model id), never dollars: that is how the wallet's
+    /// history reads, and a dollar figure here would be a second price. Left
+    /// out of the body when unset, so every other turn's card reads as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<Vec<WalletCharge>>,
+    /// `Some(true)`: some of the reply's calls hadn't settled when the card
+    /// was written — `wallet` is what had, and the card says «settling».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_partial: Option<bool>,
+}
+
+/// One currency's share of a reply's wallet charge (`getReplyCost` `totals`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WalletCharge {
+    /// The wallet currency: a model id (`deepseek-v4-flash`).
+    pub currency: String,
+    /// Wallet units of `currency` charged.
+    pub charged: i64,
 }
 
 impl RunStats {
@@ -62,7 +84,9 @@ impl RunStats {
             model_requests,
             tool_calls,
             tool_errors,
-            compactions
+            compactions,
+            wallet,
+            wallet_partial
         );
     }
 
@@ -213,6 +237,22 @@ mod tests {
         assert!(!body.contains("{%"));
         assert_eq!(serde_json::from_str::<RunStats>(&body).unwrap(), merged);
     }
+    /// The wallet total is a snapshot like the rest: a later patch replaces
+    /// it whole (the poll's last answer is the figure), an unrelated patch
+    /// leaves it alone, and it survives the card body round trip.
+    #[test]
+    fn the_wallet_total_merges_as_a_snapshot() {
+        let charge = |n| Some(vec![WalletCharge { currency: "deepseek-v4-flash".into(), charged: n }]);
+        let mut s = RunStats::default();
+        s.merge(&RunStats { wallet: charge(10), wallet_partial: Some(true), ..Default::default() });
+        s.merge(&RunStats { wallet: charge(25), ..Default::default() });
+        s.merge(&RunStats { input_tokens: Some(3), ..Default::default() });
+        assert_eq!(s.wallet, charge(25));
+        assert_eq!(s.wallet_partial, Some(true), "only an explicit patch changes it");
+        assert_eq!(serde_json::from_str::<RunStats>(&s.card_body()).unwrap(), s);
+        assert!(!RunStats::default().card_body().contains("wallet"), "unset = not written");
+    }
+
     #[test]
     fn request_aggregation_keeps_the_resolved_reasoning_effort() {
         let mut total = RunStats::default();

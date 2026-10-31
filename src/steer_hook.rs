@@ -25,8 +25,15 @@
 //! so exactly one of the two readers gets any given message.
 //!
 //! Empty is the overwhelmingly common case, and it costs one failed rename.
+//!
+//! **What the mailbox holds, and how it is worded, is not decided here.** Two
+//! kinds of entry — said TO the agent (owed an answer) and the room around it
+//! (background, never a follow-up of its own) — are encoded, parsed and framed
+//! by `mafold_types::steer`, the rule the hosted brains read too. This file
+//! only claims the mailbox and answers the hook.
 
 use anyhow::Result;
+use mafold_core::mafold_types::steer::{mailbox, Part};
 use std::io::Read;
 
 pub fn run() -> Result<()> {
@@ -46,26 +53,19 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// What a PostToolUse hook should answer when the user spoke mid-turn, or None
-/// when they didn't.
+/// What a PostToolUse hook should answer when something arrived mid-turn, or
+/// None when nothing did.
 ///
 /// Shared by both deliveries: this command (a process claude spawns per tool
 /// call, for a CLI without the control channel) and the in-process
 /// `hook_callback` the connection answers directly. One body, so the two can
 /// never drift into saying different things to the model.
 pub fn response(path: &str) -> Option<serde_json::Value> {
-    let text = take(path)?;
+    let text = Part::for_model(&mailbox::parse(&take(path)?))?;
     Some(serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": format!(
-                "The user sent this WHILE you were working, so it has not been \
-                 answered yet and it is newer than anything above:\n\n{}\n\n\
-                 Take it into account from here on. If it changes what you should \
-                 be doing, change course now rather than finishing the old plan \
-                 first; if it is just information, carry on.",
-                text.trim()
-            ),
+            "additionalContext": text,
         }
     }))
 }

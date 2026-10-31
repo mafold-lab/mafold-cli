@@ -10,20 +10,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// An item that is a tool call. Not `todo_list`: codex completes the plan at
+/// the END of the turn, after the answer, so it is no call the model made.
+pub(super) fn is_tool(item: &Value) -> bool {
+    matches!(
+        item["type"].as_str(),
+        Some("command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call" | "web_search")
+    )
+}
+
 #[derive(Default)]
 pub(super) struct ItemStats(HashMap<String, Option<bool>>);
 impl ItemStats {
     pub fn observe(&mut self, phase: &str, item: &Value) {
-        if !matches!(
-            item["type"].as_str(),
-            Some(
-                "command_execution"
-                    | "file_change"
-                    | "mcp_tool_call"
-                    | "collab_tool_call"
-                    | "web_search"
-            )
-        ) {
+        if !is_tool(item) {
             return;
         }
         let Some(id) = item["id"].as_str().filter(|s| !s.is_empty()) else {

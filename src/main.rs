@@ -6,37 +6,64 @@
 //!
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
+mod account_health;
 mod accounts;
 mod agent;
 mod apps;
 mod ask_hook;
 mod bash_hook;
+#[cfg(windows)]
+mod background_windows;
+mod bgtasks;
+mod bot_token;
 mod cards;
 mod cardtags;
 mod channels;
 mod chat;
 mod client;
 mod commands;
+mod compact_hook;
 mod computer;
+mod conceal;
 mod connection;
+mod control;
+mod d1;
 mod daemon;
+#[cfg(debug_assertions)]
+mod dev_wallet_turn;
+mod diagnose;
 mod discover;
 mod drafts;
+mod drive;
+mod flagcmd;
+mod flags;
+mod fuel;
 mod harness;
 mod inbox;
 mod install;
+mod installed;
 mod langpack;
+mod lifecycle;
+mod logfile;
+mod machine;
+mod mail;
 mod mcp_link;
+mod msgops;
 mod pair;
+mod pending;
 mod permission_mcp;
 mod platform;
-mod room;
+mod runtime_login;
 mod session;
+mod session_life;
+mod sites;
 mod steer_hook;
 mod supervisor;
+mod thumb;
 mod turnenv;
 mod update;
 mod vault;
+mod video;
 mod wallet;
 
 use anyhow::{Context, Result};
@@ -66,7 +93,7 @@ struct Cli {
     /// `report`, and the control plane.
     #[arg(long, env = "MAFOLD_ACCOUNT", global = true)]
     account: Option<String>,
-    /// Disable the agent's hourly auto-update.
+    /// Turn off automatic updates (otherwise checked every 10 minutes).
     #[arg(long, env = "MAFOLD_NO_AUTO_UPDATE", global = true)]
     no_auto_update: bool,
     #[command(subcommand)]
@@ -104,7 +131,13 @@ enum Cmd {
     /// Stop a background agent started with `agent --detach`.
     Stop,
     /// Show whether a background agent is running.
-    Status,
+    Status {
+        /// One JSON object for a program to read (the desktop app): version,
+        /// this binary, the supervisor and the binary its service is
+        /// registered against, accounts, daemons, harnesses, vault.
+        #[arg(long)]
+        json: bool,
+    },
     /// Update mafold to the latest release.
     Update {
         /// Switch this machine's release channel, then update into it.
@@ -114,8 +147,20 @@ enum Cmd {
         /// real machine WITHOUT turning auto-update off. The choice is sticky
         /// (`~/.mafold/channel`): the supervisor and every agent here follow it
         /// until you switch back with `--channel stable`.
-        #[arg(long, value_name = "stable|dev")]
+        #[arg(long, value_name = "stable|dev", value_parser = ["stable", "dev"])]
         channel: Option<String>,
+        /// Only ask whether a newer release is out — nothing is downloaded or
+        /// installed.
+        #[arg(long)]
+        check: bool,
+        /// Turn this computer's automatic updates on or off — a setting
+        /// (`~/.mafold/auto-update`) the supervisor reads on every pass.
+        /// Installs nothing; the service and its bots are left as they are.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        auto_update: Option<String>,
+        /// One JSON object for a program to read (the desktop app).
+        #[arg(long)]
+        json: bool,
     },
     /// Install a coding-agent runtime (claude-code / codex / kimi-code /
     /// opencode). No argument lists the runtimes + their install state.
@@ -139,9 +184,13 @@ enum Cmd {
         chat: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Read a forum channel instead of the main timeline.
+        /// Read a forum channel (id or #name). Inside a channel turn, this
+        /// turn's own conversation already defaults to the turn's channel.
         #[arg(long)]
         channel: Option<String>,
+        /// Read the main timeline (#all), even inside a channel turn.
+        #[arg(long, conflicts_with = "channel")]
+        main: bool,
         /// Download the transcript's photos and files to ~/.mafold/attachments
         /// and print each one's path, so the agent can actually open them.
         /// Off by default: a long page of a photo-heavy room is a lot of bytes
@@ -155,25 +204,57 @@ enum Cmd {
         /// capped by --limit), then mark it read — what opening a chat does.
         #[arg(long)]
         unread: bool,
-        /// Print each message's id, for `send --reply <id>` / `react <id>`.
-        #[arg(long)]
+        /// Accepted for old scripts; every row now shows its id.
+        #[arg(long, hide = true)]
         ids: bool,
+    },
+    /// Print one message exactly as it was sent — every card whole, nothing
+    /// folded or rewritten. What a `[folded: …]` note in a history points at.
+    Msg {
+        /// The message id (`mafold read` shows it on every row).
+        id: String,
+        /// The message as the API returns it, for code rather than for a model.
+        #[arg(long)]
+        json: bool,
     },
     /// Chat-history tickets: ask for one, see what you hold, revoke one you gave.
     Access {
         #[command(subcommand)]
         cmd: chat::AccessCmd,
     },
+    /// A message's card state: what a card's readers wrote (votes, a shared
+    /// list, moves) and what its sender put there — read what you may, write
+    /// as yourself. `mafold msg` lists it too.
+    State {
+        #[command(subcommand)]
+        cmd: chat::StateCmd,
+    },
     /// Send a message. <chat> is a conversation id or a @username.
     Send {
         chat: String,
-        /// Send into a forum channel (id or #name) instead of the main timeline.
+        /// Send into a forum channel (id or #name). Inside a channel turn, a
+        /// send to the turn's own conversation already goes to the turn's
+        /// channel; elsewhere the default is the main timeline.
         #[arg(long)]
         channel: Option<String>,
+        /// Send to the main timeline (#all), even inside a channel turn.
+        #[arg(long, conflicts_with = "channel")]
+        main: bool,
         /// Quote-reply to this message id (`mafold read --ids` shows them).
         #[arg(long)]
         reply: Option<String>,
-        #[arg(trailing_var_arg = true, required = true)]
+        /// Inside an inbox turn, a send is held back when someone spoke there
+        /// since the agent last looked (it prints what is new instead). Send
+        /// it as written regardless.
+        #[arg(long)]
+        anyway: bool,
+        /// Read the text from a file instead.
+        #[arg(long, conflicts_with = "text")]
+        file: Option<String>,
+        /// The text (words are joined with spaces), or `-` to read it from
+        /// stdin. Options go before it: from its first word on, everything is
+        /// the text.
+        #[arg(trailing_var_arg = true, required_unless_present = "file")]
         text: Vec<String>,
     },
     /// React to a message with an emoji (`--remove` takes it back).
@@ -184,11 +265,31 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
+    /// Tap a button on a card, exactly as a person's tap does — stop a reply
+    /// that is being written (`stop`), answer a question card (`ask:answer
+    /// <answer>`), a permission prompt (`perm:answer Allow`), … Whether you may
+    /// is decided where it always is, by who tapped. Afterwards the message is
+    /// read back and shown as it is now: a refusal only ever shows up as a
+    /// pop-up on a screen, so the message itself is the proof.
+    Tap {
+        /// The message the card is in (`mafold read --ids` shows ids).
+        message: String,
+        /// The button's action, as the card sends it: `stop`, `ask:answer`, `perm:answer`, …
+        action: String,
+        /// What the button carries — the answer for `ask:answer`, the verdict for `perm:answer`.
+        value: Option<String>,
+        /// A structured payload instead of `value`, as JSON.
+        #[arg(long, conflicts_with = "value")]
+        fields: Option<String>,
+    },
     /// Attach local files to the reply you are streaming right now — images,
     /// clips, documents. Run by an AGENT mid-turn (the daemon presets
     /// MAFOLD_DRAFT), so what it just made arrives in the same bubble as the
     /// text about it. The kind is read from the bytes: an image becomes a photo,
-    /// a clip becomes a player, anything else becomes a file card.
+    /// a clip becomes a player, anything else becomes a file card — unless
+    /// `--sticker` says a picture is a sticker. A public http(s) URL is
+    /// accepted too: the SERVER fetches it, so a clip parked on a vendor CDN
+    /// never comes down this machine's uplink.
     Attach {
         /// Files on this machine.
         #[arg(required = true)]
@@ -197,11 +298,52 @@ enum Cmd {
         /// reply — which is what an agent almost always wants.
         #[arg(long)]
         message: Option<String>,
+        /// Send each picture as a STICKER — drawn bare at sticker size, no
+        /// bubble, no full-screen viewer — instead of a photo. It also joins
+        /// this account's sticker library, as a sticker sent from the composer
+        /// does. Pictures only: png, jpeg, gif (animates) or webp.
+        #[arg(long)]
+        sticker: bool,
+        /// What the sticker reads as where a picture can't be shown — a push
+        /// notification, a quoted reply: `--emoji 😂`.
+        #[arg(long, requires = "sticker")]
+        emoji: Option<String>,
+        /// Also upload each picture's untouched original. A picture goes up as
+        /// a view fitted into 2560 (screenshots lossless, photos JPEG q85) —
+        /// what everyone sees and models read; with this, readers can open the
+        /// original too. Pictures that already fit go up as they are anyway.
+        #[arg(long, conflicts_with = "sticker")]
+        original: bool,
+    },
+    /// What a public web page says about itself — title, site, description,
+    /// its own picture (og:image), icon and first body images with their alt
+    /// text. For an AGENT about to put a page's real picture in a reply
+    /// (`mafold/media`): web tools hand back a page's text, never its picture
+    /// addresses. Read-only; the server fetches the page.
+    Unfurl {
+        /// The page (public http/https).
+        url: String,
+        /// Print the raw JSON instead of readable lines.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage a forum's channels (list/create/rename/close/pin/delete).
     Channels {
         #[command(subcommand)]
         cmd: channels::ChannelsCmd,
+    },
+    /// Your D1 databases (list/create/info/rename/execute/bookmark/restore/
+    /// delete/undelete) — shaped like `wrangler d1`. A bot works in its
+    /// owner's account.
+    D1 {
+        #[command(subcommand)]
+        cmd: d1::D1Cmd,
+    },
+    /// Your mafold.app sites: deploy a folder, list, remove — and a site's own
+    /// Worker (its backend, your D1 databases bound in).
+    Sites {
+        #[command(subcommand)]
+        cmd: sites::SitesCmd,
     },
     /// Your credentials at third parties (Claude Code, Anthropic, OpenAI,
     /// Codex, Notion, Figma) — encrypted so only your own devices can read
@@ -223,27 +365,69 @@ enum Cmd {
         #[arg(long)]
         forget: bool,
     },
+    /// Pin a message in the current conversation — by default the reply you are
+    /// writing right now (inside an agent turn). Prints the pinned id.
+    Pin {
+        /// Message id; omit to pin the reply in flight.
+        message: Option<String>,
+        /// Conversation (id, @username or name); default = this turn's.
+        #[arg(long)]
+        chat: Option<String>,
+        /// Remove the pin instead.
+        #[arg(long)]
+        unpin: bool,
+    },
+    /// Replace the text of a message you sent (e.g. the pinned record).
+    Edit {
+        /// The message to rewrite.
+        message: String,
+        /// The full new text, or `-` to read it from stdin.
+        text: Option<String>,
+        /// Read the full new text from a file instead.
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Video generation (agent tool surface): models / submit / status / cancel.
+    /// Prices are list prices for the estimate; the bill is the vendor's own
+    /// token count on the finished job. A finished clip is already landed
+    /// server-side (24 h vendor links never reach the chat).
+    Video {
+        #[command(subcommand)]
+        cmd: video::VideoCmd,
+    },
+    /// Feature flags, with this identity's own token: list / show / add /
+    /// remove / set / delete / check. The server decides who may
+    /// (`flags.read` / `flags.write` — an agent holds them through its
+    /// owner's agents' grant); every change is audited, and undone on the
+    /// admin portal's Flags page.
+    Flags {
+        #[command(subcommand)]
+        cmd: Option<flagcmd::FlagsCmd>,
+    },
     /// Token wallet: balances / transfer / convert / rates / history / grants.
     Wallet {
         #[command(subcommand)]
         cmd: wallet::WalletCmd,
+    },
+    /// Your mailbox at mafold.com: address / list / read / wait / raw /
+    /// block / blocks / delete. Receive only. An agent's address is
+    /// `owner.label@mafold.com`, and `--as` lets its owner read it. Mail is
+    /// an outside sender's words, so `read` and `wait` print it marked as such.
+    Mail {
+        #[command(subcommand)]
+        cmd: mail::MailCmd,
     },
     /// Author, preview, and publish developer cards.
     Cards {
         #[command(subcommand)]
         cmd: cards::CardsCmd,
     },
-    /// Author, preview, and publish developer mini-apps.
+    /// Author, preview, and publish developer mini-apps — and call an app's
+    /// own backend (`mafold app methods` / `mafold app call`).
+    #[command(alias = "app")]
     Apps {
         #[command(subcommand)]
         cmd: apps::AppsCmd,
-    },
-    /// Read/write an app's shared CRDT room in a conversation (the AI's room
-    /// peer — backs the `mafold-room` skill). Conversation via `--conv` /
-    /// `MAFOLD_CONV`; auth via `--token` / `MAFOLD_BOT_TOKEN`.
-    Room {
-        #[command(subcommand)]
-        cmd: room::RoomCmd,
     },
     /// Publish the cloud language packs (langpacks/*.json) — first-party only.
     Langpack {
@@ -252,12 +436,15 @@ enum Cmd {
     },
 
     // ── multi-daemon supervisor: one daemon per bot ──
-    /// Add a bot daemon to the local config (token from --token).
+    /// Add a bot daemon to the local config. Signed in (`mafold login`) as the
+    /// bot's owner, the name is all it takes — the token comes from your login;
+    /// otherwise pass --token.
     Add {
         /// The bot username (also the daemon's pid/log name).
         name: String,
+        /// Where it works. Default: the folder you run this in.
         #[arg(long, env = "MAFOLD_WORKDIR")]
-        workdir: String,
+        workdir: Option<String>,
         /// Local harness hint; the server (getMe) is authoritative at runtime.
         #[arg(long)]
         harness: Option<String>,
@@ -266,15 +453,75 @@ enum Cmd {
         /// pins it to one Claude login (see `/login <name>` for adding logins)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Create the agent first if you have none by this name, signed in with this (e.g. `--harness opencode --fuel wallet` runs it on your wallet); an existing agent keeps its own.
+        #[arg(long)]
+        fuel: Option<String>,
+        /// With --fuel: the model the new agent starts on.
+        #[arg(long, requires = "fuel")]
+        model: Option<String>,
     },
     /// Remove a bot daemon from the local config (stops it too).
     Rm { name: String },
-    /// Start the supervisor — keeps all configured daemons running + owns updates.
-    Up,
-    /// Stop the supervisor + all daemons (or one daemon by name).
+    /// Start the supervisor, now and on every login — keeps all configured
+    /// daemons running + owns updates. Succeeds only once it is running.
+    Up {
+        /// Move the service here onto THIS mafold when another install set it
+        /// up (or it was started by hand, or registered with
+        /// --no-auto-update): waits for replies in progress, restarts every
+        /// bot once from this binary, and registers it to run this one.
+        /// Exit status 2 when it ran but couldn't be confirmed.
+        #[arg(long)]
+        adopt: bool,
+        /// With --adopt: say whose the service is and what adopting it would
+        /// do (the bots it restarts); change nothing.
+        #[arg(long, requires = "adopt")]
+        check: bool,
+        /// With --adopt: one JSON object instead of lines (for the desktop app).
+        #[arg(long, requires = "adopt")]
+        json: bool,
+    },
+    /// Stop the supervisor + all daemons, until `mafold up`. With a name, stop
+    /// just that daemon — while the supervisor runs, it starts it again within
+    /// ~10s (a restart). Waits for each to exit; fails if one doesn't.
     Down { name: Option<String> },
-    /// Show the last lines of a bot daemon's log.
-    Logs { name: String },
+    /// Restart one bot: the supervisor stops its daemon and starts it again.
+    /// Done once the new one is read back running — exit status 2 when it
+    /// was asked but couldn't be confirmed. Replies it was writing are picked
+    /// back up.
+    Restart {
+        /// The bot, as in `mafold status`.
+        name: String,
+        /// Print the outcome as one JSON object, for a program to read (the
+        /// desktop app).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the last lines of a bot's log — or, with no name, the supervisor's
+    /// (the background service). Logs move aside to `<log>.1` past 10 MB.
+    Logs {
+        /// The bot (as in `mafold status`). Leave out for the supervisor's log.
+        name: Option<String>,
+        /// How many lines.
+        #[arg(short = 'n', long, default_value_t = 40)]
+        lines: usize,
+        /// Keep printing what gets written, until interrupted.
+        #[arg(short, long)]
+        follow: bool,
+        /// One JSON object per line, for a program to read (the desktop app).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a diagnostics file to send to whoever helps you: this computer's
+    /// status, its bots' settings (no tokens) and the end of each log, with
+    /// tokens and email addresses masked — and no conversations.
+    Diagnose {
+        /// Where to write it (default: mafold-diagnose-<time>.json here).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Print where it went as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 
     // ── human control plane (New-Bot harness recommendation + provisioning) ──
     /// Log in your HUMAN account so the Mafold app can recommend a harness from
@@ -284,6 +531,16 @@ enum Cmd {
         username: Option<String>,
         #[arg(long)]
         password: Option<String>,
+        /// Device flow for a program driving this (the desktop app): open no
+        /// browser, and print each step as one JSON line on stdout —
+        /// `{"event":"code",…}`, then `{"event":"approved",…}` or
+        /// `{"event":"expired"}`. Other lines are notes for a person.
+        #[arg(long)]
+        device_json: bool,
+        /// Log in only — leave the supervisor as it is (the caller decides
+        /// whether this machine's service is its to start).
+        #[arg(long)]
+        no_up: bool,
     },
     /// The human accounts logged in on this machine: list them, switch which
     /// one commands act as, or forget one. No argument lists them.
@@ -293,8 +550,29 @@ enum Cmd {
     },
     /// Re-report this machine's available harnesses (uses the saved login).
     Report,
-    /// Roll back to the previous binary (after a bad update).
-    Rollback,
+    /// The runtimes on this computer (Claude Code, …): sign one in.
+    Runtime {
+        #[command(subcommand)]
+        cmd: RuntimeCmd,
+    },
+    /// Roll back to the previous binary (after a bad update). The version rolled
+    /// back from is skipped by automatic updates until a newer one is out.
+    Rollback {
+        /// Say whether a rollback is possible and would stick; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Roll back to a binary from before rollbacks could stick (it updates
+        /// itself back at its next check unless automatic updates are off).
+        #[arg(long)]
+        force: bool,
+        /// One JSON object instead of lines (for the desktop app).
+        #[arg(long)]
+        json: bool,
+    },
+    /// (internal) What this binary can do that an older one can't, as a JSON
+    /// list of names — asked by another binary instead of guessing from versions.
+    #[command(hide = true)]
+    Capabilities,
     /// (internal) The long-lived supervisor loop — started by `up`.
     #[command(hide = true)]
     Supervise {
@@ -314,16 +592,86 @@ enum Cmd {
     /// (claude kills its background shells at exit). Not for humans.
     #[command(hide = true)]
     BashHook,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    BackgroundWorker { config: std::path::PathBuf },
     /// (internal) PostToolUse hook claude runs after every tool — delivers what
     /// the user said mid-turn, so a long run can be corrected instead of killed.
     /// Not for humans.
     #[command(hide = true)]
     SteerHook,
+    /// (internal) PreToolUse hook claude runs on file writes — refuses writes
+    /// into the bot's memory on a turn its owner didn't trigger. Not for humans.
+    #[command(hide = true)]
+    DriveHook,
+    /// (internal) Claude Code's PreCompact / PostCompact / SessionStart(compact)
+    /// hook — treats the summary a compaction writes as untrusted input: shapes
+    /// how it is written, checks it against what people actually said, and
+    /// tells the model where it came from. Not for humans.
+    #[command(hide = true)]
+    CompactHook {
+        /// Print the `--settings` blob that wires this binary in, and exit —
+        /// so nothing outside the daemon has to hand-copy (and drift from) it.
+        #[arg(long)]
+        print_settings: bool,
+    },
     /// (internal) The stdio MCP server claude asks when a permission RULE says a
     /// human has to approve a tool call — puts the question in the chat as an
     /// ask card and blocks on the tap. Not for humans.
     #[command(hide = true)]
     PermissionMcp,
+    /// (internal, debug builds) One wallet reply through the daemon's own
+    /// wallet steps — mint the draft's key, the OpenCode harness, the reply's
+    /// total onto the result card — printed as one JSON line. What the billing
+    /// table (`mafold-api` harness_table_tests) drives. Not for humans.
+    #[cfg(debug_assertions)]
+    #[command(hide = true)]
+    DevWalletTurn {
+        /// The reply's draft (opened by the agent, its trigger the owner's).
+        #[arg(long)]
+        draft: String,
+        #[arg(long)]
+        workdir: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// Stop the turn this many ms after its first words arrive.
+        #[arg(long)]
+        stop_after_ms: Option<u64>,
+        /// The agent's handle and the conversation: the turn's surface, so
+        /// OpenCode runs in that agent's home.
+        #[arg(long)]
+        bot: Option<String>,
+        #[arg(long)]
+        chat: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimeCmd {
+    /// Sign a runtime in — what a bot's `/login` does in chat, without one:
+    /// prints the sign-in link (no browser opens here; open it on any device),
+    /// then reads the Authentication Code from stdin.
+    Login {
+        /// The runtime. Only Claude Code signs in this way.
+        #[arg(value_parser = ["claude-code"])]
+        runtime: String,
+        /// A named login: a second subscription next to this computer's own
+        /// (bots move onto it when a usage window fills). Leave out for this
+        /// computer's own login.
+        #[arg(long)]
+        name: Option<String>,
+        /// Sign in through the Anthropic Console instead of claude.ai.
+        #[arg(long)]
+        console: bool,
+        /// For a program (the desktop app): each step as one JSON line on
+        /// stdout — `{"event":"started",…}`, `{"event":"link","url":…}`, then
+        /// `{"event":"done",…}` or `{"event":"failed","code":…}` — and the code
+        /// as one line on stdin.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -356,6 +704,10 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Cmd::BackgroundWorker { ref config } = cli.cmd {
+        return background_windows::worker(config);
+    }
 
     // The AskUserQuestion hook is invoked by claude (a child of the daemon) and
     // needs no auth — it just bridges stdin/the answer file. Handle it first.
@@ -367,6 +719,12 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::SteerHook) {
         return steer_hook::run();
+    }
+    if matches!(cli.cmd, Cmd::DriveHook) {
+        return drive::run_hook();
+    }
+    if let Cmd::CompactHook { print_settings } = cli.cmd {
+        return compact_hook::run(print_settings);
     }
     if matches!(cli.cmd, Cmd::PermissionMcp) {
         return permission_mcp::run();
@@ -405,17 +763,43 @@ async fn main() -> Result<()> {
     if matches!(cli.cmd, Cmd::Stop) {
         return daemon::stop();
     }
-    if matches!(cli.cmd, Cmd::Status) {
+    if let Cmd::Status { json } = cli.cmd {
+        if json {
+            println!("{}", supervisor::status_json().await);
+            return Ok(());
+        }
         let _ = daemon::status(); // legacy single `agent --detach`
         supervisor::status(); // multi-daemon config
         return Ok(());
     }
     match &cli.cmd {
-        Cmd::Up => return supervisor::up(&cli.base, cli.no_auto_update),
+        Cmd::Up { adopt: true, check, json } => {
+            // Adopting registers without the flag; the machine setting is
+            // how to keep updates off now, and it stays as it is.
+            if cli.no_auto_update && !*check {
+                anyhow::bail!(
+                    "--adopt registers the service without --no-auto-update — to keep updates off on this computer: `mafold update --auto-update off`"
+                );
+            }
+            return supervisor::adopt(&cli.base, *check, *json);
+        }
+        Cmd::Up { .. } => return supervisor::up(&cli.base, cli.no_auto_update),
         Cmd::Down { name } => return supervisor::down(name.as_deref()),
-        Cmd::Logs { name } => return supervisor::logs(name),
+        Cmd::Restart { name, json } => return supervisor::restart(name, *json),
+        Cmd::Logs { name, lines, follow, json } => return supervisor::logs(name.as_deref(), *lines, *follow, *json),
+        Cmd::Diagnose { out, json } => return diagnose::run(out.clone(), *json).await,
         Cmd::Rm { name } => return supervisor::rm(name),
-        Cmd::Rollback => return update::rollback(),
+        Cmd::Rollback { check, force, json } => {
+            return update::rollback(update::RollbackAsk { check: *check, force: *force, json: *json })
+        }
+        Cmd::Capabilities => {
+            println!("{}", serde_json::json!(update::CAPABILITIES));
+            return Ok(());
+        }
+        Cmd::Runtime { cmd: RuntimeCmd::Login { runtime: _, name, console, json } } => {
+            let ask = runtime_login::Ask { name: name.clone(), console: *console };
+            return runtime_login::command(ask, *json).await;
+        }
         Cmd::Supervise { hidden } => {
             if *hidden {
                 platform::hide_console();
@@ -425,39 +809,15 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    if let Cmd::Update { channel } = &cli.cmd {
-        // No release binary is built for this platform (e.g. linux-arm64) → don't
-        // claim "up to date" (the check would always no-op). Be honest instead.
-        if !update::platform_supported() {
-            println!("no mafold release is built for your platform — self-update isn't available.\nSee https://github.com/mafold-lab/mafold-cli/releases");
-            return Ok(());
-        }
+    if let Cmd::Update { channel, check, auto_update, json } = &cli.cmd {
         // `--channel` is persisted BEFORE the update runs, so the update that
         // follows is already the new channel's — one command switches and
         // lands, instead of switching and leaving the machine on the old line
         // until the next tick.
-        let channel = match channel {
-            Some(name) => {
-                let c = update::Channel::parse(name).with_context(|| {
-                    format!("unknown channel {name:?} — expected `stable` or `dev`")
-                })?;
-                c.save()?;
-                println!("✓ channel → {}", c.as_str());
-                c
-            }
-            None => update::Channel::current(),
-        };
-        let http = reqwest::Client::new();
-        match update::update_to_latest(&http, &cli.base, channel).await {
-            Ok(Some(v)) => println!("✓ updated to v{v} — restart a running agent with: mafold stop && mafold agent --detach …"),
-            Ok(None) => println!(
-                "already up to date (v{}, {} channel)",
-                update::current_version(),
-                channel.as_str()
-            ),
-            Err(e) => { eprintln!("update failed: {e}"); std::process::exit(1); }
-        }
-        return Ok(());
+        // clap took only `stable` / `dev`.
+        let channel = channel.as_deref().and_then(update::Channel::parse);
+        let ask = update::Ask { check: *check, auto_update: auto_update.as_deref().map(|v| v == "on"), channel, json: *json };
+        return update::command(&cli.base, ask).await;
     }
     // Cards: init/dev need no token; publish/list check for one themselves.
     if matches!(cli.cmd, Cmd::Cards { .. }) {
@@ -473,13 +833,6 @@ async fn main() -> Result<()> {
         };
         return apps::run(cmd, cli.base, cli.token).await;
     }
-    // Room: the AI's CRDT room peer. Auth via --token / MAFOLD_BOT_TOKEN.
-    if matches!(cli.cmd, Cmd::Room { .. }) {
-        let Cmd::Room { cmd } = cli.cmd else {
-            unreachable!()
-        };
-        return room::run(cmd, cli.base, cli.token).await;
-    }
     // Langpack: publish/list check for the first-party token themselves.
     if matches!(cli.cmd, Cmd::Langpack { .. }) {
         let Cmd::Langpack { cmd } = cli.cmd else {
@@ -489,10 +842,10 @@ async fn main() -> Result<()> {
     }
     // Human control plane: `login` mints the s_ session; `report` uses it. No bot token.
     if matches!(cli.cmd, Cmd::Login { .. }) {
-        let Cmd::Login { username, password } = cli.cmd else {
+        let Cmd::Login { username, password, device_json, no_up } = cli.cmd else {
             unreachable!()
         };
-        return login(&cli.base, username, password, cli.no_auto_update).await;
+        return login(&cli.base, username, password, cli.no_auto_update, device_json, no_up).await;
     }
     if matches!(cli.cmd, Cmd::Report) {
         return report_harnesses(&cli.base).await;
@@ -581,49 +934,133 @@ async fn main() -> Result<()> {
             workdir,
             harness,
             env,
+            fuel,
+            model,
         } => {
             let env = supervisor::parse_env(&env)?;
-            supervisor::add(name, bot_token?, workdir, harness, env, &cli.base, cli.no_auto_update)?
+            // `--fuel`: the agent may not exist yet — this machine's login
+            // creates it as its owner first (`bot_token::create_if_missing`),
+            // then it is registered like any other. It needs the login, not
+            // a token: a bot's token can't make bots.
+            let (name, created) = match fuel.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+                Some(fuel) => {
+                    let logins = session::all();
+                    let login = bot_token::login_for(&name, cli.account.as_deref(), &logins).context(
+                        "`--fuel` creates the agent as you — run `mafold login` (approve it on the web) first",
+                    )?;
+                    bot_token::create_if_missing(&cli.base, &name, harness.as_deref(), fuel, model.as_deref(), login).await?
+                }
+                None => (name, None),
+            };
+            // The token of an agent just created is its own; otherwise a
+            // token given wins. Without one, this machine's login for the
+            // bot's owner asks the server for it — nothing to paste, and
+            // nothing that ever went through a chat (`bot_token`).
+            let token = match created.or_else(|| cli.token.clone().filter(|t| !t.trim().is_empty())) {
+                Some(t) => t,
+                None => {
+                    let logins = session::all();
+                    let login = bot_token::login_for(&name, cli.account.as_deref(), &logins).context(
+                        "not signed in on this machine — run `mafold login` (approve it on the web), then `mafold add` again; or pass --token",
+                    )?;
+                    bot_token::fetch(&cli.base, &name, login).await?
+                }
+            };
+            let workdir = match workdir {
+                Some(w) => w,
+                None => std::env::current_dir()
+                    .context("no --workdir and no current folder")?
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            // Mafold Harness's pinned OpenCode goes in here, with its
+            // progress on this terminal — not on the agent's first reply.
+            crate::harness::opencode_pin::install_before_add(harness.as_deref());
+            supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
         Cmd::Chats => chats(&Client::new(cli.base, token?)).await?,
-        Cmd::Read { chat: c, limit, channel, media, json, unread, ids } => {
+        Cmd::Read { chat: c, limit, channel, main, media, json, unread, ids } => {
             chat::read(
                 &Client::new(cli.base, token?),
-                chat::ReadArgs { chat: c, limit, channel, json, media, unread, ids },
+                chat::ReadArgs { chat: c, limit, channel, main, json, media, unread, ids },
             )
             .await?
         }
+        Cmd::Msg { id, json } => chat::print_message(&Client::new(cli.base, token?), &id, json).await?,
         Cmd::Access { cmd } => chat::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::State { cmd } => chat::run_state(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Send {
             chat,
             channel,
+            main,
             reply,
+            anyway,
+            file,
             text,
         } => {
+            let text = send_body(&text, file.as_deref(), std::io::stdin())?;
             send(
                 &Client::new(cli.base, token?),
                 &chat,
-                channel.as_deref(),
+                Target::of(channel.as_deref(), main),
                 reply.as_deref(),
-                &text.join(" "),
+                &text,
+                anyway,
             )
             .await?
         }
         Cmd::React { message, emoji, remove } => {
             react(&Client::new(cli.base, token?), &message, &emoji, remove).await?
         }
-        Cmd::Attach { files, message } => {
-            attach(&Client::new(cli.base, token?), &files, message.as_deref()).await?
+        Cmd::Tap { message, action, value, fields } => {
+            tap(&Client::new(cli.base, token?), &message, &action, value.as_deref(), fields.as_deref()).await?
+        }
+        Cmd::Attach { files, message, sticker, emoji, original } => {
+            let how = if sticker {
+                client::AttachAs::Sticker { emoji: emoji.as_deref() }
+            } else {
+                client::AttachAs::Detected { original }
+            };
+            let client = Client::new(cli.base, token?);
+            // A one-shot process holds no flags yet; the daemon's are fresh.
+            flags::refresh(&client).await;
+            attach(&client, &files, message.as_deref(), how).await?
+        }
+        Cmd::Unfurl { url, json } => {
+            let v = Client::new(cli.base, token?).call("unfurlUrl", serde_json::json!({ "url": url })).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", unfurl_lines(&v));
+            }
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::D1 { cmd } => d1::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Sites { cmd } => sites::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Video { cmd } => video::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Pin { message, chat, unpin } => {
+            msgops::pin(&Client::new(cli.base, token?), message.as_deref(), chat.as_deref(), unpin).await?
+        }
+        Cmd::Edit { message, text, file } => {
+            msgops::edit(&Client::new(cli.base, token?), &message, text.as_deref(), file.as_deref()).await?
+        }
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token?)).await?,
-        Cmd::Stop | Cmd::Status | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
-        | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
+        Cmd::Mail { cmd } => mail::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Flags { cmd } => flagcmd::run(cmd.unwrap_or(flagcmd::FlagsCmd::List), &Client::new(cli.base, token?)).await?,
+        #[cfg(debug_assertions)]
+        Cmd::DevWalletTurn { draft, workdir, prompt, model, stop_after_ms, bot, chat } => {
+            let ask = dev_wallet_turn::Ask { draft, workdir, prompt, model, stop_after_ms, bot, chat };
+            dev_wallet_turn::run(Client::new(cli.base, bot_token?), ask).await?
+        }
+        Cmd::Stop | Cmd::Status { .. } | Cmd::Update { .. } | Cmd::Install { .. } | Cmd::Cards { .. }
+        | Cmd::Apps { .. } | Cmd::Connection { .. } | Cmd::Runtime { .. }
         | Cmd::Pair { .. } | Cmd::Langpack { .. } | Cmd::Login { .. }
         | Cmd::Account { .. } | Cmd::Report
-        | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
-        | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
-        | Cmd::SteerHook | Cmd::PermissionMcp => unreachable!(),
+        | Cmd::Up { .. } | Cmd::Down { .. } | Cmd::Restart { .. } | Cmd::Logs { .. } | Cmd::Diagnose { .. } | Cmd::Rm { .. }
+        | Cmd::Rollback { .. } | Cmd::Capabilities | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
+        | Cmd::SteerHook | Cmd::DriveHook | Cmd::CompactHook { .. } | Cmd::PermissionMcp => unreachable!(),
+        #[cfg(windows)]
+        Cmd::BackgroundWorker { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -642,20 +1079,27 @@ pub(crate) fn prompt_password(label: &str) -> String {
     use std::io::Write;
     print!("{label}");
     let _ = std::io::stdout().flush();
-    let _ = std::process::Command::new("stty").arg("-echo").status();
+    let _ = platform::console_std_command("stty").arg("-echo").status();
     let mut s = String::new();
     let _ = std::io::stdin().read_line(&mut s);
-    let _ = std::process::Command::new("stty").arg("echo").status();
+    let _ = platform::console_std_command("stty").arg("echo").status();
     println!();
     s.trim().to_string()
 }
 
 /// `mafold login` — mint a human `s_` session + report this machine's harnesses.
-async fn login(base: &str, username: Option<String>, password: Option<String>, no_auto_update: bool) -> Result<()> {
+async fn login(
+    base: &str,
+    username: Option<String>,
+    password: Option<String>,
+    no_auto_update: bool,
+    device_json: bool,
+    no_up: bool,
+) -> Result<()> {
     // Default (no args) → browser device flow, à la `gh auth login`. Passing
     // --username/--password keeps the direct password login (CI / scripted).
     if username.is_none() && password.is_none() {
-        return login_device(base, no_auto_update).await;
+        return login_device(base, no_auto_update, device_json, no_up).await;
     }
     let username = username.unwrap_or_else(|| prompt("Mafold username: "));
     let password = password.unwrap_or_else(|| prompt_password("Password: "));
@@ -696,7 +1140,13 @@ async fn login(base: &str, username: Option<String>, password: Option<String>, n
 /// gh-style device login: get a short code, the user approves it in the Mafold
 /// web app, and we poll until the session token comes back. Works on headless /
 /// remote machines (no browser needed on THIS box — approve from your phone).
-async fn login_device(base: &str, no_auto_update: bool) -> Result<()> {
+///
+/// `machine`: a program is driving this (the desktop app, which approves the
+/// code itself in the page where its person is already signed in). No browser
+/// is opened and each step is one JSON line on stdout; `no_up` leaves the
+/// supervisor alone, because whether this machine's service is the caller's to
+/// start is the caller's decision (mafold-desktop checks who registered it).
+async fn login_device(base: &str, no_auto_update: bool, machine: bool, no_up: bool) -> Result<()> {
     let http = reqwest::Client::new();
     let start: serde_json::Value = http
         .post(format!("{base}/api/auth/device/start"))
@@ -714,18 +1164,30 @@ async fn login_device(base: &str, no_auto_update: bool) -> Result<()> {
         .unwrap_or("https://mafold.com/login/device");
     let interval = r["interval"].as_u64().unwrap_or(3).max(1);
 
-    // The url carries the code (server-side), so the page can approve in one
-    // tap — but print both anyway: the person may be reading this over ssh and
-    // opening the page on another device, where they'll type the code by hand.
-    let opened = platform::open_browser(verify_url);
-    if opened {
-        println!("\n  Opened your browser to approve this device.");
-        println!("  (URL: {verify_url} — code {user_code})\n");
+    if machine {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "code",
+                "user_code": user_code,
+                "verify_url": verify_url,
+                "expires_in": r["expires_in"].as_u64().unwrap_or(600),
+            })
+        );
     } else {
-        println!("\n  Open this URL in your browser:  {verify_url}");
-        println!("  and enter the code:             {user_code}\n");
+        // The url carries the code (server-side), so the page can approve in one
+        // tap — but print both anyway: the person may be reading this over ssh and
+        // opening the page on another device, where they'll type the code by hand.
+        let opened = platform::open_browser(verify_url);
+        if opened {
+            println!("\n  Opened your browser to approve this device.");
+            println!("  (URL: {verify_url} — code {user_code})\n");
+        } else {
+            println!("\n  Open this URL in your browser:  {verify_url}");
+            println!("  and enter the code:             {user_code}\n");
+        }
+        println!("  Waiting for you to approve…  (Ctrl-C to cancel)");
     }
-    println!("  Waiting for you to approve…  (Ctrl-C to cancel)");
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
@@ -748,9 +1210,18 @@ async fn login_device(base: &str, no_auto_update: bool) -> Result<()> {
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                return finish_login(base, token, uname, true, no_auto_update).await;
+                finish_login(base, token, uname.clone(), !no_up, no_auto_update).await?;
+                if machine {
+                    println!("{}", serde_json::json!({ "event": "approved", "username": uname }));
+                }
+                return Ok(());
             }
-            "expired" => anyhow::bail!("that code expired — run `mafold login` again"),
+            "expired" => {
+                if machine {
+                    println!("{}", serde_json::json!({ "event": "expired" }));
+                }
+                anyhow::bail!("that code expired — run `mafold login` again")
+            }
             _ => {} // pending — keep polling
         }
     }
@@ -868,24 +1339,27 @@ async fn report_harnesses(base: &str) -> Result<()> {
 }
 
 async fn report_with(base: &str, sess: &session::Session) -> Result<()> {
-    let harnesses = harness::report_rows().await;
-    let avail: Vec<&str> = harnesses
-        .iter()
+    let body = harness::report_body(sess).await;
+    let avail: Vec<&str> = body["harnesses"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter(|h| h["available"].as_bool() == Some(true))
         .filter_map(|h| h["id"].as_str())
         .collect();
-    Client::new(base.to_string(), sess.token.clone())
-        .call(
-            "reportHarnesses",
-            serde_json::json!({
-                "device_id": sess.device_id,
-                "device_name": sess.device_name,
-                "cli_version": env!("CARGO_PKG_VERSION"),
-                "harnesses": harnesses,
-            }),
-        )
-        .await
-        .context("reportHarnesses failed")?;
+    let res = Client::new(base.to_string(), sess.token.clone()).call("reportHarnesses", body.clone()).await;
+    let outcome = match &res {
+        Ok(_) => account_health::Outcome::Accepted,
+        Err(e) => account_health::Outcome::of_error(e),
+    };
+    account_health::record(&sess.username, &sess.token, outcome);
+    if outcome == account_health::Outcome::SignedOut {
+        anyhow::bail!(
+            "Mafold has signed @{u} out on this machine (sign-in expired or revoked) — `mafold login` as @{u} signs it back in",
+            u = sess.username
+        );
+    }
+    res.context("reportHarnesses failed")?;
     println!(
         "✓ reported harnesses on {} — available: {}",
         sess.device_name,
@@ -906,6 +1380,19 @@ async fn chats(client: &Client) -> Result<()> {
     if items.is_empty() {
         println!("(no conversations)");
         return Ok(());
+    }
+    // A turn outside the owner's circle lists only the rooms its people sit in
+    // (and the one it is in): each row carries the room's last message, and
+    // the others are other people's conversations with this agent.
+    let reads = chat::ReadsFor::from_env();
+    let here = std::env::var("MAFOLD_CONV").ok();
+    let all = items.len();
+    let items: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter(|c| chat::may_read_room(Some(c), c["id"].as_str().unwrap_or_default(), here.as_deref(), &reads))
+        .collect();
+    if items.len() < all {
+        println!("(这一轮不是主人圈子的人发起的:只列 TA 自己也在的会话)");
     }
     for c in items {
         // Three things this row used to drop, each of which is the difference
@@ -965,10 +1452,16 @@ async fn chats(client: &Client) -> Result<()> {
 /// Hang local files on a message we authored — the general door for "the agent
 /// made something, put it in the reply". Images become photo bubbles, clips
 /// become players, everything else becomes a file card (the kind is decided from
-/// the bytes in `Client::attach_media`). Codex's own generated images are swept
-/// up without this (see `harness::codex::ImageSweep`); every other harness, and
-/// anything an agent writes with a script, comes through here.
-async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Result<()> {
+/// the bytes in `Client::attach_media`), and `--sticker` makes a picture a
+/// sticker. Codex's own generated images are swept up without this (see
+/// `harness::codex::ImageSweep`); every other harness, and anything an agent
+/// writes with a script, comes through here.
+async fn attach(
+    client: &Client,
+    files: &[String],
+    message: Option<&str>,
+    how: client::AttachAs<'_>,
+) -> Result<()> {
     let msg = match message {
         Some(m) => m.to_string(),
         None => {
@@ -982,20 +1475,37 @@ async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Res
             // leaves a forwarding address keyed by the original id
             // (`agent::draft_ptr_path`); without following it, a picture the
             // agent just made would be hung on a draft that no longer exists.
-            std::fs::read_to_string(agent::draft_ptr_path(&env_id))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(env_id)
+            // An update turn's bubble may not be open yet: sending a file
+            // opens it (`agent::current_draft`).
+            agent::current_draft(env_id).await?
         }
     };
     for f in files {
+        if f.starts_with("http://") || f.starts_with("https://") {
+            // A sticker is a picture this machine already holds; fetching one
+            // server-side would land it as a plain photo, the opposite of what
+            // `--sticker` asked for.
+            if matches!(how, client::AttachAs::Sticker { .. }) {
+                anyhow::bail!("--sticker takes a picture on this machine, not a URL ({f})");
+            }
+            // The server pulls the bytes itself — a generated clip parked on a
+            // vendor CDN never has to come down this machine's uplink.
+            client
+                .attach_url(&msg, f)
+                .await
+                .with_context(|| format!("attaching {f}"))?;
+            println!("✓ attached {f} (fetched server-side)");
+            continue;
+        }
         let path = std::path::Path::new(f);
         client
-            .attach_media(&msg, path)
+            .attach_media_as(&msg, path, how)
             .await
             .with_context(|| format!("attaching {}", path.display()))?;
-        println!("✓ attached {}", path.display());
+        match how {
+            client::AttachAs::Sticker { .. } => println!("✓ attached {} as a sticker", path.display()),
+            client::AttachAs::Detected { .. } => println!("✓ attached {}", path.display()),
+        }
     }
     Ok(())
 }
@@ -1035,8 +1545,58 @@ fn speaking_token(bot_token: Option<String>, account: Option<&str>) -> Result<St
 /// * `MAFOLD_SEND_DRY=1` — say what WOULD be sent and send nothing (the inbox
 ///   loop's `--dry-run`). Checked before anything touches the network: even
 ///   resolving an `@username` can open a DM.
-async fn send(client: &Client, chat: &str, channel: Option<&str>, reply: Option<&str>, text: &str) -> Result<()> {
+/// * `MAFOLD_SEND_SEEN=<file>` — the inbox loop's record of what its agent has
+///   seen; when the timeline moved on since, the send is held back and what
+///   is new is printed instead ([`inbox::send_guard`]; `anyway` overrides).
+/// Where `mafold send` was told to go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Target<'a> {
+    /// `--channel <id or #name>`.
+    Channel(&'a str),
+    /// `--main`: the main timeline, even inside a channel turn.
+    Main,
+    /// Nothing said: the turn's own channel when the chat is the turn's own
+    /// conversation (`chat::turn_channel`), the main timeline otherwise.
+    ///
+    /// It used to be the main timeline always, and an agent working in a
+    /// channel — the only place anyone was watching it — spoke into `#all`
+    /// whenever it used `send` instead of its reply (2026-10-05: the GitHub
+    /// device code a channel's turn was waiting on went to `#all`).
+    Default,
+}
+
+impl<'a> Target<'a> {
+    fn of(channel: Option<&'a str>, main: bool) -> Self {
+        match channel {
+            Some(c) => Target::Channel(c),
+            None if main => Target::Main,
+            None => Target::Default,
+        }
+    }
+}
+
+/// What `mafold send` posts: its words joined with spaces, or — read exactly
+/// as `mafold edit` reads its text ([`msgops::body_from`]) — stdin for a lone
+/// `-`, or `--file`.
+fn send_body(text: &[String], file: Option<&str>, stdin: impl std::io::Read) -> Result<String> {
+    let text = (!text.is_empty()).then(|| text.join(" "));
+    msgops::body_from(text.as_deref(), file, stdin)
+}
+
+async fn send(
+    client: &Client,
+    chat: &str,
+    target: Target<'_>,
+    reply: Option<&str>,
+    text: &str,
+    anyway: bool,
+) -> Result<()> {
     if env_flag("MAFOLD_SEND_DRY") {
+        let channel = match target {
+            Target::Channel(c) => Some(c.to_string()),
+            Target::Main => None,
+            Target::Default => chat::turn_channel(chat),
+        };
         journal(&serde_json::json!({
             "kind": "send", "dry": true, "chat_id": chat, "channel_id": channel, "reply_to": reply, "text": text,
         }));
@@ -1045,14 +1605,32 @@ async fn send(client: &Client, chat: &str, channel: Option<&str>, reply: Option<
         println!("✓ (dry-run,没有真发) → {chat}{at}{re}: {text}");
         return Ok(());
     }
-    let (chat_id, channel_id, label) = match channel {
-        Some(ch) => {
+    // The receipt says where it landed, every time — a `#all` that went
+    // unremarked is how the wrong timeline went unnoticed.
+    let (chat_id, channel_id, label) = match target {
+        Target::Channel(ch) => {
             let (chat_id, ch) = channels::resolve(client, chat, ch).await?;
             let name = ch["name"].as_str().unwrap_or("?").to_string();
             (chat_id, ch["id"].as_str().map(str::to_string), format!("{chat} #{name}"))
         }
-        None => (client.resolve_chat(chat).await?, None, chat.to_string()),
+        Target::Main => (client.resolve_chat(chat).await?, None, format!("{chat} #all")),
+        Target::Default => {
+            let chat_id = client.resolve_chat(chat).await?;
+            match chat::turn_channel(&chat_id) {
+                Some(ch) => {
+                    let name = chat::channel_name(client, &chat_id, &ch).await;
+                    (chat_id, Some(ch), format!("{chat} #{name} (this turn's channel; --main for #all)"))
+                }
+                None => (chat_id, None, chat.to_string()),
+            }
+        }
     };
+    if !anyway {
+        if let Some(fresh) = inbox::send_guard(client, &chat_id, channel_id.as_deref(), &label).await {
+            println!("{fresh}");
+            anyhow::bail!("没发出去 —— 先看上面的新消息");
+        }
+    }
     if env_flag("MAFOLD_SEND_PACE") {
         pace_typing(client, &chat_id, channel_id.as_deref(), text).await;
     }
@@ -1067,7 +1645,11 @@ async fn send(client: &Client, chat: &str, channel: Option<&str>, reply: Option<
         "reply_to": reply,
         "text": text,
     }));
-    println!("✓ sent to {label}");
+    if let Some(id) = sent["id"].as_str() {
+        agent::write_declared(client, id, text).await;
+    }
+    let id = sent["id"].as_str().map(|id| format!(" · #{id}")).unwrap_or_default();
+    println!("✓ sent to {label}{id} · {}", msgops::receipt(text));
     Ok(())
 }
 
@@ -1084,6 +1666,83 @@ async fn react(client: &Client, message: &str, emoji: &str, remove: bool) -> Res
         "emoji": emoji,
     }));
     println!("✓ {} {emoji}", if remove { "removed" } else { "reacted" });
+    Ok(())
+}
+
+/// What a tap carries: `value` as the string most buttons send (an answer, a
+/// verdict), or `fields` as a JSON payload; neither = a bare tap (`stop`).
+fn tap_payload(value: Option<&str>, fields: Option<&str>) -> Result<Option<serde_json::Value>> {
+    match (value, fields) {
+        (Some(v), _) => Ok(Some(serde_json::Value::String(v.to_string()))),
+        (None, Some(f)) => serde_json::from_str(f).map(Some).context("--fields is not valid JSON"),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The answer stamped into a question card once it was answered
+/// (`{% mafold/ask answered="…" %}`).
+fn answered_of(content: &str) -> Option<String> {
+    let at = content.find("answered=\"")? + "answered=\"".len();
+    let rest = &content[at..];
+    Some(rest[..rest.find('"')?].replace("&quot;", "\""))
+}
+
+/// The message as it is after a tap, in one line.
+fn after_tap(before: &serde_json::Value, after: &serde_json::Value, now_ms: u64) -> String {
+    if inbox::in_progress(after) {
+        return format!("仍在进行 —— {}", inbox::working_status(after, now_ms));
+    }
+    let content = after["content"].as_str().unwrap_or("");
+    if inbox::in_progress(before) {
+        return "已停下(不再生成)".to_string();
+    }
+    if let Some(a) = answered_of(content) {
+        return format!("卡片已回答:「{a}」");
+    }
+    let body = chat::readable_body(content, after["id"].as_str().unwrap_or(""));
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = body.chars().count();
+    if n > 200 { format!("{}…", body.chars().take(200).collect::<String>()) } else { body }
+}
+
+/// `mafold tap` — a card button pressed through the same pipe a finger uses.
+/// The server tells us only that the tap was DELIVERED; whether it took is
+/// decided on the other side (a bot's daemon refuses a stop from someone it
+/// doesn't allow with a pop-up nobody here can see). So the message is read
+/// back until it changes (or ~10s pass) and shown as it is.
+async fn tap(client: &Client, message: &str, action: &str, value: Option<&str>, fields: Option<&str>) -> Result<()> {
+    let payload = tap_payload(value, fields)?;
+    if env_flag("MAFOLD_SEND_DRY") {
+        journal(&serde_json::json!({ "kind": "tap", "dry": true, "message_id": message, "action": action }));
+        println!("✓ (dry-run,没有真点) {action} → #{message}");
+        return Ok(());
+    }
+    let before = client.get_message(message).await.context("reading the message the card is in")?;
+    let chat_id = before["conversation_id"].as_str().context("that message has no conversation")?.to_string();
+    // A card in another of this agent's rooms is pressed — and read back —
+    // only for a turn whose people could open that room (`chat::ensure_may_open`).
+    chat::ensure_may_open(client, &chat_id).await;
+    let r = client.send_component_action(&chat_id, message, action, payload).await?;
+    journal(&serde_json::json!({ "kind": "tap", "chat_id": chat_id, "message_id": message, "action": action }));
+    if let Some(m) = r["message"].as_str().filter(|m| !m.trim().is_empty()) {
+        println!("{m}");
+    }
+    let mut after = before.clone();
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Ok(m) = client.get_message(message).await {
+            after = m;
+        }
+        if after["content"] != before["content"] || after["finalized_at"] != before["finalized_at"] {
+            break;
+        }
+    }
+    let now = inbox::now_ms();
+    let state = after_tap(&before, &after, now);
+    println!("✓ 点了 {action} → #{message}\n现在:{state}");
+    if action == "stop" && inbox::in_progress(&before) && inbox::in_progress(&after) {
+        anyhow::bail!("没停下 —— 对方没有接受这次叫停(多半是没有权限),或者还没收到");
+    }
     Ok(())
 }
 
@@ -1119,5 +1778,181 @@ fn journal(entry: &serde_json::Value) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{entry}");
+    }
+}
+
+#[cfg(test)]
+mod send_target_tests {
+    use super::*;
+
+    fn send_target(args: &[&str]) -> Result<(Option<String>, bool), clap::Error> {
+        let argv = ["mafold", "send", "72355ef4-c43f-44ba-a0d5-b2c061026cd6"].iter().chain(args).chain(["hi"].iter());
+        match Cli::try_parse_from(argv)?.cmd {
+            Cmd::Send { channel, main, .. } => Ok((channel, main)),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Nothing said ⇒ the turn decides (its channel, or #all outside one);
+    /// `--main` is #all even inside a channel turn; a named channel wins; and
+    /// asking for both is refused rather than silently picking one.
+    #[test]
+    fn where_a_send_goes_is_said_once() {
+        let (c, m) = send_target(&[]).unwrap();
+        assert_eq!(Target::of(c.as_deref(), m), Target::Default);
+        let (c, m) = send_target(&["--main"]).unwrap();
+        assert_eq!(Target::of(c.as_deref(), m), Target::Main);
+        let (c, m) = send_target(&["--channel", "#发版"]).unwrap();
+        assert_eq!(Target::of(c.as_deref(), m), Target::Channel("#发版"));
+        assert!(send_target(&["--main", "--channel", "#发版"]).is_err());
+        assert!(Cli::try_parse_from(["mafold", "read", "--main", "--channel", "x"]).is_err());
+        assert!(Cli::try_parse_from(["mafold", "read", "--main"]).is_ok());
+    }
+
+    /// What `mafold send <chat> <args…>` posts when `stdin` is piped in.
+    fn sends(args: &[&str], stdin: &str) -> Result<String> {
+        let argv = ["mafold", "send", "72355ef4-c43f-44ba-a0d5-b2c061026cd6"].iter().chain(args);
+        match Cli::try_parse_from(argv)?.cmd {
+            Cmd::Send { text, file, .. } => send_body(&text, file.as_deref(), stdin.as_bytes()),
+            _ => unreachable!(),
+        }
+    }
+
+    /// 2026-10-19/20, linsky's Rei: `… | mafold send <chat> -` — the way
+    /// `mafold edit` documents — posted a bubble reading just "-", six times,
+    /// each acknowledged "✓ sent". `-` is stdin for `send` exactly as for `edit`.
+    #[test]
+    fn a_dash_reads_the_text_from_stdin_as_edit_does() {
+        let piped = "617.42 的安装脚本好了，现在可以开始：\n1. Win+R → 输入 cmd\n";
+        assert_eq!(sends(&["-"], piped).unwrap(), piped.trim_end());
+        assert_eq!(
+            sends(&["-"], piped).unwrap(),
+            msgops::body_from(Some("-"), None, piped.as_bytes()).unwrap(),
+            "send and edit read a text the same way"
+        );
+        // Only a lone `-` means stdin; among words it is a word.
+        assert_eq!(sends(&["a", "-", "b"], piped).unwrap(), "a - b");
+        assert_eq!(sends(&["没问题", "-", "就这样"], "").unwrap(), "没问题 - 就这样");
+    }
+
+    /// Nothing to say is refused before anything is sent: an empty pipe, a
+    /// blank argument, a text of nothing but whitespace.
+    #[test]
+    fn an_empty_text_is_refused_not_sent() {
+        assert!(sends(&["-"], "").is_err(), "nothing was piped in");
+        assert!(sends(&["-"], " \n\n").is_err());
+        assert!(sends(&[""], "").is_err());
+        assert!(sends(&["  ", "\t"], "").is_err());
+    }
+
+    /// `--file` like `edit`'s, and never together with a text.
+    #[test]
+    fn send_reads_a_file_as_edit_does() {
+        let path = std::env::temp_dir().join(format!("mafold-send-body-{}.txt", std::process::id()));
+        std::fs::write(&path, "第一行\n第二行\n").unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(sends(&["--file", p], "").unwrap(), "第一行\n第二行");
+        assert!(sends(&["--file", p, "hi"], "").is_err(), "a text OR a file");
+        std::fs::write(&path, "\n").unwrap();
+        assert!(sends(&["--file", p], "").is_err(), "an empty file is an empty text");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A tap carries what the card's own button carries: most send a string
+    /// (an ask answer, a permission verdict), `stop` sends nothing.
+    #[test]
+    fn a_tap_carries_what_the_button_carries() {
+        assert_eq!(tap_payload(Some("Allow"), None).unwrap(), Some(serde_json::json!("Allow")));
+        assert_eq!(tap_payload(None, Some(r#"{"name":"x"}"#)).unwrap(), Some(serde_json::json!({"name": "x"})));
+        assert_eq!(tap_payload(None, None).unwrap(), None);
+        assert!(tap_payload(None, Some("{not json")).is_err());
+        assert!(Cli::try_parse_from(["mafold", "tap", "m1", "stop"]).is_ok());
+        assert!(Cli::try_parse_from(["mafold", "tap", "m1", "ask:answer", "Cloudflare"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["mafold", "tap", "m1", "x", "v", "--fields", "{}"]).is_err(),
+            "a value and --fields at once is ambiguous"
+        );
+    }
+
+    /// After a tap the message is shown as it is now — the only place a
+    /// refused stop can be seen from here.
+    #[test]
+    fn after_a_tap_the_message_says_whether_it_took() {
+        let writing = serde_json::json!({
+            "sender": { "username": "opsdu:claude-code", "kind": "bot" },
+            "created_at": "2026-10-06T02:00:00Z",
+            "finalized_at": null,
+            "content": "查日志中\n{% mafold/generating started=1 beat=1 beatAt=1 tokens=0 shells=0 /%}\n",
+        });
+        let stopped = serde_json::json!({
+            "sender": { "username": "opsdu:claude-code", "kind": "bot" },
+            "created_at": "2026-10-06T02:00:00Z",
+            "finalized_at": "2026-10-06T02:01:00Z",
+            "content": "查日志中\n\n⏹ Stopped.",
+        });
+        assert_eq!(after_tap(&writing, &stopped, 0), "已停下(不再生成)");
+        assert!(after_tap(&writing, &writing, 0).starts_with("仍在进行 —— "), "a refused stop shows as still running");
+
+        let card = serde_json::json!({ "content": "{% mafold/ask answered=\"Cloudflare\" %}\nq|部署|0|去哪?\no|Cloudflare|x\n{% /mafold/ask %}" });
+        assert_eq!(after_tap(&card, &card, 0), "卡片已回答:「Cloudflare」");
+        assert_eq!(answered_of("{% mafold/ask %}"), None);
+    }
+}
+
+/// `mafold unfurl`'s readable form: one fact per line, images numbered with
+/// their alt text and declared size — what an agent needs to pick one.
+fn unfurl_lines(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    for (key, label) in [
+        ("url", "url"),
+        ("title", "title"),
+        ("site_name", "site"),
+        ("description", "description"),
+        ("image", "image"),
+        ("touch_icon", "icon"),
+        ("favicon", "favicon"),
+    ] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            out.push_str(&format!("{label}: {s}\n"));
+        }
+    }
+    let images = v.get("images").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    if !images.is_empty() {
+        out.push_str("images:\n");
+        for (i, img) in images.iter().enumerate() {
+            let src = img.get("src").and_then(|x| x.as_str()).unwrap_or_default();
+            out.push_str(&format!("  {}. {src}", i + 1));
+            if let Some(alt) = img.get("alt").and_then(|x| x.as_str()) {
+                out.push_str(&format!(" — \"{alt}\""));
+            }
+            if let (Some(w), Some(h)) = (img.get("width").and_then(|x| x.as_u64()), img.get("height").and_then(|x| x.as_u64())) {
+                out.push_str(&format!(" ({w}×{h})"));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod unfurl_lines_tests {
+    use super::unfurl_lines;
+
+    #[test]
+    fn lists_facts_then_numbered_images() {
+        let v = serde_json::json!({
+            "url": "https://fuse.energy/technology",
+            "title": "Technology",
+            "site_name": "Fuse",
+            "image": "https://fuse.energy/og.jpg",
+            "images": [
+                {"src": "https://fuse.energy/titan.jpg", "alt": "TITAN", "width": 1600, "height": 1200},
+                {"src": "https://fuse.energy/zstar.jpg"}
+            ]
+        });
+        let s = unfurl_lines(&v);
+        assert!(s.starts_with("url: https://fuse.energy/technology\ntitle: Technology\nsite: Fuse\nimage: https://fuse.energy/og.jpg\n"));
+        assert!(s.contains("  1. https://fuse.energy/titan.jpg — \"TITAN\" (1600×1200)\n"));
+        assert!(s.contains("  2. https://fuse.energy/zstar.jpg\n"));
     }
 }

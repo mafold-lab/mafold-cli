@@ -57,6 +57,15 @@ pub struct AuthStyle {
 }
 
 /// RFC 6750 — the default, and what every OAuth provider expects.
+/// Inert, like [`BEARER`] on rows nothing calls — but naming the field a
+/// secure-input row actually holds, so the "auth reads a real field" invariant
+/// stays true without inventing an `access_token` key.
+pub const BEARER_VALUE: AuthStyle = AuthStyle {
+    header: "Authorization",
+    prefix: "Bearer ",
+    field: "value",
+};
+
 pub const BEARER: AuthStyle = AuthStyle {
     header: "Authorization",
     prefix: "Bearer ",
@@ -198,6 +207,13 @@ pub struct ProviderSpec {
     /// — which is exactly where the vault wants a credential born. `None` for
     /// providers linked by paste, env, import, or MCP dynamic registration.
     pub oauth_client: Option<OAuthClientSpec>,
+    /// A flag that must be on for the account before any surface offers this
+    /// provider (`mafold_types::flags`). The pack goes live on every client the
+    /// moment it is published — no release in between — so a provider still
+    /// behind a flag rides in pack 2 named, and the clients and `putConnection`
+    /// hold it back. Pack 1 leaves it out: the clients that read it can't
+    /// ([`PACK_V1`]). `None` for everything shipped to all.
+    pub flag: Option<&'static str>,
 }
 
 /// See [`ProviderSpec::oauth_client`].
@@ -427,6 +443,59 @@ pub mod github {
     pub const SECRET_ENV: &str = "GITHUB_OAUTH_CLIENT_SECRET";
 }
 
+// MARK: - Google OAuth constants
+//
+// Mafold's registered Google app, brokered for the same measured reason as
+// GitHub and Figma. Probed 2026-09-29:
+//
+//   GET https://accounts.google.com/.well-known/openid-configuration
+//     → no `registration_endpoint`, and `token_endpoint_auth_methods_supported`
+//       is only `client_secret_post` / `client_secret_basic`
+//
+// So a browser cannot finish the exchange alone and the secret lives on the api
+// host. The client is a "Web application" whose authorized redirect is the page
+// below (and the dev server's), registered by its owner in Google Cloud.
+//
+// ⚠️ The project behind this client is, for now, fei's TEST project (publishing
+// status "Testing", test users added by hand) — owner ruling 2026-09-29. That
+// has two consequences worth knowing before debugging anything:
+//   * only listed test users can consent at all; everyone else is stopped at
+//     Google's consent screen, which is the correct place for it;
+//   * Google expires a Testing app's refresh tokens after 7 days. The renewal
+//     is then answered `invalid_grant`, the row is marked "needs reconnecting",
+//     and the Connections row offers one click — that is the designed path,
+//     not a fault.
+// Moving to a Mafold-owned production project is a new `CLIENT_ID` + secret;
+// grants minted for this one then fail renewal at the broker (unknown client
+// id), get marked, and are reconnected once.
+//
+// This is NOT the "Sign in with Google" binding (`identity_api.rs`): a
+// different project, a different secret, and a different review lifecycle.
+pub mod google {
+    pub const CLIENT_ID: &str =
+        "163267733042-rnrfhj2eo62veu36a6vi31ibt87a9h1g.apps.googleusercontent.com";
+    pub const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+    /// Mafold's broker, NOT Google — see [`super::BrokerSpec`].
+    pub const TOKEN_ENDPOINT: &str = "https://api.mafold.com/api/exchangeConnectionToken";
+    /// Google mints and renews at one URL.
+    pub const UPSTREAM_TOKEN: &str = "https://oauth2.googleapis.com/token";
+    pub const UPSTREAM_REFRESH: &str = "https://oauth2.googleapis.com/token";
+    /// The page we serve; the browser finishes the link alone.
+    pub const REDIRECT_URI: &str = "https://mafold.com/app/link/callback";
+    /// Read mail, send mail, read the calendar — the owner-agreed set, and the
+    /// calendar half read-only AT THE GRANT: a token that could write a
+    /// calendar could be made to, whatever tools a catalog lists.
+    ///
+    /// `gmail.readonly` is a RESTRICTED scope. In Testing that costs nothing;
+    /// publishing to everyone means Google's restricted-scope review plus an
+    /// annual CASA assessment. `gmail.send` and `calendar.readonly` are only
+    /// sensitive.
+    pub const SCOPES: &str = "https://www.googleapis.com/auth/gmail.readonly \
+        https://www.googleapis.com/auth/gmail.send \
+        https://www.googleapis.com/auth/calendar.readonly";
+    pub const SECRET_ENV: &str = "GOOGLE_CONNECTION_CLIENT_SECRET";
+}
+
 /// What a `computer` connection holds. Nothing here is a secret in the sense
 /// the rest of this file means — a device id is not a password, and holding it
 /// grants nothing. It is sealed anyway, and that is the point: **the binding is
@@ -589,6 +658,16 @@ const API_KEY: &[SecretField] = &[SecretField {
     issued: false,
 }];
 
+/// The one value a secure-input card collects. Named `value`, not `api_key`:
+/// it is as often a site password as a key, and a bot reads it by the
+/// CONNECTION's name (`$DB_PASSWORD`), never by this field's.
+const SECRET_VALUE: &[SecretField] = &[SecretField {
+    key: "value",
+    label: "Value",
+    required: true,
+    issued: false,
+}];
+
 /// Providers whose credential is a bearer token, however it was obtained: an
 /// OAuth grant returns `access_token`, and a hand-pasted integration token is
 /// sent in exactly the same header. One field name for both paths — naming it
@@ -718,6 +797,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -735,6 +815,28 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
+        oauth_client: None,
+    },
+    ProviderSpec {
+        id: "modelark",
+        display: "BytePlus ModelArk",
+        blurb: "Your own key for Seedance video",
+        badge: "modelark",
+        kind: ProviderKind::ApiKey,
+        fields: API_KEY,
+        import_path: None,
+        env_var: Some("ARK_API_KEY"),
+        auth: BEARER_API_KEY,
+        oauth_capable: false,
+        help_url: Some("https://console.byteplus.com/ark/region:ap-southeast-1/apiKey"),
+        mcp_url: None,
+        // The device half of `mafold video …` with the user's own key: submit /
+        // status / cancel against ModelArk, the finished clip lands through the
+        // server's `ingestUrl`. The house-key path (server env) stays as is.
+        native_api: Some("ark-video"),
+        device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -752,6 +854,32 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
+        oauth_client: None,
+    },
+    // Secure input (`.docs/secure-input-v1.md`): a value only the person knows
+    // — a site password, their own project's env var — handed to a bot through
+    // a `mafold/connection-create provider="secret"` card. NOT a paste door for
+    // anything in this table with a link flow of its own: the api refuses a
+    // request whose variable is one of those providers' `env_var`s and the card
+    // sends the person to that provider's own connect instead (§3.6).
+    ProviderSpec {
+        id: "secret",
+        display: "Secret",
+        blurb: "A password or key only you know, handed to one bot",
+        badge: "",
+        kind: ProviderKind::ApiKey,
+        fields: SECRET_VALUE,
+        import_path: None,
+        // None on purpose: the variable is the connection's own name.
+        env_var: None,
+        auth: BEARER_VALUE,
+        oauth_capable: false,
+        help_url: None,
+        mcp_url: None,
+        native_api: None,
+        device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -777,6 +905,31 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // step, and is what makes this grantable to other agents.
         native_api: None,
         device_bound: false,
+        flag: None,
+        oauth_client: None,
+    },
+    // The key to someone's OpenCode Go plan. Mafold Harness and their own
+    // OpenCode run on it: the computer opens it for each reply
+    // (`connection::open_owner_key` reads `api_key`). Go has no sign-in a
+    // browser or a machine could run, so this is a paste — once, here.
+    ProviderSpec {
+        id: "opencode-go",
+        display: "OpenCode Go",
+        blurb: "Your OpenCode Go plan, for Mafold Harness and OpenCode agents",
+        badge: "opencode",
+        kind: ProviderKind::ApiKey,
+        fields: API_KEY,
+        import_path: None,
+        // What OpenCode itself reads the key from (models.dev, `opencode-go`).
+        env_var: Some("OPENCODE_API_KEY"),
+        auth: BEARER_API_KEY,
+        oauth_capable: false,
+        // Where Go's own docs send you for the key: sign in, subscribe, copy it.
+        help_url: Some("https://opencode.ai/console"),
+        mcp_url: None,
+        native_api: None,
+        device_bound: false,
+        flag: Some("openCodeGo"),
         oauth_client: None,
     },
     ProviderSpec {
@@ -794,6 +947,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: Some("codex-responses"),
         device_bound: false,
+        flag: None,
         oauth_client: Some(OAuthClientSpec {
             client_id: codex::CLIENT_ID,
             authorize_url: codex::AUTHORIZE_URL,
@@ -826,6 +980,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://mcp.notion.com/mcp"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -848,6 +1003,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://mcp.figma.com/mcp"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     // Figma twice, and NOT a duplicate: the two rows hold different
@@ -877,6 +1033,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://mcp.figma.com/mcp"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: Some(OAuthClientSpec {
             client_id: figma::CLIENT_ID,
             authorize_url: figma::AUTHORIZE_URL,
@@ -928,6 +1085,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://api.githubcopilot.com/mcp/"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: Some(OAuthClientSpec {
             client_id: github::CLIENT_ID,
             authorize_url: github::AUTHORIZE_URL,
@@ -939,6 +1097,54 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 upstream_token: github::UPSTREAM_TOKEN,
                 upstream_refresh: github::UPSTREAM_REFRESH,
                 secret_env: github::SECRET_ENV,
+            }),
+        }),
+    },
+    // Gmail and Calendar, one consent, one row — see `google` above for why it
+    // is brokered, why its project is a TEST project for now, and what the
+    // weekly `invalid_grant` means.
+    //
+    // A native driver rather than `mcp_url`: Google's own MCP servers
+    // (`gmailmcp.googleapis.com`, `calendarmcp.googleapis.com`) are Developer
+    // Preview only, the Gmail one cannot send (drafts only) and demands the
+    // restricted `gmail.compose`, and they are two endpoints — two links for
+    // one account. The OAuth half below is exactly what an MCP row would need
+    // too; the day those servers can do the job, this row gains an `mcp_url`
+    // and drops the driver, and linking does not change.
+    ProviderSpec {
+        id: "google",
+        display: "Google",
+        blurb: "Read and send Gmail, read your calendar",
+        // Google's own "G", on white at the size the other marks use.
+        badge: "google",
+        kind: ProviderKind::OAuth,
+        fields: OAUTH_RENEWABLE_BAG,
+        import_path: None,
+        env_var: None,
+        auth: BEARER,
+        // Brokered, so it must not claim the browser-alone flag — same as
+        // `github` and `figma-oauth`.
+        oauth_capable: false,
+        // Where the person reviews or removes what they granted.
+        help_url: Some("https://myaccount.google.com/connections"),
+        mcp_url: None,
+        native_api: Some("google-workspace"),
+        device_bound: false,
+        flag: None,
+        oauth_client: Some(OAuthClientSpec {
+            client_id: google::CLIENT_ID,
+            authorize_url: google::AUTHORIZE_URL,
+            token_endpoint: google::TOKEN_ENDPOINT,
+            redirect_uri: google::REDIRECT_URI,
+            scopes: google::SCOPES,
+            // Both or no refresh token: `offline` asks for one, `consent`
+            // makes Google hand it out again on a RE-connect (it otherwise
+            // returns one only on the very first consent).
+            extra_params: &[("access_type", "offline"), ("prompt", "consent")],
+            broker: Some(BrokerSpec {
+                upstream_token: google::UPSTREAM_TOKEN,
+                upstream_refresh: google::UPSTREAM_REFRESH,
+                secret_env: google::SECRET_ENV,
             }),
         }),
     },
@@ -983,6 +1189,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: Some("computer"),
         device_bound: true,
+        flag: None,
         oauth_client: None,
     },
     // Any MCP server the user can name — the one row that is not a vendor.
@@ -1023,6 +1230,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
 ];
@@ -1038,6 +1246,38 @@ impl ProviderSpec {
     /// rule is spelled out there.
     pub fn delegates_endpoint(&self) -> bool {
         self.mcp_url.is_none() && self.fields.iter().any(|f| f.key == "endpoint")
+    }
+
+    /// A value the PERSON names and already holds — a site password, their own
+    /// project's env var — rather than a credential some vendor mints: one
+    /// field, no variable of its own (the connection's name is the variable,
+    /// the same rule the cli reads off the row), nothing to call, nothing to
+    /// import. Vendor-less the way `device_bound` and `delegates_endpoint` rows
+    /// are: there is no mark to wear and no console to send anyone to.
+    pub fn names_its_own_value(&self) -> bool {
+        self.env_var.is_none()
+            && self.fields.len() == 1
+            && self.import_path.is_none()
+            && self.mcp_url.is_none()
+            && self.native_api.is_none()
+            && !self.oauth_capable
+            && !self.device_bound
+    }
+
+    /// A coding agent's OWN login (Claude Code, Codex): an agent runs ON this
+    /// credential rather than calling some service with it.
+    ///
+    /// Derived, not a new column, from the two facts that already say so: an
+    /// OAuth token bag ([`ProviderKind::OAuth`] — "produced by an OAuth login
+    /// the harness already performed") that is lifted from the vendor CLI's own
+    /// file (`import_path`). No other row has both: GitHub, Google and Figma
+    /// are consented to in a browser, keys are pasted.
+    ///
+    /// What it changes: an owner may give a login only to an agent whose
+    /// sheet has a slot for that provider (`grantConnectionAccess`) — anything
+    /// else would list an agent under "uses this login" that never runs on it.
+    pub fn is_agent_login(&self) -> bool {
+        self.kind == ProviderKind::OAuth && self.import_path.is_some()
     }
 }
 
@@ -1159,6 +1399,9 @@ pub struct ProviderInfo {
     /// pretend. The only part of a provider that a release still gates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_api: Option<String>,
+    /// [`ProviderSpec::flag`]: offered only to an account with it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
 }
 
 impl ProviderInfo {
@@ -1198,18 +1441,88 @@ impl ProviderInfo {
 /// one that sends a device's decrypted credential somewhere new.
 pub const PACK_PUBLIC_KEY_B64: &str = "5p8gk69DfUBrwm4TYeisbc86ZqfjplSsfSZcL5HVbBU=";
 
+/// The two shapes a pack is published in. Every publish signs both, under one
+/// version; a client says which it reads (`getConnectionProviders { pack }`).
+///
+/// **Pack 1 is what every client before 10-31 reads, and it never changes
+/// shape.** Those clients check the signature over their OWN re-serialisation
+/// of the rows, so a row carrying a key their `ProviderInfo` doesn't have comes
+/// out different, the check fails, and they refuse the whole registry — every
+/// connection on the device stops, not just the new row. `flag` (#1364) was the
+/// first such key. Pack 1 therefore carries only the rows [`v1_can_carry`]
+/// passes, which also keeps a row behind a flag away from clients that could
+/// not hold it back.
+///
+/// **Pack 2 carries every row, checked over the JSON exactly as it arrived**
+/// ([`pack_digest`] over the raw rows), and the reader then takes the fields it
+/// knows. A key added later costs a pack-2 client nothing.
+pub const PACK_V1: u32 = 1;
+pub const PACK_V2: u32 = 2;
+
 /// A published registry, exactly as it travels and is stored.
 ///
 /// The signature belongs to the pack rather than to the transport, so the same
-/// three fields are what CI signs, what the api keeps, and what a client
-/// verifies. A server that stored the rows without the signature would have to
-/// be trusted to re-attest them, which is the trust this design removes.
+/// fields are what CI signs, what the api keeps, and what a client verifies. A
+/// server that stored the rows without the signature would have to be trusted
+/// to re-attest them, which is the trust this design removes.
+///
+/// The rows are RAW JSON: the api stores and serves them byte for byte, so a
+/// key its own build doesn't know yet still reaches the clients that do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderPack {
+    /// [`PACK_V1`] or [`PACK_V2`]. Absent ⇒ 1: every pack stored or served
+    /// before pack 2 existed was written without it.
+    #[serde(default = "pack_v1", skip_serializing_if = "is_pack_v1")]
+    pub pack: u32,
     pub version: u32,
-    pub providers: Vec<ProviderInfo>,
-    /// Base64 raw Ed25519 over [`providers_digest`].
+    pub providers: Vec<serde_json::Value>,
+    /// Base64 raw Ed25519 over [`pack_digest`].
     pub signature: String,
+}
+
+fn pack_v1() -> u32 {
+    PACK_V1
+}
+
+fn is_pack_v1(p: &u32) -> bool {
+    *p == PACK_V1
+}
+
+/// The registry's rows as the JSON a pack carries.
+pub fn provider_rows(providers: &[ProviderInfo]) -> Vec<serde_json::Value> {
+    providers.iter().map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null)).collect()
+}
+
+/// The rows pack 1 carries: the ones a client from before pack 2 takes whole.
+pub fn v1_rows(providers: &[ProviderInfo]) -> Vec<ProviderInfo> {
+    providers.iter().filter(|p| serde_json::to_value(p).is_ok_and(|row| v1_can_carry(&row))).cloned().collect()
+}
+
+/// Every key a client from before pack 2 knows, as `ProviderInfo` and its parts
+/// stood when `flag` was added (d708fe36) — minus `flag`.
+const V1_ROW_KEYS: &[&str] = &[
+    "id", "display", "blurb", "badge", "kind", "fields", "payload_keys", "help_url", "oauth", "mcp_url",
+    "browser_linkable", "device_link", "oauth_fixed", "auth", "import_path", "env_var", "native_api",
+];
+const V1_FIELD_KEYS: &[&str] = &["key", "label", "required"];
+const V1_AUTH_KEYS: &[&str] = &["header", "prefix", "field"];
+const V1_FIXED_KEYS: &[&str] = &["client_id", "authorize_url", "token_endpoint", "redirect_uri", "scopes", "extra_params"];
+const V1_KINDS: &[&str] = &["api-key", "o-auth"];
+
+/// Whether a row can ride in pack 1: every key in it, at every level, is one a
+/// client from before pack 2 re-serialises, and its `kind` is one it can parse.
+/// A row behind a flag never can (`flag` is not such a key), which is what
+/// keeps it away from clients that would show it to everyone.
+pub fn v1_can_carry(row: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    fn only(v: &Value, keys: &[&str]) -> bool {
+        v.as_object().is_some_and(|o| o.keys().all(|k| keys.contains(&k.as_str())))
+    }
+    only(row, V1_ROW_KEYS)
+        && row["kind"].as_str().is_some_and(|k| V1_KINDS.contains(&k))
+        && only(&row["auth"], V1_AUTH_KEYS)
+        && row["fields"].as_array().is_some_and(|fs| fs.iter().all(|f| only(f, V1_FIELD_KEYS)))
+        && row.get("oauth_fixed").map_or(true, |f| only(f, V1_FIXED_KEYS))
 }
 
 /// A content hash of the whole provider pack.
@@ -1219,7 +1532,13 @@ pub struct ProviderPack {
 /// prove it changed something. Canonicalised by hand for the same reason —
 /// `serde_json`'s `preserve_order` is a build-graph-wide flag we do not control.
 pub fn providers_checksum(providers: &[ProviderInfo]) -> String {
-    crate::fnv1a_hex(providers_canonical(providers).as_bytes())
+    rows_checksum(&provider_rows(providers))
+}
+
+/// [`providers_checksum`] over rows as they arrived — what a pack-2 reader,
+/// which may hold keys its build doesn't know, asks "still current?" with.
+pub fn rows_checksum(rows: &[serde_json::Value]) -> String {
+    crate::fnv1a_hex(rows_canonical(rows).as_bytes())
 }
 
 /// The exact bytes every party agrees the pack "is".
@@ -1229,13 +1548,17 @@ pub fn providers_checksum(providers: &[ProviderInfo]) -> String {
 /// would produce a pack that verifies nowhere and a bug that looks like key
 /// mismatch.
 pub fn providers_canonical(providers: &[ProviderInfo]) -> String {
-    let value = serde_json::to_value(providers).unwrap_or(serde_json::Value::Null);
+    rows_canonical(&provider_rows(providers))
+}
+
+fn rows_canonical(rows: &[serde_json::Value]) -> String {
     let mut canonical = String::new();
-    crate::canon_json(&value, &mut canonical);
+    crate::canon_json(&serde_json::Value::Array(rows.to_vec()), &mut canonical);
     canonical
 }
 
-/// What a publish SIGNS: SHA-256 over the version and the canonical pack.
+/// What a publish SIGNS: SHA-256 over the pack's shape, its version and its
+/// canonical rows.
 ///
 /// Deliberately not [`providers_checksum`], which is FNV — fine for "did this
 /// change?", useless against someone choosing what it changes to. A pack tells
@@ -1243,15 +1566,22 @@ pub fn providers_canonical(providers: &[ProviderInfo]) -> String {
 /// signature has to be one an attacker cannot aim.
 ///
 /// The version is inside the digest so a valid old signature cannot be replayed
-/// over a newer pack number to make a downgrade look current.
-pub fn providers_digest(version: u32, providers: &[ProviderInfo]) -> [u8; 32] {
+/// over a newer pack number to make a downgrade look current; the shape is in
+/// its first line, so a signature never passes for the other pack.
+pub fn pack_digest(pack: u32, version: u32, rows: &[serde_json::Value]) -> [u8; 32] {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    h.update(b"mafold-provider-pack-v1\n");
+    h.update(format!("mafold-provider-pack-v{pack}\n").as_bytes());
     h.update(version.to_string().as_bytes());
     h.update(b"\n");
-    h.update(providers_canonical(providers).as_bytes());
+    h.update(rows_canonical(rows).as_bytes());
     h.finalize().into()
+}
+
+/// [`pack_digest`] of pack 1, over typed rows — the check every client before
+/// pack 2 makes, kept so tests can make it too.
+pub fn providers_digest(version: u32, providers: &[ProviderInfo]) -> [u8; 32] {
+    pack_digest(PACK_V1, version, &provider_rows(providers))
 }
 
 /// [`AuthStyle`], owned — the form that survives a trip through the cloud.
@@ -1373,6 +1703,7 @@ pub fn provider_infos() -> Vec<ProviderInfo> {
             import_path: p.import_path.map(str::to_string),
             env_var: p.env_var.map(str::to_string),
             native_api: p.native_api.map(str::to_string),
+            flag: p.flag.map(str::to_string),
         })
         .collect()
 }
@@ -1407,6 +1738,16 @@ pub struct ConnectionMeta {
     pub key_id: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Set when a device tried to renew this credential and the provider said
+    /// the grant is gone (`invalid_grant`: expired, revoked). Unix seconds;
+    /// absent = nothing known to be wrong. Cleared by any write of the row,
+    /// since every write is a fresh credential. Every surface reads it the
+    /// same way: this row needs its owner to reconnect it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relink_at: Option<i64>,
+    /// The provider's own words for why, bounded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub relink_reason: String,
 }
 
 /// A device enrolled in the user's vault.
@@ -1473,17 +1814,29 @@ mod tests {
             vec![
                 "claude-code-oauth",
                 "anthropic-api",
+                "modelark",
                 "openai-api",
+                "secret",
                 "dashscope",
+                "opencode-go",
                 "codex-oauth",
                 "notion",
                 "figma",
                 "figma-oauth",
                 "github",
+                "google",
                 "computer",
                 "mcp",
             ]
         );
+    }
+
+    /// Exactly the two coding-agent logins count as one — a GitHub or Google
+    /// consent, a pasted key, a machine, a secret do not.
+    #[test]
+    fn only_coding_agent_logins_are_agent_logins() {
+        let logins: Vec<&str> = PROVIDERS.iter().filter(|p| p.is_agent_login()).map(|p| p.id).collect();
+        assert_eq!(logins, vec!["claude-code-oauth", "codex-oauth"]);
     }
 
     /// The `mcp` row is the first provider whose SERVER is chosen by the user,
@@ -1624,7 +1977,7 @@ mod tests {
             // described row is vendor-less the same way: it stands for every
             // server the table does not name.
             assert!(
-                !p.badge.is_empty() || p.device_bound || p.delegates_endpoint(),
+                !p.badge.is_empty() || p.device_bound || p.delegates_endpoint() || p.names_its_own_value(),
                 "{}: no badge slug",
                 p.id
             );
@@ -1886,9 +2239,12 @@ mod tests {
             // "Pasted" means a form really draws an input. A row whose every
             // field is `issued` draws none — the machine writes them — so there
             // is nothing for a help link to help with.
+            // A value the person names themselves (a secure-input secret) is
+            // already in their head — there is no console to send them to.
             let pasted = p.import_path.is_none()
                 && !p.oauth_capable
-                && p.fields.iter().any(|f| !f.issued);
+                && p.fields.iter().any(|f| !f.issued)
+                && !p.names_its_own_value();
             if pasted {
                 assert!(
                     p.help_url.is_some(),
@@ -2004,6 +2360,131 @@ mod tests {
         assert_ne!(rehomed[0].auth.header, "X-Exfiltrate", "pick a header it does not already use");
         rehomed[0].auth.header = "X-Exfiltrate".into();
         assert_ne!(sum, providers_checksum(&rehomed), "an auth swap must change the digest too");
+    }
+
+    /// `ProviderInfo` as every client from before pack 2 has it: d708fe36's,
+    /// minus `flag` — what such a client parses a pack into and re-serialises
+    /// to check the signature.
+    #[derive(Serialize, Deserialize)]
+    struct ClientBeforePack2 {
+        id: String,
+        display: String,
+        blurb: String,
+        badge: String,
+        kind: ProviderKind,
+        fields: Vec<SecretFieldInfo>,
+        payload_keys: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        help_url: Option<String>,
+        oauth: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mcp_url: Option<String>,
+        browser_linkable: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        device_link: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oauth_fixed: Option<FixedClientInfo>,
+        auth: AuthInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_api: Option<String>,
+    }
+
+    /// The digest such a client computes over the rows it was sent.
+    fn digest_before_pack2(version: u32, rows: &[serde_json::Value]) -> [u8; 32] {
+        let reread: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| serde_json::to_value(serde_json::from_value::<ClientBeforePack2>(r.clone()).unwrap()).unwrap())
+            .collect();
+        pack_digest(PACK_V1, version, &reread)
+    }
+
+    /// The 10-31 bug, as a test: one row behind a flag in the pack, and a
+    /// client from before pack 2 computes a different digest — so it refuses
+    /// the whole registry. Pack 1 is what it reads, and pack 1 verifies for it.
+    #[test]
+    fn pack_1_is_one_a_client_before_pack_2_verifies() {
+        let all = provider_infos();
+        let rows = provider_rows(&all);
+        assert!(all.iter().any(|p| p.flag.is_some()), "the positive control needs a row behind a flag");
+        assert_ne!(
+            digest_before_pack2(7, &rows),
+            pack_digest(PACK_V1, 7, &rows),
+            "every row in one pack: an old client's check fails (the bug pack 1 exists for)"
+        );
+        let v1 = provider_rows(&v1_rows(&all));
+        assert_eq!(digest_before_pack2(7, &v1), pack_digest(PACK_V1, 7, &v1), "pack 1 verifies for it");
+        assert_eq!(providers_digest(7, &v1_rows(&all)), pack_digest(PACK_V1, 7, &v1));
+    }
+
+    /// Pack 1 leaves out a row only because an old client couldn't take it:
+    /// today that is exactly the rows behind a flag. A key added to a row that
+    /// is open to all would make pack 1 drop that row, and every client before
+    /// pack 2 lose the provider — so it fails here first. Keep new keys off
+    /// such rows (`skip_serializing_if`), or show why losing it is right.
+    #[test]
+    fn pack_1_leaves_out_exactly_the_rows_behind_a_flag() {
+        let all = provider_infos();
+        let kept: Vec<String> = v1_rows(&all).into_iter().map(|p| p.id).collect();
+        let open: Vec<String> = all.iter().filter(|p| p.flag.is_none()).map(|p| p.id.clone()).collect();
+        assert_eq!(kept, open);
+        assert!(!kept.contains(&"opencode-go".to_string()), "the Go row waits behind openCodeGo");
+    }
+
+    /// The digest pack 1 has always been signed with, spelled out: if this
+    /// moved, every pack CI signs would fail on every client in the field.
+    #[test]
+    fn pack_1_digest_is_the_one_clients_already_check() {
+        use sha2::Digest;
+        let v1 = v1_rows(&provider_infos());
+        let mut h = sha2::Sha256::new();
+        h.update(format!("mafold-provider-pack-v1\n42\n{}", providers_canonical(&v1)).as_bytes());
+        let then: [u8; 32] = h.finalize().into();
+        assert_eq!(providers_digest(42, &v1), then);
+    }
+
+    /// A signature is over one shape: pack 1's never passes for pack 2's, or
+    /// the other way round, even over the same rows.
+    #[test]
+    fn a_signature_belongs_to_one_pack() {
+        let rows = provider_rows(&v1_rows(&provider_infos()));
+        assert_ne!(pack_digest(PACK_V1, 3, &rows), pack_digest(PACK_V2, 3, &rows));
+    }
+
+    #[test]
+    fn what_pack_1_can_carry() {
+        let row = serde_json::to_value(provider_infos().into_iter().find(|p| p.id == "notion").unwrap()).unwrap();
+        assert!(v1_can_carry(&row));
+        let with = |path: &[&str], v: serde_json::Value| {
+            let mut r = row.clone();
+            let mut at = &mut r;
+            for p in &path[..path.len() - 1] {
+                at = &mut at[*p];
+            }
+            at[path[path.len() - 1]] = v;
+            r
+        };
+        assert!(!v1_can_carry(&with(&["flag"], "openCodeGo".into())), "a flag: an old client would offer it to all");
+        assert!(!v1_can_carry(&with(&["transport"], "sse".into())), "a key old clients don't know");
+        assert!(!v1_can_carry(&with(&["auth", "scheme"], "x".into())), "nested ones too");
+        assert!(!v1_can_carry(&with(&["kind"], "device".into())), "a kind old clients can't parse");
+        let mut field = row.clone();
+        field["fields"] = serde_json::json!([{ "key": "k", "label": "K", "required": true, "secret": true }]);
+        assert!(!v1_can_carry(&field), "a field's keys too");
+    }
+
+    /// Stored and served packs from before pack 2 have no `pack`: they are 1.
+    /// Pack 1 is still written without it; pack 2 says so.
+    #[test]
+    fn a_pack_without_a_shape_is_pack_1() {
+        let old: ProviderPack = serde_json::from_str(r#"{"version":9,"providers":[],"signature":"s"}"#).unwrap();
+        assert_eq!(old.pack, PACK_V1);
+        assert!(serde_json::to_value(&old).unwrap().get("pack").is_none());
+        let two = ProviderPack { pack: PACK_V2, ..old };
+        assert_eq!(serde_json::to_value(&two).unwrap()["pack"], 2);
     }
 
     /// `client_id` is the only key the broker has to find a row by, because the
@@ -2145,5 +2626,99 @@ mod tests {
             !scopes.contains(&"write:packages"),
             "publishing packages is not something connecting should grant"
         );
+    }
+
+    /// Google is ONE row, linked by the browser alone, through the broker —
+    /// Google issues no public web client and its token endpoint accepts only
+    /// `client_secret_basic` / `client_secret_post` (probed 2026-09-29).
+    #[test]
+    fn google_is_one_brokered_row_the_browser_can_finish_alone() {
+        let ids: Vec<&str> = PROVIDERS.iter().filter(|p| p.id.starts_with("google")).map(|p| p.id).collect();
+        assert_eq!(ids, vec!["google"], "§3.6: one provider, one way in");
+
+        let info = provider_infos().into_iter().find(|i| i.id == "google").unwrap();
+        assert!(info.oauth && info.browser_linkable && !info.device_link);
+        assert_eq!(info.native_api.as_deref(), Some("google-workspace"));
+        assert!(info.mcp_url.is_none(), "Google's MCP servers are preview-only and cannot send");
+        let fixed = info.oauth_fixed.expect("the browser needs the fixed client parameters");
+        assert!(fixed.token_endpoint.contains("exchangeConnectionToken"));
+        assert_eq!(fixed.client_id, google::CLIENT_ID);
+
+        let b = provider("google").unwrap().oauth_client.unwrap().broker.unwrap();
+        assert_eq!(b.upstream_token, "https://oauth2.googleapis.com/token");
+        assert_eq!(b.upstream_refresh, b.upstream_token);
+        // NOT the sign-in binding's secret: a different Google project, and a
+        // different lifecycle (this one heads for restricted-scope review).
+        assert_eq!(b.secret_env, "GOOGLE_CONNECTION_CLIENT_SECRET");
+        assert!(google::REDIRECT_URI.starts_with("https://mafold.com/"));
+    }
+
+    /// The agreed scopes, exactly — and read-only at the GRANT for the
+    /// calendar, not merely in the tool list: a token that can write a
+    /// calendar can be made to, whatever the catalog says (owner, 09-29).
+    #[test]
+    fn google_asks_for_exactly_the_agreed_scopes_and_cannot_write_a_calendar() {
+        let scopes: Vec<&str> = google::SCOPES.split(' ').collect();
+        assert_eq!(
+            scopes,
+            vec![
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.send",
+                "https://www.googleapis.com/auth/calendar.readonly",
+            ]
+        );
+        for s in scopes.iter().filter(|s| s.contains("/auth/calendar")) {
+            assert!(s.ends_with(".readonly"), "{s} would let the token change a calendar");
+        }
+        assert!(!google::SCOPES.contains("mail.google.com"), "full mailbox access is not agreed");
+    }
+
+    /// Google hands out a refresh token only for `access_type=offline`, and on
+    /// a repeat consent only with `prompt=consent`. Without both, a connection
+    /// works for an hour and then can never renew — and a RE-connect (the
+    /// "needs reconnecting" button) would come back with no refresh token at
+    /// all, because the person already consented once.
+    #[test]
+    fn google_asks_for_a_refresh_token_every_time() {
+        let oc = provider("google").unwrap().oauth_client.unwrap();
+        assert!(oc.extra_params.contains(&("access_type", "offline")));
+        assert!(oc.extra_params.contains(&("prompt", "consent")));
+    }
+
+    /// The Connections page's table (`client-shared/connections.cases.json`):
+    /// the registry exactly as clients receive it, and which tab each
+    /// provider's tile sits under. The page derives that tab from these rows
+    /// alone (client-shared/connections.ts `categoryOf`, no provider names), and
+    /// the twin specs hold it to `category`; this keeps `providers` the real
+    /// registry, so a new or changed row can't slip past them — and makes
+    /// whoever adds a provider say where it goes.
+    ///
+    /// Stale after a registry edit? `MAFOLD_WRITE_CASES=1 cargo test -p
+    /// mafold-types connections_page_table` rewrites `providers`; then put the
+    /// new id in `category` and run the web spec.
+    #[test]
+    fn connections_page_table_is_the_registry() {
+        const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../client-shared/connections.cases.json");
+        let raw = std::fs::read_to_string(PATH).expect("connections.cases.json");
+        let mut table: serde_json::Value = serde_json::from_str(&raw).expect("connections.cases.json parses");
+        let live = serde_json::to_value(provider_infos()).unwrap();
+        if table["providers"] != live {
+            if std::env::var_os("MAFOLD_WRITE_CASES").is_some() {
+                table["providers"] = live.clone();
+                std::fs::write(PATH, serde_json::to_string_pretty(&table).unwrap() + "\n").unwrap();
+            } else {
+                panic!("client-shared/connections.cases.json is not the registry — rerun with MAFOLD_WRITE_CASES=1");
+            }
+        }
+        let tabs = ["logins", "models", "apps", "computers", "secrets"];
+        let cat = table["category"].as_object().expect("category");
+        let ids: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
+        for id in &ids {
+            let c = cat.get(*id).and_then(|v| v.as_str()).unwrap_or_else(|| panic!("{id}: say which tab it sits under in `category`"));
+            assert!(tabs.contains(&c), "{id}: {c} is not a tab");
+        }
+        for id in cat.keys() {
+            assert!(ids.contains(&id.as_str()), "`category` names {id}, which the registry doesn't have");
+        }
     }
 }

@@ -1,9 +1,9 @@
 //! Feature-flag engine — the ONE client-side implementation (.docs/feature-flags.md).
 //!
-//! A flag is born HERE: `KNOWN_FLAGS` is the single home of the key, the
-//! compile-time default and the metadata (invariant ① — the server record is a
-//! rollout override only, never a second default). Resolution precedence:
-//! `local override > server value > compile default (dev or prod)`.
+//! A flag is born in `mafold_types::flags::KNOWN_FLAGS`: the single home of the
+//! key, the compile-time default and the metadata (invariant ① — the server
+//! record is a rollout override only, never a second default). Resolution
+//! precedence: `local override > server value > compile default (dev or prod)`.
 //!
 //! Server values arrive as a `mafold_types::FlagState` (bootstrap `getFlags` +
 //! WS `flagsChanged`) and are persisted to the core KV, so a cold offline start
@@ -20,72 +20,26 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
-
 use crate::storage::Storage;
 use crate::store::Store;
 
-/// Compile-time flag registry — key + default + metadata. One entry per flag;
-/// delete the entry together with its gate code when the feature hits 100%.
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct FlagMeta {
-    pub key: &'static str,
-    /// Production default (when neither an override nor a server value exists).
-    pub default: bool,
-    /// Default in dev/internal builds (`set_flags_dev(true)`) — preserves the
-    /// old devmode.ts behavior of dev-only tabs without magic overrides.
-    pub dev_default: bool,
-    pub label: &'static str,
-    pub description: &'static str,
-    /// Who owns the flag's lifecycle (flags are temporary — see the doc §6).
-    pub owner: &'static str,
-    /// yyyy-mm added — lets a periodic check surface stale flags.
-    pub added: &'static str,
+/// The registry lives in the wire crate (`mafold_types::flags`) because the
+/// api reads it too; the core resolves the flags a client reads — an api-only
+/// flag (`clients` empty) has no client default and stays out of the snapshot.
+pub use mafold_types::flags::{FlagMeta, KNOWN_FLAGS};
+
+fn client_flags() -> impl Iterator<Item = &'static FlagMeta> {
+    KNOWN_FLAGS.iter().filter(|m| !m.clients.is_empty())
 }
 
-/// The registry. Keys must match the server's control-plane records and the
-/// gate code on every client.
-pub static KNOWN_FLAGS: &[FlagMeta] = &[
-    FlagMeta {
-        key: "starterTutorial",
-        default: false,
-        dev_default: true,
-        label: "Starter tutorial",
-        description: "Three guided starter quests in Activity Center.",
-        owner: "ops",
-        added: "2026-09",
-    },
-    FlagMeta {
-        key: "showIds",
-        default: false,
-        dev_default: false,
-        label: "Show chat & message IDs",
-        description: "Profiles show a copyable chat id; message menus show the message id.",
-        owner: "ops",
-        added: "2026-07",
-    },
-    FlagMeta {
-        key: "gardenApps",
-        default: false,
-        dev_default: true,
-        label: "Moments & Garden",
-        description: "Reveals the bottom tab switcher (Moments / Chats / Garden) under the chat list.",
-        owner: "ops",
-        added: "2026-07",
-    },
-    FlagMeta {
-        key: "moments",
-        default: false,
-        dev_default: true,
-        label: "Moments",
-        description: "The Moments tab (author feed + composer). WIP — gated separately from gardenApps so Garden can ship without exposing unfinished Moments.",
-        owner: "ops",
-        added: "2026-07",
-    },
-];
-
 fn meta(key: &str) -> Option<&'static FlagMeta> {
-    KNOWN_FLAGS.iter().find(|m| m.key == key)
+    client_flags().find(|m| m.key == key)
+}
+
+/// A flag's production default — for a client that holds the server's values
+/// itself instead of in a [`Store`] (the daemon). Unknown key → false.
+pub fn prod_default(key: &str) -> bool {
+    meta(key).is_some_and(|m| m.default)
 }
 
 const TBL: &str = "flags";
@@ -167,7 +121,7 @@ impl<S: Storage> Store<S> {
         let dev = self.flags_is_dev();
 
         let mut out: BTreeMap<String, bool> = BTreeMap::new();
-        for m in KNOWN_FLAGS {
+        for m in client_flags() {
             out.insert(
                 m.key.to_string(),
                 if dev { m.dev_default } else { m.default },
@@ -204,9 +158,10 @@ impl<S: Storage> Store<S> {
     }
 }
 
-/// The registry as JSON (for clients to render the toggle list from).
+/// The registry as JSON (for clients to render the toggle list from) — the
+/// flags a client reads; an api-only one has nothing to toggle on a device.
 pub fn registry_json() -> String {
-    serde_json::to_string(KNOWN_FLAGS).unwrap_or_else(|_| "[]".into())
+    serde_json::to_string(&client_flags().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into())
 }
 
 // ─────────────────────────────── tests ───────────────────────────────

@@ -118,7 +118,7 @@ param([Parameter(ValueFromRemainingArguments = $true)][string[]]$MafoldArgs)
     & $bin @MafoldArgs
   } else {
     Write-Host ""
-    Write-Host "run:  mafold login                                  # pair this computer"
-    Write-Host "      mafold agent --detach --token mb_xxx          # works in the current folder"
+    Write-Host "run:  mafold login         # pair this computer (approve it on the web)"
+    Write-Host "      mafold add <bot>     # then, from its project folder, run your bot here"
   }
 }

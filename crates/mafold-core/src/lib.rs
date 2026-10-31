@@ -19,7 +19,12 @@ pub mod flags;
 pub mod connections;
 pub mod providers;
 mod codex;
+/// Public for its [`ark::DRIVER`] id: `mafold video` picks the owner's own
+/// ModelArk connection by the driver its provider row names, the same way
+/// `computer::DRIVER` / `google::DRIVER` are read — never by provider slug.
+pub mod ark;
 pub mod computer;
+pub mod google;
 pub mod mcp;
 pub mod methods;
 pub mod vault;
@@ -337,6 +342,31 @@ pub struct CoreConvApp {
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
 pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Secure input (`.docs/secure-input-v1.md` §6): seal a payload to a set of
+/// devices' public keys, no master key needed. JSON in / JSON out so the wasm
+/// and UniFFI bindings are the same one-line shim over the same Rust:
+/// `recipients_json` = `[{"device_id","public_key"}]` →
+/// `{"blob","device_wraps":{device_id: wrapped}}`.
+pub fn seal_for_devices_json(recipients_json: &str, payload_json: &str) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Recipient {
+        device_id: String,
+        public_key: String,
+    }
+    let list: Vec<Recipient> =
+        serde_json::from_str(recipients_json).map_err(|e| format!("recipients: {e}"))?;
+    let pairs: Vec<(String, String)> = list.into_iter().map(|r| (r.device_id, r.public_key)).collect();
+    let (blob, wraps) = vault::seal_for_devices(&pairs, payload_json).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "blob": blob, "device_wraps": wraps }).to_string())
+}
+
+/// The native face of [`seal_for_devices_json`] — what the phone calls.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn vault_seal_for_devices(recipients_json: String, payload_json: String) -> Result<String, CoreError> {
+    seal_for_devices_json(&recipients_json, &payload_json).map_err(CoreError::Db)
 }
 
 /// Sync engine stage 1 (native): the core makes the API call itself — async over
@@ -718,6 +748,13 @@ mod web {
         crate::vault::fingerprint(&public_key)
     }
 
+    /// Secure input: seal to devices' public keys — no unlocked vault needed,
+    /// so a browser that never joined the vault can still hand a value over.
+    #[wasm_bindgen(js_name = vaultSealForDevices)]
+    pub fn vault_seal_for_devices(recipients_json: String, payload_json: String) -> Result<String, JsValue> {
+        crate::seal_for_devices_json(&recipients_json, &payload_json).map_err(|e| JsValue::from_str(&e))
+    }
+
     /// An unlocked vault. Dropping it (`free()`) drops the master key.
     #[wasm_bindgen]
     pub struct Vault {
@@ -743,8 +780,23 @@ mod web {
         Vault { umk: crate::vault::Key::random(), key_id: crate::vault::new_key_id() }
     }
 
+    #[wasm_bindgen(js_name = vaultRecover)]
+    pub fn vault_recover(blob_json: String, passphrase: String, key_id: String) -> Result<Vault, JsValue> {
+        let blob: crate::vault::RecoveryBlob = serde_json::from_str(&blob_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let umk = crate::vault::unwrap_umk_with_passphrase(&blob, &passphrase)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(Vault { umk, key_id })
+    }
+
     #[wasm_bindgen]
     impl Vault {
+        #[wasm_bindgen(js_name = recoveryBlob)]
+        pub fn recovery_blob(&self, passphrase: String) -> Result<String, JsValue> {
+            let blob = crate::vault::wrap_umk_with_passphrase(&self.umk, &passphrase)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            serde_json::to_string(&blob).map_err(|e| JsValue::from_str(&e.to_string()))
+        }
         #[wasm_bindgen(getter, js_name = keyId)]
         pub fn key_id(&self) -> String {
             self.key_id.clone()
@@ -786,6 +838,25 @@ mod web {
                 "sealed_dek": s.sealed_dek,
             })
             .to_string())
+        }
+
+        /// Trade a secure-input row's per-device seal for one under this
+        /// vault's master key → `{blob, wrapped_dek}`. `device_wraps_json` is
+        /// the row's `device_wraps` object; `device_secret` is this browser's
+        /// own device key. The value is opened and sealed again in here and
+        /// never handed to JS.
+        #[wasm_bindgen(js_name = resealDeviceRow)]
+        pub fn reseal_device_row(
+            &self,
+            device_secret: String,
+            blob: String,
+            device_wraps_json: String,
+        ) -> Result<String, JsValue> {
+            let wraps: std::collections::BTreeMap<String, String> = serde_json::from_str(&device_wraps_json)
+                .map_err(|e| JsValue::from_str(&format!("device_wraps: {e}")))?;
+            let s = crate::vault::reseal_device_row(&self.umk, &device_secret, &blob, wraps.values().map(String::as_str))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            Ok(serde_json::json!({ "blob": s.blob, "wrapped_dek": s.wrapped_dek }).to_string())
         }
 
         /// Open one → the payload JSON.

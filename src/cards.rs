@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::client::Client;
+use mafold_core::mafold_types::units::EN;
 
 /// Pinned esbuild version fetched on demand.
 const ESBUILD_VERSION: &str = "0.24.2";
@@ -94,6 +95,18 @@ struct CardManifest {
     /// `false` keeps the card out of row previews (a reply's usage footer).
     #[serde(default)]
     preview: Option<bool>,
+    /// `true` = the card has a one-line intrinsic size and may sit inside a
+    /// line of text. Carried verbatim.
+    #[serde(default)]
+    inline: Option<bool>,
+    /// `{image?, page?}` — which fields name a picture to re-host or a page to
+    /// read. Carried verbatim; the server checks the shape.
+    #[serde(default)]
+    urls: Option<serde_json::Value>,
+    /// `{doc, example?, flag?, offer?}` — what agents are told about the card.
+    /// Carried verbatim; the server checks the shape.
+    #[serde(default)]
+    agent: Option<serde_json::Value>,
 }
 fn default_entry() -> String {
     "src/card.tsx".into()
@@ -183,7 +196,7 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
     println!("  watching {} (Ctrl-C to stop)\n", manifest.entry);
 
     // esbuild runs the watch + static server itself; this blocks until Ctrl-C.
-    let mut c = tokio::process::Command::new(&esbuild);
+    let mut c = crate::platform::console_command(&esbuild);
     c.current_dir(dir)
         .arg(&manifest.entry)
         .args(bundle_args(&out))
@@ -220,7 +233,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let out = out_dir.join(format!("{}.js", manifest.slug()));
 
     println!("→ bundling {} …", manifest.entry);
-    let status = tokio::process::Command::new(&esbuild)
+    let status = crate::platform::console_command(&esbuild)
         .current_dir(dir)
         .arg(&manifest.entry)
         .args(bundle_args(&format!("dist/{}.js", manifest.slug())))
@@ -232,11 +245,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         anyhow::bail!("esbuild exited with {status}");
     }
     let bundle = std::fs::read(&out).with_context(|| format!("reading {}", out.display()))?;
-    println!(
-        "  bundle: {} ({:.1} KB)",
-        out.display(),
-        bundle.len() as f64 / 1024.0
-    );
+    println!("  bundle: {} ({})", out.display(), EN.bytes(bundle.len() as f64));
 
     let client = Client::new(base, token);
     let meta = json!({
@@ -246,6 +255,9 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         "composer": manifest.composer,
         "display_names": manifest.display_names,
         "preview": manifest.preview,
+        "inline": manifest.inline,
+        "urls": manifest.urls,
+        "agent": manifest.agent,
     });
     let r = client.publish_card(&meta, bundle).await?;
     let scope = r["scope"].as_str().unwrap_or("?");
@@ -432,7 +444,7 @@ pub(crate) async fn ensure_esbuild() -> Result<PathBuf> {
         let tgz = stage.join("esbuild.tgz");
         std::fs::write(&tgz, &bytes)?;
         // The npm tarball stores the binary at package/bin/esbuild.
-        let status = std::process::Command::new("tar")
+        let status = crate::platform::console_std_command("tar")
             .arg("-xzf")
             .arg(&tgz)
             .arg("-C")

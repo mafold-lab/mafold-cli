@@ -37,7 +37,7 @@ pub fn executor() -> Executor {
 }
 
 async fn run(job: Job) -> Result<Value> {
-    match job {
+    let done = match job {
         Job::Exec {
             cmd,
             cwd,
@@ -46,6 +46,33 @@ async fn run(job: Job) -> Result<Value> {
         Job::Spawn { cmd, cwd } => spawn(&cmd, cwd.as_deref()).await,
         Job::Status { task_id, tail } => status(&task_id, tail),
         Job::Kill { task_id } => kill(&task_id),
+    };
+    signed(done)
+}
+
+/// Which process ran this, and with what rights. A command runs with exactly
+/// the token of the process that answered — nothing here raises or lowers it —
+/// so when "Access is denied" comes back, this is the line that says why: the
+/// process holding the machine wasn't elevated (linsky's ThinkBook,
+/// 2026-10-08, where nobody could tell which of five processes had answered).
+fn served_by() -> Value {
+    json!({ "pid": std::process::id(), "elevated": crate::platform::elevated() })
+}
+
+/// Every answer says who ran it — the failures too, since those are the ones
+/// somebody has to explain.
+fn signed(done: Result<Value>) -> Result<Value> {
+    match done {
+        Ok(Value::Object(mut answer)) => {
+            answer.insert("served_by".into(), served_by());
+            Ok(Value::Object(answer))
+        }
+        Ok(other) => Ok(other),
+        Err(e) => Err(format!(
+            "{e} (pid {}, {})",
+            std::process::id(),
+            if crate::platform::elevated() { "elevated" } else { "not elevated" }
+        )),
     }
 }
 
@@ -99,7 +126,7 @@ fn workdir(cwd: Option<&str>) -> Result<PathBuf> {
 async fn exec(cmd: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Value> {
     let dir = workdir(cwd)?;
     let (sh, args) = shell();
-    let mut command = tokio::process::Command::new(&sh);
+    let mut command = crate::platform::console_command(&sh);
     command
         .args(&args)
         .arg(cmd)
@@ -123,50 +150,96 @@ async fn exec(cmd: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Value> {
         .spawn()
         .map_err(|e| format!("could not start `{sh}`: {e}"))?;
     let pid = child.id();
-    let out = child.stdout.take().map(read_capped);
-    let err = child.stderr.take().map(read_capped);
-    let (out, err) = (
-        tokio::spawn(async move {
-            match out {
-                Some(f) => f.await,
-                None => (String::new(), false),
-            }
-        }),
-        tokio::spawn(async move {
-            match err {
-                Some(f) => f.await,
-                None => (String::new(), false),
-            }
-        }),
-    );
+    // Into the job at once, before the shell has started anything — see `Tree`.
+    #[cfg(windows)]
+    let tree = child.raw_handle().and_then(Tree::of);
+    let (mut out, mut err) = (Captured::from(child.stdout.take()), Captured::from(child.stderr.take()));
 
     let deadline = std::time::Duration::from_millis(timeout_ms);
     let (code, timed_out) = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => (status.code(), false),
         Ok(Err(e)) => return Err(format!("{cmd}: {e}")),
         Err(_) => {
-            // Kill the GROUP: the shell may have exited already, leaving the
-            // thing we actually care about running under it.
+            // Kill the whole TREE: the shell may have exited already, leaving
+            // the thing we actually care about running under it.
             if let Some(pid) = pid {
                 kill_group(pid as i32);
             }
-            let _ = child.wait().await;
+            #[cfg(windows)]
+            if let Some(tree) = &tree {
+                tree.kill();
+            }
+            // A shell that traps the signal gets a moment to clean up; one
+            // that ignores it is killed outright — this wait has to end.
+            if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
             (None, true)
         }
     };
-    // The readers finish when the pipes close, which the kill above guarantees.
-    let (stdout, out_trunc) = out.await.unwrap_or_default();
-    let (stderr, err_trunc) = err.await.unwrap_or_default();
+    // The readers end when the pipes close — normally the instant the command
+    // exits. Not when it left something running that inherited them (`cmd &`,
+    // PowerShell's `Start-Process`): that holds them open for as long as IT
+    // runs, and waiting on it held this call open with it — on a paired
+    // machine, every call queued behind it too. So the drain gets a moment, and
+    // then what has arrived is the answer. The readers keep draining on their
+    // own, so the job left behind never blocks on a full pipe.
+    let (out_done, err_done) = tokio::join!(out.settle(DRAIN_GRACE), err.settle(DRAIN_GRACE));
+    let (stdout, out_trunc) = out.take();
+    let (stderr, err_trunc) = err.take();
 
     Ok(json!({
         "exit_code": code,
         "stdout": stdout,
         "stderr": stderr,
-        "truncated": out_trunc || err_trunc,
+        // A stream something is still writing to is, by definition, cut short.
+        "truncated": out_trunc || err_trunc || !out_done || !err_done,
         "timed_out": timed_out,
         "duration_ms": started.elapsed().as_millis() as u64,
         "cwd": dir.to_string_lossy(),
     }))
+}
+
+/// How long `shell.exec` waits for its output pipes to close once the command
+/// itself has ended. Output already written is drained in milliseconds; this
+/// only ever runs out when a background process is holding a pipe.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// How long a timed-out command's shell has between the polite signal and the
+/// kill. With [`DRAIN_GRACE`] on top of the core's 25s cap this still answers
+/// inside the api's 30s park — which is what the cap was sized against.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One output stream of a running command: what has been read so far, shared
+/// with the task reading it — so an answer can be cut from it while the
+/// reading goes on.
+struct Captured {
+    got: Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Captured {
+    fn from<R: tokio::io::AsyncRead + Unpin + Send + 'static>(stream: Option<R>) -> Self {
+        let got = Arc::new(std::sync::Mutex::new((Vec::new(), false)));
+        let reader = stream.map(|r| tokio::spawn(read_capped(r, got.clone())));
+        Self { got, reader }
+    }
+
+    /// Wait up to `grace` for the stream to close; false = something still
+    /// holds it open.
+    async fn settle(&mut self, grace: std::time::Duration) -> bool {
+        match self.reader.as_mut() {
+            Some(reader) => tokio::time::timeout(grace, reader).await.is_ok(),
+            None => true,
+        }
+    }
+
+    /// What has been read, and whether any of it was dropped at the cap.
+    fn take(&self) -> (String, bool) {
+        let got = self.got.lock().unwrap_or_else(|e| e.into_inner());
+        (String::from_utf8_lossy(&got.0).into_owned(), got.1)
+    }
 }
 
 /// Read a stream, keeping at most [`MAX_OUTPUT`] bytes but DRAINING the rest.
@@ -175,27 +248,32 @@ async fn exec(cmd: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Value> {
 /// pipe full, which blocks the child on its next write — so a chatty command
 /// would hang forever instead of being truncated, and the caller would see a
 /// timeout with no output at all.
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> (String, bool) {
-    let mut kept: Vec<u8> = Vec::new();
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    into: Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
+) {
     let mut buf = [0u8; 8192];
-    let mut truncated = false;
     loop {
         match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let room = MAX_OUTPUT.saturating_sub(kept.len());
-                if room == 0 {
-                    truncated = true;
-                    continue;
-                }
-                let take = room.min(n);
-                kept.extend_from_slice(&buf[..take]);
-                truncated |= take < n;
+                let mut got = into.lock().unwrap_or_else(|e| e.into_inner());
+                let take = MAX_OUTPUT.saturating_sub(got.0.len()).min(n);
+                got.0.extend_from_slice(&buf[..take]);
+                got.1 |= take < n;
             }
         }
     }
-    (String::from_utf8_lossy(&kept).into_owned(), truncated)
 }
+
+/// The process TREE a command started, so a timeout can end all of it: on
+/// Windows a job object ([`crate::platform::JobTree`]) — Unix has `setsid` +
+/// `killpg`. Before it, `kill_group` was a no-op there, so the timeout killed
+/// nothing and a `shell.exec` on Windows ran as long as it liked: the caller
+/// gave up at 30s with "no device answered", and the machine stayed busy with
+/// it for minutes.
+#[cfg(windows)]
+use crate::platform::JobTree as Tree;
 
 #[cfg(unix)]
 fn kill_group(pid: i32) {
@@ -207,8 +285,11 @@ fn kill_group(pid: i32) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_group(_pid: i32) {}
+#[cfg(windows)]
+fn kill_group(pid: i32) {
+    // The worker owns a kill-on-close job covering all descendants.
+    crate::platform::terminate(pid as u32);
+}
 
 // ── shell.spawn / status / kill ───────────────────────────────────────────
 
@@ -216,9 +297,15 @@ fn kill_group(_pid: i32) {}
 /// directory: those belong to a conversation's agent turn and are swept when
 /// that turn reports them, and a task started over a connection has no turn.
 fn tasks_dir() -> Result<PathBuf> {
-    let dir = home().join(".mafold").join("computer");
+    let dir = tasks_root();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+/// [`tasks_dir`], not created — for the supervisor, which ends a daemon
+/// without its background tasks (`bgtasks::running_in`).
+pub(crate) fn tasks_root() -> PathBuf {
+    home().join(".mafold").join("computer")
 }
 
 fn now_ms() -> i64 {
@@ -276,7 +363,7 @@ async fn spawn(cmd: &str, cwd: Option<&str>) -> Result<Value> {
         .open(&log)
         .map_err(|e| format!("{}: {e}", log.display()))?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
-    let mut command = tokio::process::Command::new("/bin/sh");
+    let mut command = crate::platform::command("/bin/sh");
     command
         .arg(&script)
         .current_dir(&dir)
@@ -318,9 +405,25 @@ async fn spawn(cmd: &str, cwd: Option<&str>) -> Result<Value> {
     }))
 }
 
-#[cfg(not(unix))]
-async fn spawn(_cmd: &str, _cwd: Option<&str>) -> Result<Value> {
-    Err("shell.spawn needs a POSIX machine — this one can only run shell.exec".into())
+#[cfg(windows)]
+async fn spawn(cmd: &str, cwd: Option<&str>) -> Result<Value> {
+    let dir = workdir(cwd)?;
+    let root = tasks_dir()?;
+    sweep_old(&root);
+    let id = new_task_id();
+    let script = root.join(format!("{id}.cmd"));
+    let log = root.join(format!("{id}.log"));
+    std::fs::write(&script, format!("@echo off\r\n{cmd}\r\n")).map_err(|e| e.to_string())?;
+    let task = crate::background_windows::Task {
+        script, log: log.clone(), cwd: dir.clone(), bash: false, timeout_secs: None,
+    };
+    // Already runs in the computer executor, outside any harness process job.
+    let pid = tokio::task::spawn_blocking(move || crate::background_windows::start(&task, None))
+        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    std::fs::write(root.join(format!("{id}.meta")),
+        json!({"cmd": cmd, "cwd": dir.to_string_lossy(), "started_at": now_ms()}).to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"task_id": id, "pid": pid, "log": log.to_string_lossy(), "cwd": dir.to_string_lossy()}))
 }
 
 fn status(task_id: &str, tail: usize) -> Result<Value> {
@@ -384,9 +487,9 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-#[cfg(not(unix))]
-fn alive(_pid: i32) -> bool {
-    false
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    crate::platform::child_running(pid as u32)
 }
 
 /// Last `n` lines of a log, and whether anything was left out.
@@ -446,6 +549,50 @@ fn sweep_old(dir: &Path) {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_spawn_status_exit_and_tree_kill() {
+        let dir = std::env::temp_dir().join(format!("mf spawn & spaces {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A task's first output waits on two process starts: the worker, which
+        // in tests is this test binary (its "running 1 test" banner lands in the
+        // log), then the command. A PowerShell cold start on a CI runner pushed
+        // that past 10s (run 39946530592, #1122).
+        let start = std::time::Duration::from_secs(20);
+        let task = spawn("echo spawned-output & exit /b 7", dir.to_str()).await.unwrap();
+        let id = task["task_id"].as_str().unwrap();
+        let began = std::time::Instant::now();
+        let done = loop {
+            let value = status(id, 30).unwrap();
+            if value["running"] == false { break value; }
+            assert!(began.elapsed() < start, "{value}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(done["exit_code"], 7, "{done}");
+        assert!(done["output"].as_str().unwrap().contains("spawned-output"));
+
+        let task = spawn("powershell.exe -NoProfile -Command \"$PID; Start-Sleep -Seconds 60\"", dir.to_str()).await.unwrap();
+        let id = task["task_id"].as_str().unwrap();
+        let began = std::time::Instant::now();
+        let child_pid = loop {
+            let value = status(id, 30).unwrap();
+            if let Some(pid) = value["output"].as_str().unwrap().lines().find_map(|l| l.trim().parse::<u32>().ok()) { break pid; }
+            assert!(began.elapsed() < start, "{value}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(crate::platform::console_window_of(child_pid), Some(false));
+        assert_eq!(kill(id).unwrap()["killed"], true);
+        let began = std::time::Instant::now();
+        while crate::platform::child_running(child_pid) {
+            assert!(began.elapsed() < std::time::Duration::from_secs(5), "grandchild survived shell.kill");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let done = status(id, 30).unwrap();
+        assert_eq!(done["running"], false);
+        assert_eq!(done["killed"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn exec_returns_output_and_an_exit_code() {
         let out = exec("echo hello && exit 3", Some("/tmp"), 5_000).await.unwrap();
@@ -475,6 +622,54 @@ mod tests {
         );
     }
 
+    /// A command that leaves a job running in the background ends when the
+    /// SHELL ends — not when the job does. The job inherits the output pipes,
+    /// and waiting for them to close held the call open for the job's whole
+    /// life (on a paired machine, every call queued behind it too).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_job_cannot_hold_the_answer() {
+        let t0 = std::time::Instant::now();
+        let out = exec("echo started; sleep 30 &", Some("/tmp"), 10_000).await.unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "held for {:?}", t0.elapsed());
+        assert_eq!(out["timed_out"], json!(false));
+        assert_eq!(out["exit_code"], json!(0));
+        assert!(out["stdout"].as_str().unwrap().contains("started"), "{out}");
+    }
+
+    /// Windows' `shell.exec` timeout used to kill nothing (`kill_group` was a
+    /// no-op there), so the call ran until the command finished on its own —
+    /// here, 30 seconds of a grandchild the shell started. It must end at the
+    /// timeout, grandchild and all. (`ping -n` is the sleep every Windows has,
+    /// and it needs no quoting to survive `cmd /C`.)
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_a_timeout_ends_the_whole_tree() {
+        let dir = std::env::temp_dir();
+        let t0 = std::time::Instant::now();
+        let out = exec("echo before & ping -n 30 127.0.0.1 > nul", dir.to_str(), 1_500)
+            .await
+            .unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "ran {:?}", t0.elapsed());
+        assert_eq!(out["timed_out"], json!(true), "{out}");
+        assert!(out["stdout"].as_str().unwrap().contains("before"), "{out}");
+    }
+
+    /// `start /b` is Windows' `&`: the job shares the shell's output handles
+    /// and outlives it. The answer comes when the shell is done.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_a_background_job_cannot_hold_the_answer() {
+        let dir = std::env::temp_dir();
+        let t0 = std::time::Instant::now();
+        let out = exec("start /b ping -n 30 127.0.0.1 & echo started", dir.to_str(), 10_000)
+            .await
+            .unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(8), "held for {:?}", t0.elapsed());
+        assert_eq!(out["timed_out"], json!(false), "{out}");
+        assert!(out["stdout"].as_str().unwrap().contains("started"), "{out}");
+    }
+
     /// The cap exists so a relayed answer stays a message rather than a dump —
     /// and the command must still FINISH, which is what draining buys.
     #[tokio::test]
@@ -490,6 +685,22 @@ mod tests {
         assert_eq!(out["exit_code"], json!(0));
         assert_eq!(out["truncated"], json!(true));
         assert!(out["stdout"].as_str().unwrap().len() <= MAX_OUTPUT);
+    }
+
+    /// Every answer — and every failure — names the process that ran it and
+    /// whether it was elevated: the one fact a caller needs when a command
+    /// comes back "Access is denied", and could not get (2026-10-08).
+    #[tokio::test]
+    async fn every_answer_says_which_process_ran_it_and_with_what_rights() {
+        let ok = run(Job::Exec { cmd: "echo hi".into(), cwd: None, timeout_ms: 5_000 }).await.unwrap();
+        assert_eq!(ok["served_by"]["pid"], json!(std::process::id()));
+        assert_eq!(ok["served_by"]["elevated"], json!(crate::platform::elevated()));
+
+        let err = run(Job::Exec { cmd: "echo x".into(), cwd: Some("/no/such/place/at/all".into()), timeout_ms: 5_000 })
+            .await
+            .unwrap_err();
+        assert!(err.contains(&format!("pid {}", std::process::id())), "{err}");
+        assert!(err.contains("elevated"), "{err}");
     }
 
     #[tokio::test]

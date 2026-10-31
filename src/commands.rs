@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use mafold_core::mafold_types::units::{self, EN};
+
 pub enum Outcome {
     /// Handled locally — send this markdown reply.
     Reply(String),
@@ -25,6 +27,11 @@ pub enum Outcome {
 /// chat runs on (`crate::accounts`): everything here that asks `claude` or
 /// Anthropic a question asks it about THAT login.
 pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>, env: &[(String, String)]) -> Outcome {
+    // The list is the gate: what `takes` doesn't declare never runs here, so
+    // the parser and this match can't disagree about what is emulated.
+    if takes(name).is_none() {
+        return Outcome::Forward;
+    }
     match name {
         // ── usage stats (rich card): local transcript scan + live rate limits ──
         "stats" | "usage" | "cost" => {
@@ -63,6 +70,30 @@ pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>
         // ── terminal-only: a friendly mock note ──
         n if mock_desc(n).is_some() => Outcome::Reply(mock_reply(n)),
         _ => Outcome::Forward,
+    }
+}
+
+/// Every command [`handle`] answers itself (the mocks aside).
+const EMULATED: &[&str] = &[
+    "stats", "usage", "cost", "logout", "config", "settings", "memory", "mcp", "agents", "sessions", "skills",
+    "hooks", "permissions", "plugin", "plugins", "keybindings", "statusline", "privacy-settings", "privacy", "doctor",
+];
+
+/// What `name` takes here (`crate::harness::Takes`): nothing — every command
+/// [`handle`] answers ignores what follows it, so `/usage is wrong today` is a
+/// message, not `/usage`. `None` = not emulated: it goes to `claude -p`, which
+/// hands a skill or command whatever follows.
+pub fn takes(name: &str) -> Option<crate::harness::Takes> {
+    (EMULATED.contains(&name) || mock_desc(name).is_some()).then_some(crate::harness::Takes::Nothing)
+}
+
+/// Who may run `name` here (`crate::harness::Who`). Everything above reads or
+/// changes the owner's own Claude Code — their circle's — except `/logout`,
+/// which signs the machine's login out: the owner's alone, as `/login` is.
+pub fn who(name: &str) -> crate::harness::Who {
+    match name {
+        "logout" => crate::harness::Who::Owner,
+        _ => crate::harness::Who::Circle,
     }
 }
 
@@ -557,13 +588,9 @@ fn bucket_cost(short: &str, b: &Buckets) -> f64 {
         / 1e6
 }
 
-/// "$4.20" / "$59.2k" — compact once the cents stop mattering.
+/// "$4.20" / "$59,234" / "$0.0042" — the shared ruler (`mafold_types::units`).
 fn fmt_usd(v: f64) -> String {
-    if v >= 1000.0 {
-        format!("${:.1}k", v / 1000.0)
-    } else {
-        format!("${v:.2}")
-    }
+    units::usd(v)
 }
 
 /// Everything the usage card needs, from either data source.
@@ -1038,10 +1065,10 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
         trivia.push(format!("longest session {}", fmt_dur(agg.longest_sess)));
     }
     if cur_streak > 0 {
-        trivia.push(format!("streak {cur_streak}d"));
+        trivia.push(format!("streak {}", fmt_dur(cur_streak as i64 * 86_400)));
     }
     if best_streak > cur_streak {
-        trivia.push(format!("best {best_streak}d"));
+        trivia.push(format!("best {}", fmt_dur(best_streak as i64 * 86_400)));
     }
     if let Some(d) = busiest_day {
         trivia.push(format!("most active {d}"));
@@ -1113,7 +1140,7 @@ fn now_ms() -> i64 {
 pub(crate) fn oauth_token(env: &[(String, String)]) -> Option<String> {
     match stored_login(env) {
         StoredLogin::Fresh(t) => Some(t),
-        StoredLogin::Stale | StoredLogin::Missing => None,
+        StoredLogin::Stale | StoredLogin::Missing | StoredLogin::Unreadable(_) => None,
     }
 }
 
@@ -1122,7 +1149,8 @@ pub(crate) fn oauth_token(env: &[(String, String)]) -> Option<String> {
 pub(crate) enum StoredLogin {
     /// An unexpired access token.
     Fresh(String),
-    /// The access token has lapsed but the refresh token is there. This is
+    /// The access token has lapsed but the refresh token is there and hasn't
+    /// reached its own end ([`login_expiry_from`]). This is
     /// NOT a logged-out seat: the access token lives 8 hours (measured
     /// 2026-09-27 — Keychain write time to `expiresAt`, 8.00h on two seats)
     /// and Claude Code renews it on its next run. Any login nobody has run
@@ -1132,35 +1160,28 @@ pub(crate) enum StoredLogin {
     /// it was skipped (a Muse turn on 2026-09-27 hit a full window with a
     /// second login sitting at 0%).
     Stale,
-    /// No credential, an unreadable one, or no way to renew it.
+    /// No credential or no way to renew it, including an expired refresh token.
     Missing,
+    /// Storage could not be read; re-authenticating is not the remedy.
+    Unreadable(String),
 }
 
 pub(crate) fn stored_login(env: &[(String, String)]) -> StoredLogin {
-    match read_credential(env) {
-        Some(raw) => stored_login_from(&raw, now_ms()),
-        None => StoredLogin::Missing,
+    stored_login_read(read_credential(env), now_ms())
+}
+
+fn stored_login_read(raw: Result<String, crate::accounts::NoStoredLogin>, now: i64) -> StoredLogin {
+    match raw {
+        Ok(raw) => stored_login_from(&raw, now),
+        Err(e) if e.signed_out() => StoredLogin::Missing,
+        Err(e) => StoredLogin::Unreadable(e.to_string()),
     }
 }
 
-/// The seat's stored credential blob: `<dir>/.credentials.json`, else (macOS)
-/// the Keychain item Claude Code names after the directory.
-fn read_credential(env: &[(String, String)]) -> Option<String> {
-    let acct = crate::accounts::Account::from_env(env);
-    if let Ok(s) = std::fs::read_to_string(acct.credentials_file()) {
-        return Some(s);
-    }
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", &acct.keychain_service(), "-w"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
+/// The seat's stored credential blob, from wherever Claude Code keeps it —
+/// the same reader `connection --import` uses ([`crate::accounts::LoginStore`]).
+fn read_credential(env: &[(String, String)]) -> Result<String, crate::accounts::NoStoredLogin> {
+    crate::accounts::Account::from_env(env).store_for(env).read()
 }
 
 /// Which credential the seat holds, as a short hash of its refresh token —
@@ -1168,30 +1189,57 @@ fn read_credential(env: &[(String, String)]) -> Option<String> {
 /// changed fingerprint is how a remembered refusal
 /// ([`crate::accounts::SignedOut`]) learns it no longer applies.
 pub(crate) fn credential_fingerprint(env: &[(String, String)]) -> Option<String> {
-    fingerprint_of(&read_credential(env)?)
+    fingerprint_of(&read_credential(env).ok()?)
 }
 
 /// [`credential_fingerprint`] on a blob already read.
 pub(crate) fn fingerprint_of(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    let r = v["claudeAiOauth"]["refreshToken"].as_str().filter(|s| !s.is_empty())?;
-    Some(crate::accounts::hash8(r))
+    let oauth = &v["claudeAiOauth"];
+    let token = oauth["refreshToken"].as_str().filter(|s| !s.is_empty())
+        .or_else(|| oauth["accessToken"].as_str().filter(|s| !s.is_empty()))?;
+    Some(crate::accounts::hash8(token))
 }
 
 /// [`stored_login`] on a credential blob already read — split out so the
 /// verdict is testable without a Keychain.
 pub(crate) fn stored_login_from(raw: &str, now_ms: i64) -> StoredLogin {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
-        return StoredLogin::Missing;
+        return StoredLogin::Unreadable("stored Claude credential is not valid JSON".into());
     };
     let o = &v["claudeAiOauth"];
-    let renewable = o["refreshToken"].as_str().is_some_and(|s| !s.is_empty());
-    match (o["accessToken"].as_str(), o["expiresAt"].as_i64()) {
+    let renewable = o["refreshToken"].as_str().is_some_and(|s| !s.is_empty())
+        && refresh_token_end(o).is_none_or(|end| end > now_ms);
+    match (o["accessToken"].as_str().filter(|s| !s.is_empty()), o["expiresAt"].as_i64()) {
         (Some(t), Some(exp)) if exp > now_ms => StoredLogin::Fresh(t.to_string()),
         (Some(t), None) => StoredLogin::Fresh(t.to_string()),
         _ if renewable => StoredLogin::Stale,
         _ => StoredLogin::Missing,
     }
+}
+
+/// When the seat's sign-in itself ends, epoch ms: Claude Code's
+/// `refreshTokenExpiresAt`. The refresh token can't be renewed past it, so
+/// the next run after it is refused and Claude Code wipes the login (seen
+/// 2026-10-05 on `work` and `personal`, about four weeks after each signed
+/// in). Renewing the access token does not move it — `default` renewed that
+/// morning and kept its date — so this is the seat's real deadline, and only
+/// `/login` resets it. The field survives the wipe, which is what lets a
+/// listing say when a signed-out seat ran out. None when the login has no
+/// such end (`claude setup-token`) or the blob doesn't say.
+pub(crate) fn login_expiry_from(raw: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    refresh_token_end(&v["claudeAiOauth"])
+}
+
+/// [`login_expiry_from`] for the seat `env` selects.
+pub(crate) fn login_expiry(env: &[(String, String)]) -> Option<i64> {
+    login_expiry_from(&read_credential(env).ok()?)
+}
+
+fn refresh_token_end(oauth: &serde_json::Value) -> Option<i64> {
+    let end = &oauth["refreshTokenExpiresAt"];
+    end.as_i64().or_else(|| end.as_f64().map(|f| f as i64)).filter(|ms| *ms > 0)
 }
 
 /// `GET /api/oauth/usage` — the exact request Claude Code makes to refresh its
@@ -1211,9 +1259,10 @@ pub(crate) enum UtilizationProbe {
     Ok(serde_json::Value),
     /// Upstream answered with a non-2xx status.
     Http(u16),
-    /// No readable credential on this machine, or one that can't be renewed —
-    /// no request was made.
+    /// No stored credential, or one that cannot be renewed; no request was made.
     NoCredential,
+    /// Storage is inaccessible, not signed out. Preserve the actionable reason.
+    Unreadable(String),
     /// The access token has lapsed but can be renewed ([`StoredLogin::Stale`]):
     /// the seat is signed in, its windows just can't be read until Claude
     /// Code runs on it. No request was made.
@@ -1232,6 +1281,7 @@ pub(crate) async fn probe_utilization(env: &[(String, String)]) -> UtilizationPr
         StoredLogin::Fresh(t) => t,
         StoredLogin::Stale => return UtilizationProbe::Stale,
         StoredLogin::Missing => return UtilizationProbe::NoCredential,
+        StoredLogin::Unreadable(why) => return UtilizationProbe::Unreadable(why),
     };
     let res = match reqwest::Client::new()
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -1340,7 +1390,7 @@ pub(crate) async fn login_identity(env: &[(String, String)]) -> WhoProbe {
         StoredLogin::Fresh(t) => t,
         // Signed in, just not renewed yet — who it is can't be asked with a
         // lapsed token, and "not signed in" would be false.
-        StoredLogin::Stale => return WhoProbe::Unknown,
+        StoredLogin::Stale | StoredLogin::Unreadable(_) => return WhoProbe::Unknown,
         StoredLogin::Missing => return WhoProbe::SignedOut,
     };
     let res = match reqwest::Client::new()
@@ -1592,13 +1642,12 @@ fn parse_usage_text(text: &str) -> String {
 /// Pipe `input` into a headless `claude -p` (on the seat `env` selects) and
 /// return its (ANSI-stripped) output, or "" on any failure/timeout.
 async fn run_claude_stdin(input: &str, secs: u64, env: &[(String, String)]) -> String {
-    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
+    let mut cmd = crate::platform::command(crate::harness::program("claude"));
     cmd.arg("-p")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::platform::no_window(&mut cmd);
     let fut = async {
         let mut child = cmd.spawn()?;
         if let Some(mut si) = child.stdin.take() {
@@ -1724,18 +1773,10 @@ fn streaks(days: &[i64], today: i64) -> (u64, u64) {
     (current, best)
 }
 
-/// Seconds → "35d 0h" / "9h 24m" / "42m".
+/// Whole seconds → "35d 0h 25m" / "9h 24m" / "42m 7s" / "30s" / "0s" — the
+/// shared ruler, as a clock: whole seconds, so nothing reads "0ms".
 pub(crate) fn fmt_dur(secs: i64) -> String {
-    let d = secs / 86400;
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{}m", m.max(1))
-    }
+    EN.elapsed(secs as f64 * 1000.0)
 }
 
 /// Uppercase the first ASCII letter ("week (all models)" → "Week (all models)").
@@ -1977,7 +2018,8 @@ pub(crate) fn preview_from_head(head: &str) -> String {
         // real trigger is whatever follows the last END marker.
         let t = [
             "[END RECENT CONVERSATION — now handle the triggering message below.]",
-            "[END AVAILABLE APPS & ROOMS]",
+            "[END AVAILABLE APPS & ROOMS]", // before the room retired (2026-10-29)
+            "[END AVAILABLE APPS]",
             "[END REPLY CONTEXT]",
         ]
         .iter()
@@ -1996,17 +2038,9 @@ pub(crate) fn preview_from_head(head: &str) -> String {
     String::new()
 }
 
-/// Seconds → "just now" / "5m ago" / "3h ago" / "2d ago".
+/// Seconds → "just now" / "5m ago" / "3h ago" / "2d ago" — the shared ruler.
 pub(crate) fn fmt_age(secs: i64) -> String {
-    if secs < 60 {
-        "just now".into()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
+    EN.ago(secs as f64)
 }
 
 /// An interactive `claude` session someone else is holding right now — a
@@ -2134,21 +2168,9 @@ pub(crate) fn resolve_session<'a>(metas: &'a [SessionMeta], arg: &str) -> Resolv
     }
 }
 
-/// 1_234_567 → "1.2M" (K/M/B, trailing `.0` stripped).
+/// 1_234_567 → "1.2M" — the shared ruler.
 pub(crate) fn humanize(n: u64) -> String {
-    let f = n as f64;
-    let s = if f >= 1e9 {
-        format!("{:.1}B", f / 1e9)
-    } else if f >= 1e6 {
-        format!("{:.1}M", f / 1e6)
-    } else if f >= 1e3 {
-        format!("{:.1}K", f / 1e3)
-    } else {
-        return n.to_string();
-    };
-    s.replace(".0B", "B")
-        .replace(".0M", "M")
-        .replace(".0K", "K")
+    EN.compact(n as f64)
 }
 
 /// "claude-opus-4-5-20251101" → "opus-4-5".
@@ -2220,11 +2242,10 @@ fn mock_reply(name: &str) -> String {
 /// Run `claude <args>` on the seat `env` selects (see `crate::accounts`) and
 /// return its output; `&[]` = the daemon's own login.
 async fn run_claude(args: &[&str], secs: u64, env: &[(String, String)]) -> String {
-    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
+    let mut cmd = crate::platform::command(crate::harness::program("claude"));
     cmd.args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     let fut = cmd.output();
     match tokio::time::timeout(Duration::from_secs(secs), fut).await {
         Ok(Ok(o)) => {
@@ -2459,9 +2480,15 @@ Last 7d · 7983 requests · 30 sessions
 
     #[test]
     fn durations() {
-        assert_eq!(fmt_dur(3_025_524), "35d 0h");
+        // The shared ruler (client-shared/units.cases.json): at most three
+        // units, trailing zeros dropped, never "1m" for thirty seconds.
+        assert_eq!(fmt_dur(3_025_524), "35d 0h 25m");
         assert_eq!(fmt_dur(33_840), "9h 24m");
-        assert_eq!(fmt_dur(30), "1m");
+        assert_eq!(fmt_dur(30), "30s");
+        assert_eq!(fmt_dur(0), "0s", "a one-turn session, a daemon that just started");
+        assert_eq!(humanize(25_488_300), "25.5M");
+        assert_eq!(fmt_usd(59_234.0), "$59,234");
+        assert_eq!(fmt_usd(0.0042), "$0.0042");
     }
 
     #[test]
@@ -2758,6 +2785,29 @@ mod stored_login_tests {
         assert_eq!(stored_login_from(&cred(Some("a"), Some(""), Some(NOW - 1)), NOW), StoredLogin::Missing);
     }
 
+    /// 2026-10-05, `work` and `personal`: the refresh token has a hard end of
+    /// its own (`refreshTokenExpiresAt`, about four weeks after sign-in).
+    /// Past it nothing can renew the seat — Claude Code's next run is refused
+    /// and wipes the login — so it is signed out, not idle.
+    #[test]
+    fn a_lapsed_token_whose_refresh_token_has_expired_is_missing() {
+        let mut v: serde_json::Value = serde_json::from_str(&cred(Some("a"), Some("r"), Some(NOW - 9 * 3_600_000))).unwrap();
+        v["claudeAiOauth"]["refreshTokenExpiresAt"] = (NOW - 3_600_000).into();
+        assert_eq!(stored_login_from(&v.to_string(), NOW), StoredLogin::Missing);
+        // Still ahead: an idle seat like any other.
+        v["claudeAiOauth"]["refreshTokenExpiresAt"] = (NOW + 86_400_000).into();
+        assert_eq!(stored_login_from(&v.to_string(), NOW), StoredLogin::Stale);
+    }
+
+    /// The access token outlives the refresh token by up to 8 hours, and
+    /// until it lapses it still works — the seat runs on it.
+    #[test]
+    fn an_unexpired_token_is_fresh_even_past_its_refresh_tokens_end() {
+        let mut v: serde_json::Value = serde_json::from_str(&cred(Some("a"), Some("r"), Some(NOW + 60_000))).unwrap();
+        v["claudeAiOauth"]["refreshTokenExpiresAt"] = (NOW - 1).into();
+        assert_eq!(stored_login_from(&v.to_string(), NOW), StoredLogin::Fresh("a".into()));
+    }
+
     /// A long-lived token (`claude setup-token`) carries no expiry: unchanged.
     #[test]
     fn a_token_without_an_expiry_is_fresh() {
@@ -2765,8 +2815,20 @@ mod stored_login_tests {
     }
 
     #[test]
+    fn inaccessible_storage_is_never_reported_as_a_missing_login() {
+        let dir = std::env::temp_dir().join(format!("mafold-login-verdict-{}", std::process::id()));
+        let store = crate::accounts::LoginStore { file: dir.join("absent.json"), keychain_service: "synthetic".into() };
+        let empty = |_: &str| Ok(None);
+        let locked = |_: &str| Err("login Keychain is locked".to_string());
+        assert_eq!(super::stored_login_read(store.read_with(Some(&empty)), NOW), StoredLogin::Missing);
+        assert!(matches!(super::stored_login_read(store.read_with(Some(&locked)), NOW),
+            StoredLogin::Unreadable(why) if why.contains("Keychain is locked")));
+        assert_eq!(stored_login_from(&cred(Some(""), None, Some(NOW + 60_000)), NOW), StoredLogin::Missing);
+    }
+
+    #[test]
     fn junk_is_missing() {
-        assert_eq!(stored_login_from("not json", NOW), StoredLogin::Missing);
+        assert!(matches!(stored_login_from("not json", NOW), StoredLogin::Unreadable(_)));
         assert_eq!(stored_login_from("{}", NOW), StoredLogin::Missing);
     }
 }

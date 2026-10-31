@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.123-dev.99"
+version = "0.9.157-dev.120"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -28,17 +28,24 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "ti
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 futures-util = "0.3"
+# Pictures go up as a ≤2560 view + 40px strip (src/thumb.rs). Decoders for what
+# agents actually attach; WebP is encoded lossless only (screenshots), photos
+# as JPEG. No HEIC — those go up as they are.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 sha2 = "0.10"
-# Shared-room CRDT peer for the AI: same crate/version the API uses
-# (compact_room_log), so change blobs interop with web's @automerge/automerge.
-automerge = "0.5"
+# NFC, the form Claude Code hashes a config directory in to name its Keychain
+# item (`accounts::LoginStore::resolve`). Already in the graph via mafold-types.
+unicode-normalization = "0.1.25"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `mafold diagnose` masks what looks like a token, a JWT or an email in the
+# logs it bundles (diagnose.rs) — shapes, not values, so a pattern language.
+regex = "1"
 
 # Process/session control (detach via setsid, liveness + stop via signals) — Unix only.
 [target.'cfg(unix)'.dependencies]
@@ -57,6 +64,16 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Globalization",
+    # `shell.exec`'s timeout: a job object is the process group Windows lacks
+    # (computer::Tree). CreateJobObjectW's signature needs the Security types.
+    "Win32_System_JobObjects",
+    "Win32_Security",
+    # GetTickCount64: when the machine booted (platform::boot_time), so a
+    # supervisor that went down with it doesn't read as a crash.
+    "Win32_System_SystemInformation",
+    # CreateToolhelp32Snapshot: the processes a daemon started, ended with it
+    # (platform::end_tree) — nothing else on Windows takes them down.
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 # Test-only: `#[tokio::test(start_paused = true)]`. A failed attachment fetch

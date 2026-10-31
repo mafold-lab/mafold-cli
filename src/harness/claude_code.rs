@@ -36,6 +36,12 @@ impl Harness for ClaudeCode {
         true
     }
 
+    /// Yes: every stream-json line carries the `session_id`, and [`Self::run`]
+    /// reports it on the first one.
+    fn names_session_first(&self) -> bool {
+        true
+    }
+
     /// Open the connection this turn will want, while the caller is still
     /// assembling its prompt. Everything it needs is in the SHAPE; the per-turn
     /// half reaches the child through `turnenv` at `begin_turn`.
@@ -49,7 +55,8 @@ impl Harness for ClaudeCode {
         let key = cc_conn::PoolKey::new(
             &shape.conv, &shape.surface, &shape.workdir, shape.model.as_deref(),
             shape.effort.as_deref(), shape.thinking, shape.system.as_deref(), &shape.env,
-        );
+        )
+        .with_mount(&shape.mount);
         // Nothing to gain when one is already warm (or already on its way), and
         // a second process for the same key would just sit out its TTL.
         let Some(sid) = shape.session.clone() else { return };
@@ -59,11 +66,15 @@ impl Harness for ClaudeCode {
         tokio::spawn(async move {
             let _release = cc_conn::PrewarmGuard(key.clone());
             let began = std::time::Instant::now();
-            let exe = std::env::current_exe()
+            let exe = crate::platform::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "mafold".into());
-            let Built { mut cmd, hook_settings, bash_only } = build_cmd(&shape, &exe);
+            // Built the way the turn it is for will need it: a turn that finds
+            // its session already running (`cc_conn::lease`) only takes a
+            // process that forks.
+            let Built { mut cmd, hook_settings, always, forks } =
+                build_cmd(&shape, &exe, cc_conn::is_leased(&sid));
             let id = cc_conn::oneshot_id();
             cmd.env("MAFOLD_TURN", crate::turnenv::path_for(&id));
             let fallback = hook_settings.as_ref().map(|s| {
@@ -71,7 +82,7 @@ impl Harness for ClaudeCode {
                 f.arg("--settings").arg(s);
                 f
             });
-            cmd.arg("--settings").arg(&bash_only);
+            cmd.arg("--settings").arg(&always);
             let Ok(mut c) = cc_conn::Conn::spawn(key, id.clone(), String::new(), cmd, &shape.workdir).await
             else { return };
             if !c.register_hooks(true, true).await {
@@ -82,6 +93,7 @@ impl Harness for ClaudeCode {
                 else { return };
                 c = c2;
             }
+            c.forks = forks;
             // A connection only answers for the session it actually holds, and
             // a prewarmed one has not spoken yet — so claim the session the turn
             // will ask to resume. It was passed `--resume` with exactly that id.
@@ -96,7 +108,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount, skill_plugins, proc } = turn;
         let _ = sink.send(AgentEvent::Stats(RunStats {
             effort: effort.clone(), ..Default::default()
         }));
@@ -116,8 +128,14 @@ impl Harness for ClaudeCode {
             thinking,
             system.as_deref(),
             &env,
-        );
-        let exe = std::env::current_exe()
+        )
+        .with_mount(&mount);
+        // Every hook and the permission server run as `<exe> …`. By the path on
+        // disk: after an update on Linux, the binary this daemon still runs as
+        // is `<path> (deleted)`, and a turn it starts before the supervisor
+        // restarts it would find no permission tool and fail its first command
+        // (10-29, DEV, the first turn after cli@0.9.150).
+        let exe = crate::platform::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "mafold".into());
@@ -131,8 +149,19 @@ impl Harness for ClaudeCode {
             thinking,
             system: system.clone(),
             env: env.clone(),
+            mount: mount.clone(),
         };
-        let Built { mut cmd, hook_settings, bash_only } = build_cmd(&shape, &exe);
+        // Held for the whole run. Taken BEFORE the command is built, so the
+        // answer to "is another turn of ours on this session" is settled and
+        // claimed in one step — the build then forks if it has to.
+        let (_lease, must_fork) = cc_conn::lease(session.as_deref());
+        if must_fork {
+            eprintln!(
+                "[cc-pool] session {} is already running another turn here — this one forks it",
+                session.as_deref().unwrap_or("")
+            );
+        }
+        let Built { mut cmd, hook_settings, always, forks } = build_cmd(&shape, &exe, must_fork);
         // The reply being streamed right now — `mafold attach <file>` hangs
         // media on it. Kept in the env for an OLDER `mafold` on the agent's
         // $PATH; ours reads the turn file, which is current on every turn.
@@ -144,15 +173,14 @@ impl Harness for ClaudeCode {
         let _perm_watch: Option<PermWatch> = ask_file
             .as_ref()
             .map(|af| permission_watcher(format!("{af}.perm"), sink.clone()));
-        // Don't let the console child flash a window (the agent runs detached).
-        crate::platform::no_window(&mut cmd);
         cmd.env_remove("CLAUDECODE").env_remove("ANTHROPIC_API_KEY");
 
         // A WARM connection for this exact configuration, or a new process.
         // `take` removes it from the pool, so a second concurrent turn in the
-        // same conversation finds nothing and opens its own — which is what
-        // happens today (turns already run concurrently and fork the session).
-        let mut conn = match cc_conn::take_or_wait(&key, session.as_deref()).await {
+        // same conversation finds nothing and opens its own — forking the
+        // session when the first is still on it (`must_fork`), and taking a
+        // warm one only if that one was spawned to fork too.
+        let mut conn = match cc_conn::take_or_wait(&key, session.as_deref(), must_fork).await {
             Some(c) => c,
             None => {
                 let id = cc_conn::oneshot_id();
@@ -167,9 +195,9 @@ impl Harness for ClaudeCode {
                     f.arg("--settings").arg(s);
                     f
                 });
-                // The Bash hook goes in either way; ask and steer are registered
-                // over the control channel just below.
-                cmd.arg("--settings").arg(&bash_only);
+                // The Bash hook and the compaction guard go in either way; ask
+                // and steer are registered over the control channel just below.
+                cmd.arg("--settings").arg(&always);
                 let mut c =
                     cc_conn::Conn::spawn(key.clone(), id.clone(), draft.clone(), cmd, &workdir).await?;
                 if !c.register_hooks(ask_file.is_some(), steer_file.is_some()).await {
@@ -186,6 +214,7 @@ impl Harness for ClaudeCode {
                         c = cc_conn::Conn::spawn(key.clone(), id, draft.clone(), f, &workdir).await?;
                     }
                 }
+                c.forks = forks;
                 c
             }
         };
@@ -199,6 +228,8 @@ impl Harness for ClaudeCode {
             steer: steer_file.clone().unwrap_or_default(),
             perm: ask_file.as_ref().map(|af| format!("{af}.perm")).unwrap_or_default(),
             surface: surface.clone(),
+            skill_plugins,
+            bg_events: crate::bgtasks::events_on(),
         };
         crate::turnenv::write(&crate::turnenv::path_for(&conn.id), &tenv);
         // An OLDER `mafold` on the agent's $PATH still reads `MAFOLD_DRAFT` from
@@ -209,6 +240,9 @@ impl Harness for ClaudeCode {
         if reused && conn.spawn_draft != draft {
             let _ = std::fs::write(crate::agent::draft_ptr_path(&conn.spawn_draft), &draft);
         }
+        // From here until `run` returns, this process IS the turn: while it
+        // runs, a silent tool call is work in progress, not a producer gone.
+        let _serving = proc.serve(conn.pid());
         conn.begin_turn(&prompt, tenv).await?;
 
         let mut produced = false;
@@ -280,7 +314,14 @@ impl Harness for ClaudeCode {
                 }
             };
             if session_id.is_none() {
-                if let Some(sid) = v["session_id"].as_str() { session_id = Some(sid.to_string()); }
+                if let Some(sid) = v["session_id"].as_str() {
+                    session_id = Some(sid.to_string());
+                    // Said NOW, not only in the outcome: a daemon killed in the
+                    // middle of this turn never gets to the outcome, and the
+                    // next one can only continue the work from the session it
+                    // is being written into (`drafts::Journal::session`).
+                    let _ = sink.send(AgentEvent::Session(sid.to_string()));
+                }
             }
             // Claude Code compacting its OWN context, mid-turn. It runs for
             // minutes (135s / 162s / 308s in this machine's transcripts) and
@@ -300,7 +341,9 @@ impl Harness for ClaudeCode {
                 }));
             }
             if v["type"] == "system" && v["subtype"] == "compact_boundary" {
-                let _ = sink.send(AgentEvent::Compacted { pre_tokens: compaction_pre_tokens(&v) });
+                let sid = v["session_id"].as_str().or(session_id.as_deref());
+                let verdict = sid.and_then(|s| crate::compact_hook::load_fresh(s, crate::compact_hook::FRESH));
+                let _ = sink.send(compacted(&v, verdict));
                 continue;
             }
             // Another local claude session tried to say something to this one
@@ -324,10 +367,17 @@ impl Harness for ClaudeCode {
                     // through — so it must never move the turn to another
                     // login, or a 76%-used account would hand every turn away
                     // for the rest of the week.
+                    // A refusal is told ONCE, by how the turn ends: moved to
+                    // another login (the ↻ seam says so) or failed (the
+                    // failure card carries this window and when it lifts).
+                    // Rendered here too, it was a second card for the same
+                    // refusal — and a false «this turn couldn't run» on a turn
+                    // another login went on to answer.
                     if status == "rejected" {
-                        limit = Some(super::LimitHit { kind: kind.clone(), resets_at });
+                        limit = Some(super::LimitHit { kind, resets_at });
+                        continue;
                     }
-                    let _ = sink.send(AgentEvent::RateLimited { kind, resets_at, status });
+                    let _ = sink.send(AgentEvent::RateLimited { kind, resets_at, status, fallback: None });
                 }
                 continue;
             }
@@ -442,10 +492,11 @@ impl Harness for ClaudeCode {
                                 }
                             }
                             Some("tool_use") => {
+                                let name = b["name"].as_str().unwrap_or("tool").to_string();
                                 let _ = sink.send(AgentEvent::ToolCall {
                                     id: b["id"].as_str().unwrap_or("").to_string(),
-                                    name: b["name"].as_str().unwrap_or("tool").to_string(),
-                                    input: b["input"].clone(),
+                                    input: super::model_tool_input(&name, &b["input"]),
+                                    name,
                                 });
                                 produced = true;
                             }
@@ -512,11 +563,7 @@ impl Harness for ClaudeCode {
                 // any `result` was reported as a normal Done — errors vanished).
                 let subtype = v["subtype"].as_str().unwrap_or("");
                 if v["is_error"].as_bool().unwrap_or(false) || (!subtype.is_empty() && subtype != "success") {
-                    error = Some(
-                        v["result"].as_str().map(str::trim).filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| format!("agent ended with `{}`", if subtype.is_empty() { "error" } else { subtype })),
-                    );
+                    error = Some(result_error(&v));
                     break;
                 }
                 // Not OUR receipt. `claude -p --resume` drains the session's
@@ -660,6 +707,14 @@ impl Harness for ClaudeCode {
         }
     }
 
+    fn command_who(&self, name: &str) -> super::Who {
+        crate::commands::who(name)
+    }
+
+    fn command_takes(&self, name: &str) -> Option<super::Takes> {
+        crate::commands::takes(name)
+    }
+
     async fn status_line(&self, env: &[(String, String)]) -> String {
         crate::commands::auth_status_line(env).await
     }
@@ -667,40 +722,23 @@ impl Harness for ClaudeCode {
     /// The seat `env` selects, asked the same quota-free question Claude Code
     /// asks itself (`/api/oauth/usage`), with the failure taxonomy kept apart
     /// — 401 wants a login, 403 does not, unreachable wants patience.
+    ///
+    /// The heartbeat asks this every 30 seconds for every login on the
+    /// machine, so an answer is reused for [`SEAT_HEALTH_FRESH`] while it is
+    /// still about the same login ([`SeenSeat::reusable`]).
     async fn seat_health(&self, env: &[(String, String)]) -> SeatHealth {
-        use crate::commands::UtilizationProbe as P;
-        match crate::commands::probe_utilization(env).await {
-            P::Ok(v) => {
-                let limits = v["limits"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|l| {
-                        let percent = l["percent"].as_f64()?;
-                        let kind = l["kind"].as_str().unwrap_or("usage").to_string();
-                        Some(SeatLimit {
-                            label: seat_limit_label(&kind, l),
-                            kind,
-                            percent,
-                            resets_at: l["resets_at"].as_str().and_then(crate::commands::iso_epoch_secs),
-                        })
-                    })
-                    .collect();
-                // The plan chip comes from `~/.claude.json`, which the LAST
-                // login to sign in owns — only the default seat can claim it.
-                let tier = if crate::accounts::Account::from_env(env).is_default() {
-                    crate::commands::plan_tier()
-                } else {
-                    None
-                };
-                SeatHealth::from_limits(tier, limits)
-            }
-            P::NoCredential => SeatHealth::unauthenticated(),
-            // Signed in, renewed on its next run — we didn't get to look.
-            P::Stale => SeatHealth::unknown(),
-            P::Http(s) => SeatHealth::from_status(s),
-            P::Unreachable => SeatHealth::unreachable(),
+        let seat = self.seat_key(env);
+        let login = crate::commands::credential_fingerprint(env);
+        let seen = seen_seats().lock().unwrap_or_else(|p| p.into_inner()).get(&seat).cloned();
+        if let Some(s) = seen.filter(|s| s.reusable(login.as_deref(), std::time::Instant::now(), crate::accounts::now())) {
+            return s.health;
         }
+        let health = probe_seat_health(env).await;
+        seen_seats().lock().unwrap_or_else(|p| p.into_inner()).insert(
+            seat,
+            SeenSeat { at: std::time::Instant::now(), login, health: health.clone() },
+        );
+        health
     }
 
     async fn cli_version(&self) -> String {
@@ -757,6 +795,87 @@ impl Harness for ClaudeCode {
     }
 }
 
+/// How long [`ClaudeCode::seat_health`] reuses an answer. A window doesn't
+/// move much in five minutes, and the cards that show it say when it was
+/// measured (`SeatHealth::checked_at`).
+const SEAT_HEALTH_FRESH: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What a seat last answered, and for which login.
+#[derive(Clone)]
+struct SeenSeat {
+    at: std::time::Instant,
+    /// [`crate::commands::credential_fingerprint`] when it was asked; never
+    /// sent anywhere.
+    login: Option<String>,
+    health: SeatHealth,
+}
+
+impl SeenSeat {
+    /// Whether this answer may stand in for asking again: the same login
+    /// (signing in, out or as somebody else is a new question), younger than
+    /// [`SEAT_HEALTH_FRESH`], not a failure to get through (that one is worth
+    /// retrying at the next heartbeat), and — for a full window — not past the
+    /// moment a window said it would roll over.
+    fn reusable(&self, login: Option<&str>, at: std::time::Instant, now: i64) -> bool {
+        self.login.as_deref() == login
+            && at.saturating_duration_since(self.at) < SEAT_HEALTH_FRESH
+            && self.health.state != "unreachable"
+            && (self.health.state != "exhausted"
+                || self.health.limits.iter().all(|l| l.resets_at.is_none_or(|r| r > now)))
+    }
+}
+
+/// Last answer per seat ([`Harness::seat_key`]), for this process.
+fn seen_seats() -> &'static std::sync::Mutex<std::collections::HashMap<String, SeenSeat>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, SeenSeat>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// Ask `/api/oauth/usage` for the seat `env` selects (no cache).
+async fn probe_seat_health(env: &[(String, String)]) -> SeatHealth {
+    use crate::commands::UtilizationProbe as P;
+    match crate::commands::probe_utilization(env).await {
+        P::Ok(v) => {
+            // Shared usage semantics: a model-only wall or paid overage
+            // must not advertise the entire subscription as exhausted.
+            let tier = if crate::accounts::Account::from_env(env).is_default() {
+                crate::commands::plan_tier()
+            } else {
+                None
+            };
+            seat_health_from_usage(&v, tier, crate::accounts::now())
+        }
+        P::NoCredential => SeatHealth::unauthenticated(),
+        // Signed in, renewed on its next run — we didn't get to look.
+        P::Stale => SeatHealth::unknown(),
+        P::Http(s) => SeatHealth::from_status(s),
+        P::Unreachable | P::Unreadable(_) => SeatHealth::unreachable(),
+    }
+}
+
+/// Report the actual windows while deriving usability from the SAME verdict
+/// that `/account` and pre-turn selection use, including overage and scope.
+fn seat_health_from_usage(v: &Value, tier: Option<String>, now: i64) -> SeatHealth {
+    let snapshot = crate::accounts::snapshot_from_usage(v, now);
+    let limits = v["limits"].as_array().into_iter().flatten()
+        .filter_map(|l| {
+            let percent = l["percent"].as_f64().filter(|percent| percent.is_finite() && *percent >= 0.0)?;
+            let kind = l["kind"].as_str().unwrap_or("usage").to_string();
+            Some(SeatLimit {
+                label: seat_limit_label(&kind, l), kind, percent,
+                resets_at: l["resets_at"].as_str().and_then(crate::commands::iso_epoch_secs),
+            })
+        }).collect();
+    let mut health = SeatHealth::from_limits(tier, limits);
+    health.state = match snapshot.state {
+        crate::accounts::SeatState::Exhausted { .. } => "exhausted",
+        crate::accounts::SeatState::Unknown => "unknown",
+        _ => "ok",
+    }.into();
+    health
+}
+
 /// A value `--effort` cannot possibly mean, used to make the binary state its
 /// own valid list.
 const EFFORT_NONSENSE: &str = "mafold-probe";
@@ -774,13 +893,12 @@ const HIDDEN_EFFORTS: &[&str] = &["ultracode"];
 /// `None` when the CLI couldn't be run at all — distinct from an empty stderr,
 /// which is the binary saying it has no objection.
 async fn effort_probe(env: &[(String, String)], value: &str) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(super::program("claude"));
+    let mut cmd = crate::platform::command(super::program("claude"));
     cmd.arg("--effort")
         .arg(value)
         .arg("--version")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
         .await
         .ok()?
@@ -862,7 +980,7 @@ fn account_of(resp: &Value) -> Option<String> {
 /// support" that doesn't spend the thing being asked about.
 async fn handshake(env: &[(String, String)]) -> Option<Value> {
     use tokio::io::AsyncWriteExt;
-    let mut cmd = tokio::process::Command::new(super::program("claude"));
+    let mut cmd = crate::platform::command(super::program("claude"));
     cmd.arg("-p")
         .arg("--input-format").arg("stream-json")
         .arg("--output-format").arg("stream-json")
@@ -878,7 +996,6 @@ async fn handshake(env: &[(String, String)]) -> Option<Value> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    crate::platform::no_window(&mut cmd);
     let mut child = cmd.spawn().ok()?;
     let _guard = super::ChildGuard::new(child.id());
     let req = serde_json::json!({
@@ -943,6 +1060,10 @@ impl Drop for PermWatch {
     fn drop(&mut self) {
         self.task.abort();
         let _ = std::fs::remove_file(&self.file);
+        // And the verdict mailbox: `<ask>.perm` → `<ask>.verdict`.
+        if let Some(ask) = self.file.strip_suffix(".perm") {
+            let _ = std::fs::remove_file(crate::permission_mcp::verdict_file(ask));
+        }
     }
 }
 
@@ -971,6 +1092,18 @@ fn permission_watcher(file: String, sink: UnboundedSender<AgentEvent>) -> PermWa
             for line in body.lines().skip(drawn) {
                 drawn += 1;
                 let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+                // Nobody answered in time: stamp the open card, so it stops
+                // offering Allow for a call that has already been refused. The
+                // stamp lands on the last UNANSWERED ask, which is this one —
+                // prompts are sequential and each is answered or expired before
+                // the next is published.
+                if crate::permission_mcp::is_expiry(&record) {
+                    let closed = AgentEvent::AskAnswered(crate::permission_mcp::EXPIRED.into());
+                    if sink.send(closed).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let id = record["tool_use_id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -997,6 +1130,28 @@ fn permission_watcher(file: String, sink: UnboundedSender<AgentEvent>) -> PermWa
 /// a silently-wrong path here reads exactly like no compaction at all.
 fn compaction_pre_tokens(v: &Value) -> Option<u64> {
     v["compactMetadata"]["preTokens"].as_u64()
+}
+
+/// A `compact_boundary` event, plus what the PostCompact hook saved about the
+/// summary it produced. The hook runs before claude writes the boundary, so a
+/// verdict for this compaction is already on disk when the event arrives; no
+/// verdict (an older CLI, a hook that failed) still reports the compaction.
+fn compacted(v: &Value, verdict: Option<crate::compact_hook::Verdict>) -> AgentEvent {
+    let (summary, flagged) = match verdict {
+        Some(x) => {
+            let shown = x.shown_flags();
+            (Some(x.summary), shown)
+        }
+        None => (None, Vec::new()),
+    };
+    AgentEvent::Compacted {
+        pre_tokens: compaction_pre_tokens(v),
+        // Newer CLIs report it (2.1.282 does); older ones don't, and a missing
+        // count must stay missing rather than read as "compacted to nothing".
+        post_tokens: v["compactMetadata"]["postTokens"].as_u64(),
+        summary,
+        flagged,
+    }
 }
 
 /// The usage-limit state worth relaying from a `rate_limit_event`'s
@@ -1056,13 +1211,16 @@ fn seat_limit_label(kind: &str, l: &Value) -> String {
 /// daemon log, which is how this class of dead reply went unexplained for weeks.
 fn exit_reason(code: Option<i32>, stderr: &str, plain_tail: &[String]) -> String {
     const HEAD: &str = "claude exited unsuccessfully";
+    // What claude said follows `logfile::EXITED`, so a diagnostics file
+    // keeps how long it was and not what it said.
+    let said = |text: &str| format!("claude{}{text}", crate::logfile::EXITED);
     let stderr = stderr.trim();
     if !stderr.is_empty() {
-        return format!("{HEAD}: {stderr}");
+        return said(stderr);
     }
     let tail: Vec<&str> = plain_tail.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if !tail.is_empty() {
-        return format!("{HEAD}: {}", tail.join(" / "));
+        return said(&tail.join(" / "));
     }
     match code {
         Some(c) => format!("{HEAD} (exit code {c}, and it printed nothing to stdout or stderr)"),
@@ -1095,8 +1253,11 @@ struct Built {
     /// The full COMMAND-hook settings, attached only when the control-channel
     /// handshake fails.
     hook_settings: Option<String>,
-    /// The Bash hook alone — always attached (see `cc_conn`'s callback ids).
-    bash_only: String,
+    /// The command hooks attached whatever the handshake says: the Bash hook
+    /// (see `cc_conn`'s callback ids) and the compaction guard.
+    always: String,
+    /// It resumes with `--fork-session` (see `cc_conn::Conn::forks`).
+    forks: bool,
 }
 
 /// Build the command for a turn's SHAPE. Nothing per-turn goes in here: the
@@ -1104,8 +1265,14 @@ struct Built {
 /// turn, while this process may serve many, and they reach the child through
 /// `turnenv` instead. That is what lets [`ClaudeCode::prewarm`] build the same
 /// process before there is a message to answer.
-fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
-        let mut cmd = tokio::process::Command::new(super::program("claude"));
+///
+/// `must_fork`: another turn of ours is running on the session this resumes
+/// (`cc_conn::lease`).
+fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
+        // Windowless from the constructor on. `run` used to add that after
+        // calling here, and `prewarm` (the process that actually serves a
+        // turn) never did — every message to a Windows agent opened a window.
+        let mut cmd = crate::platform::command(super::program("claude"));
         // `-p` with NO prompt argument: the prompt goes in on stdin instead (see
         // the write below). It is the one input here that grows without bound —
         // it carries the conversation — and Windows hard-caps a command line at
@@ -1131,6 +1298,29 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
             // which pops a Python dock icon and adds seconds of startup latency
             // per reply. The daemon passes no --mcp-config, so this loads none.
             .arg("--strict-mcp-config");
+        // The skills this bot has: Mafold's own plugin, then the bot's drive
+        // (`crate::drive`). Per PROCESS — a `--resume` that leaves them out has
+        // no skills at all (measured, CC 2.1.282) — so every spawn path, one-shot,
+        // resumed and pre-warmed alike, goes through here.
+        for d in &shape.mount.plugin_dirs {
+            cmd.arg("--plugin-dir").arg(d);
+        }
+        // The built-in tools this process may use (`Mount::tools`). Per
+        // process too: the set is fixed when claude starts.
+        if let Some(t) = &shape.mount.tools {
+            cmd.arg("--tools").arg(t);
+        }
+        // A guest's turn (`Mount::guest`) runs on none of the owner's own
+        // Claude Code: `user` drops out of the setting sources, and with it
+        // their skills, plugins and CLAUDE.md. Measured on CC 2.1.289: the
+        // `--plugin-dir` plugins, the `--settings` hooks, the control-channel
+        // hooks and `--resume` all stay (`scripts/skill-gate-probe`).
+        if shape.mount.guest {
+            cmd.arg("--setting-sources").arg("project,local");
+        }
+        // …but the owner's guardrails and plumbing come along, merged into the
+        // daemon's own settings blob (`guest_settings`).
+        let guest_carry = shape.mount.guest.then(owner_settings);
         if let Some(m) = &shape.model {
             cmd.arg("--model").arg(m);
         }
@@ -1139,14 +1329,34 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
         if let Some(e) = &shape.effort {
             cmd.arg("--effort").arg(e);
         }
-        // Export the current conversation so `mafold room …` (run by the agent
-        // via the room skill) defaults to THIS room. Per-turn (not a global env)
-        // because concurrent turns run different conversations.
-        cmd.env("MAFOLD_CONV", &shape.conv);
+        // Export the current conversation and forum channel so `mafold send`
+        // and `read` default to THIS room and channel (`turn_env`).
+        // Per-process: a warm process serves one surface, and the surface
+        // carries the channel.
+        for (k, v) in super::turn_env(&shape.conv, &shape.surface, &shape.mount.reads) {
+            cmd.env(k, v);
+        }
+        // `mafold …` in the agent's shell is THIS daemon's binary: the commands
+        // a skill names (`mafold video`, `mafold pin`) exist in the version that
+        // installed the skill — not in whatever `mafold` happens to be first on
+        // PATH, or none at all (a daemon started from a GUI or a service often
+        // has no install dir on PATH, and then every `mafold` call in the turn
+        // fails with "command not found").
+        if let Some(dir) = crate::platform::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+            let joined = std::env::join_paths(
+                std::iter::once(dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+            );
+            if let Ok(p) = joined {
+                cmd.env("PATH", p);
+            }
+        }
         // The surface (conv + forum channel) the reply lands on — the bash-hook
         // registers detached background tasks under it, so their wrap-up turn
         // comes back to THIS channel instead of leaking into another one.
         cmd.env("MAFOLD_SURFACE", &shape.surface);
+        // …and how it watches them (`turnenv::bg_events` — a reused
+        // connection's turn file says it per turn).
+        cmd.env("MAFOLD_BGTASK_EVENTS", if crate::bgtasks::events_on() { "1" } else { "" });
         // Name this process in the machine's session registry
         // (`~/.claude/sessions/<pid>.json`), which is the address book every
         // other local claude session sees. Without it the name is auto-derived
@@ -1198,8 +1408,22 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
             "matcher": "Bash",
             "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
         });
-        let bash_only = serde_json::json!({ "hooks": { "PreToolUse": [bash_hook.clone()] } }).to_string();
+        // The compaction guard rides in the same always-attached blob: it has no
+        // control-channel form, it fires once per compaction, and a turn that
+        // compacts without it hands the model its own summary in the user's
+        // voice. See `compact_hook`.
+        let always = {
+            let mut hooks = crate::compact_hook::settings(exe);
+            hooks.insert("PreToolUse".into(), serde_json::json!([bash_hook.clone()]));
+            guest_settings(serde_json::json!({ "hooks": hooks }), guest_carry.as_ref()).to_string()
+        };
         pre.push(bash_hook);
+        // The skill gate's command form (`crate::drive::skill_gate`); in
+        // process it is a control-channel hook (`cc_conn`).
+        pre.push(serde_json::json!({
+            "matcher": "Skill",
+            "hooks": [{ "type": "command", "command": format!("\"{exe}\" drive-hook") }]
+        }));
         {
             pre.push(serde_json::json!({
                 "matcher": "AskUserQuestion",
@@ -1227,7 +1451,9 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
             }));
         }
         if !pre.is_empty() || !post.is_empty() {
-            let mut hooks = serde_json::Map::new();
+            // The fallback replaces `always` rather than joining it, so it has
+            // to carry the compaction guard too.
+            let mut hooks = crate::compact_hook::settings(exe);
             if !pre.is_empty() {
                 hooks.insert("PreToolUse".into(), serde_json::Value::Array(pre));
             }
@@ -1241,9 +1467,10 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
             // to read the CURRENT turn rather than the environment this process
             // was born with), so this is kept as the fallback for a CLI that
             // can't do that. Attaching both would fire every hook twice.
-            hook_settings = Some(serde_json::json!({ "hooks": hooks }).to_string());
+            hook_settings = Some(guest_settings(serde_json::json!({ "hooks": hooks }), guest_carry.as_ref()).to_string());
         }
         cmd.kill_on_drop(true);
+        let mut forks = false;
         if let Some(sid) = &shape.session {
             cmd.arg("--resume").arg(sid);
             // Somebody else is holding this exact transcript right now (a VS
@@ -1256,11 +1483,45 @@ fn build_cmd(shape: &super::TurnShape, exe: &str) -> Built {
             // words all along. The new id arrives on the stream (`session_id`)
             // and is what the caller stores, so this costs one fork, not one
             // per turn.
-            if crate::commands::session_held_elsewhere(sid) {
+            //
+            // …and the somebody can be US. That check skips our own processes
+            // on purpose (they are how the daemon runs at all), so it never
+            // saw a second turn of this daemon on the same session, and the
+            // two braided exactly like a daemon and an editor would. The
+            // lease is what sees it (`cc_conn::lease`).
+            if must_fork || crate::commands::session_held_elsewhere(sid) {
                 cmd.arg("--fork-session");
+                forks = true;
             }
         }
-        Built { cmd, hook_settings, bash_only }
+        Built { cmd, hook_settings, always, forks }
+}
+
+/// What a guest's process keeps of the owner's own `settings.json` (`user`),
+/// merged into the daemon's settings blob: the owner's guardrails
+/// (`permissions` — an `ask` or `deny` rule binds under
+/// `--dangerously-skip-permissions`, and a guest is who it most has to bind)
+/// and what the process needs to reach a model at all (`env`, `apiKeyHelper`,
+/// `model`). Not their hooks, plugins or anything else: those are the owner's
+/// own Claude Code, which a guest doesn't run on. `None` = not a guest.
+pub(crate) fn guest_settings(mut blob: Value, user: Option<&Value>) -> Value {
+    let Some(user) = user else { return blob };
+    if let Some(o) = blob.as_object_mut() {
+        for k in ["permissions", "env", "apiKeyHelper", "model"] {
+            if let Some(v) = user.get(k) {
+                o.entry(k).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    blob
+}
+
+/// The owner's own `settings.json`, as JSON (`Null` when there is none).
+pub(crate) fn owner_settings() -> Value {
+    crate::permission_mcp::user_settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or_default()
 }
 
 /// The first non-empty line of `t`, bounded — a subagent's report can be pages
@@ -1342,6 +1603,31 @@ fn is_queued_receipt(v: &Value, produced: bool) -> bool {
         && v["result"].as_str().map(str::trim).is_none_or(str::is_empty)
 }
 
+/// Why a non-success `result` ended the turn: its `result` text, else its
+/// `errors` list, else the subtype.
+///
+/// `errors` is not optional reading. A `--resume` whose transcript is gone
+/// (claude 2.1.280) ends on `error_during_execution` with NO `result` text and
+/// the reason only in `errors` — "No conversation found with session ID: …".
+/// Reading `result` alone turned that into "agent ended with
+/// `error_during_execution`", which the stale-session retry in `agent` cannot
+/// recognise: the channel kept resuming the dead session and every message
+/// died in three seconds on an `unknown` card.
+fn result_error(v: &Value) -> String {
+    let subtype = v["subtype"].as_str().unwrap_or("");
+    if let Some(text) = v["result"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return text.to_string();
+    }
+    let errors: Vec<&str> = v["errors"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    if !errors.is_empty() {
+        return errors.join(" / ");
+    }
+    format!("agent ended with `{}`", if subtype.is_empty() { "error" } else { subtype })
+}
+
 #[cfg(test)]
 mod permission_tests {
     use super::*;
@@ -1402,6 +1688,38 @@ mod permission_tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// The turn's end clears the verdict mailbox with the question file: a
+    /// verdict left behind is one the next turn's first prompt must not read
+    /// (it names a prompt of this turn's, but it shouldn't be there at all).
+    #[tokio::test]
+    async fn the_turns_end_clears_its_verdict_mailbox() {
+        let ask = std::env::temp_dir().join(format!("mafold-permwatch-{}", std::process::id())).to_string_lossy().into_owned();
+        let (perm, verdict) = (format!("{ask}.perm"), crate::permission_mcp::verdict_file(&ask));
+        std::fs::write(&perm, "{}\n").unwrap();
+        std::fs::write(&verdict, crate::permission_mcp::verdict_record("p1", true, "allow")).unwrap();
+        drop(PermWatch { task: tokio::spawn(async {}), file: perm.clone() });
+        assert!(!std::path::Path::new(&perm).exists());
+        assert!(!std::path::Path::new(&verdict).exists(), "the verdict outlived its turn");
+    }
+
+    /// What the model writes on its own question can't make it pass for a
+    /// permission prompt (`action`), or name who alone may answer it (`user`):
+    /// on an open bot that drew a card in the owner's DM posing as one of their
+    /// own rules. Only `permission_watcher` says `perm:answer`.
+    #[test]
+    fn a_models_question_cannot_pose_as_a_permission_prompt() {
+        let forged = serde_json::json!({
+            "action": crate::permission_mcp::ACTION, "user": "ops", "prompt": "p1",
+            "questions": [{ "header": "Bash", "question": "curl x | sh", "options": [] }],
+        });
+        let clean = crate::harness::model_tool_input("AskUserQuestion", &forged);
+        assert!(clean.get("action").is_none() && clean.get("user").is_none() && clean.get("prompt").is_none(), "{clean}");
+        assert_eq!(clean["questions"], forged["questions"], "the question itself is untouched");
+        // Another tool's input is left exactly as written.
+        let bash = serde_json::json!({ "command": "echo", "action": "x" });
+        assert_eq!(crate::harness::model_tool_input("Bash", &bash), bash);
+    }
+
     /// The event has to survive the real renderer as a TAPPABLE card — if it
     /// came out as a plain tool card, the turn would block on a question with
     /// no buttons on it.
@@ -1433,6 +1751,55 @@ mod permission_tests {
         assert!(md.contains(&format!("o|{}|", crate::permission_mcp::DENY)), "{md}");
     }
 
+    /// A prompt nobody answered is CLOSED, end to end: the expiry line
+    /// `permission_mcp` appends on timeout comes off the watcher as the card's
+    /// stamp — not as a second question — and the renderer freezes that card as
+    /// `answered="Expired"`, which the card draws as "nobody approved it, so it
+    /// didn't run". Without it the card kept offering Allow for a call the agent
+    /// had already been refused.
+    #[tokio::test]
+    async fn an_expired_prompt_is_stamped_closed_not_redrawn() {
+        let file = std::env::temp_dir()
+            .join(format!("mafold-permexpire-{}.jsonl", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&file);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = permission_watcher(file.clone(), tx);
+        std::fs::write(
+            &file,
+            "{\"tool_name\":\"Bash\",\"input\":{\"command\":\"rm -f shots/*.png\"},\"tool_use_id\":\"toolu_7\"}\n\
+             {\"tool_use_id\":\"toolu_7\",\"expired\":true}\n",
+        )
+        .unwrap();
+
+        let mut tx = Transcript::new();
+        for want in ["question", "expiry"] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the watcher never sent the {want}"))
+                .expect("sink closed");
+            match (want, &ev) {
+                ("question", AgentEvent::ToolCall { name, .. }) => assert_eq!(name, "AskUserQuestion"),
+                ("expiry", AgentEvent::AskAnswered(a)) => assert_eq!(a, crate::permission_mcp::EXPIRED),
+                _ => panic!("expected the {want}, got {ev:?}"),
+            }
+            tx.push(&ev);
+        }
+        let md = tx.finish();
+        assert!(
+            md.contains(&format!(
+                "{{% mafold/ask action=\"{}\" answered=\"{}\" %}}",
+                crate::permission_mcp::ACTION,
+                crate::permission_mcp::EXPIRED
+            )),
+            "{md}"
+        );
+        assert_eq!(md.matches("{% mafold/ask").count(), 1, "one card, closed — not a second one: {md}");
+        drop(watch);
+        let _ = std::fs::remove_file(&file);
+    }
+
     /// The watcher stops with the turn. It polls forever by construction, so a
     /// leak here is one live task per reply for the life of the daemon.
     #[tokio::test]
@@ -1454,6 +1821,190 @@ mod permission_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resuming(sid: &str) -> super::super::TurnShape {
+        super::super::TurnShape {
+            conv: "c1".into(),
+            surface: "s1".into(),
+            workdir: "/tmp".into(),
+            session: Some(sid.into()),
+            model: None,
+            effort: None,
+            thinking: None,
+            system: None,
+            env: vec![],
+            mount: Default::default(),
+        }
+    }
+
+    fn args(b: &Built) -> Vec<String> {
+        b.cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    /// The agent process is told its conversation AND its forum channel —
+    /// `mafold send` / `read` default to the channel (`turn_env`). Exported
+    /// empty on #all so a daemon-level value can't leak in.
+    #[test]
+    fn the_agent_process_is_told_its_conversation_and_channel() {
+        let env_of = |surface: &str| {
+            let shape = super::super::TurnShape { surface: surface.into(), ..resuming("turn-env-test") };
+            let b = build_cmd(&shape, "mafold", false);
+            let get = |k: &str| {
+                b.cmd.as_std().get_envs().find(|(n, _)| *n == k).and_then(|(_, v)| v).map(|v| v.to_string_lossy().into_owned())
+            };
+            (get("MAFOLD_CONV"), get("MAFOLD_FORUM_CHANNEL"))
+        };
+        assert_eq!(env_of("c1__ch-0001__opsdu_claude-code"), (Some("c1".into()), Some("ch-0001".into())));
+        assert_eq!(env_of("c1____opsdu_claude-code"), (Some("c1".into()), Some(String::new())));
+    }
+
+    /// …and whose eyes it reads with (`Mount::reads`), on every way a process
+    /// starts: a guest's process reads for that guest, a process nobody said
+    /// anything about for nobody.
+    #[test]
+    fn the_agent_process_is_told_whom_it_reads_for() {
+        let reads_of = |reads: crate::chat::ReadsFor, forked: bool| {
+            let mount = super::super::Mount { reads, ..Default::default() };
+            let shape = super::super::TurnShape { mount, ..resuming("reads-env-test") };
+            let b = build_cmd(&shape, "mafold", forked);
+            b.cmd
+                .as_std()
+                .get_envs()
+                .find(|(n, _)| *n == crate::chat::READS_FOR_ENV)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        for forked in [false, true] {
+            assert_eq!(reads_of(crate::chat::ReadsFor::All, forked).as_deref(), Some("*"));
+            assert_eq!(reads_of(crate::chat::ReadsFor::People(vec!["alice".into()]), forked).as_deref(), Some("alice"));
+            assert_eq!(reads_of(Default::default(), forked).as_deref(), Some("-"));
+        }
+    }
+
+    /// The drive mount is per PROCESS and `--resume` doesn't carry it (measured,
+    /// CC 2.1.282: no `--plugin-dir` on a resume = no skills), so every way a
+    /// process starts — fresh, resumed, forked — must carry both plugin folders.
+    /// The agent's memory is never redirected: no `autoMemoryDirectory`, no
+    /// memory guard, in either settings blob (drives hold no memory since
+    /// 2026-09-30).
+    #[test]
+    fn every_spawn_path_carries_the_drive_mount_and_leaves_memory_alone() {
+        let mount = super::super::Mount {
+            plugin_dirs: vec!["/h/.mafold/plugins/mafold".into(), "/h/.mafold/drives/0123456789ab".into()],
+            ..Default::default()
+        };
+        let sid = format!("mount-test-{}", std::process::id());
+        let fresh = super::super::TurnShape { session: None, mount: mount.clone(), ..resuming(&sid) };
+        let resumed = super::super::TurnShape { mount: mount.clone(), ..resuming(&sid) };
+        for (label, b) in [
+            ("fresh", build_cmd(&fresh, "mafold", false)),
+            ("resumed", build_cmd(&resumed, "mafold", false)),
+            ("forked", build_cmd(&resumed, "mafold", true)),
+        ] {
+            let a = args(&b);
+            let dirs: Vec<&str> = a.windows(2).filter(|w| w[0] == "--plugin-dir").map(|w| w[1].as_str()).collect();
+            assert_eq!(dirs, ["/h/.mafold/plugins/mafold", "/h/.mafold/drives/0123456789ab"], "{label}");
+            for blob in [Some(b.always.clone()), b.hook_settings.clone()].into_iter().flatten() {
+                let v: Value = serde_json::from_str(&blob).unwrap();
+                assert!(v.get("autoMemoryDirectory").is_none(), "{label}: {blob}");
+                assert!(v["hooks"]["PreToolUse"].is_array(), "the hooks are still there: {blob}");
+            }
+            // The skill gate: its command form in the fallback set only — in
+            // process it is a control-channel hook, and both would fire twice.
+            assert!(!b.always.contains("drive-hook"), "{label}: {}", b.always);
+            let fallback: Value = serde_json::from_str(b.hook_settings.as_deref().unwrap()).unwrap();
+            let gate: Vec<&Value> = fallback["hooks"]["PreToolUse"].as_array().unwrap().iter().filter(|h| h["matcher"] == "Skill").collect();
+            assert_eq!(gate.len(), 1, "{label}: {fallback}");
+            assert_eq!(gate[0]["hooks"][0]["command"], "\"mafold\" drive-hook", "{label}");
+        }
+        let plain = build_cmd(&resuming(&sid), "mafold", false);
+        assert!(!args(&plain).iter().any(|a| a == "--plugin-dir"));
+    }
+
+    /// A mount that names its tools starts every process on just those —
+    /// fresh, resumed or forked — and is a different process in the pool than
+    /// one on the full set. No tools named = claude's own set, no flag.
+    #[test]
+    fn a_mount_that_names_its_tools_gets_only_those() {
+        let narrow = super::super::Mount { tools: Some("Bash,Read,Edit,Write".into()), ..Default::default() };
+        let sid = format!("tools-test-{}", std::process::id());
+        let fresh = super::super::TurnShape { session: None, mount: narrow.clone(), ..resuming(&sid) };
+        let resumed = super::super::TurnShape { mount: narrow.clone(), ..resuming(&sid) };
+        for (label, b) in [
+            ("fresh", build_cmd(&fresh, "mafold", false)),
+            ("resumed", build_cmd(&resumed, "mafold", false)),
+            ("forked", build_cmd(&resumed, "mafold", true)),
+        ] {
+            let a = args(&b);
+            let tools: Vec<&str> = a.windows(2).filter(|w| w[0] == "--tools").map(|w| w[1].as_str()).collect();
+            assert_eq!(tools, ["Bash,Read,Edit,Write"], "{label}");
+        }
+        assert!(!args(&build_cmd(&resuming(&sid), "mafold", false)).iter().any(|a| a == "--tools"));
+        assert_ne!(narrow.signature(), super::super::Mount::default().signature());
+    }
+
+    /// What a guest's process keeps of the owner's settings: their guardrails
+    /// and what reaching a model needs — never their hooks or plugins, and
+    /// never over the daemon's own keys.
+    #[test]
+    fn a_guest_keeps_the_owners_guardrails_and_nothing_else() {
+        let owner = serde_json::json!({
+            "permissions": { "deny": ["Bash(git push *)"], "ask": ["Bash(rm *)"] },
+            "env": { "HTTPS_PROXY": "http://127.0.0.1:7890" },
+            "apiKeyHelper": "/usr/local/bin/key",
+            "model": "opus",
+            "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "owner-hook" }] }] },
+            "enabledPlugins": { "superpowers@m": true },
+        });
+        let ours = serde_json::json!({ "hooks": { "PreToolUse": [] }, "model": "daemon-pick" });
+        let v = guest_settings(ours.clone(), Some(&owner));
+        assert_eq!(v["permissions"]["deny"][0], "Bash(git push *)");
+        assert_eq!(v["env"]["HTTPS_PROXY"], "http://127.0.0.1:7890");
+        assert_eq!(v["apiKeyHelper"], "/usr/local/bin/key");
+        assert_eq!(v["model"], "daemon-pick", "the daemon's own keys win");
+        assert_eq!(v["hooks"], ours["hooks"], "not the owner's hooks");
+        assert!(v.get("enabledPlugins").is_none());
+        assert_eq!(guest_settings(ours.clone(), None), ours, "not a guest: untouched");
+    }
+
+    /// A guest's process loads none of the owner's own Claude Code, on every
+    /// way it starts — and nothing about setting sources is said for anyone
+    /// else's.
+    #[test]
+    fn a_guests_process_leaves_the_owners_own_settings_out() {
+        let sid = format!("guest-test-{}", std::process::id());
+        let mount = super::super::Mount { plugin_dirs: vec!["/h/.mafold/plugins/mafold".into()], guest: true, ..Default::default() };
+        let fresh = super::super::TurnShape { session: None, mount: mount.clone(), ..resuming(&sid) };
+        let resumed = super::super::TurnShape { mount: mount.clone(), ..resuming(&sid) };
+        for (label, b) in [
+            ("fresh", build_cmd(&fresh, "mafold", false)),
+            ("resumed", build_cmd(&resumed, "mafold", false)),
+            ("forked", build_cmd(&resumed, "mafold", true)),
+        ] {
+            let a = args(&b);
+            let sources: Vec<&str> = a.windows(2).filter(|w| w[0] == "--setting-sources").map(|w| w[1].as_str()).collect();
+            assert_eq!(sources, ["project,local"], "{label}: {a:?}");
+            assert!(a.windows(2).any(|w| w[0] == "--plugin-dir" && w[1] == "/h/.mafold/plugins/mafold"), "{label}");
+        }
+        let owners = super::super::TurnShape { mount: super::super::Mount { guest: false, ..mount }, ..resuming(&sid) };
+        assert!(!args(&build_cmd(&owners, "mafold", false)).iter().any(|a| a == "--setting-sources"));
+    }
+
+    /// A turn whose session another turn of ours is running resumes it as a
+    /// FORK; one that has it to itself resumes it as-is. Before, both resumed
+    /// as-is and wrote into one transcript.
+    #[test]
+    fn a_turn_on_a_held_session_forks_it() {
+        let sid = format!("fork-test-{}", std::process::id());
+        let alone = build_cmd(&resuming(&sid), "mafold", false);
+        assert!(!alone.forks);
+        assert!(args(&alone).windows(2).any(|w| w == ["--resume", sid.as_str()]));
+        assert!(!args(&alone).iter().any(|a| a == "--fork-session"));
+        let second = build_cmd(&resuming(&sid), "mafold", true);
+        assert!(second.forks);
+        assert!(args(&second).windows(2).any(|w| w == ["--resume", sid.as_str()]));
+        assert!(args(&second).iter().any(|a| a == "--fork-session"));
+    }
 
     /// The exact shape claude emitted at 13:45:08 on the field machine, right
     /// after a stopped turn left a `<task-notification>` in the session queue.
@@ -1505,6 +2056,24 @@ mod tests {
     fn stderr_is_the_reason_when_claude_writes_there() {
         let r = exit_reason(Some(1), "No conversation found with session ID: 29cbfee1\n", &[]);
         assert!(r.contains("No conversation found"), "{r}");
+    }
+
+    /// claude 2.1.280 says a missing `--resume` transcript ON the stream: an
+    /// `error_during_execution` result with no `result` text and the reason
+    /// only in `errors` (frame as captured from the field, 10-26).
+    #[test]
+    fn a_result_without_text_reads_its_errors() {
+        let v = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "num_turns": 0, "session_id": "bd681c70-93c8-45d0-8c03-0bfd11daa4ec",
+            "errors": ["No conversation found with session ID: bd681c70-93c8-45d0-8c03-0bfd11daa4ec"],
+        });
+        let r = result_error(&v);
+        assert_eq!(r, "No conversation found with session ID: bd681c70-93c8-45d0-8c03-0bfd11daa4ec");
+        // `result` text still wins, and with neither the subtype is the reason.
+        assert_eq!(result_error(&serde_json::json!({"subtype": "error_during_execution", "result": "API Error: 500", "errors": ["x"]})), "API Error: 500");
+        assert_eq!(result_error(&serde_json::json!({"subtype": "error_max_turns", "errors": []})), "agent ended with `error_max_turns`");
+        assert_eq!(result_error(&serde_json::json!({"is_error": true})), "agent ended with `error`");
     }
 
     /// The regression this fixes: claude printed the reason as PLAIN TEXT on
@@ -1692,6 +2261,74 @@ mod tests {
         assert_eq!(seat_limit_label("some_new_window", &Value::Null), "Some new window");
     }
 
+    /// The heartbeat asks every 30 seconds; the seat is asked again only when
+    /// the answer is old, about another login, a failure, or a full window
+    /// whose reset has come (activity center C1).
+    #[test]
+    fn a_seat_answer_is_reused_until_it_could_have_changed() {
+        let t0 = std::time::Instant::now();
+        let now = 1_788_000_000;
+        let seen = |state: &str, resets_at: Option<i64>| SeenSeat {
+            at: t0,
+            login: Some("login-a".into()),
+            health: SeatHealth {
+                state: state.into(),
+                status: Some(200),
+                tier: None,
+                limits: vec![SeatLimit { kind: "session".into(), label: "Session".into(), percent: 100.0, resets_at }],
+                checked_at: now,
+            },
+        };
+        let ok = seen("ok", Some(now + 60));
+        let later = |secs| t0 + std::time::Duration::from_secs(secs);
+        assert!(ok.reusable(Some("login-a"), later(30), now), "the next heartbeat: no new probe");
+        assert!(ok.reusable(Some("login-a"), later(299), now));
+        assert!(!ok.reusable(Some("login-a"), later(SEAT_HEALTH_FRESH.as_secs()), now), "five minutes: ask again");
+        assert!(!ok.reusable(Some("login-b"), later(30), now), "signed in as somebody else");
+        assert!(!ok.reusable(None, later(30), now), "signed out");
+        let out = SeenSeat { login: None, ..seen("unauthenticated", None) };
+        assert!(out.reusable(None, later(30), now), "still signed out: nothing new to ask");
+        assert!(!out.reusable(Some("login-a"), later(30), now), "signed in since: ask at once");
+        assert!(!seen("unreachable", None).reusable(Some("login-a"), later(30), now), "a failure is retried");
+        let full = seen("exhausted", Some(now + 60));
+        assert!(full.reusable(Some("login-a"), later(30), now));
+        assert!(!full.reusable(Some("login-a"), later(30), now + 60), "the window rolled over");
+    }
+
+    #[test]
+    fn seat_health_uses_the_choosers_scope_and_overage_semantics() {
+        let now = 1_788_000_000;
+        let mut usage = serde_json::json!({
+            "limits": [{"kind":"weekly_scoped", "percent":100, "scope":{"model":{"display_name":"Fable"}}}]
+        });
+        let health = seat_health_from_usage(&usage, None, now);
+        assert_eq!(health.state, "ok");
+        assert_eq!(health.limits[0].percent, 100.0, "still report the model wall");
+        usage["limits"][0]["scope"] = Value::Null;
+        usage["limits"][0]["kind"] = "weekly_all".into();
+        assert_eq!(seat_health_from_usage(&usage, None, now).state, "exhausted");
+        usage["extra_usage"] = serde_json::json!({"is_enabled":true,"spend_limit_reached":false});
+        assert_eq!(seat_health_from_usage(&usage, None, now).state, "ok");
+        usage["extra_usage"]["spend_limit_reached"] = true.into();
+        assert_eq!(seat_health_from_usage(&usage, None, now).state, "exhausted");
+    }
+
+    #[test]
+    fn seat_health_rejects_invalid_usage_numbers_without_claiming_exhaustion() {
+        let usage = serde_json::json!({"limits":[
+            {"kind":"session", "percent":-1},
+            {"kind":"weekly_all", "percent":"unknown"},
+            {"kind":"weekly_scoped", "percent":null}
+        ]});
+        let health = seat_health_from_usage(&usage, None, 1000);
+        assert_eq!(health.state, "unknown");
+        assert!(health.limits.is_empty());
+        let zero = seat_health_from_usage(&serde_json::json!({"limits":[{"kind":"session","percent":0}]}), None, 1000);
+        assert_eq!(zero.state, "ok");
+        assert_eq!(zero.limits.len(), 1);
+        assert_eq!(zero.limits[0].percent, 0.0);
+    }
+
     /// A real `initialize` answer (2.1.272, trimmed) becomes the roster, tiers
     /// and all — including the model that has NO tiers, which is an answer and
     /// not a gap: Haiku takes no `--effort`, so the sheet must offer it none.
@@ -1765,5 +2402,107 @@ mod tests {
             "at least one model must report its tiers, or the effort menu has nothing to be built from"
         );
         assert!(probe.efforts.is_empty(), "a handshake attributes every tier to a model");
+    }
+
+    // ── no console window (Windows) ──────────────────────────────────────
+    // What linsky saw: every message to a Windows agent opened a black window
+    // titled «claude», and it stayed open. The daemon has no console, so a
+    // console program it starts without CREATE_NO_WINDOW is given a console and
+    // a window of its own. The warm process `prewarm` starts, which then serves
+    // the turn, never had the flag. These two tests stand in for the daemon.
+    // The first starts the second the way the supervisor starts a daemon; the
+    // second starts `claude` every way a message does and asks each process
+    // whether it has a window.
+
+    /// A message to a Windows agent opens no console window.
+    #[cfg(windows)]
+    #[test]
+    fn win_console_a_message_opens_no_window() {
+        let dir = std::env::temp_dir().join(format!("mafold-nowindow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `claude` for the length of the test: a console program that stays up
+        // long enough to be asked, started through `cmd.exe` like npm's
+        // `claude.cmd`. Short-lived on purpose: whatever it leaves running
+        // holds this test's output pipes until it exits.
+        std::fs::write(dir.join("claude.cmd"), "@ping -n 12 127.0.0.1 >nul\r\n").unwrap();
+        let path = format!("{};{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+        let mut cmd = crate::platform::std_command(crate::platform::current_exe().unwrap());
+        cmd.args(["--exact", "harness::claude_code::tests::win_console_daemon_side"])
+            .args(["--include-ignored", "--test-threads=1", "--nocapture"])
+            .env("MAFOLD_CONSOLE_PROBE_DIR", &dir)
+            .env("PATH", path)
+            .env_remove("MAFOLD_CC_POOL")
+            .stdin(Stdio::null());
+        crate::platform::configure_detached(&mut cmd);
+        let out = cmd.output().expect("start the console-less half");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "the console-less half has to actually run:\n{text}");
+    }
+
+    /// The daemon's half, which runs with no console of its own.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "half of win_console_a_message_opens_no_window, which runs it console-less"]
+    async fn win_console_daemon_side() {
+        use crate::platform::{console_window_of, has_console, unhidden_command};
+        let Ok(dir) = std::env::var("MAFOLD_CONSOLE_PROBE_DIR") else { return };
+        assert!(!has_console(), "started the way a daemon is: no console");
+        let claude = std::path::PathBuf::from(super::super::program("claude"));
+        assert!(claude.starts_with(&dir), "PATH finds the stand-in first: {}", claude.display());
+
+        // Positive control: started with no flags (the way the warm process
+        // was), the stand-in DOES get a window here. Without it, "no window"
+        // below could just mean this machine never shows one.
+        let mut bare = unhidden_command(&claude)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let seen = console_window_of(bare.id());
+        let _ = bare.kill();
+        assert_eq!(seen, Some(true), "control: an unflagged child of a console-less process gets a window");
+
+        // A turn's process, spawned exactly as `build_cmd` returns it.
+        let shape = super::super::TurnShape {
+            conv: "c1".into(),
+            surface: "s1".into(),
+            workdir: dir.clone(),
+            session: Some("00000000-0000-4000-8000-000000000001".into()),
+            model: None,
+            effort: None,
+            thinking: None,
+            system: None,
+            env: vec![],
+            mount: Default::default(),
+        };
+        let Built { mut cmd, .. } = build_cmd(&shape, "mafold", false);
+        let mut turn = cmd
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let seen = console_window_of(turn.id().unwrap());
+        let _ = turn.kill().await;
+        assert_eq!(seen, Some(false), "a turn's claude has no window");
+
+        // The warm process a message starts before its turn: the one that had
+        // no flag. It registers itself as a live harness child as it starts.
+        let before: std::collections::HashSet<u32> = super::super::live_children().lock().unwrap().clone();
+        ClaudeCode.prewarm(shape);
+        let began = std::time::Instant::now();
+        let warm = loop {
+            let now = super::super::live_children().lock().unwrap().clone();
+            if let Some(p) = now.difference(&before).next() {
+                break *p;
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(10), "prewarm started nothing");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(console_window_of(warm), Some(false), "the warm claude a message starts has no window");
     }
 }

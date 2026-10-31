@@ -183,9 +183,19 @@ pub fn all(workdir: &str) -> Value {
     let home = home_dir();
     scan_commands(&home.join(".claude/commands"), "", &mut found);
     scan_skills(&home.join(".claude/skills"), "", &mut found);
-    // 3. Installed plugins.
+    // 3. The plugin folders every turn is mounted with (`crate::drive`):
+    //    Mafold's own and the bot's drive, named `<plugin>:<skill>` exactly as
+    //    the agent sees them (the plugin name is the manifest's, not the folder's).
+    let mounted = std::iter::once(crate::drive::mafold_plugin_dir())
+        .chain(crate::drive::current().map(|m| PathBuf::from(m.root())));
+    for dir in mounted {
+        if let Some(name) = crate::drive::plugin_name(&dir) {
+            scan_skills(&dir.join("skills"), &format!("{name}:"), &mut found);
+        }
+    }
+    // 4. Installed plugins.
     scan_plugins(&home, &mut found);
-    // 4. Built-ins.
+    // 5. Built-ins.
     for (cmd, desc) in BUILTINS {
         found.entry((*cmd).to_string()).or_insert(Found {
             description: (*desc).to_string(),
@@ -282,6 +292,17 @@ fn scan_skills(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Found>) {
 
 /// Scan installed plugins (`~/.claude/plugins/installed_plugins.json`) → their
 /// `commands/` + `skills/`, namespaced `plugin:name`.
+/// The short names of the plugins installed into the user's own Claude Code
+/// (`"vercel@claude-plugins-official"` → `vercel`) — the prefixes their
+/// skills go by.
+pub fn installed_plugin_names(home: &Path) -> Vec<String> {
+    std::fs::read_to_string(home.join(".claude/plugins/installed_plugins.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v["plugins"].as_object().map(|o| o.keys().map(|k| k.split('@').next().unwrap_or(k).to_string()).collect()))
+        .unwrap_or_default()
+}
+
 fn scan_plugins(home: &Path, out: &mut BTreeMap<String, Found>) {
     let manifest = home.join(".claude/plugins/installed_plugins.json");
     let Ok(text) = std::fs::read_to_string(&manifest) else {

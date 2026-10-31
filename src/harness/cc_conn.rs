@@ -35,7 +35,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -138,6 +138,14 @@ impl PoolKey {
             sys_sig.unwrap_or_else(|| "-".into()),
         ))
     }
+
+    /// What the process is pointed at (`super::Mount`): its plugin folders and
+    /// memory folder are fixed at spawn, so a process started with one mount
+    /// never serves a turn that needs another — e.g. the moment a bot's memory
+    /// moves into its drive.
+    pub fn with_mount(self, mount: &super::Mount) -> Self {
+        Self(format!("{}\u{1}{}", self.0, mount.signature()))
+    }
 }
 
 /// State the reader task keeps current for the whole life of the connection —
@@ -210,12 +218,20 @@ pub struct Conn {
     /// deregisters the pid from `live_children`.
     child: Option<tokio::process::Child>,
     _guard: super::ChildGuard,
+    /// Ends [`recv`](Self::recv) when the process is gone but its stdout is
+    /// not — see [`super::ExitWatch`].
+    exit: super::ExitWatch,
     pub last_used: Instant,
     pub turns: u32,
     /// True once the hooks were registered over the control channel, so the
     /// caller knows it does NOT also need the `--settings` command hooks (which
     /// would fire a second, duplicate copy of every one of them).
     pub control_hooks: bool,
+    /// Spawned with `--fork-session`: its first turn continues the session it
+    /// was asked to resume under a NEW id, leaving the original to whoever is
+    /// already writing it. Set by the caller that added the flag. Only such a
+    /// connection may serve a turn whose session another turn holds ([`lease`]).
+    pub forks: bool,
 }
 
 /// Callback ids we register. Prefixed because they share a namespace with any
@@ -228,6 +244,7 @@ pub struct Conn {
 /// as still running forever. It stays a command hook, where that contract holds.
 const CB_ASK: &str = "mf-ask";
 const CB_STEER: &str = "mf-steer";
+const CB_SKILLS: &str = "mf-skills";
 
 impl Conn {
     /// Spawn a process for `key`. `configure` receives the `Command` so the
@@ -304,9 +321,11 @@ impl Conn {
             pid,
             child: Some(child),
             _guard: guard,
+            exit: super::ExitWatch::new(pid),
             last_used: Instant::now(),
             turns: 0,
             control_hooks: false,
+            forks: false,
         })
     }
 
@@ -333,6 +352,11 @@ impl Conn {
         if ask {
             pre.push(serde_json::json!({ "matcher": "AskUserQuestion", "hookCallbackIds": [CB_ASK] }));
         }
+        // The Skill tool, so a turn the bot's owner didn't start can't use the
+        // owner's own skills (`crate::drive::skill_gate`). Registered for every
+        // process: whose turn it is is decided per turn (`TurnEnv::
+        // skill_plugins`), and a pooled process serves many turns.
+        pre.push(serde_json::json!({ "matcher": "Skill", "hookCallbackIds": [CB_SKILLS] }));
         let mut hooks = serde_json::Map::new();
         if !pre.is_empty() {
             hooks.insert("PreToolUse".into(), Value::Array(pre));
@@ -375,15 +399,12 @@ impl Conn {
             // this side cannot reconstruct afterwards.
             let tail = self.stderr_text();
             let tail = tail.trim_end();
-            eprintln!(
-                "[cc-pool] hook handshake failed after {}ms ({why}) rid={rid}{}",
-                began.elapsed().as_millis(),
-                if tail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — claude stderr: {}", tail.replace('\n', " ⏎ "))
-                }
-            );
+            let words = format!("[cc-pool] hook handshake failed after {}ms ({why}) rid={rid}", began.elapsed().as_millis());
+            if tail.is_empty() {
+                eprintln!("{words}");
+            } else {
+                eprintln!("{}", crate::logfile::quoting(&format!("{words} — claude stderr"), &tail.replace('\n', " ⏎ ")));
+            }
         }
         self.shared.pending.lock().unwrap().remove(&rid);
         self.control_hooks = ok;
@@ -414,6 +435,14 @@ impl Conn {
 
     pub fn session_id(&self) -> Option<String> {
         self.shared.session.lock().unwrap().clone()
+    }
+
+    /// Its next turn resumes as a fork. Only the FIRST turn of a process
+    /// spawned with `--fork-session` does: after it, the process is the one
+    /// writer of the new session, and handing it to a turn beside another on
+    /// that session is two writers again.
+    pub fn will_fork(&self) -> bool {
+        self.forks && self.turns == 0
     }
 
     /// Live in-process work → this connection must not be evicted.
@@ -471,11 +500,12 @@ impl Conn {
     pub async fn begin_turn(&mut self, prompt: &str, env: crate::turnenv::TurnEnv) -> Result<()> {
         let (dropped, orphan) = self.drain_parked();
         if !orphan.is_empty() {
-            eprintln!(
+            let words = format!(
                 "[cc-pool] ⚠️ discarded {dropped} frame(s) claude produced while parked \
-(pid {}) — that reply belonged to an already-finalized turn and reached nobody: {orphan}",
+(pid {}) — that reply belonged to an already-finalized turn and reached nobody",
                 self.pid().unwrap_or(0)
             );
+            eprintln!("{}", crate::logfile::quoting(&words, &orphan));
         }
         self.shared.plain.lock().unwrap().clear();
         *self.shared.turn.lock().unwrap() = env;
@@ -491,8 +521,26 @@ impl Conn {
     }
 
     /// The next frame of the running turn, or None when the process ended.
+    ///
+    /// "Ended" means the PROCESS, not just its pipe: killed while a process it
+    /// started still holds stdout, claude never delivers EOF, and the turn sat
+    /// open until the 15-minute stall watchdog. Frames already in the pipe are
+    /// still delivered first (`biased`); the caller then takes the same road as
+    /// any other death, and a connection that ended this way is never pooled.
     pub async fn recv(&mut self) -> Option<Value> {
-        self.rx.recv().await
+        tokio::select! {
+            biased;
+            v = self.rx.recv() => v,
+            _ = self.exit.gone() => {
+                self.shared.alive.store(false, Ordering::SeqCst);
+                eprintln!(
+                    "[cc-pool] pid {} exited mid-turn but its stdout is still held open \
+                     (by something it started) — ending the turn",
+                    self.pid.unwrap_or(0)
+                );
+                None
+            }
+        }
     }
 
     /// Stop forwarding; the connection stays up.
@@ -639,6 +687,11 @@ async fn handle_hook(shared: Arc<Shared>, out: UnboundedSender<String>, v: Value
             let f = shared.turn.lock().unwrap().steer.clone();
             if f.is_empty() { None } else { crate::steer_hook::response(&f) }
         }
+        CB_SKILLS => {
+            let plugins = shared.turn.lock().unwrap().skill_plugins.clone();
+            let input = &req["input"];
+            plugins.and_then(|p| crate::drive::skill_gate(input["tool_name"].as_str().unwrap_or("Skill"), &input["tool_input"], &p))
+        }
         _ => None,
     };
     let mut resp = serde_json::json!({ "subtype": "success", "request_id": rid });
@@ -765,7 +818,9 @@ pub fn oneshot_id() -> String {
 /// quietly stops matching what we actually pass.
 pub fn clone_cmd(src: &Command) -> Command {
     let std = src.as_std();
-    let mut c = Command::new(std.get_program());
+    // Creation flags can't be read back from the builder, so the copy gets
+    // them from the same constructor rather than losing them.
+    let mut c = crate::platform::command(std.get_program());
     for a in std.get_args() {
         c.arg(a);
     }
@@ -778,21 +833,69 @@ pub fn clone_cmd(src: &Command) -> Command {
     if let Some(d) = std.get_current_dir() {
         c.current_dir(d);
     }
-    // Not readable back from the builder, so re-applied rather than lost (it is
-    // what keeps a console window from flashing on Windows).
-    crate::platform::no_window(&mut c);
     c
+}
+
+/// Sessions a turn in THIS process is running right now → how many turns.
+fn leased() -> &'static Mutex<HashMap<String, usize>> {
+    static L: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A turn's hold on the session it resumes, released when the turn ends.
+pub struct SessionLease(Option<String>);
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let Some(sid) = self.0.take() else { return };
+        let mut l = leased().lock().unwrap();
+        if let Some(n) = l.get_mut(&sid) {
+            *n -= 1;
+            if *n == 0 {
+                l.remove(&sid);
+            }
+        }
+    }
+}
+
+/// Hold `sid` for the length of a turn. True in the second place when another
+/// turn of ours ALREADY holds it — which means this one must fork.
+///
+/// Print-mode `--resume` does not fork (`commands::session_held_elsewhere`),
+/// and that check deliberately skips our own SDK processes, so two turns of
+/// this daemon on one session each resumed it as-is: two processes appending
+/// to one transcript, the resume pointer landing wherever the last write did
+/// (2026-09-28: two people in one channel, two copies of the agent, one
+/// braided session). Most of those overlaps are now one turn (a mid-turn
+/// message goes INTO the running turn, `agent::pick_turn`); the ones that
+/// can't be — a thread turn beside the channel's, a billed sender beside a
+/// free one — fork here. Check and claim are one step under one lock, so two
+/// turns starting in the same instant can't both see "free".
+pub fn lease(sid: Option<&str>) -> (SessionLease, bool) {
+    let Some(sid) = sid else { return (SessionLease(None), false) };
+    let mut l = leased().lock().unwrap();
+    let n = l.entry(sid.to_string()).or_insert(0);
+    let contended = *n > 0;
+    *n += 1;
+    (SessionLease(Some(sid.to_string())), contended)
+}
+
+/// Is a turn of ours running on `sid` right now? For a prewarm, which holds
+/// nothing itself but must be spawned the way the turn it is for will need.
+pub fn is_leased(sid: &str) -> bool {
+    leased().lock().unwrap().contains_key(sid)
 }
 
 /// Take the warm connection for `key`, if there is a live one. Taking REMOVES
 /// it: a second concurrent turn in the same conversation finds nothing and
-/// opens its own process, which is exactly what happens today (turns in one
-/// conversation already run concurrently and fork the session).
+/// opens its own process.
 /// `want_session` is the transcript this turn asked to resume. A warm
 /// connection is only the right one when it is ALREADY on that session —
 /// otherwise the turn would silently continue a different conversation thread.
 /// `None` means "no prior session" (a first turn, or a deliberate reset), which
 /// never reuses: starting fresh is exactly what was asked for.
+/// `must_fork`: another turn holds that session ([`lease`]), so only a
+/// connection spawned to fork it will do.
 /// [`take`], but if a prewarm for this key is still on its way, WAIT for it
 /// instead of racing it.
 ///
@@ -802,8 +905,8 @@ pub fn clone_cmd(src: &Command) -> Command {
 /// ~1.3s to come up. The turn then starts its own — two processes for one key,
 /// one of them useless. Waiting costs nothing over that: the alternative was
 /// paying the same startup on a process nobody else can use.
-pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>) -> Option<Conn> {
-    if let Some(c) = take(key, want_session) {
+pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>, must_fork: bool) -> Option<Conn> {
+    if let Some(c) = take(key, want_session, must_fork) {
         return Some(c);
     }
     // Bounded by what a spawn costs, not by hope: past this the prewarm is not
@@ -817,7 +920,7 @@ pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>) -> Option<C
             break; // nothing in flight — don't wait on something that isn't coming
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
-        if let Some(c) = take(key, want_session) {
+        if let Some(c) = take(key, want_session, must_fork) {
             // The half of the startup this turn still had to pay for. Subtract
             // it from the prewarm's own duration (logged when it lands) and the
             // rest is what the overlap actually hid.
@@ -825,16 +928,19 @@ pub async fn take_or_wait(key: &PoolKey, want_session: Option<&str>) -> Option<C
             return Some(c);
         }
     }
-    take(key, want_session)
+    take(key, want_session, must_fork)
 }
 
-pub fn take(key: &PoolKey, want_session: Option<&str>) -> Option<Conn> {
+pub fn take(key: &PoolKey, want_session: Option<&str>, must_fork: bool) -> Option<Conn> {
     let want = want_session?;
     let mut p = pool().lock().unwrap();
     sweep(&mut p);
-    let i = p
-        .iter()
-        .position(|c| &c.key == key && c.alive() && c.session_id().as_deref() == Some(want))?;
+    let i = p.iter().position(|c| {
+        &c.key == key
+            && c.alive()
+            && c.session_id().as_deref() == Some(want)
+            && (!must_fork || c.will_fork())
+    })?;
     let c = p.remove(i);
     let (pid, turns, warm) = (c.pid(), c.turns, p.len());
     drop(p);
@@ -901,6 +1007,24 @@ fn orphaned_text_preview(frames: &[Value]) -> String {
     }
     let shown: String = flat.chars().take(PREVIEW).collect();
     format!("{shown}{}", if flat.chars().count() > PREVIEW { "…" } else { "" })
+}
+
+/// Retire the parked processes that could be started afresh at no cost: the
+/// bot's skills changed, and a process lists its skills once, at start. One
+/// running in-process work (a subagent, a workflow) is kept — killing it would
+/// kill that work; it picks up the new skills when it's next replaced.
+/// Returns how many went.
+pub fn drop_idle() -> usize {
+    let mut p = pool().lock().unwrap();
+    let before = p.len();
+    p.retain_mut(|c| {
+        if c.busy_with_tasks() {
+            return true;
+        }
+        c.kill();
+        false
+    });
+    before - p.len()
 }
 
 /// Drop everything — called before the daemon re-execs itself so an update
@@ -1017,7 +1141,31 @@ mod tests {
     #[test]
     fn a_turn_with_no_prior_session_never_takes_a_warm_one() {
         let k = key("opus");
-        assert!(take(&k, None).is_none(), "no session asked for → no reuse");
+        assert!(take(&k, None, false).is_none(), "no session asked for → no reuse");
+    }
+
+    /// Two turns of ours on one session: the first holds it as-is, every one
+    /// after it is told to fork, and the hold ends with the turn — the next
+    /// turn after both have finished resumes plainly again.
+    #[test]
+    fn a_second_turn_on_a_held_session_is_told_to_fork() {
+        let sid = format!("lease-test-{}", std::process::id());
+        let (first, contended) = lease(Some(&sid));
+        assert!(!contended, "the first turn on a session forks nothing");
+        assert!(is_leased(&sid));
+        let (second, contended) = lease(Some(&sid));
+        assert!(contended, "a second writer on one transcript");
+        drop(first);
+        assert!(is_leased(&sid), "the second still holds it");
+        let (third, contended) = lease(Some(&sid));
+        assert!(contended);
+        drop(second);
+        drop(third);
+        assert!(!is_leased(&sid), "a hold that outlives its turn forks every turn after it");
+        assert!(!lease(Some(&sid)).1);
+        // No session = nothing to share.
+        assert!(!lease(None).1);
+        assert!(!lease(None).1);
     }
 
     #[test]
@@ -1157,7 +1305,7 @@ mod tests {
     /// A stub standing in for claude: `script` owns stdin/stdout the same way
     /// the real CLI does, so the handshake runs its true path.
     async fn stub(script: &str) -> Conn {
-        let mut cmd = Command::new("bash");
+        let mut cmd = crate::platform::command("bash");
         cmd.arg("-c").arg(script);
         Conn::spawn(key("opus"), "t1".into(), String::new(), cmd, "/tmp")
             .await
@@ -1166,6 +1314,56 @@ mod tests {
 
     const REPLY: &str =
         r#"{"type":"control_response","response":{"subtype":"%S","request_id":"mf-init-t1"}}"#;
+
+    /// claude killed mid-turn while a process it started still holds its
+    /// stdout (the K case of `scripts/beat-alive-e2e.sh`): no EOF ever comes,
+    /// and the turn used to sit there until the 15-minute stall watchdog. The
+    /// process being gone has to end the stream — after what was already in the
+    /// pipe has been read — and the connection must never be pooled again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn harness_exit_ends_the_turn_even_if_a_child_holds_the_pipe() {
+        let mut c = stub(
+            r#"read -r _; echo '{"type":"assistant","message":{"content":[]},"session_id":"s-orphan"}'; sleep 30 & sleep 30"#,
+        )
+        .await;
+        c.begin_turn("hi", Default::default()).await.expect("the turn starts");
+        let first = tokio::time::timeout(Duration::from_secs(10), c.recv())
+            .await
+            .expect("the first frame arrives")
+            .expect("a frame, not the end");
+        assert_eq!(first["session_id"], "s-orphan");
+
+        crate::platform::terminate(c.pid().expect("a pid"));
+        let killed = Instant::now();
+        let end = tokio::time::timeout(Duration::from_secs(20), c.recv())
+            .await
+            .expect("the turn was still waiting 20s after its process died — a child of it holds the pipe");
+        assert!(end.is_none(), "once the process is gone the stream ends, got {end:?}");
+        assert!(
+            killed.elapsed() < super::super::EXIT_DRAIN + Duration::from_secs(2),
+            "ended {:?} after the kill — one {:?} drain, not more",
+            killed.elapsed(),
+            super::super::EXIT_DRAIN
+        );
+        assert!(!c.alive(), "a dead process must never go back in the pool");
+    }
+
+    /// A process spawned to fork a held session forks ONCE — its first turn.
+    /// Parked after that it is the only writer of the new session, and a turn
+    /// that must fork has to be given a different process, not this one.
+    #[tokio::test]
+    async fn a_forking_process_forks_only_its_first_turn() {
+        let mut plain = stub("cat > /dev/null").await;
+        assert!(!plain.will_fork(), "spawned without --fork-session");
+        let mut fork = stub("cat > /dev/null").await;
+        fork.forks = true;
+        assert!(fork.will_fork());
+        fork.end_turn();
+        assert!(!fork.will_fork(), "already writing its own session — a second writer again");
+        plain.kill();
+        fork.kill();
+    }
 
     #[tokio::test]
     async fn a_cli_that_answers_the_handshake_registers_control_hooks() {
@@ -1176,6 +1374,50 @@ mod tests {
         .await;
         assert!(c.register_hooks(true, true).await);
         assert!(c.control_hooks);
+    }
+
+    /// The skill gate over the control channel (`crate::drive::skill_gate`):
+    /// registered with every handshake, silent on the owner's turn, and on
+    /// anyone else's refusing a skill from outside the mounted plugins.
+    #[tokio::test]
+    async fn the_skill_callback_holds_a_non_owner_turn_to_the_mounted_plugins() {
+        let sent = std::env::temp_dir().join(format!("mafold-cc-init-{}.json", std::process::id()));
+        let mut c = stub(&format!(
+            "read -r l; printf '%s' \"$l\" > {}; echo '{}'; cat > /dev/null",
+            sent.display(),
+            REPLY.replace("%S", "success")
+        ))
+        .await;
+        assert!(c.register_hooks(false, false).await);
+        let init: Value = serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&sent);
+        assert_eq!(
+            init["request"]["hooks"]["PreToolUse"],
+            serde_json::json!([{ "matcher": "Skill", "hookCallbackIds": [CB_SKILLS] }]),
+            "registered even with nothing else to register: {init}"
+        );
+
+        let shared = test_shared();
+        let answer = |skill: &str| {
+            let shared = shared.clone();
+            let v = serde_json::json!({ "type": "control_request", "request_id": "r1", "request": {
+                "subtype": "hook_callback", "callback_id": CB_SKILLS,
+                "input": { "hook_event_name": "PreToolUse", "tool_name": "Skill", "tool_input": { "skill": skill } } } });
+            async move {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                handle_hook(shared, tx, v).await;
+                serde_json::from_str::<Value>(&rx.recv().await.unwrap()).unwrap()["response"].clone()
+            }
+        };
+        let r = answer("superpowers:brainstorming").await;
+        assert_eq!((r["subtype"].as_str(), r.get("response")), (Some("success"), None), "the owner's turn: any skill");
+        shared.turn.lock().unwrap().skill_plugins = Some(vec!["tea-bot".into(), "mafold".into()]);
+        let r = answer("superpowers:brainstorming").await;
+        assert_eq!(r["request_id"], "r1");
+        assert_eq!(r["response"]["hookSpecificOutput"]["permissionDecision"], "deny", "{r}");
+        for ok in ["tea-bot:brew", "mafold:mafold-video"] {
+            assert_eq!(answer(ok).await.get("response"), None, "{ok}");
+        }
     }
 
     /// The reply we don't recognise must fail FAST — conflating it with the

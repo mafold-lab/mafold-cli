@@ -14,13 +14,16 @@
 //!   react` — one message per call, as many as it likes, none at all being a
 //!   perfectly good outcome.
 //! * **One mind.** One harness session for the whole account, one turn at a
-//!   time, rolled over daily; the working directory is its notebook.
+//!   time, rolled over the way a bot's session is (`session_life`: full, or
+//!   idle); the working directory is its notebook. A session is handed each
+//!   message once — what it already holds is not given again.
 //!
 //! Nothing here knows which account it runs: a bot can run it as well as a
 //! person (`--account`). No special case for anyone.
 
 use crate::client::{Client, Dest};
 use crate::harness::{self, AgentEvent, Turn};
+use mafold_core::mafold_types::units::Units;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,6 +39,11 @@ pub struct InboxOpts {
     /// account. Everyone else's messages are information to be judged.
     #[arg(long, env = "MAFOLD_INBOX_PRINCIPAL")]
     pub principal: Option<String>,
+    /// Another handle that addresses THIS account's person (repeatable): an @
+    /// or a reply to it wakes the loop like one to this account. A clone
+    /// passes its principal — the team writes @opsdu, not @realopsdu.
+    #[arg(long = "alias")]
+    pub aliases: Vec<String>,
     /// Seconds between looks during active hours.
     #[arg(long, default_value_t = 600)]
     pub heartbeat: u64,
@@ -95,6 +103,13 @@ pub struct InboxOpts {
     /// Reasoning effort for the harness (low/medium/high/xhigh/max).
     #[arg(long)]
     pub effort: Option<String>,
+    /// The harness's built-in tools, comma-separated (Claude Code `--tools`;
+    /// other harnesses keep their own). This mode acts through `mafold` in a
+    /// shell and keeps its notebook in files; every other tool is a
+    /// description re-read on every model call — 13 unused ones were 11.5k
+    /// tokens of each request (2026-10-25). `default` = the harness's full set.
+    #[arg(long, default_value = "Bash,Read,Edit,Write,WebFetch,WebSearch")]
+    pub tools: String,
 }
 
 /// At most this many messages are read from one timeline per look.
@@ -122,9 +137,16 @@ struct State {
     /// The one harness session — the account's single mind.
     #[serde(default)]
     session: Option<String>,
-    /// Local date the session was started on; a new day starts a new one.
+    /// What `session_life` knows about it — its context when its last turn
+    /// ended, and when that was — keyed like a bot's ([`surface_of`]). It ends
+    /// the way a bot's session does ([`ends`]). Kept here rather than in
+    /// `~/.mafold/session_life.json`: every daemon process saves that file
+    /// whole, and a second writer's record would be dropped.
     #[serde(default)]
-    session_day: Option<String>,
+    life: HashMap<String, crate::session_life::Life>,
+    /// What that session already holds ([`Known`]).
+    #[serde(default)]
+    known: Known,
     /// Timeline key → consecutive exchanges with AI and no human in between.
     #[serde(default)]
     ai_streak: HashMap<String, u32>,
@@ -150,6 +172,89 @@ struct State {
     /// ask`). While it waits there is no new patrol — one open question at a time.
     #[serde(default)]
     pending_ask: Option<PendingAsk>,
+    /// Replies that were still being written when this loop's read marker
+    /// passed them. The server brings such a reply back as one more unread
+    /// once it finishes (a "resurrection") — but it sits BEFORE the marker,
+    /// where counting back from the newest line never reaches. This list is
+    /// how the loop knows which message that unread is.
+    #[serde(default)]
+    watching: Vec<Watched>,
+    /// Timeline key → `created_at` of the newest message this loop marked read
+    /// there: what tells a resurrected reply (finished behind the marker) from
+    /// one the badge counts in place.
+    #[serde(default)]
+    marked_at: HashMap<String, String>,
+}
+
+/// A reply still being written that the marker moved past (see [`State::watching`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct Watched {
+    key: String,
+    chat_id: String,
+    #[serde(default)]
+    channel_id: Option<String>,
+    id: String,
+    created_at: String,
+    /// Epoch secs it was first seen; long-dead drafts are let go.
+    since: u64,
+}
+
+/// How long a draft is watched for. One still unfinished after this is an
+/// abandoned turn, not a reply on its way.
+const WATCH_SECS: u64 = 2 * 24 * 3600;
+
+/// What the current session already holds, so a resumed one isn't handed it
+/// again. Every look used to give each timeline a few already-read lines of
+/// context, as if each turn started fresh — and the session, resumed all day,
+/// held 323 messages 1393 times (2026-10-25: 29% of one 605k-token request).
+/// Starts over with every new session and every compaction.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+struct Known {
+    /// The session this is about. Any other one holds none of it.
+    #[serde(default)]
+    session: Option<String>,
+    /// Messages it was handed in full — a look's lines, a steered aside — or sent.
+    #[serde(default)]
+    msgs: HashSet<String>,
+    /// Replies still being written whose status line it was given → which
+    /// status ([`status_kind`]). Told again only when that changes.
+    #[serde(default)]
+    drafts: HashMap<String, char>,
+}
+
+impl Known {
+    /// What `session` already holds: this record, if it is about that
+    /// session — nothing for a new one (None) or another.
+    fn of(&self, session: Option<&str>) -> Option<&Known> {
+        (session.is_some() && self.session.as_deref() == session).then_some(self)
+    }
+
+    fn has(&self, m: &Value) -> bool {
+        m["id"].as_str().is_some_and(|id| self.msgs.contains(id))
+    }
+
+    fn told(&self, d: &Draft) -> bool {
+        self.drafts.get(&d.id) == Some(&d.kind)
+    }
+
+    /// A turn on `session` ran: what it was handed and what it sent are in
+    /// that session now. A compaction rewrote the session into a summary —
+    /// nothing in it is verbatim any more, so nothing counts as held.
+    fn settle(
+        &mut self,
+        session: Option<&str>,
+        compacted: bool,
+        msgs: impl IntoIterator<Item = String>,
+        drafts: impl IntoIterator<Item = (String, char)>,
+    ) {
+        if compacted || self.session.as_deref() != session {
+            *self = Known { session: session.map(str::to_string), ..Default::default() };
+        }
+        if !compacted {
+            self.msgs.extend(msgs);
+            self.drafts.extend(drafts);
+        }
+    }
 }
 
 /// One piece of work a patrol found, as the agent writes it to `proposals.json`
@@ -340,6 +445,32 @@ fn save_state(dir: &Path, s: &State) {
     }
 }
 
+/// `--tools` as a mount takes it: `default` (or nothing) = the harness's own set.
+fn tools_of(arg: &str) -> Option<String> {
+    let t = arg.trim();
+    (!t.is_empty() && !t.eq_ignore_ascii_case("default")).then(|| t.to_string())
+}
+
+/// The surface an inbox turn runs on: its process's name in the pool, and the
+/// key its session's `session_life` record is kept under.
+fn surface_of(me_lc: &str) -> String {
+    format!("inbox____{}", me_lc.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '-'), "_"))
+}
+
+/// Has the session run its course, by the rule a bot's session ends by
+/// (`session_life`: past its context limit, or idle until its cache is gone)?
+/// Then the session it was, and why. One this loop holds no record of — from
+/// before it kept them — isn't resumed either: nothing says how big it grew.
+/// It used to roll over at midnight instead: by evening one day's session
+/// carried 600k tokens into every call.
+fn ends(state: &State, surface: &str, now: i64) -> Option<(String, String)> {
+    let sid = state.session.as_deref()?;
+    if !state.life.get(surface).is_some_and(|l| l.session == sid) {
+        return Some((sid.to_string(), "no record of how big it is".into()));
+    }
+    crate::session_life::verdict_in(&state.life, surface, sid, now).map(|why| (sid.to_string(), why.to_string()))
+}
+
 // ───────────────────────────── time ─────────────────────────────
 
 fn now_secs() -> u64 {
@@ -415,10 +546,10 @@ fn timeline_key(chat_id: &str, channel_id: Option<&str>) -> String {
     }
 }
 
-/// The glance: every timeline with an unread badge. One `getChats`, plus one
-/// `listChannels` per forum whose channels have unread.
+/// The glance: every timeline with an unread badge. One `getChats` (unread
+/// only), plus one `listChannels` per forum whose channels have unread.
 async fn unread_timelines(client: &Client, me_lc: &str) -> Result<Vec<Timeline>> {
-    let list = client.chats().await?;
+    let list = client.unread_chats().await?;
     let mut out = Vec::new();
     for c in list["items"].as_array().cloned().unwrap_or_default() {
         let Some(id) = c["id"].as_str() else { continue };
@@ -475,25 +606,283 @@ fn is_bot(m: &Value) -> bool {
     m["sender"]["kind"].as_str().is_some_and(|k| k.eq_ignore_ascii_case("bot"))
 }
 
-/// A reply still streaming. Content-driven (the `generating` tag is removed by
-/// the last push), never inferred from `finalized_at`.
-fn in_progress(m: &Value) -> bool {
-    m["content"].as_str().is_some_and(|c| c.contains("{% mafold/generating"))
+/// A reply still streaming: it still ends on its live `generating` card (the
+/// last push removes it), or it is an agent's draft that was never finalized. A
+/// person's message is always finalized on send, so the second test only ever
+/// holds a bot's reply back — the 133 KB one that woke this loop every 40
+/// seconds while it was still being written, before the tag-only test caught up.
+///
+/// Only the card on the END counts ([`trailing_generating`]). A finished reply
+/// that quoted the tag mid-sentence once passed for a draft: the badge counted
+/// it, this loop skipped it and handed over the line before it on every look
+/// for twelve days, and the marker never got past it.
+///
+/// [`trailing_generating`]: mafold_transcript::render::trailing_generating
+pub(crate) fn in_progress(m: &Value) -> bool {
+    m["content"].as_str().is_some_and(|c| mafold_transcript::render::trailing_generating(c).is_some())
+        || (is_bot(m) && m.get("finalized_at").is_some_and(Value::is_null))
 }
 
-/// The last messages of a timeline, oldest first, cut before the first reply
-/// that is still being written — read up to it, never past it. The loop's own
-/// log posts (`skip`) are dropped: they are bookkeeping, not conversation.
+/// What the writing agent reports about a reply in progress — the attributes
+/// of its `{% mafold/generating … /%}` tag.
+#[derive(Debug, Default, PartialEq)]
+struct Progress {
+    started_ms: Option<u64>,
+    beat_at_ms: Option<u64>,
+    shells: u64,
+    awaiting: Option<String>,
+}
+
+/// One attribute of a card tag's inside: `name=123` or `name="text"`.
+fn tag_attr<'a>(inner: &'a str, name: &str) -> Option<&'a str> {
+    let at = inner.find(&format!(" {name}="))? + name.len() + 2;
+    let rest = &inner[at..];
+    if let Some(q) = rest.strip_prefix('"') {
+        q.find('"').map(|e| &q[..e])
+    } else {
+        Some(rest.split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or(""))
+    }
+}
+
+fn progress_of(content: &str) -> Option<Progress> {
+    const OPEN: &str = "{% mafold/generating";
+    // The live card on the end — an earlier mention of the tag is prose.
+    let card = mafold_transcript::render::trailing_generating(content)?;
+    let inner = card.strip_prefix(OPEN)?;
+    let inner = &inner[..inner.find("%}")?];
+    let inner = format!(" {}", inner.trim());
+    let num = |n: &str| tag_attr(&inner, n).and_then(|v| v.parse::<u64>().ok());
+    Some(Progress {
+        started_ms: num("started"),
+        beat_at_ms: num("beatAt"),
+        shells: num("shells").unwrap_or(0),
+        awaiting: tag_attr(&inner, "awaiting").map(|w| w.replace("&quot;", "\"")).filter(|w| !w.trim().is_empty()),
+    })
+}
+
+/// A reply this long without a heartbeat has stopped, as far as anyone can tell.
+const STALL_MS: u64 = 10 * 60 * 1000;
+/// How much of what a reply in progress has written so far is shown.
+const WORKING_TAIL: usize = 120;
+
+/// 「45 秒」「3 分 12 秒」「1 小时 20 分」 — how long something has been going
+/// on, on the shared ruler (`mafold_types::units`), whole seconds.
+fn span_zh(ms: u64) -> String {
+    Units::new("zh-Hans").elapsed(ms as f64)
+}
+
+/// What a reply still being written ([`in_progress`]) is doing, in one line:
+/// alive and for how long, parked on a card, or gone quiet — and the last
+/// thing it has written so far. Hiding the draft made "they're on it" and
+/// "nobody answered" look identical to this loop, and it @-ed agents that
+/// were already halfway through their answer.
+pub(crate) fn working_status(m: &Value, now_ms: u64) -> String {
+    let raw = m["content"].as_str().unwrap_or("");
+    let mut s = match progress_of(raw) {
+        Some(p) => {
+            let started = p.started_ms.or_else(|| secs_of(Some(created(m))).map(|s| s as u64 * 1000));
+            let elapsed_ms = started.map(|t| now_ms.saturating_sub(t));
+            let elapsed = elapsed_ms.map(span_zh).unwrap_or_else(|| "?".into());
+            let ago = |ms: u64| Units::new("zh-Hans").ago(ms as f64 / 1000.0);
+            let quiet = p.beat_at_ms.map(|b| now_ms.saturating_sub(b));
+            if let Some(who) = &p.awaiting {
+                format!("⏸ 在等 @{} 回答卡片(已写 {elapsed})", who.trim_start_matches('@'))
+            } else if let Some(q) = quiet.filter(|q| *q >= STALL_MS) {
+                let began = elapsed_ms.map(ago).unwrap_or_else(|| "?".into());
+                format!("⚠️ {}没动静了(开写 {began}) —— 可能卡住了", span_zh(q))
+            } else {
+                let mut s = format!("⏳ 正在回复 · 已写 {elapsed}");
+                match quiet {
+                    Some(q) if q < 60_000 => s.push_str(" · 刚有动静"),
+                    Some(q) => s.push_str(&format!(" · 最后动静 {}", ago(q))),
+                    None => {}
+                }
+                if p.shells > 0 {
+                    s.push_str(&format!(" · {} 个后台任务", p.shells));
+                }
+                s
+            }
+        }
+        None => "⏳ 草稿还没写完(没有进度信号)".into(),
+    };
+    let prose = collapse_blank(&mafold_transcript::render::strip_cards(raw));
+    let prose = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !prose.is_empty() {
+        let n = prose.chars().count();
+        let tail: String = prose.chars().skip(n.saturating_sub(WORKING_TAIL)).collect();
+        s.push_str(&format!(" · 已写到:「{}{tail}」", if n > WORKING_TAIL { "…" } else { "" }));
+    }
+    s
+}
+
+/// [`working_status`] with the same head a message line has (`#id [when] @who(AI)`).
+fn working_line(m: &Value, me_lc: &str, principal: Option<&str>, off: i32, now_ms: u64) -> String {
+    format!("{}: {}", msg_head(m, me_lc, principal, off), working_status(m, now_ms))
+}
+
+/// Which status a [`working_status`] reports — its first character: ⏳
+/// writing, ⏸ waiting on a card, ⚠ gone quiet. "Still writing, two minutes
+/// further on" is no news to a session that was told it was writing.
+fn status_kind(status: &str) -> char {
+    status.chars().next().unwrap_or('⏳')
+}
+
+/// A reply still being written, as a look hands it over: its [`working_line`]
+/// and which status that is.
+#[derive(Debug, Clone, PartialEq)]
+struct Draft {
+    id: String,
+    kind: char,
+    line: String,
+}
+
+impl Draft {
+    fn of(m: &Value, me_lc: &str, principal: Option<&str>, off: i32, now_ms: u64) -> Draft {
+        let status = working_status(m, now_ms);
+        Draft {
+            id: m["id"].as_str().unwrap_or("").to_string(),
+            kind: status_kind(&status),
+            line: format!("{}: {status}", msg_head(m, me_lc, principal, off)),
+        }
+    }
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// `created_at` order, robust to the server's mix of `…:12Z` and `…:12.345678Z`
+/// (plain string order puts `12.3Z` before `12Z`).
+fn later(a: &str, b: &str) -> bool {
+    let micros = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| t.timestamp_micros());
+    match (micros(a), micros(b)) {
+        (Some(x), Some(y)) => x > y,
+        _ => a > b,
+    }
+}
+
+/// The last messages of a timeline, oldest first — replies still being written
+/// included: [`arrange`] decides what each one is. The loop's own log posts
+/// (`skip`) are dropped: they are bookkeeping, not conversation.
 async fn read_timeline(client: &Client, tl: &Timeline, skip: &HashSet<String>) -> Result<Vec<Value>> {
     let n = (tl.unread + CONTEXT_LINES).clamp(1, MAX_PER_TIMELINE + CONTEXT_LINES);
     let page = client.get_chat_history(&tl.chat_id, n, tl.channel_id.as_deref()).await?;
     let mut items = page["items"].as_array().cloned().unwrap_or_default();
     items.retain(|m| m["id"].as_str().is_none_or(|id| !skip.contains(id)));
     items.sort_by(|a, b| created(a).cmp(created(b)));
-    if let Some(i) = items.iter().position(in_progress) {
-        items.truncate(i);
-    }
     Ok(items)
+}
+
+/// One timeline's page, sorted out.
+#[derive(Debug, Default)]
+struct Arranged {
+    context: Vec<Value>,
+    new: Vec<Value>,
+    /// Other people's replies still being written — shown as status lines.
+    working: Vec<Value>,
+}
+
+/// Split a timeline's page into context / new / still being written.
+///
+/// The server's badge (`unread`) counts two things beyond "finished messages
+/// after my marker": a reply still being written counts in place like any
+/// message, and a reply that FINISHED after my marker had already passed it
+/// counts once more (the server resurrects it). `finished` are the watched
+/// replies that have finished since (fetched by id); `marked_at` is the newest
+/// message this loop marked read here — a finished reply at or before it is a
+/// resurrection and is delivered as new, wherever it sits in the page.
+fn arrange(items: &[Value], unread: usize, me_lc: &str, finished: Vec<Value>, marked_at: Option<&str>) -> Arranged {
+    let working: Vec<Value> = items.iter().filter(|m| in_progress(m) && sender(m) != me_lc).cloned().collect();
+    let done: Vec<Value> = items.iter().filter(|m| !in_progress(m)).cloned().collect();
+    let resurrected: Vec<Value> =
+        finished.into_iter().filter(|m| marked_at.is_some_and(|at| !later(created(m), at))).collect();
+    let unread_drafts = working.iter().filter(|m| marked_at.is_none_or(|at| later(created(m), at))).count();
+    let positional = unread.saturating_sub(resurrected.len() + unread_drafts);
+    let (mut context, mut new) = split_new(&done, positional, me_lc);
+    for r in resurrected {
+        let id = r["id"].clone();
+        context.retain(|m| m["id"] != id);
+        new.retain(|m| m["id"] != id);
+        new.push(r);
+    }
+    new.sort_by(|a, b| created(a).cmp(created(b)));
+    Arranged { context, new, working }
+}
+
+/// The watched replies of one timeline that have finished since (`finished`),
+/// and the ids to stop watching outright (`gone`: deleted, or no longer
+/// readable). One `getMessage` per watched reply — only for timelines being
+/// read, and a loop rarely has more than a few replies in flight.
+async fn check_watched(client: &Client, watching: &[Watched], key: &str) -> (Vec<Value>, Vec<String>) {
+    let mut finished = Vec::new();
+    let mut gone = Vec::new();
+    for w in watching.iter().filter(|w| w.key == key) {
+        match client.get_message(&w.id).await {
+            Ok(m) if m.get("id").is_some() => {
+                if m["deleted"].as_bool() == Some(true) {
+                    gone.push(w.id.clone());
+                } else if !in_progress(&m) {
+                    finished.push(m);
+                }
+            }
+            Ok(_) => gone.push(w.id.clone()),
+            Err(e) => {
+                let s = format!("{e:#}");
+                if s.contains("404") || s.contains("not found") || s.contains("permission") {
+                    gone.push(w.id.clone());
+                } else {
+                    eprintln!("inbox: checking the reply {} failed: {s}", w.id);
+                }
+            }
+        }
+    }
+    (finished, gone)
+}
+
+/// What a turn learned about replies in flight, applied only once its markers
+/// actually moved: a draft is watched when the marker passes it, and a watched
+/// reply is let go when it has been delivered finished.
+#[derive(Default)]
+struct Book {
+    watch: Vec<Watched>,
+    delivered: HashSet<String>,
+}
+
+impl Book {
+    fn saw_draft(&mut self, tl: &Timeline, d: &Value) {
+        let Some(id) = d["id"].as_str() else { return };
+        if self.watch.iter().any(|w| w.id == id) {
+            return;
+        }
+        self.watch.push(Watched {
+            key: tl.key(),
+            chat_id: tl.chat_id.clone(),
+            channel_id: tl.channel_id.clone(),
+            id: id.to_string(),
+            created_at: created(d).to_string(),
+            since: now_secs(),
+        });
+    }
+
+    /// After `markers.mark`: remember how far each timeline was marked, watch
+    /// the drafts the marker passed, drop what was delivered or has expired.
+    fn settle(self, state: &mut State, markers: &Markers) {
+        for (key, at) in markers.newest() {
+            let e = state.marked_at.entry(key).or_default();
+            if e.is_empty() || later(&at, e) {
+                *e = at;
+            }
+        }
+        state.watching.retain(|w| !self.delivered.contains(&w.id));
+        for w in self.watch {
+            let passed = state.marked_at.get(&w.key).is_some_and(|at| later(at, &w.created_at));
+            if passed && !state.watching.iter().any(|x| x.id == w.id) {
+                state.watching.push(w);
+            }
+        }
+        let now = now_secs();
+        state.watching.retain(|w| now.saturating_sub(w.since) < WATCH_SECS);
+    }
 }
 
 /// Split a page into (already read, new). The badge counts other people's
@@ -528,9 +917,13 @@ fn secs_of(ts: Option<&str>) -> Option<i64> {
 /// timeline or a forum channel) whose newest message falls inside the window,
 /// newest first, with its last few lines — the chat list with previews a person
 /// scans before deciding what to open. DMs stay out: what matters there
-/// arrives as unread anyway. Read-only: no marker moves.
-async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> String {
-    let Ok(list) = ctx.client.chats().await else { return String::new() };
+/// arrives as unread anyway. Read-only: no marker moves. Also returns, per
+/// timeline shown, the newest message in it — what the agent has now seen
+/// there (the send guard's starting point). A line the session already holds
+/// (`known`) is only counted: it is right there above.
+async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>, known: Option<&Known>) -> (String, Vec<(String, String)>) {
+    let mut shown: Vec<(String, String)> = Vec::new();
+    let Ok(list) = ctx.client.chats().await else { return (String::new(), shown) };
     let off = ctx.opts.utc_offset;
     let mut spots: Vec<(i64, Timeline)> = Vec::new();
     for c in list["items"].as_array().cloned().unwrap_or_default() {
@@ -572,43 +965,83 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>) -> String {
     spots.truncate(OVERVIEW_SPOTS);
 
     let mut out = String::new();
+    let now = now_ms();
     for (_, tl) in &spots {
         let Ok(page) = ctx.client.get_chat_history(&tl.chat_id, OVERVIEW_LINES, tl.channel_id.as_deref()).await else {
             continue;
         };
         let mut items = page["items"].as_array().cloned().unwrap_or_default();
-        items.retain(|m| !in_progress(m) && m["id"].as_str().is_none_or(|id| !skip.contains(id)));
+        items.retain(|m| m["id"].as_str().is_none_or(|id| !skip.contains(id)));
         items.sort_by(|a, b| created(a).cmp(created(b)));
         if items.is_empty() {
             continue;
         }
+        if let Some(last) = items.last() {
+            shown.push((tl.key(), created(last).to_string()));
+        }
         out.push_str(&format!("\n== {} ==\n", tl.heading()));
+        let mut held = 0usize;
         for m in &items {
-            let line = render_msg(m, &ctx.me_lc, ctx.principal.as_deref(), off);
-            out.push_str(&clip(&line, OVERVIEW_BODY + 80));
+            if known.is_some_and(|k| k.has(m)) {
+                held += 1;
+                continue;
+            }
+            // A reply still being written is a status ("on it since …"), not
+            // a half-sentence to read as the answer.
+            let line = if in_progress(m) {
+                if sender(m) == ctx.me_lc {
+                    continue;
+                }
+                // Already bounded, and its point is at the START ("⏳ …").
+                working_line(m, &ctx.me_lc, ctx.principal.as_deref(), off, now)
+            } else {
+                let line = render_msg(m, &ctx.me_lc, ctx.principal.as_deref(), off);
+                // An agent's line keeps its END (the conclusion), a person's its start.
+                if is_bot(m) { clip_body_tail(&line, OVERVIEW_BODY + 80) } else { clip(&line, OVERVIEW_BODY + 80) }
+            };
+            out.push_str(&line);
             out.push('\n');
+        }
+        if held > 0 {
+            out.push_str(&format!("(另有 {held} 条这个会话里给你看过)\n"));
         }
     }
     if dropped > 0 {
         out.push_str(&format!("\n(还有 {dropped} 处也有动静,没列出来 —— `mafold chats` / `mafold channels list <chat>` 自己看)\n"));
     }
-    out
+    (out, shown)
 }
 
 /// Would a person's phone have buzzed for this? A DM, an @, a reply to me —
-/// from a PERSON. From an AI only an explicit @ counts: the same one door the
+/// from a PERSON. From an AI only an explicit @ counts — one that opens a line
+/// (`mafold_transcript::mention`): the same one door the
 /// bot loop opens to AI senders (`agent.rs` `should_respond`), which is what
 /// keeps two agents from answering each other forever.
 fn wakes_now(m: &Value, me_lc: &str, is_dm: bool) -> bool {
-    if sender(m) == me_lc || in_progress(m) {
+    wakes_now_as(m, me_lc, aliases(), is_dm)
+}
+
+/// `wakes_now` with the aliases explicit. An alias is another handle for the
+/// same person (a clone's principal): the team @s @opsdu, not @realopsdu, so
+/// for the clone an @ or a reply to opsdu is an @ or a reply to it.
+fn wakes_now_as(m: &Value, me_lc: &str, aliases: &[String], is_dm: bool) -> bool {
+    let who = sender(m);
+    if who == me_lc || in_progress(m) || aliases.iter().any(|a| *a == who) {
         return false;
     }
     let content = m["content"].as_str().unwrap_or("");
-    let at_me = crate::agent::mentions_me(content, me_lc);
-    if is_bot(m) {
+    // Called, by the one rule the bot gates run (`mafold_transcript::mention`):
+    // a person's @ anywhere, an AI's only where it opens a line — an agent
+    // naming the principal mid-sentence is reporting, not calling.
+    let ai = is_bot(m);
+    let calls = |who: &str| mafold_transcript::mention::summons(content, who, ai);
+    let at_me = calls(me_lc) || aliases.iter().any(|a| calls(a));
+    if ai {
         return at_me;
     }
-    let reply_to_me = m["reply_to_sender"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(me_lc));
+    let reply_to_me = m["reply_to_sender"]
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case(me_lc) || aliases.iter().any(|a| s.eq_ignore_ascii_case(a)));
     is_dm || at_me || reply_to_me
 }
 
@@ -635,9 +1068,69 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// How much of an agent's (prose) reply a look shows: its opening and, above
+/// all, its ending — where the conclusion is.
+const BOT_HEAD: usize = 300;
+const BOT_TAIL: usize = 1800;
+
+/// `s` if short; else its first `head` and last `tail` chars around a marker.
+fn head_tail(s: &str, head: usize, tail: usize) -> String {
+    let n = s.chars().count();
+    if n <= head + tail {
+        return s.to_string();
+    }
+    let front: String = s.chars().take(head).collect();
+    let back: String = s.chars().skip(n - tail).collect();
+    format!("{front} …(中间省略 {} 字)… {back}", n - head - tail)
+}
+
+/// A rendered line (`#id [time] @who…: body`) cut to `max`, keeping the header
+/// and the END of the body.
+fn clip_body_tail(line: &str, max: usize) -> String {
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let (head, body) = line.split_once(": ").unwrap_or(("", line));
+    let room = max.saturating_sub(head.chars().count() + 3).max(40);
+    let n = body.chars().count();
+    let tail: String = body.chars().skip(n.saturating_sub(room)).collect();
+    format!("{head}: …{tail}")
+}
+
+/// Other handles that address THIS account's person — the principal's own
+/// account, for a clone. Set once at start (`--alias`); empty otherwise.
+static ALIASES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn aliases() -> &'static [String] {
+    ALIASES.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Runs of blank lines and indentation left behind by stripped cards → one space.
+fn collapse_blank(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What an agent's reply SAID: its working trail cut whole — the run group,
+/// each tool call, the result stamp (`render::strip_trail_cards`) — and the
+/// rest folded the way every history view folds it (`agent::model_view`): an
+/// ask or an html page it wrote, and how it ended (an error, a limit, tasks
+/// still running). Folded, the trail was still a tag and a note per card —
+/// 39k tokens of one day's prompts, none of it an answer; `mafold msg <id>`
+/// opens it. A reply that was nothing but its trail keeps the folded trail,
+/// so it doesn't read as «—».
+fn agent_said(raw: &str, id: &str) -> String {
+    let said = crate::agent::model_view(&mafold_transcript::render::strip_trail_cards(raw), id);
+    if said.trim().is_empty() {
+        crate::agent::model_view(raw, id)
+    } else {
+        said
+    }
+}
+
 /// One message as the agent reads it: id to reply with, time, who (and what
 /// kind of who), what it answers, then the text a person would see.
-fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> String {
+/// `#id [when] @who(tag)` — the head every line about a message starts with.
+fn msg_head(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> String {
     let who = sender(m);
     let tag = if who == me_lc {
         "(你自己)"
@@ -648,14 +1141,17 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
     } else {
         ""
     };
-    let mut line = format!(
-        "#{} [{}] @{who}{tag}",
-        m["id"].as_str().unwrap_or("?"),
-        when(m, off)
-    );
+    format!("#{} [{}] @{who}{tag}", m["id"].as_str().unwrap_or("?"), when(m, off))
+}
+
+fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> String {
+    let who = sender(m);
+    let mut line = msg_head(m, me_lc, principal, off);
     if let Some(to) = m["reply_to_sender"].as_str() {
         if to.eq_ignore_ascii_case(me_lc) {
             line.push_str(" ↩回复你");
+        } else if aliases().iter().any(|a| to.eq_ignore_ascii_case(a)) {
+            line.push_str(&format!(" ↩回复本人(@{to})"));
         } else {
             line.push_str(&format!(" ↩回复 @{to}"));
         }
@@ -663,9 +1159,22 @@ fn render_msg(m: &Value, me_lc: &str, principal: Option<&str>, off: i32) -> Stri
             line.push_str(&format!(" #{rid}"));
         }
     }
-    let body = crate::chat::readable_body(m["content"].as_str().unwrap_or(""));
+    let raw = m["content"].as_str().unwrap_or("");
+    if who != me_lc && aliases().iter().any(|a| *a != who && mafold_transcript::mention::summons(raw, a, is_bot(m))) {
+        line.push_str(" [找本人的]");
+    }
+    // An agent's reply is read for what it SAID ([`agent_said`]): its answer —
+    // the prose, usually the last paragraph — without its working trail. It
+    // keeps head AND tail when long: clipping from the front is exactly how
+    // this loop read "no answer yet" into replies that had one.
+    let mid = m["id"].as_str().unwrap_or("");
+    let body = if is_bot(m) {
+        head_tail(&collapse_blank(&agent_said(raw, mid)), BOT_HEAD, BOT_TAIL)
+    } else {
+        clip(&crate::chat::readable_body(raw, mid), BODY_MAX)
+    };
     line.push_str(": ");
-    line.push_str(&clip(if body.is_empty() { "—" } else { &body }, BODY_MAX));
+    line.push_str(if body.trim().is_empty() { "—" } else { &body });
     for a in m["attachments"].as_array().into_iter().flatten() {
         line.push_str(&format!(" [附:{}]", crate::chat::attachment_name(a)));
     }
@@ -703,6 +1212,33 @@ struct Batch {
     tl: Timeline,
     context: Vec<Value>,
     new: Vec<Value>,
+    /// Other people's replies still being written, as status lines ([`Draft`]).
+    working: Vec<Draft>,
+    /// Ids among `new` that are replies which just finished — shown with a
+    /// "(刚写完)" mark, since they may sit far back in the timeline.
+    finished: HashSet<String>,
+    /// `created_at` of the newest reply still being written here (shown as a
+    /// status): part of what the agent has seen, for the send guard.
+    newest_working: Option<String>,
+}
+
+impl Batch {
+    /// Leave out what the session already holds ([`Known`]): context lines it
+    /// was handed before, a status it was told already. The new lines always go.
+    fn without(&mut self, known: &Known) {
+        self.context.retain(|m| !known.has(m));
+        self.working.retain(|w| !known.told(w));
+    }
+
+    /// The newest thing in this timeline the agent was shown.
+    fn newest_seen(&self) -> Option<String> {
+        self.context
+            .iter()
+            .chain(self.new.iter())
+            .map(|m| created(m).to_string())
+            .chain(self.newest_working.clone())
+            .reduce(|a, b| if later(&b, &a) { b } else { a })
+    }
 }
 
 /// A patrol's brief: what it is for, and the overview it starts from.
@@ -711,6 +1247,8 @@ struct Patrol<'a> {
     window_hours: u64,
     /// `--patrol-mode ask`: propose, don't hand out.
     ask: bool,
+    /// The last card is still unanswered: follow up, don't propose.
+    card_pending: bool,
     /// The last few decisions (`decisions_digest`).
     decisions: &'a str,
 }
@@ -719,7 +1257,7 @@ struct Patrol<'a> {
 fn build_prompt(
     now_local: &str,
     reasons: &[&str],
-    new_day: bool,
+    fresh: bool,
     batches: &[Batch],
     braked: &[String],
     due: &[Followup],
@@ -730,8 +1268,8 @@ fn build_prompt(
     off: i32,
 ) -> String {
     let mut p = format!("[{now_local} · 这次看消息是因为:{}]\n", reasons.join(" / "));
-    if new_day {
-        p.push_str("新的一天(新会话)。先看一眼工作目录里的 ledger.md、followups.json 和 memory/,接上昨天的事,再处理下面的消息。\n");
+    if fresh {
+        p.push_str("新会话:之前会话里的事这里都没有。先看一眼工作目录里的 ledger.md、followups.json 和 memory/,接上之前的事,再处理下面的消息。\n");
     }
     if let Some(d) = decision {
         p.push_str(d);
@@ -745,9 +1283,17 @@ fn build_prompt(
              - 已经有人在做、或者 ledger 里派过的,别重复提 —— 该追的写成「追一句」。\n",
             pt.window_hours
         ));
-        if pt.ask {
+        p.push_str(
+            "- **跟进不用等任何人批**:群里谁在等 ops(问了你、找你拍板、交了活等验收、答应了到点没兑现),这一轮就接 ——\
+             回答、验收(看证据,不够就要)、追一句、或者把需要拍板的事写成提案。\n",
+        );
+        if pt.ask && pt.card_pending {
             p.push_str(
-                "- **这一轮先别派。** 把找到的活按优先级写进工作目录的 `proposals.json`(JSON 数组,第一个最优先,最多 8 件):\n\
+                "- 上一张提案卡本人还没回答:**这一轮只跟进**,不要写 proposals.json(卡答了才出下一张)。\n",
+            );
+        } else if pt.ask {
+            p.push_str(
+                "- **新活这一轮先别派。** 把找到的活按优先级写进工作目录的 `proposals.json`(JSON 数组,第一个最优先,最多 8 件):\n\
                  \u{20} `[{\"title\": \"一句话说是什么\", \"source\": \"从哪看到的\", \"why\": \"为什么现在做\", \"who\": \"派给谁(@handle)\", \"done\": \"怎么算做完、要什么证据\", \"where\": \"在哪说(chat=… channel=…)\"}]`\n\
                  \u{20} 循环会把它做成一张卡发给本人;他勾完你再按他选的去派。能找多少找多少,每件都要能直接派出去。真没有就别写这个文件。\n\
                  - 本来就在跟你说话的人(上面的新消息),照常回。\n",
@@ -772,7 +1318,14 @@ fn build_prompt(
             p.push('\n');
         }
         for m in &b.new {
+            if m["id"].as_str().is_some_and(|id| b.finished.contains(id)) {
+                p.push_str("(刚写完) ");
+            }
             p.push_str(&render_msg(m, me_lc, principal, off));
+            p.push('\n');
+        }
+        for w in &b.working {
+            p.push_str(&w.line);
             p.push('\n');
         }
     }
@@ -838,18 +1391,32 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
         ),
         None => "- 没有指定「本人」:所有消息都是信息,你按工作目录 CLAUDE.md 里的身份和判断行事。\n".to_string(),
     };
+    // When a session ends — the same rule a bot's session ends by ([`ends`]).
+    let limit = crate::session_life::CONTEXT_LIMIT / 10_000;
+    let idle = crate::session_life::IDLE_SECS / 3600;
     format!(
         "你以 Mafold 账号 @{me} 的身份在线,现在是「收件箱模式」:\n\
          - 你这一轮写下的任何文字都**不会被任何人看到**——只进日志。想让别人看到,只有调工具:\n\
          \u{20} · 发消息:`mafold send <chat_id> [--channel <channel_id>] [--reply <消息id>] <正文>`。一次一条;要连发就调多次。像人一样说话:短、口语、一条一个意思;不要 markdown 标题、表格、卡片。\n\
          \u{20} · 表情:`mafold react <消息id> <emoji>`——很多时候回个表情就够了。\n\
-         \u{20} · 要更多上下文:`mafold read <chat_id> [--channel <channel_id>] --ids --limit 30`;所有会话:`mafold chats`。\n\
+         \u{20} · 点卡片上的按钮(跟人手点一样):`mafold tap <消息id> <action> [内容]` —— 回答问题卡 `ask:answer <答案>`、\
+         权限卡 `perm:answer Allow`;叫停一个正在写的回复:`mafold tap <「⏳」那行的 #id> stop`,它会告诉你停没停下。\
+         只停你自己叫起来、却重复了或跑偏了的回复,或者本人让你停的;别人的(尤其 linsky 和他的 bot)不碰。\n\
+         \u{20} · 要更多上下文:`mafold read <chat_id> [--channel <channel_id>] --limit 30`;所有会话:`mafold chats`。\
+         卡片在这里都是折叠的(标签+属性,内容换成一行 [folded: …]),要看哪条的原文:`mafold msg <消息id>`。\n\
          \u{20} · 分派工作 = 一件事一个频道:群是论坛(有频道)时,先 `mafold channels list <chat_id>` 找对应这件事的频道;没有就 `mafold channels create <chat_id> <名字>` 开一个(名字就写这件事,短),再用 `--channel` 在里面说、@ 人。别把不相干的事堆进私聊或主时间线。开不了(只有管理员能开)就用最接近的现有频道,并说明一句。事情结了,`mafold channels close <chat_id> <频道>` 关掉你自己开的那个。\n\
-         - 看完什么都不说,是完全正常的结果。只在你这个身份真的会开口的时候开口。\n\
+         - 闲聊、别人之间的事,看完不说话完全正常。但**有人在等你**的时候必须接:问了你(或「找本人的」)的问题、\
+         找你拍板、交了活等你验收(看它的结论和证据,不够就要)、答应的事到点没动静 —— 回答、验收、拍板或追,别只在日志里记一笔。\n\
          {who}\
          - 消息前的 `#…` 是消息 id,给 --reply / react 用。「(AI)」是 bot 发的,「(本人)」是指令来源,「(你自己)」是你之前发的。\n\
+         - 「⏳ 正在回复」= 对方已经在写了:别重复 @、别说他没开工 —— 写完会以「(刚写完)」作为新消息到你这儿。\
+         「⏸ 在等 @X 回答卡片」= 卡在等那个人点卡,该提醒的是那个人。只有「⚠️ … 没动静了」才去问一声。\n\
+         - `mafold send` 回你「✋ 没发出去」= 你想的这会儿,那里又有人说话(或开始回复)了:先看它列出的新消息再决定说什么;确定还要照原样发,加 `--anyway`。\n\
          - 要在某个时间回头看某件事:写进工作目录的 followups.json(数组,每项 {{\"at\": \"带时区的 RFC3339\", \"conv\": \"会话 id\", \"note\": \"要做什么\"}}),到点会叫醒你;做完就删掉那一项。\n\
-         - ledger.md 记谁答应了什么、什么时候到期;memory/ 记决定和人。它们是你跨天的记忆——会话每天换一次。\n\
+         - ledger.md 记谁答应了什么、什么时候到期;memory/ 记决定和人。它们是你跨会话的记忆:上下文到了约 {limit} 万 token、\
+         或者闲了 {idle} 小时,就换一个新会话,之前会话里的事新会话里都没有。\n\
+         - 同一个会话里,一条消息只给你一次:看过的不会再以「(之前)」补给你(往上翻就有);正在写的回复,状态变了才再说。\
+         AI 的回复只留它说的话,过程卡、用量卡都去掉了 —— 要看全过程:`mafold msg <消息id>`。\n\
          - 这一轮进行中新到的消息,会在工具调用之间递给你;你说完一句之后对方回了,也会这样接上。\n\
          - 这一轮最后写一两句中文总结(只进日志,给本人看):看了什么、做了什么;没开口的话,为什么。过程里的自言自语也用中文——日志是给本人看的。\n"
     )
@@ -857,15 +1424,146 @@ fn preamble(me: &str, principal: Option<&str>) -> String {
 
 // ───────────────────────────── the turn ─────────────────────────────
 
+// ─────────────────────────── the send guard ───────────────────────────
+
+/// What the agent has actually seen this turn, per timeline — the ledger the
+/// send guard checks against (`$MAFOLD_SEND_SEEN`, rewritten every turn).
+///
+/// Why: a turn reads, then THINKS — minutes, often — and only then speaks. New
+/// messages reach it between tool calls, so the ones that arrive while it is
+/// thinking land right AFTER its `mafold send`: 68 of 87 sends we could
+/// attribute had the same timeline speak again while the message was being
+/// composed. The guard re-checks the timeline at the moment of sending.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Seen {
+    me: String,
+    #[serde(default)]
+    principal: Option<String>,
+    #[serde(default)]
+    off: i32,
+    /// When this turn started reading: the floor for a timeline it never read.
+    started: String,
+    /// The steer mailbox. A steered message counts as seen once the mailbox no
+    /// longer holds it — the hook has handed it to the agent.
+    #[serde(default)]
+    steer_file: String,
+    /// Timeline key → `created_at` of the newest message shown there.
+    #[serde(default)]
+    timelines: HashMap<String, String>,
+    /// Messages handed over mid-turn through the steer mailbox.
+    #[serde(default)]
+    queued: Vec<Queued>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct Queued {
+    key: String,
+    id: String,
+    at: String,
+}
+
+fn seen_path(dir: &Path, dry: bool) -> PathBuf {
+    dir.join(if dry { "seen-dry.json" } else { "seen.json" })
+}
+
+fn load_seen(path: &Path) -> Option<Seen> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Atomic, so the guard (a child process) never reads half a file.
+fn save_seen(path: &Path, s: &Seen) {
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(body) = serde_json::to_string(s) {
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// `created_at`-shaped stamp for an epoch second (UTC).
+fn stamp_of(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        .unwrap_or_default()
+}
+
+/// The newest message in a timeline the agent had seen when it decided to
+/// speak: what it was shown at the start of the turn (or the turn's start,
+/// for a timeline it never read), moved forward by every steered message it
+/// has actually been handed.
+fn seen_floor(seen: &Seen, key: &str, mailbox: &str) -> String {
+    let mut floor = seen.timelines.get(key).cloned().unwrap_or_else(|| seen.started.clone());
+    for q in seen.queued.iter().filter(|q| q.key == key && !mailbox.contains(&q.id)) {
+        if later(&q.at, &floor) {
+            floor = q.at.clone();
+        }
+    }
+    floor
+}
+
+/// Other people's messages in a page newer than `floor`, oldest first —
+/// finished ones, and replies that started being written since.
+fn fresh_since(items: &[Value], floor: &str, me_lc: &str) -> Vec<Value> {
+    let mut v: Vec<Value> = items.iter().filter(|m| sender(m) != me_lc && later(created(m), floor)).cloned().collect();
+    v.sort_by(|a, b| created(a).cmp(created(b)));
+    v
+}
+
+/// How far back the guard looks. More than this many new lines since the
+/// agent last looked is a conversation it should re-read anyway.
+const GUARD_LINES: usize = 20;
+
+/// `mafold send` from inside an inbox turn: has anyone spoken in this timeline
+/// since the agent last saw it — or started writing a reply? Then the message
+/// is NOT sent; this returns what is new (to print as the command's output),
+/// and those lines now count as seen, so sending again goes through unless
+/// someone speaks again. None = nothing new, not an inbox turn, or the check
+/// itself failed (a network blip must not swallow what the agent says).
+pub(crate) async fn send_guard(client: &Client, chat_id: &str, channel_id: Option<&str>, label: &str) -> Option<String> {
+    let path = PathBuf::from(std::env::var("MAFOLD_SEND_SEEN").ok().filter(|p| !p.trim().is_empty())?);
+    let mut seen = load_seen(&path)?;
+    let key = timeline_key(chat_id, channel_id);
+    let mailbox = std::fs::read_to_string(&seen.steer_file).unwrap_or_default();
+    let floor = seen_floor(&seen, &key, &mailbox);
+    let page = match client.get_chat_history(chat_id, GUARD_LINES, channel_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("(没能先看一眼 {label} 有没有新消息,照发:{e:#})");
+            return None;
+        }
+    };
+    let fresh = fresh_since(page["items"].as_array().map_or(&[][..], |v| v.as_slice()), &floor, &seen.me);
+    let last = fresh.last()?;
+    let now = now_ms();
+    let lines: Vec<String> = fresh
+        .iter()
+        .map(|m| {
+            if in_progress(m) {
+                working_line(m, &seen.me, seen.principal.as_deref(), seen.off, now)
+            } else {
+                render_msg(m, &seen.me, seen.principal.as_deref(), seen.off)
+            }
+        })
+        .collect();
+    seen.timelines.insert(key, created(last).to_string());
+    save_seen(&path, &seen);
+    Some(format!(
+        "✋ 没发出去:你开始想之后,{label} 又有了新动静 —— 先看完,再决定这句还要不要照原样发(确定照发:同一条命令加 --anyway)。\n{}",
+        lines.join("\n")
+    ))
+}
+
 /// Environment for the harness child: speak as THIS account, paced like a
-/// person, journaled so the loop knows who was spoken to, and with this very
-/// binary first on PATH so `mafold send --reply` means what the preamble says.
-fn child_env(client: &Client, me: &str, journal: &Path, dry: bool) -> Vec<(String, String)> {
+/// person, journaled so the loop knows who was spoken to, checked against what
+/// it has seen before each send, and with this very binary first on PATH so
+/// `mafold send --reply` means what the preamble says.
+fn child_env(client: &Client, me: &str, journal: &Path, seen: &Path, dry: bool) -> Vec<(String, String)> {
     let mut env = vec![
         ("MAFOLD_BASE".to_string(), client.base.clone()),
         ("MAFOLD_SEND_PACE".to_string(), if dry { "0" } else { "1" }.to_string()),
         ("MAFOLD_SEND_DRY".to_string(), if dry { "1" } else { "0" }.to_string()),
         ("MAFOLD_SEND_JOURNAL".to_string(), journal.to_string_lossy().into_owned()),
+        ("MAFOLD_SEND_SEEN".to_string(), seen.to_string_lossy().into_owned()),
     ];
     let person = crate::session::load_named(me).is_some_and(|s| s.token == client.token);
     if person {
@@ -875,7 +1573,7 @@ fn child_env(client: &Client, me: &str, journal: &Path, dry: bool) -> Vec<(Strin
         env.push(("MAFOLD_BOT_TOKEN".into(), client.token.clone()));
         env.push(("MAFOLD_ACCOUNT".into(), String::new()));
     }
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+    if let Some(dir) = crate::platform::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
         let mut paths = vec![dir];
         if let Some(p) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&p));
@@ -883,6 +1581,81 @@ fn child_env(client: &Client, me: &str, journal: &Path, dry: bool) -> Vec<(Strin
         if let Ok(joined) = std::env::join_paths(paths) {
             env.push(("PATH".into(), joined.to_string_lossy().into_owned()));
         }
+    }
+    env
+}
+
+/// The login a turn starts on — see [`Ctx::seat_pref`]. When it is not the
+/// preferred one, the loop's log says which and why each login before it was
+/// passed over.
+async fn pick_seat(ctx: &Ctx) -> (Option<crate::accounts::Account>, Vec<mafold_transcript::failure::AccountIssue>) {
+    if !ctx.seats {
+        return (None, Vec::new());
+    }
+    let choice = crate::accounts::choose(ctx.seat_pref.as_deref(), ctx.opts.model.as_deref()).await;
+    if let Some(note) = choice.note().or_else(|| choice.none_note()) {
+        println!("inbox: {note}");
+    }
+    (choice.account, choice.skipped)
+}
+
+/// Keep the final session id, with an event fallback for event-only harnesses.
+fn retain_attempt_session(last: &mut Option<String>, outcome: &harness::TurnOutcome, event: Option<&str>) {
+    crate::agent::retain_attempt_session(last, outcome);
+    // A final id can be newer than the init event after a fork or compaction.
+    // Event-only harnesses still get a fallback, subject to the same trust rule.
+    if outcome.session.is_none() && (outcome.produced || (!outcome.stopped && outcome.error.is_none())) {
+        if let Some(sid) = event { *last = Some(sid.to_owned()); }
+    }
+}
+
+/// A finished attempt that ended on its login (full window, refused sign-in):
+/// remember that for the login and name the next one that can take the turn,
+/// with the line that says so. None = nothing to fail over — the run ended on
+/// something else, or no other login can take it (then the attempt's own
+/// error stands, and the log says why each login was passed over).
+async fn next_seat(
+    cur: Option<&crate::accounts::Account>,
+    attempt: &Result<crate::harness::TurnOutcome>,
+    tried: &[String],
+    model: Option<&str>,
+    issues: &mut Vec<mafold_transcript::failure::AccountIssue>,
+    attempted_credential: Option<&str>,
+) -> (Option<(crate::accounts::Account, String)>, bool) {
+    use crate::agent::Handover;
+    let (Some(cur), Ok(o)) = (cur, attempt) else { return (None, false) };
+    let Some(cause) = crate::agent::handover_cause(o) else { return (None, false) };
+    crate::agent::remember_account_issues(issues, [crate::agent::account_attempt_issue(
+        &cur.name, o.error.as_deref().unwrap_or("Account refused this turn"), o.limit.as_ref(),
+    )]);
+    let (next, why) = match &cause {
+        Handover::Limit(hit) => crate::accounts::failover(&cur.name, &hit.kind, hit.resets_at, model, tried, attempted_credential).await,
+        Handover::SignedOut => crate::accounts::failover_signed_out(&cur.name, model, tried, attempted_credential).await,
+    };
+    crate::agent::remember_account_issues(issues, why.clone());
+    let Some(next) = next else {
+        let line = why.iter().map(|i| format!("`{}` {}", i.account, i.detail)).collect::<Vec<_>>().join("; ");
+        println!(
+            "inbox: ⛔ login `{}` {} — no other login can take over{}",
+            cur.name,
+            cause.what(),
+            if line.is_empty() { String::new() } else { format!(" ({line})") }
+        );
+        return (None, true);
+    };
+    let note = format!("↻ login `{}` {} — continuing on `{}`", cur.name, cause.what(), next.name);
+    println!("inbox: {note}");
+    (Some((next, note)), false)
+}
+
+/// The turn's environment: the loop's own plus its login's
+/// (`CLAUDE_SECURESTORAGE_CONFIG_DIR`). The default login has no variable,
+/// which is why `run` takes the one it was started with out of the process.
+fn with_seat(base: &[(String, String)], seat: Option<&crate::accounts::Account>) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> =
+        base.iter().filter(|(k, _)| k != crate::accounts::ENV).cloned().collect();
+    if let Some(a) = seat {
+        env.extend(a.env());
     }
     env
 }
@@ -904,6 +1677,36 @@ fn event_json(ev: &AgentEvent) -> Option<Value> {
         }
         other => json!({ "t": "other", "v": clip(&format!("{other:?}"), 2000) }),
     })
+}
+
+/// What a turn's events say about its session: the largest context a model
+/// request reported (what `session_life` decides the next look by, as the
+/// daemon does) and whether it compacted.
+#[derive(Debug, Default)]
+struct Gauge {
+    context: u64,
+    compacted: bool,
+}
+
+impl Gauge {
+    fn read(&mut self, ev: &AgentEvent) {
+        match ev {
+            AgentEvent::Stats(s) => self.context = self.context.max(s.context_used_tokens.unwrap_or(0)),
+            AgentEvent::Compacted { .. } => self.compacted = true,
+            _ => {}
+        }
+    }
+}
+
+/// The messages the agent sent this turn, from the send journal: ids.
+fn sent_ids(journal: &Path) -> Vec<String> {
+    std::fs::read_to_string(journal)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["kind"].as_str() == Some("send"))
+        .filter_map(|v| v["message_id"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// Who the agent spoke to this turn, from the send journal: timeline keys.
@@ -943,6 +1746,13 @@ impl Markers {
     fn contains(&self, id: &str) -> bool {
         self.by_key.values().any(|(_, l)| l.iter().any(|(_, i)| i == id))
     }
+    /// Timeline key → `created_at` of the newest message marked there.
+    fn newest(&self) -> Vec<(String, String)> {
+        self.by_key
+            .iter()
+            .filter_map(|(k, (_, l))| l.iter().map(|(at, _)| at.clone()).reduce(|a, b| if later(&b, &a) { b } else { a }).map(|at| (k.clone(), at)))
+            .collect()
+    }
     async fn mark(&self, client: &Client) {
         for (tl, list) in self.by_key.values() {
             let Some((_, id)) = list.iter().max() else { continue };
@@ -973,26 +1783,70 @@ struct Ctx {
     ask_chat: Option<String>,
     env: Vec<(String, String)>,
     journal: PathBuf,
+    /// The send guard's ledger ([`Seen`]), rewritten at the start of every turn.
+    seen: PathBuf,
+    /// Whether turns pick a Claude login (`crate::accounts`) at all: a Claude
+    /// Code loop started on a login this machine knows. Anything else keeps
+    /// the one environment it was started with, exactly as before.
+    seats: bool,
+    /// The login this loop prefers — the one it was started on. Each turn runs
+    /// on it unless its window is full or its sign-in was refused, then on the
+    /// next login that can take the turn: the daemon's own `accounts::choose`
+    /// before the turn and `accounts::failover` during it. None = default login.
+    seat_pref: Option<String>,
 }
 
 /// Messages that arrived while a turn runs, and that it should hear now: the
 /// timelines it is already looking at, plus anything a phone would buzz for.
+/// What a steer check found: the text for the mailbox, the message ids it
+/// carries, and the same messages as send-guard entries.
+struct Steer {
+    text: String,
+    ids: HashSet<String>,
+    queued: Vec<Queued>,
+}
+
 async fn steer_check(
     ctx: &Ctx,
     turn_keys: &HashSet<String>,
     markers: &mut Markers,
     state: &State,
+    book: &mut Book,
     cancel: &Notify,
-) -> Option<(String, HashSet<String>)> {
+) -> Option<Steer> {
     let tls = unread_timelines(&ctx.client, &ctx.me_lc).await.ok()?;
     let skip = state.log_set();
     let mut block = String::new();
     let mut ids = HashSet::new();
+    let mut queued = Vec::new();
+    let now = now_ms();
     for tl in tls {
         let Ok(items) = read_timeline(&ctx.client, &tl, &skip).await else { continue };
-        let (_, new) = split_new(&items, tl.unread, &ctx.me_lc);
-        let braked = state.ai_streak.get(&tl.key()).copied().unwrap_or(0) >= AI_STREAK_BRAKE;
+        let key = tl.key();
+        let (finished, _) = check_watched(&ctx.client, &state.watching, &key).await;
+        let finished_ids: HashSet<String> =
+            finished.iter().filter_map(|m| m["id"].as_str().map(str::to_string)).collect();
+        let a = arrange(&items, tl.unread, &ctx.me_lc, finished, state.marked_at.get(&key).map(String::as_str));
+        let new = a.new;
+        let braked = state.ai_streak.get(&key).copied().unwrap_or(0) >= AI_STREAK_BRAKE;
         let mut lines = Vec::new();
+        // Someone started answering in a timeline this turn is about: say so
+        // now, or the agent may @ them again before their reply lands.
+        if turn_keys.contains(&key) {
+            for d in &a.working {
+                let Some(id) = d["id"].as_str() else { continue };
+                if state.watching.iter().any(|w| w.id == id) || book.watch.iter().any(|w| w.id == id) {
+                    continue;
+                }
+                lines.push(working_line(d, &ctx.me_lc, ctx.principal.as_deref(), ctx.opts.utc_offset, now));
+                queued.push(Queued { key: key.clone(), id: id.to_string(), at: created(d).to_string() });
+            }
+        }
+        // Every draft here, shown or not: if this turn's marker ends up past
+        // one, it has to be watched to be recognized when it finishes.
+        for d in &a.working {
+            book.saw_draft(&tl, d);
+        }
         for m in new {
             let Some(id) = m["id"].as_str() else { continue };
             if markers.contains(id) || sender(&m) == ctx.me_lc {
@@ -1012,8 +1866,17 @@ async fn steer_check(
                 continue;
             }
             if turn_keys.contains(&tl.key()) || wakes_now(&m, &ctx.me_lc, tl.is_dm) {
-                lines.push(render_msg(&m, &ctx.me_lc, ctx.principal.as_deref(), ctx.opts.utc_offset));
+                let just_finished = finished_ids.contains(id);
+                lines.push(format!(
+                    "{}{}",
+                    if just_finished { "(刚写完) " } else { "" },
+                    render_msg(&m, &ctx.me_lc, ctx.principal.as_deref(), ctx.opts.utc_offset)
+                ));
+                if just_finished {
+                    book.delivered.insert(id.to_string());
+                }
                 ids.insert(id.to_string());
+                queued.push(Queued { key: key.clone(), id: id.to_string(), at: created(&m).to_string() });
                 markers.add(&tl, &m);
             }
         }
@@ -1021,7 +1884,7 @@ async fn steer_check(
             block.push_str(&format!("== {} ==\n{}\n", tl.heading(), lines.join("\n")));
         }
     }
-    (!block.is_empty()).then(|| (format!("【你看消息的这会儿,又来了新消息】\n{block}"), ids))
+    (!block.is_empty()).then(|| Steer { text: format!("【你看消息的这会儿,又来了新消息】\n{block}"), ids, queued })
 }
 
 /// The brake (§6): speaking into a timeline where only AI spoke since last time
@@ -1068,8 +1931,10 @@ async fn look(
     let mut batches = Vec::new();
     let mut braked = Vec::new();
     let mut markers = Markers::default();
+    let mut book = Book::default();
     let mut humans: HashSet<String> = HashSet::new();
     let skip = state.log_set();
+    let now_m = now_ms();
     for tl in tls {
         let items = match read_timeline(&ctx.client, &tl, &skip).await {
             Ok(i) => i,
@@ -1078,26 +1943,41 @@ async fn look(
                 continue;
             }
         };
-        let (context, new) = split_new(&items, tl.unread, &ctx.me_lc);
+        let key = tl.key();
+        let (finished, gone) = check_watched(&ctx.client, &state.watching, &key).await;
+        state.watching.retain(|w| !gone.contains(&w.id));
+        let finished_ids: HashSet<String> =
+            finished.iter().filter_map(|m| m["id"].as_str().map(str::to_string)).collect();
+        let a = arrange(&items, tl.unread, &ctx.me_lc, finished, state.marked_at.get(&key).map(String::as_str));
+        let (context, new) = (a.context, a.new);
         for m in &new {
             markers.add(&tl, m);
         }
-        if new.is_empty() {
+        for d in &a.working {
+            book.saw_draft(&tl, d);
+        }
+        book.delivered.extend(new.iter().filter_map(|m| m["id"].as_str()).filter(|id| finished_ids.contains(*id)).map(str::to_string));
+        // Nothing from anyone else (only my own lines, or only replies still
+        // being written): nothing to read — marked read, but no reason for a
+        // turn. A reply in progress is a status, not something said yet.
+        if new.iter().all(|m| sender(m) == ctx.me_lc) {
             continue;
         }
-        let key = tl.key();
         if has_human(&new, &ctx.me_lc) {
             humans.insert(key.clone());
         } else if state.ai_streak.get(&key).copied().unwrap_or(0) >= AI_STREAK_BRAKE {
             braked.push(format!("{}{}", tl.label, tl.channel_name.as_deref().map(|c| format!(" #{c}")).unwrap_or_default()));
             continue;
         }
-        batches.push(Batch { tl, context, new });
+        let working = a.working.iter().map(|d| Draft::of(d, &ctx.me_lc, ctx.principal.as_deref(), off, now_m)).collect();
+        let finished = new.iter().filter_map(|m| m["id"].as_str()).filter(|id| finished_ids.contains(*id)).map(str::to_string).collect();
+        batches.push(Batch { tl, context, new, working, finished, newest_working: a.working.iter().map(|d| created(d).to_string()).max() });
     }
 
     if batches.is_empty() && due.is_empty() && !patrol {
         if !dry {
             markers.mark(&ctx.client).await;
+            book.settle(state, &markers);
         }
         return Ok(Looked::Quiet);
     }
@@ -1142,22 +2022,40 @@ async fn look(
         }
     }
 
-    // One mind, rolled over daily. A dry run never touches it: it starts fresh
-    // and its thoughts don't become the live account's memory.
-    let today = local(now, off).format("%Y-%m-%d").to_string();
-    let new_day = dry || state.session_day.as_deref() != Some(today.as_str());
-    if new_day && !dry {
-        state.session = None;
-        state.session_day = Some(today);
+    // One mind, for as long as a bot's session would last ([`ends`]): past its
+    // context limit, or idle until its cache is gone, the next look starts a
+    // new one, the notebook its memory. A dry run never touches it: it starts
+    // fresh and its thoughts don't become the live account's memory.
+    let surface = surface_of(&ctx.me_lc);
+    if !dry {
+        if let Some((sid, why)) = ends(state, &surface, now as i64) {
+            println!("inbox: 🆕 new session ({why}); {sid} stays resumable");
+            state.session = None;
+        }
     }
-    let seen = if patrol {
-        overview(ctx, now as i64 - (ctx.opts.patrol_window * 3600) as i64, &skip).await
+    let fresh = dry || state.session.is_none();
+    // What the session it resumes already holds is not handed over again.
+    let known = if fresh { None } else { state.known.of(state.session.as_deref()) };
+    if let Some(k) = known {
+        for b in &mut batches {
+            b.without(k);
+        }
+    }
+    let (seen, overview_seen) = if patrol {
+        overview(ctx, now as i64 - (ctx.opts.patrol_window * 3600) as i64, &skip, known).await
     } else {
-        String::new()
+        (String::new(), Vec::new())
     };
     let past = if patrol { decisions_digest(&ctx.workdir) } else { String::new() };
     let ask_mode = ctx.opts.patrol_mode == "ask";
-    let brief = Patrol { overview: &seen, window_hours: ctx.opts.patrol_window, ask: ask_mode, decisions: &past };
+    let card_pending = state.pending_ask.is_some();
+    let brief = Patrol {
+        overview: &seen,
+        window_hours: ctx.opts.patrol_window,
+        ask: ask_mode,
+        card_pending,
+        decisions: &past,
+    };
     if patrol {
         // A stale file from a run that died must not come back as this patrol's finds.
         let _ = std::fs::remove_file(Path::new(&ctx.workdir).join("proposals.json"));
@@ -1165,7 +2063,7 @@ async fn look(
     let prompt = build_prompt(
         &now_local,
         &reasons,
-        new_day,
+        fresh,
         &batches,
         &braked,
         &due,
@@ -1190,23 +2088,27 @@ async fn look(
         .join(format!("mafold-inbox-steer-{}-{nanos}.txt", ctx.me_lc))
         .to_string_lossy()
         .into_owned();
-    let cancel = Arc::new(Notify::new());
-    let turn = Turn {
-        prompt: prompt.clone(),
-        conv: String::new(),
-        surface: format!("inbox____{}", ctx.me_lc.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '-'), "_")),
-        draft: String::new(),
-        workdir: ctx.workdir.clone(),
-        session: if dry { None } else { state.session.clone() },
-        model: ctx.opts.model.clone(),
-        effort: ctx.opts.effort.clone(),
-        thinking: None,
-        cancel: cancel.clone(),
-        system: Some(preamble(&ctx.me, ctx.principal.as_deref())),
-        ask_file: None,
-        steer_file: Some(steer_file.clone()),
-        env: ctx.env.clone(),
+    // The send guard's ledger for this turn: the newest line shown in every
+    // timeline the agent was handed (batches and the patrol overview); any
+    // other timeline counts from the moment this look began.
+    let mut seen_ledger = Seen {
+        me: ctx.me_lc.clone(),
+        principal: ctx.principal.clone(),
+        off,
+        started: stamp_of(now),
+        steer_file: steer_file.clone(),
+        ..Default::default()
     };
+    for (key, at) in batches.iter().filter_map(|b| b.newest_seen().map(|at| (b.tl.key(), at))).chain(overview_seen) {
+        let e = seen_ledger.timelines.entry(key).or_default();
+        if e.is_empty() || later(&at, e) {
+            *e = at;
+        }
+    }
+    save_seen(&ctx.seen, &seen_ledger);
+    let cancel = Arc::new(Notify::new());
+    let (mut seat, mut account_issues) = pick_seat(ctx).await;
+    let mut accounts_unavailable = ctx.seats && seat.is_none();
     for f in &due {
         state.fired.insert(f.key());
     }
@@ -1225,52 +2127,146 @@ async fn look(
     let mut tx_log = mafold_transcript::Transcript::new();
 
     let turn_keys: HashSet<String> = batches.iter().map(|b| b.tl.key()).collect();
-    let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let run = ctx.harness.run(turn, sink);
-    tokio::pin!(run);
-    let mut tick = tokio::time::interval(Duration::from_secs(STEER_EVERY));
-    tick.tick().await;
     let mut steered: Vec<(String, HashSet<String>)> = Vec::new();
     let mut session_seen: Option<String> = None;
+    let mut gauge = Gauge::default();
+    let mut last_good_session = None;
+    let mut seats_tried: Vec<String> = seat.iter().map(|a| a.name.clone()).collect();
+    // One attempt per login. A run that ended on its SEAT — a full window, a
+    // refused sign-in — says nothing about the conversation: the transcript
+    // lives in the shared `~/.claude`, so the same session resumes under any
+    // other credential. Hand the turn to the next login instead of sitting out
+    // the window (a pinned loop once sat out three hours of one this way while
+    // another login on the machine was free). Each login is tried at most once.
     let outcome = loop {
-        tokio::select! {
-            out = &mut run => break out,
-            Some(ev) = rx.recv() => {
-                if let AgentEvent::Session(s) = &ev { session_seen = Some(s.clone()); }
-                write(event_json(&ev));
-                tx_log.push(&ev);
+        if accounts_unavailable {
+            break Ok(harness::TurnOutcome {
+                error: Some("No Claude account could take this turn".into()),
+                ..Default::default()
+            });
+        }
+        // The tier, held to what this machine's binary says the model takes —
+        // the same door a bot's turn goes through (`harness::effort_for_turn`):
+        // run as picked, or not at all and the log says why.
+        let env = with_seat(&ctx.env, seat.as_ref());
+        let attempted_credential = seat.as_ref().and_then(|_| crate::commands::credential_fingerprint(&env));
+        let effort = match harness::effort_for_turn(
+            ctx.harness.as_ref(),
+            &env,
+            ctx.opts.model.as_deref(),
+            ctx.opts.effort.as_deref(),
+        )
+        .await
+        {
+            harness::EffortVerdict::Pass(e) => e,
+            harness::EffortVerdict::NoDial(note) => {
+                eprintln!("inbox: {note}");
+                None
             }
-            _ = tick.tick() => {
-                if let Some((text, ids)) = steer_check(ctx, &turn_keys, &mut markers, state, &cancel).await {
-                    use std::io::Write;
-                    let ok = std::fs::OpenOptions::new().create(true).append(true).open(&steer_file)
-                        .and_then(|mut f| writeln!(f, "{text}")).is_ok();
-                    if ok {
-                        let ev = AgentEvent::Steered(clip(&text, 400));
-                        write(event_json(&ev));
-                        tx_log.push(&ev);
-                        steered.push((text, ids));
-                    } else {
-                        markers.forget(&ids);
+            harness::EffortVerdict::Refuse(why) => {
+                eprintln!("inbox: {why}");
+                break Ok(harness::TurnOutcome { error: Some(why), ..Default::default() });
+            }
+        };
+        let turn = Turn {
+            prompt: prompt.clone(),
+            conv: String::new(),
+            surface: surface.clone(),
+            draft: String::new(),
+            workdir: ctx.workdir.clone(),
+            session: last_good_session.clone().or_else(|| if dry { None } else { state.session.clone() }),
+            model: ctx.opts.model.clone(),
+            effort,
+            thinking: None,
+            cancel: cancel.clone(),
+            system: Some(preamble(&ctx.me, ctx.principal.as_deref())),
+            ask_file: None,
+            steer_file: Some(steer_file.clone()),
+            env,
+            // The inbox speaks as a PERSON; people have no bot drive to mount —
+            // only Mafold's own plugin (`mafold:mafold-video`, …), which used to
+            // reach it through `~/.claude/skills`. One mind for the whole
+            // account, nobody else's turn: it reads with the account's own eyes.
+            // And it gets the tools this mode works with (`--tools`), no more.
+            mount: crate::harness::Mount {
+                reads: crate::chat::ReadsFor::All,
+                tools: tools_of(&ctx.opts.tools),
+                ..crate::drive::mount(None).await
+            },
+            // It runs for the person whose skills these are.
+            skill_plugins: None,
+            // …and no generating card whose heartbeat it would keep.
+            proc: Default::default(),
+        };
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let run = ctx.harness.run(turn, sink);
+        tokio::pin!(run);
+        let mut tick = tokio::time::interval(Duration::from_secs(STEER_EVERY));
+        tick.tick().await;
+        let attempt = loop {
+            tokio::select! {
+                out = &mut run => break out,
+                Some(ev) = rx.recv() => {
+                    if let AgentEvent::Session(s) = &ev { session_seen = Some(s.clone()); }
+                    gauge.read(&ev);
+                    write(event_json(&ev));
+                    tx_log.push(&ev);
+                }
+                _ = tick.tick() => {
+                    if let Some(Steer { text, ids, queued }) = steer_check(ctx, &turn_keys, &mut markers, state, &mut book, &cancel).await {
+                        use std::io::Write;
+                        let ok = std::fs::OpenOptions::new().create(true).append(true).open(&steer_file)
+                            .and_then(|mut f| writeln!(f, "{text}")).is_ok();
+                        if ok {
+                            let ev = AgentEvent::Steered(clip(&text, 400));
+                            write(event_json(&ev));
+                            tx_log.push(&ev);
+                            steered.push((text, ids));
+                            // The guard counts these as seen once the hook has
+                            // taken them out of the mailbox. Read back first:
+                            // the guard itself writes the ledger too.
+                            if let Some(mut s) = load_seen(&ctx.seen) {
+                                s.queued.extend(queued);
+                                save_seen(&ctx.seen, &s);
+                            }
+                        } else {
+                            markers.forget(&ids);
+                        }
                     }
                 }
             }
-        }
-    };
-    while let Ok(ev) = rx.try_recv() {
-        if let AgentEvent::Session(s) = &ev {
-            session_seen = Some(s.clone());
-        }
-        write(event_json(&ev));
-        tx_log.push(&ev);
-    }
-
-    // What never reached the model stays unread for the next look.
-    if let Some(left) = crate::steer_hook::take(&steer_file) {
-        for (text, ids) in &steered {
-            if left.contains(text.trim()) {
-                markers.forget(ids);
+        };
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::Session(s) = &ev {
+                session_seen = Some(s.clone());
             }
+            gauge.read(&ev);
+            write(event_json(&ev));
+            tx_log.push(&ev);
+        }
+        if let Ok(o) = &attempt {
+            retain_attempt_session(&mut last_good_session, o, session_seen.as_deref());
+        }
+        let (next, unavailable) = next_seat(seat.as_ref(), &attempt, &seats_tried, ctx.opts.model.as_deref(), &mut account_issues, attempted_credential.as_deref()).await;
+        accounts_unavailable = unavailable;
+        let Some((next, note)) = next else {
+            break attempt;
+        };
+        session_seen = None;
+        write(Some(json!({ "t": "seat", "v": note })));
+        seats_tried.push(next.name.clone());
+        seat = Some(next);
+    };
+
+    // What never reached the model stays unread for the next look; what did
+    // is in the session now.
+    let left = crate::steer_hook::take(&steer_file);
+    let mut steered_in: Vec<String> = Vec::new();
+    for (text, ids) in &steered {
+        if left.as_deref().is_some_and(|l| l.contains(text.trim())) {
+            markers.forget(ids);
+        } else {
+            steered_in.extend(ids.iter().cloned());
         }
     }
     let _ = std::fs::remove_file(&steer_file);
@@ -1279,16 +2275,34 @@ async fn look(
         Ok(o) => (o.error.is_none(), o.stopped, o.error.clone()),
         Err(e) => (false, false, Some(format!("{e:#}"))),
     };
-    if let (Ok(o), false) = (&outcome, dry) {
-        if let Some(s) = o.session.clone().or(session_seen) {
-            state.session = Some(s);
+    if !dry {
+        if let Some(s) = last_good_session { state.session = Some(s); }
+        // What `session_life` decides the next look by ([`ends`]): how big the
+        // session is now, when the harness said, and that it was just used.
+        if let Some(sid) = state.session.clone() {
+            let context = (gauge.context > 0).then_some(gauge.context);
+            crate::session_life::record_in(&mut state.life, &surface, &sid, context, now_secs() as i64, HashMap::new());
         }
     }
     let (spoke, sends) = spoke_to(&ctx.journal);
 
     if (ok || stopped) && !dry {
         markers.mark(&ctx.client).await;
+        book.settle(state, &markers);
         update_streaks(&mut state.ai_streak, &turn_keys, &humans, &spoke);
+        // What the session holds now ([`Known`]): the lines it was handed, the
+        // asides steered into it, what it sent, the statuses it was told.
+        let handed: Vec<String> = batches
+            .iter()
+            .flat_map(|b| b.context.iter().chain(b.new.iter()))
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .chain(steered_in)
+            .chain(sent_ids(&ctx.journal))
+            .collect();
+        let told: Vec<(String, char)> =
+            batches.iter().flat_map(|b| b.working.iter().map(|d| (d.id.clone(), d.kind))).collect();
+        let sid = state.session.clone();
+        state.known.settle(sid.as_deref(), gauge.compacted, handed, told);
     }
     if sends > 0 && !dry {
         state.waiting_until = now_secs() + WAITING_WINDOW;
@@ -1301,7 +2315,10 @@ async fn look(
     if patrol && ok {
         let stamp = local(now, off).format("%Y%m%d-%H%M%S").to_string();
         if let Some(props) = load_proposals(&ctx.workdir) {
-            if ask_mode {
+            if ask_mode && card_pending {
+                // Told not to, did anyway: one open card at a time holds.
+                eprintln!("inbox: a card is still unanswered — ignoring {} new proposal(s)", props.len());
+            } else if ask_mode {
                 let card = render_ask_card(&props, &now_local);
                 carded = props.len();
                 if dry {
@@ -1344,22 +2361,44 @@ async fn look(
         if dry { "dry-run,本来会发" } else { "发了" },
         if carded > 0 { format!(" · 提案卡 {carded} 件等你勾") } else { String::new() },
         if stopped { " · ⏹ 已停" } else { "" },
-        err.as_deref().map(|e| format!(" · ⚠️ {}", clip(e, 200))).unwrap_or_default()
+        // The headline says THAT it failed; what and why is the shared failure
+        // card at the end of the log — this line used to carry the raw error.
+        if err.is_some() { " · ⚠️ 没跑完" } else { "" }
     );
+    // The card, at the end of what the run did — the same one a reply that
+    // dies ends on (`agent::failure_card`), with the seat's limit when that
+    // is what stopped it.
+    // What only some readers of the log may read — a compaction's summary, the
+    // failure's raw error — as state on the log message once it is posted.
+    let mut private = tx_log.take_private();
+    let failed = err.as_deref().map(|e| {
+        let limit = outcome.as_ref().ok().and_then(|o| o.limit.as_ref());
+        if !account_issues.is_empty() {
+            if let Some(a) = &seat {
+                crate::agent::remember_account_issues(&mut account_issues, [crate::agent::account_attempt_issue(&a.name, e, limit)]);
+            }
+        }
+        let (card, item) = crate::agent::failure_card_with_accounts(&ctx.me, e, limit, &account_issues, accounts_unavailable);
+        private.extend(item);
+        format!("\n\n{card}")
+    });
     if dry {
         // Nothing leaves the machine: the trace and what it WOULD have sent.
         println!("{head}\n");
         for line in std::fs::read_to_string(&ctx.journal).unwrap_or_default().lines() {
             println!("  would: {line}");
         }
-        println!("\n{}", tx_log.finish_folded());
+        println!("\n{}{}", tx_log.finish_folded(), failed.as_deref().unwrap_or(""));
     } else if let Some(log_chat) = &ctx.log_chat {
-        let body = clip(&tx_log.finish_folded(), LOG_MAX);
+        let body = format!("{}{}", clip(&tx_log.finish_folded(), LOG_MAX), failed.as_deref().unwrap_or(""));
         let dest = Dest::chat(log_chat).channel(ctx.log_channel.as_deref());
         match ctx.client.send_to(dest, &format!("{head}\n\n{body}")).await {
             Ok(m) => {
                 if let Some(id) = m["id"].as_str() {
                     state.remember_log(id);
+                    if !private.is_empty() {
+                        crate::agent::write_private(&ctx.client, id, private).await;
+                    }
                 }
             }
             Err(e) => eprintln!("inbox: posting the log failed: {e:#}"),
@@ -1383,6 +2422,13 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         .as_deref()
         .map(|p| p.trim().trim_start_matches('@').to_lowercase())
         .filter(|p| !p.is_empty());
+    let _ = ALIASES.set(
+        opts.aliases
+            .iter()
+            .map(|a| a.trim().trim_start_matches('@').to_lowercase())
+            .filter(|a| !a.is_empty() && *a != me_lc)
+            .collect(),
+    );
     let mut workdir = match workdir {
         Some(w) => w,
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
@@ -1397,6 +2443,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         workdir = scratch.to_string_lossy().into_owned();
     }
     let harness = harness::select(&harness_id);
+    anyhow::ensure!(harness.runs(), "{}", harness::unsupported::refusal(harness.id()));
     anyhow::ensure!(
         harness.available(),
         "harness {harness_id} isn't installed here — `mafold install {harness_id}`"
@@ -1426,7 +2473,26 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
     // A dry run beside the live loop must not share its send journal: the live
     // one clears and reads it to know who IT spoke to.
     let journal = dir.join(if opts.dry_run { "journal-dry.jsonl" } else { "journal.jsonl" });
-    let env = child_env(&client, &me, &journal, opts.dry_run);
+    let seen = seen_path(&dir, opts.dry_run);
+    let env = child_env(&client, &me, &journal, &seen, opts.dry_run);
+    // The login this process was started on (`CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+    // set by whatever launched it) becomes the loop's PREFERENCE rather than a
+    // pin, and leaves our own environment: every turn names its login
+    // explicitly, and the default login has no variable at all — a child that
+    // inherited the pin would run on it whatever the choice said. A directory
+    // the registry doesn't know stays a pin: there is nothing to fail over to
+    // that we could name.
+    let started_on = crate::accounts::Account::from_env(&[]);
+    let seats = harness.id() == "claude-code"
+        && (started_on.is_default() || crate::accounts::load().get(&started_on.name).is_some());
+    let seat_pref = (seats && !started_on.is_default()).then(|| started_on.name.clone());
+    if seats {
+        std::env::remove_var(crate::accounts::ENV);
+        println!(
+            "inbox: Claude login `{}` preferred — a full window or refused sign-in moves the turn to the next login on this machine",
+            started_on.name
+        );
+    }
     println!(
         "inbox: @{me} · harness {} · workdir {workdir} · principal {} · heartbeat {}s ({}s outside {}) · patrol {} · glance {}s · log {}{}{}",
         harness.id(),
@@ -1454,6 +2520,9 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         ask_chat,
         env,
         journal,
+        seen,
+        seats,
+        seat_pref,
     };
     let dry = ctx.opts.dry_run;
 
@@ -1519,11 +2588,11 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         let heartbeat = now.saturating_sub(state.last_look) >= every;
         // A patrol is a look that needs nothing new: the CEO going round to see
         // what should be moving and isn't. Active hours only.
-        // One open question at a time: while a proposal card waits for its
-        // answer there is no new patrol (and so no new card).
-        let patrol = state.pending_ask.is_none()
-            && ((first && ctx.opts.patrol_now)
-                || (ctx.opts.patrol > 0 && active && now.saturating_sub(state.last_patrol) >= ctx.opts.patrol));
+        // A patrol runs on schedule whatever the card is doing: following up
+        // (chasing, checking delivered work, answering) never waits on it. What
+        // an unanswered card blocks is only the NEXT card (see `look`).
+        let patrol = (first && ctx.opts.patrol_now)
+            || (ctx.opts.patrol > 0 && active && now.saturating_sub(state.last_patrol) >= ctx.opts.patrol);
         let was_first = std::mem::replace(&mut first, false);
 
         let mut reasons = Vec::new();
@@ -1604,6 +2673,23 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_final_session_outranks_the_init_event_and_failed_events_are_ignored() {
+        let mut saved = Some("prior".into());
+        let mut outcome = crate::harness::TurnOutcome {
+            produced: true, session: Some("after-compaction".into()), ..Default::default()
+        };
+        super::retain_attempt_session(&mut saved, &outcome, Some("init-session"));
+        assert_eq!(saved.as_deref(), Some("after-compaction"));
+        outcome.session = None;
+        super::retain_attempt_session(&mut saved, &outcome, Some("event-only"));
+        assert_eq!(saved.as_deref(), Some("event-only"));
+        outcome.produced = false;
+        outcome.error = Some("authentication failed".into());
+        super::retain_attempt_session(&mut saved, &outcome, Some("failed-fork"));
+        assert_eq!(saved.as_deref(), Some("event-only"));
+    }
+
     use super::*;
 
     fn msg(id: &str, who: &str, kind: &str, at: &str, text: &str) -> Value {
@@ -1630,6 +2716,69 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_is_the_same_person() {
+        let alias = vec!["opsdu".to_string()];
+        // The team @s the principal, not the clone: that wakes the clone.
+        let at = msg("1", "linsky", "human", "", "@opsdu 这个你定一下");
+        assert!(wakes_now_as(&at, "realopsdu", &alias, false));
+        assert!(!wakes_now_as(&at, "realopsdu", &[], false), "without the alias it's just chatter");
+        let mut reply = msg("2", "linsky", "human", "", "好的");
+        reply["reply_to_sender"] = json!("opsdu");
+        assert!(wakes_now_as(&reply, "realopsdu", &alias, false));
+        // An agent calling @opsdu (e.g. for a release) counts too — by the AI
+        // rule, a line that opens with the @. Naming opsdu mid-sentence is a
+        // report, read on the next heartbeat like any chatter.
+        let bot = msg("3", "opsdu:claude-code", "bot", "", "只差发版。\n@opsdu 要你点头");
+        assert!(wakes_now_as(&bot, "realopsdu", &alias, false));
+        let named = msg("3b", "opsdu:claude-code", "bot", "", "只差发版,要 @opsdu 点头");
+        assert!(!wakes_now_as(&named, "realopsdu", &alias, false));
+        // The principal's own messages never wake it through the alias.
+        let own = msg("4", "opsdu", "human", "", "@opsdu 备忘");
+        assert!(!wakes_now_as(&own, "realopsdu", &alias, false));
+    }
+
+    #[test]
+    fn an_agents_reply_is_read_by_its_conclusion() {
+        let trail = "{% mafold/run summary=\"Ran 40 shell commands\" %}\n".to_string()
+            + &"{% mafold/tool name=\"Bash\" detail=\"cargo test\" %}output line\n{% /mafold/tool %}\n".repeat(300)
+            + "{% /mafold/run %}\n";
+        let content = format!("{trail}开头一句。{}**结论**:PR #556 合了,只差 api 和 cli 发版,要 ops 点头。", "中间的叙述。".repeat(400));
+        let mut m = msg("9", "opsdu:claude-code", "bot", "2026-09-25T12:45:00Z", &content);
+        m["finalized_at"] = json!("2026-09-25T12:45:51Z");
+        let line = render_msg(&m, "realopsdu", Some("opsdu"), 8);
+        assert!(line.contains("只差 api 和 cli 发版,要 ops 点头"), "the ending survives");
+        assert!(!line.contains("output line") && !line.contains("mafold/tool"), "the trail is gone");
+        assert!(!line.contains("mafold/run") && !line.contains("[folded"), "…not even a folded line of it: {line}");
+        assert!(line.contains("中间省略"), "long prose is cut in the middle, not at the end");
+        assert!(line.chars().count() < BOT_HEAD + BOT_TAIL + 200);
+        // In the overview the END is what's kept, too.
+        let short = clip_body_tail(&line, 260);
+        assert!(short.contains("要 ops 点头") && short.starts_with("#9 "), "{short}");
+    }
+
+    #[test]
+    fn an_agents_unfinished_draft_is_not_read() {
+        let mut draft = msg("d", "opsdu:claude-code", "bot", "", "@realopsdu 还在写");
+        draft["finalized_at"] = Value::Null;
+        assert!(in_progress(&draft), "a bot message with no finalized_at is still being written");
+        assert!(!wakes_now_as(&draft, "realopsdu", &[], true));
+        let mut done = draft.clone();
+        done["finalized_at"] = json!("2026-09-25T12:00:00Z");
+        assert!(!in_progress(&done));
+        // A person's message never carries a finalized_at test: absent field ≠ null.
+        let person = msg("p", "linsky", "human", "", "在吗");
+        assert!(!in_progress(&person));
+    }
+
+    #[test]
+    fn a_patrol_with_an_open_card_only_follows_up() {
+        let pt = Patrol { overview: "", window_hours: 72, ask: true, card_pending: true, decisions: "" };
+        let p = build_prompt("2026-09-25 21:00", &["巡视"], false, &[], &[], &[], Some(&pt), None, "realopsdu", Some("opsdu"), 8);
+        assert!(p.contains("跟进不用等任何人批"));
+        assert!(p.contains("这一轮只跟进") && !p.contains("新活这一轮先别派"));
+    }
+
+    #[test]
     fn a_person_buzzes_on_dm_at_and_reply_an_ai_only_on_at() {
         let dm = msg("1", "linsky", "human", "", "在吗");
         assert!(wakes_now(&dm, "realopsdu", true));
@@ -1650,6 +2799,11 @@ mod tests {
         assert!(!wakes_now(&bot_reply, "realopsdu", false));
         let bot_at = msg("6", "opsdu:claude-code", "bot", "", "@realopsdu 合好了");
         assert!(wakes_now(&bot_at, "realopsdu", false));
+        // …an @ that opens a line: mid-sentence an AI is only naming it.
+        let bot_named = msg("6b", "opsdu:claude-code", "bot", "", "合好了,等 @realopsdu 出发版卡");
+        assert!(!wakes_now(&bot_named, "realopsdu", false));
+        let person_named = msg("6c", "linsky", "human", "", "合好了,等 @realopsdu 出发版卡");
+        assert!(wakes_now(&person_named, "realopsdu", false), "a person's @ anywhere still buzzes");
 
         // Never myself, never a reply still being written.
         let mine = msg("7", "realopsdu", "human", "", "@realopsdu");
@@ -1682,13 +2836,13 @@ mod tests {
     fn a_patrol_runs_on_nothing_new_and_carries_the_overview() {
         let ov = "\n== Mafold DEV · 24 人群 · #上架app · chat=c channel=ch ==\n#1 [09-25 09:00] @linsky: 审核还没过\n";
         let past = "- 09-25 11:14 提了 ①甲 ②乙 → 本人选了 ②\n";
-        let pt = Patrol { overview: ov, window_hours: 72, ask: true, decisions: past };
+        let pt = Patrol { overview: ov, window_hours: 72, ask: true, card_pending: false, decisions: past };
         let p = build_prompt("2026-09-25 11:00", &["巡视"], false, &[], &[], &[], Some(&pt), None, "realopsdu", Some("opsdu"), 8);
         assert!(p.contains("主动巡视") && p.contains("最近 72 小时"));
         assert!(p.contains("[全局概览]") && p.contains("#上架app") && p.contains("审核还没过"));
         assert!(p.contains("这一轮先别派") && p.contains("proposals.json"), "ask mode proposes");
         assert!(p.contains("[本人过去的取舍") && p.contains("本人选了 ②"));
-        let quiet = Patrol { overview: "  ", window_hours: 24, ask: false, decisions: "" };
+        let quiet = Patrol { overview: "  ", window_hours: 24, ask: false, card_pending: false, decisions: "" };
         let p = build_prompt("2026-09-25 11:00", &["巡视"], false, &[], &[], &[], Some(&quiet), None, "realopsdu", None, 8);
         assert!(p.contains("这段时间哪儿都没动静"));
         assert!(!p.contains("这一轮先别派") && p.contains("推的方式"), "auto mode hands out");
@@ -1904,17 +3058,197 @@ mod tests {
         let b = Batch {
             tl,
             context: vec![msg("0", "linsky", "human", "2026-09-25T02:00:00Z", "早")],
-            new: vec![msg("1", "linsky", "human", "2026-09-25T02:01:00Z", "@realopsdu 看下")],
+            new: vec![
+                msg("9", "opsdu:claude-code", "bot", "2026-09-25T01:50:00Z", "根因是重启丢了游标"),
+                msg("1", "linsky", "human", "2026-09-25T02:01:00Z", "@realopsdu 看下"),
+            ],
+            working: vec![Draft {
+                id: "w".into(),
+                kind: '⏳',
+                line: "#w [09-25 10:01] @opsdu:codex(AI): ⏳ 正在回复 · 已写 3 分钟".into(),
+            }],
+            finished: ["9".to_string()].into_iter().collect(),
+            newest_working: None,
         };
         let due = vec![Followup { at: "2026-09-25T10:00:00+08:00".into(), conv: "c1".into(), note: "追 PR".into() }];
         let p = build_prompt("2026-09-25 10:01", &["心跳"], true, &[b], &["某群".into()], &due, None, None, "realopsdu", Some("opsdu"), 8);
         assert!(!p.contains("主动巡视"), "no patrol brief on a plain look");
-        assert!(p.contains("新的一天"));
+        assert!(p.contains("新会话") && p.contains("ledger.md"), "a new session is told to pick up from the notebook");
         assert!(p.contains("== Mafold DEV · 24 人群 · #dev · chat=c1 channel=ch1 =="));
         assert!(p.contains("  (之前) #0"));
         assert!(p.contains("#1 [09-25 10:01] @linsky: @realopsdu 看下"));
         assert!(p.contains("只标已读") && p.contains("某群"));
         assert!(p.contains("[到期的跟进]") && p.contains("追 PR"));
+        assert!(p.contains("(刚写完) #9 "), "a reply that just finished is marked as such");
+        assert!(p.contains("⏳ 正在回复 · 已写 3 分钟"), "a reply in progress shows as a status line");
+    }
+
+    /// A session resumed all day held 323 messages 1393 times: every look
+    /// re-handed each timeline's last few lines as context. A line the session
+    /// already holds is left out now, and so is a status it was already told;
+    /// the new lines — and a status that changed — always go.
+    #[test]
+    fn a_resumed_session_is_not_handed_what_it_holds() {
+        let tl = Timeline {
+            chat_id: "c1".into(),
+            channel_id: None,
+            channel_name: None,
+            label: "ops · 私聊".into(),
+            is_dm: true,
+            unread: 1,
+        };
+        let draft = |kind: char| Draft { id: "w".into(), kind, line: format!("#w [09-25 10:01] @opsdu:codex(AI): {kind} …") };
+        let batch = |kind: char| Batch {
+            tl: tl.clone(),
+            context: vec![
+                msg("0", "opsdu", "human", "2026-09-25T02:00:00Z", "早上那句"),
+                msg("1", "realopsdu", "human", "2026-09-25T02:01:00Z", "我回的那句"),
+            ],
+            new: vec![msg("2", "opsdu", "human", "2026-09-25T02:02:00Z", "新的这句")],
+            working: vec![draft(kind)],
+            finished: HashSet::new(),
+            newest_working: None,
+        };
+        let mut known = Known::default();
+        known.settle(Some("s1"), false, ["0".to_string(), "1".to_string()], [("w".to_string(), '⏳')]);
+        let k = known.of(Some("s1")).expect("the session this record is about");
+        let mut same = batch('⏳');
+        same.without(k);
+        let p = build_prompt("2026-09-25 10:02", &["私聊"], false, &[same], &[], &[], None, None, "realopsdu", Some("opsdu"), 8);
+        assert!(!p.contains("(之前)"), "{p}");
+        assert!(p.contains("#2 ") && p.contains("新的这句"), "the new line always goes: {p}");
+        assert!(!p.contains("#w "), "a status it was told already: {p}");
+        let mut changed = batch('⚠');
+        changed.without(k);
+        assert_eq!(changed.working.len(), 1, "a status that changed is news");
+        // Another session — or a new one — holds none of it.
+        assert!(known.of(Some("s2")).is_none() && known.of(None).is_none());
+        let p = build_prompt("2026-09-25 10:02", &["私聊"], true, &[batch('⏳')], &[], &[], None, None, "realopsdu", Some("opsdu"), 8);
+        assert!(p.contains("(之前) #0") && p.contains("(之前) #1") && p.contains("#w "), "{p}");
+    }
+
+    #[test]
+    fn what_a_session_holds_starts_over_with_a_new_one_or_a_compaction() {
+        let none = Vec::<(String, char)>::new;
+        let mut k = Known::default();
+        k.settle(Some("s1"), false, ["a".to_string()], [("d".to_string(), '⏳')]);
+        k.settle(Some("s1"), false, ["b".to_string()], none());
+        assert!(k.msgs.contains("a") && k.msgs.contains("b") && k.drafts.contains_key("d"));
+        k.settle(Some("s2"), false, ["c".to_string()], none());
+        assert_eq!(k.session.as_deref(), Some("s2"));
+        assert!(!k.msgs.contains("a") && k.msgs.contains("c") && k.drafts.is_empty(), "a new session holds only its own");
+        k.settle(Some("s2"), true, ["e".to_string()], none());
+        assert!(k.msgs.is_empty(), "a compaction leaves nothing verbatim");
+        assert_eq!(k.session.as_deref(), Some("s2"));
+    }
+
+    /// The session ends by the rule a bot's does — past `session_life`'s
+    /// context limit, or idle until the cache is gone — not at midnight.
+    #[test]
+    fn the_session_ends_the_way_a_bots_does() {
+        use crate::session_life::{record_in, Why, CONTEXT_LIMIT, IDLE_SECS};
+        let surface = surface_of("realopsdu");
+        assert_eq!(surface, "inbox____realopsdu");
+        let mut s = State { session: Some("s1".into()), ..Default::default() };
+        assert!(ends(&s, &surface, 1_000).is_some(), "a session from before records were kept isn't resumed");
+        record_in(&mut s.life, &surface, "s1", Some(CONTEXT_LIMIT / 2), 1_000, HashMap::new());
+        assert!(ends(&s, &surface, 1_000 + IDLE_SECS - 1).is_none());
+        assert_eq!(ends(&s, &surface, 1_000 + IDLE_SECS), Some(("s1".to_string(), Why::Idle(IDLE_SECS).to_string())));
+        record_in(&mut s.life, &surface, "s1", Some(CONTEXT_LIMIT), 2_000, HashMap::new());
+        assert_eq!(ends(&s, &surface, 2_001), Some(("s1".to_string(), Why::Context(CONTEXT_LIMIT).to_string())));
+        // A record about another session is no record of this one.
+        s.session = Some("s2".into());
+        assert!(ends(&s, &surface, 2_001).is_some());
+        s.session = None;
+        assert!(ends(&s, &surface, 2_001).is_none(), "no session, nothing to end");
+    }
+
+    /// An agent's reply is read for what it said and how it ended — the tasks
+    /// it left running stay (folded, like any history view); its trail and
+    /// its stamps go. A reply that was nothing but its trail still shows it.
+    #[test]
+    fn an_agents_reply_keeps_what_it_said_and_how_it_ended() {
+        let content = "{% mafold/trace summary=\"Ran 6 shell commands\" steps=\"6\" %}\n\
+            {% mafold/bash cmd=\"gh pr checks\" /%}\n{% /mafold/trace %}\n\n\
+            CI 在跑,跑完我回来报。\n\
+            {% mafold/bgtasks n=1 %}\nwatching the PR\n{% /mafold/bgtasks %}\n\n\
+            {% mafold/result duration=\"2m\" %}\n{\"cost_usd\":1.2}\n{% /mafold/result %}\n";
+        let mut m = msg("r", "opsdu:claude-code", "bot", "2026-09-25T12:45:00Z", content);
+        m["finalized_at"] = json!("2026-09-25T12:46:00Z");
+        let line = render_msg(&m, "realopsdu", Some("opsdu"), 8);
+        assert!(line.contains("CI 在跑,跑完我回来报。"), "{line}");
+        assert!(line.contains("mafold/bgtasks"), "the tasks it left running: {line}");
+        for gone in ["mafold/trace", "Ran 6 shell commands", "gh pr checks", "mafold/result", "cost_usd"] {
+            assert!(!line.contains(gone), "{gone} survived: {line}");
+        }
+        let trail = "{% mafold/run summary=\"Ran 1 shell command\" %}\n{% mafold/bash cmd=\"ls\" /%}\n{% /mafold/run %}";
+        let line = render_msg(&msg("t", "opsdu:claude-code", "bot", "2026-09-25T12:45:00Z", trail), "realopsdu", Some("opsdu"), 8);
+        assert!(line.contains("mafold/run"), "a reply that was only its trail isn't «—»: {line}");
+    }
+
+    #[test]
+    fn the_journal_names_what_was_sent() {
+        let dir = std::env::temp_dir().join(format!("inbox-sent-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let j = dir.join("j.jsonl");
+        std::fs::write(
+            &j,
+            "{\"kind\":\"send\",\"chat_id\":\"c1\",\"message_id\":\"m1\"}\n\
+             {\"kind\":\"send\",\"dry\":true,\"chat_id\":\"c1\"}\n\
+             {\"kind\":\"react\",\"message_id\":\"m2\"}\n",
+        )
+        .unwrap();
+        assert_eq!(sent_ids(&j), vec!["m1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mode works through `mafold` in a shell and a notebook in files —
+    /// it starts on those tools, not on every description the harness has.
+    #[test]
+    fn the_inbox_runs_on_the_tools_it_works_with() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            o: InboxOpts,
+        }
+        let o = <Cli as clap::Parser>::parse_from(["inbox"]).o;
+        let tools = tools_of(&o.tools).expect("a narrow set by default");
+        for t in ["Bash", "Read", "Edit", "Write"] {
+            assert!(tools.split(',').any(|x| x == t), "{t} in {tools}");
+        }
+        for t in ["Agent", "Skill", "Workflow", "ToolSearch"] {
+            assert!(!tools.split(',').any(|x| x == t), "{t} in {tools}");
+        }
+        assert_eq!(tools_of("default"), None);
+        assert_eq!(tools_of(" "), None);
+    }
+
+    #[test]
+    fn preamble_says_what_a_session_holds_and_when_it_ends() {
+        let p = preamble("realopsdu", Some("opsdu"));
+        assert!(p.contains("看过的不会再以「(之前)」补给你"), "{p}");
+        assert!(p.contains(&format!("约 {} 万 token", crate::session_life::CONTEXT_LIMIT / 10_000)), "{p}");
+        assert!(!p.contains("会话每天换"), "{p}");
+    }
+
+    /// A turn names its login explicitly: a named login's directory rides the
+    /// env, the default login carries NO variable (so a stale one from the
+    /// base env must not survive), and a loop without seats keeps its env as is.
+    #[test]
+    fn a_turn_env_names_its_login_and_nothing_else() {
+        use crate::accounts::{Account, ENV};
+        let base = vec![
+            ("MAFOLD_BASE".to_string(), "https://api".to_string()),
+            (ENV.to_string(), "/stale/pin".to_string()),
+        ];
+        let work = Account { name: "work".into(), dir: Some("/seats/work".into()), email: None, added_at: 0 };
+        let on_work = with_seat(&base, Some(&work));
+        assert!(on_work.contains(&(ENV.to_string(), "/seats/work".to_string())));
+        assert_eq!(on_work.iter().filter(|(k, _)| k == ENV).count(), 1, "one login, not two");
+        let on_default = with_seat(&base, Some(&Account::default_login()));
+        assert!(!on_default.iter().any(|(k, _)| k == ENV), "the default login has no variable");
+        assert!(on_default.contains(&("MAFOLD_BASE".to_string(), "https://api".to_string())));
+        assert!(!with_seat(&base, None).iter().any(|(k, _)| k == ENV));
     }
 
     /// 522 turns of @realopsdu never once opened a channel: the preamble taught
@@ -1928,5 +3262,285 @@ mod tests {
         assert!(p.contains("mafold channels create <chat_id> <名字>"));
         assert!(p.contains("mafold channels close <chat_id> <频道>"));
         assert!(p.contains("别把不相干的事堆进私聊或主时间线"));
+    }
+
+    /// A bot reply still being written: no finalized_at, a live generating tag.
+    fn draft(id: &str, at: &str, content: &str) -> Value {
+        let mut d = msg(id, "opsdu:claude-code", "bot", at, content);
+        d["finalized_at"] = Value::Null;
+        d
+    }
+
+    const T0: u64 = 1_790_000_000_000; // a fixed "now", in ms
+
+    #[test]
+    fn the_generating_tag_is_read_back() {
+        let tag = mafold_transcript::render::generating_tag_awaiting(T0 - 600_000, 7, T0 - 30_000, 1200, 2, Some("opsdu"));
+        let p = progress_of(&format!("先看日志{tag}")).expect("the tag is found");
+        assert_eq!(p.started_ms, Some(T0 - 600_000));
+        assert_eq!(p.beat_at_ms, Some(T0 - 30_000));
+        assert_eq!(p.shells, 2);
+        assert_eq!(p.awaiting.as_deref(), Some("opsdu"));
+        assert!(progress_of("没有卡片的正文").is_none());
+    }
+
+    /// The status says who is on it and whether it is alive — the difference
+    /// between "they're working" and "nobody answered" that the hidden draft erased.
+    #[test]
+    fn a_reply_in_progress_reads_as_what_it_is() {
+        let tag = |started: u64, beat: u64, shells: u64, awaiting: Option<&str>| {
+            mafold_transcript::render::generating_tag_awaiting(started, 1, beat, 0, shells, awaiting)
+        };
+        let alive = draft("d", "2026-09-25T02:00:00Z", &format!("先查日志,再看游标{}", tag(T0 - 9 * 60_000, T0 - 60_000, 2, None)));
+        let s = working_status(&alive, T0);
+        assert!(s.starts_with("⏳ 正在回复 · 已写 9 分 · 最后动静 1 分钟前 · 2 个后台任务"), "{s}");
+        assert!(s.contains("已写到:「先查日志,再看游标」"), "{s}");
+
+        let quiet = draft("d", "", &tag(T0 - 40 * 60_000, T0 - 25 * 60_000, 0, None));
+        assert!(working_status(&quiet, T0).starts_with("⚠️ 25 分没动静了(开写 40 分钟前)"), "{}", working_status(&quiet, T0));
+
+        let parked = draft("d", "", &tag(T0 - 5 * 60_000, T0 - 20 * 60_000, 0, Some("opsdu")));
+        assert!(working_status(&parked, T0).starts_with("⏸ 在等 @opsdu 回答卡片"), "parked beats quiet: {}", working_status(&parked, T0));
+
+        let bare = draft("d", "2026-09-25T02:00:00Z", "写了一半");
+        assert!(working_status(&bare, T0).starts_with("⏳ 草稿还没写完"));
+
+        let long = "很".repeat(300);
+        let s = working_status(&draft("d", "", &format!("{long}{}", tag(T0, T0, 0, None))), T0);
+        assert!(s.contains("已写到:「…") && s.chars().count() < 200, "only the tail of a long draft: {s}");
+    }
+
+    /// What @opsdu:claude-code said in #还没有消息？ on 09-25 — finished, and
+    /// quoting the generating tag mid-sentence, in backticks.
+    const QUOTES_THE_CARD: &str = "这个洞 main 上确实还在。现在 agent 一开始思考,daemon 和托管 bot 都会马上把 `{% mafold/generating %}` 卡推进草稿,草稿内容就不是空的了。\n\n你是想自己改,还是我照这个方案改好、CI 绿了合进去?";
+
+    /// Only the live card on the END says "still being written"; prose that
+    /// talks about the card is just prose.
+    #[test]
+    fn a_finished_reply_that_quotes_the_card_is_not_a_draft() {
+        let mut said = msg("18a2", "opsdu:claude-code", "bot", "2026-09-25T14:08:35.755720855Z", QUOTES_THE_CARD);
+        said["finalized_at"] = json!("2026-09-25T14:08:35.755717995Z");
+        assert!(!in_progress(&said), "finished, whatever its prose talks about");
+
+        // A quote early and the live card on the end: still being written, and
+        // the status is read off the live card — not the quote.
+        let tag = mafold_transcript::render::generating_tag(T0 - 60_000, 3, T0 - 5_000, 0, 1);
+        let live = msg("l", "opsdu:claude-code", "bot", "2026-09-25T14:08:35Z", &format!("{QUOTES_THE_CARD}{tag}"));
+        assert!(in_progress(&live), "the card arm alone (no finalized_at field) sees the live card");
+        let p = progress_of(live["content"].as_str().unwrap()).expect("the live card is read");
+        assert_eq!((p.started_ms, p.shells), (Some(T0 - 60_000), 1));
+    }
+
+    /// The page the clone's loop got for DEV #还没有消息？ (2026-10-07), ids
+    /// cut short. The badge said 1: the finished reply after the marker. The
+    /// loop took that reply for a draft and handed over 86890897 — the line
+    /// BEFORE it — on every look, marking read where the marker already was.
+    #[test]
+    fn the_reply_that_quotes_the_card_is_the_one_handed_over() {
+        let mut fixed = msg("86890897", "linsky:opus48", "bot", "2026-09-18T19:08:02.728523592Z", "修好了 —— 但要更正我上一条的一处说法。");
+        fixed["finalized_at"] = json!("2026-09-18T19:19:13.880496978Z");
+        let mut said = msg("18a2a2be", "opsdu:claude-code", "bot", "2026-09-25T14:08:35.755720855Z", QUOTES_THE_CARD);
+        said["finalized_at"] = json!("2026-09-25T14:08:35.755717995Z");
+        let items = vec![
+            msg("703e7a1c", "linsky", "human", "2026-09-18T19:07:56.479653772Z", "继续"),
+            fixed,
+            said,
+            msg("ac4b9a52", "realopsdu", "human", "2026-09-26T11:20:16.903324898Z", "@linsky 你的 #508 claude-code 看了"),
+            msg("7bf2ce96", "realopsdu", "human", "2026-09-27T15:11:34.486084025Z", "@linsky #508 空草稿预览晾一个多礼拜了"),
+        ];
+        let ids = |v: &[Value]| v.iter().map(|m| m["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // Marked here before (the live loop) or never (a fresh state file).
+        for marked_at in [Some("2026-09-18T19:08:02.728523592Z"), None] {
+            let a = arrange(&items, 1, "realopsdu", vec![], marked_at);
+            assert_eq!(ids(&a.new), ["18a2a2be", "ac4b9a52", "7bf2ce96"], "marked_at={marked_at:?}");
+            assert!(a.working.is_empty(), "nothing here is still being written");
+            // …so the marker goes past the reply, and the badge clears.
+            let tl = Timeline {
+                chat_id: "c".into(),
+                channel_id: Some("ch".into()),
+                channel_name: None,
+                label: "x".into(),
+                is_dm: false,
+                unread: 1,
+            };
+            let mut markers = Markers::default();
+            for m in &a.new {
+                markers.add(&tl, m);
+            }
+            assert_eq!(markers.newest(), [("c/ch".to_string(), "2026-09-27T15:11:34.486084025Z".to_string())]);
+        }
+    }
+
+    /// The old reader stopped at the first draft: everything after it — a
+    /// person's message included — stayed invisible until the draft finished.
+    #[test]
+    fn a_draft_no_longer_hides_what_came_after_it() {
+        let items = vec![
+            msg("a", "linsky", "human", "2026-09-25T02:00:00Z", "早"),
+            draft("d", "2026-09-25T02:01:00Z", "写着呢"),
+            msg("b", "linsky", "human", "2026-09-25T02:02:00Z", "@realopsdu 急"),
+        ];
+        // The badge counts the draft in place, plus b.
+        let a = arrange(&items, 2, "realopsdu", vec![], Some("2026-09-25T02:00:00Z"));
+        assert_eq!(a.new.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(a.context.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(a.working.len(), 1, "the draft is a status, not a message");
+    }
+
+    /// A reply that finished after the marker had passed it comes back as ONE
+    /// more unread that sits before the marker — counting back from the newest
+    /// line would hand over the wrong message and never the reply.
+    #[test]
+    fn a_reply_that_finished_behind_the_marker_comes_back_as_new() {
+        let r = msg("r", "opsdu:claude-code", "bot", "2026-09-25T02:01:00Z", "结论:修好了");
+        let items = vec![
+            msg("a", "linsky", "human", "2026-09-25T02:00:00Z", "早"),
+            r.clone(),
+            msg("z", "linsky", "human", "2026-09-25T02:05:00Z", "好"),
+        ];
+        let a = arrange(&items, 1, "realopsdu", vec![r.clone()], Some("2026-09-25T02:05:00Z"));
+        assert_eq!(a.new.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["r"]);
+        assert!(!a.context.iter().any(|m| m["id"] == "r"), "not shown twice");
+        assert!(!a.new.iter().any(|m| m["id"] == "z"), "z was already read");
+
+        // Finished AHEAD of the marker: the badge counts it in place — once.
+        let a = arrange(&items, 2, "realopsdu", vec![r], Some("2026-09-25T02:00:00Z"));
+        assert_eq!(a.new.iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["r", "z"]);
+    }
+
+    #[test]
+    fn a_draft_is_watched_only_once_the_marker_passes_it() {
+        let tl = Timeline {
+            chat_id: "c1".into(),
+            channel_id: None,
+            channel_name: None,
+            label: "x".into(),
+            is_dm: false,
+            unread: 0,
+        };
+        let mut state = State::default();
+        let mut book = Book::default();
+        book.saw_draft(&tl, &draft("early", "2026-09-25T02:01:00Z", ""));
+        book.saw_draft(&tl, &draft("late", "2026-09-25T02:09:00Z", ""));
+        let mut markers = Markers::default();
+        markers.add(&tl, &msg("m", "linsky", "human", "2026-09-25T02:05:00Z", "x"));
+        book.settle(&mut state, &markers);
+        let watched: Vec<&str> = state.watching.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(watched, vec!["early"], "the draft after the marker still counts in place");
+        assert_eq!(state.marked_at.get("c1").map(String::as_str), Some("2026-09-25T02:05:00Z"));
+
+        // Delivered once finished: let go.
+        let mut book = Book::default();
+        book.delivered.insert("early".into());
+        book.settle(&mut state, &Markers::default());
+        assert!(state.watching.is_empty());
+    }
+
+    /// The guard's floor: what the agent was shown, moved forward only by what
+    /// the steer hook actually handed it — not by what still sits in the mailbox.
+    #[test]
+    fn the_guard_counts_only_what_the_agent_was_handed() {
+        let seen = Seen {
+            me: "realopsdu".into(),
+            started: "2026-09-25T02:00:00.000000Z".into(),
+            timelines: [("c1".to_string(), "2026-09-25T02:03:00Z".to_string())].into_iter().collect(),
+            queued: vec![
+                Queued { key: "c1".into(), id: "handed".into(), at: "2026-09-25T02:04:00Z".into() },
+                Queued { key: "c1".into(), id: "waiting".into(), at: "2026-09-25T02:06:00Z".into() },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(seen_floor(&seen, "c1", "== x ==\n#waiting [..] @linsky: 还没递到"), "2026-09-25T02:04:00Z");
+        assert_eq!(seen_floor(&seen, "c1", ""), "2026-09-25T02:06:00Z", "an empty mailbox: everything was handed over");
+        assert_eq!(seen_floor(&seen, "other", ""), "2026-09-25T02:00:00.000000Z", "a timeline it never read counts from the turn's start");
+
+        let items = vec![
+            msg("old", "linsky", "human", "2026-09-25T02:03:00Z", "看过的"),
+            msg("mine", "realopsdu", "human", "2026-09-25T02:07:00Z", "我说的"),
+            msg("new", "linsky", "human", "2026-09-25T02:07:30.5Z", "补充一句"),
+            draft("d", "2026-09-25T02:08:00Z", ""),
+        ];
+        let fresh = fresh_since(&items, "2026-09-25T02:04:00Z", "realopsdu");
+        let ids: Vec<&str> = fresh.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["new", "d"], "someone spoke and someone started answering; my own line is not news");
+    }
+
+    #[test]
+    fn timestamps_compare_as_times_not_strings() {
+        assert!(later("2026-09-25T02:00:12.5Z", "2026-09-25T02:00:12Z"));
+        assert!(!later("2026-09-25T02:00:12Z", "2026-09-25T02:00:12.5Z"));
+    }
+
+    #[test]
+    fn preamble_explains_the_status_lines_and_the_held_send() {
+        let p = preamble("realopsdu", Some("opsdu"));
+        assert!(p.contains("「⏳ 正在回复」") && p.contains("别重复 @"));
+        assert!(p.contains("「✋ 没发出去」") && p.contains("--anyway"));
+    }
+
+    /// A tap is how the loop presses what a person would press — and the
+    /// rule for a stop travels with it.
+    #[test]
+    fn preamble_teaches_the_tap_and_when_to_stop() {
+        let p = preamble("realopsdu", Some("opsdu"));
+        assert!(p.contains("mafold tap <消息id> <action>"));
+        assert!(p.contains("ask:answer") && p.contains("perm:answer"));
+        assert!(p.contains("stop") && p.contains("只停你自己叫起来"));
+    }
+
+    /// The glance runs every few seconds and only wants what has unread, so it
+    /// asks the api for exactly that instead of every chat with its preview —
+    /// the full list it used to pull was most of the 210 getChats answers cut
+    /// short in Caddy's log (10-12). An api that predates `unread_only` sends
+    /// the whole list as before; the filter here still picks the unread ones.
+    #[tokio::test]
+    async fn the_glance_asks_only_for_chats_with_unread() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (path, body) = loop {
+                let mut chunk = [0; 8192];
+                let n = socket.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..n]);
+                let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                let header = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let len: usize = header
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() < end + 4 + len {
+                    continue;
+                }
+                let path = header.split_whitespace().nth(1).unwrap().to_string();
+                break (path, String::from_utf8_lossy(&bytes[end + 4..end + 4 + len]).to_string());
+            };
+            // An old api's answer: everything, read and unread alike.
+            let reply = json!({"ok": true, "result": {"items": [
+                {"id": "c-read", "kind": "direct", "participants": [], "unread_count": 0},
+                {"id": "c-new", "kind": "direct", "participants": [], "unread_count": 2},
+            ]}})
+            .to_string();
+            socket
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}", reply.len())
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            (path, body)
+        });
+        let client = Client::new(base, "test".into());
+        let tls = unread_timelines(&client, "me").await.unwrap();
+        let (path, body) = server.await.unwrap();
+        assert_eq!(path, "/api/getChats");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["unread_only"], json!(true), "the glance must ask for unread chats only: {body}");
+        assert_eq!(tls.iter().map(|t| t.chat_id.as_str()).collect::<Vec<_>>(), vec!["c-new"]);
     }
 }

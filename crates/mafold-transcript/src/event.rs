@@ -91,9 +91,15 @@ pub enum AgentEvent {
     /// The producer compacted its OWN context part-way through the turn (Claude
     /// Code's auto-compact). It takes minutes and produces no stream output
     /// while it runs, so relaying it is what keeps a long reply from reading as
-    /// a hang. `pre_tokens` is the context size that was compacted, when the
-    /// producer reports it.
-    Compacted { pre_tokens: Option<u64> },
+    /// a hang. `pre_tokens` / `post_tokens` are the context size before and
+    /// after, when the producer reports them.
+    ///
+    /// `summary` is what the model will now read INSTEAD of the conversation —
+    /// its own words, handed back in the user's voice — and `flagged` the lines
+    /// of it an independent check found giving instructions or approvals no
+    /// person gave. Both are shown to the owner, who otherwise never learns what
+    /// the agent now believes it was told.
+    Compacted { pre_tokens: Option<u64>, post_tokens: Option<u64>, summary: Option<String>, flagged: Vec<String> },
     /// The producer reported a usage limit that is NOT in the healthy state.
     /// Producers emit this ONLY for the non-healthy states; a limit that's
     /// fine is not news and must not be relayed into every reply.
@@ -106,7 +112,14 @@ pub enum AgentEvent {
     ///   request went through anyway. Claude Code repeats this every turn
     ///   until the window resets, i.e. for days, so it is a signal for the
     ///   seat logic and NOT something to render (see `render`).
-    RateLimited { kind: String, resets_at: Option<i64>, status: String },
+    ///
+    /// `fallback`: the model that answered THIS turn instead, when the profile
+    /// declared one and the kernel switched to it. `None` = nothing stood in —
+    /// the reader is told the limit and when it lifts, and no answer follows.
+    /// One event for both the daemon's seat limits and a hosted bot's router
+    /// 429, rendered by one renderer — there used to be a second, hand-written
+    /// sentence for the hosted case that never said when the limit lifted.
+    RateLimited { kind: String, resets_at: Option<i64>, status: String, fallback: Option<String> },
     /// End-of-turn summary.
     Done {
         duration_ms: Option<f64>,

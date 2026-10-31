@@ -8,8 +8,8 @@
 //! gets a tappable mention label.
 //!
 //! Every scanner that asks "does this text @-mention X" — the api's unread badge
-//! (`mentions_user`), the api's bot trigger (`extract_mentions`), the daemon's
-//! reply gate (`mentions_me`) — has to ask it of THIS text, or it answers about
+//! (`mentions_user`), the bot trigger on both sides (`crate::mention`, which
+//! holds the grammar) — has to ask it of THIS text, or it answers about
 //! text the reader never sees as a mention. Measured in the Mafold DEV forum on
 //! 2026-09-06: of 49 `@linsky` hits that lit a channel's `@` badge, 41 sat in a
 //! card body (an agent's HTML mock-up showing a profile row "@linsky", tool
@@ -30,9 +30,10 @@
 //! `{% x /%}@ops` mentions in the bubble (the `@` opens a fresh text run) and it
 //! mentions here.
 //!
-//! Not the same question as [`crate::render::strip_cards`]: that one feeds a
-//! model the prose of its own last turn, where a code block IS the answer and
-//! stays. This one asks what a person sees as a mention label.
+//! Not the same question as [`crate::render::strip_cards`], though the same
+//! grammar (it walks with these helpers): that one feeds a model the prose of
+//! a turn, where a code block IS the answer and stays. This one asks what a
+//! person sees as a mention label.
 
 use std::borrow::Cow;
 
@@ -40,11 +41,33 @@ use std::borrow::Cow;
 /// there is nothing to cut — the common case, a human line — so the unread walk
 /// that runs this over every message of every conversation allocates nothing.
 pub fn visible_prose(text: &str) -> Cow<'_, str> {
+    project(text, '\n')
+}
+
+/// [`visible_prose`] with its LINES kept the reader's: a card or a code block
+/// is a block in the bubble, so it still becomes a newline, but an inline code
+/// span sits inside its line, so it becomes [`INLINE_CUT`] instead. For asking
+/// what OPENS a line (`crate::mention`): in `改的是 `fire_bots` @a 那条路`, `@a`
+/// is mid-sentence, and a newline in place of the span would make it open one.
+pub fn visible_lines(text: &str) -> Cow<'_, str> {
+    project(text, INLINE_CUT)
+}
+
+/// What stands in for an inline code span in [`visible_lines`]: not a handle
+/// byte, so a mention still ends (or may begin) at it, and not whitespace, so
+/// the text after it does not open a line.
+pub const INLINE_CUT: char = '\u{FFFC}';
+
+/// The cut itself. A card or a fenced block — a block in the bubble — becomes
+/// a newline; an inline code span becomes `inline`.
+fn project(text: &str, inline: char) -> Cow<'_, str> {
     if !text.contains("{%") && !text.contains('`') && !text.contains("~~~") {
         return Cow::Borrowed(text);
     }
-    let mut ranges = code_ranges(text);
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut spans = code_spans(text);
+    let mut ranges = plain(&spans);
+    // `(start, end, block)`: a card or a fence is a block, a backtick span not.
+    let mut cuts: Vec<(usize, usize, bool)> = Vec::new();
     let mut settled = 0usize; // prose before this offset already had its code cut
     let mut i = 0usize;
     while let Some(rel) = text[i..].find("{%") {
@@ -65,34 +88,35 @@ pub fn visible_prose(text: &str) -> Cow<'_, str> {
                 .or_else(|| orphan_close(text, tag.end, &ranges, tag.name).map(|(_, end)| end))
                 .unwrap_or(text.len())
         };
-        push_code_cuts(&mut cuts, &ranges, settled, start);
-        cuts.push((start, end));
+        push_code_cuts(&mut cuts, &spans, settled, start);
+        cuts.push((start, end, true));
         // A fence inside this card must not put the rest of the message "in
         // code" — recompute for the suffix (only needed if the span could have
         // opened one at all).
         if text[start..end].contains(['`', '~']) {
-            ranges = if end < text.len() {
-                code_ranges(&text[end..]).into_iter().map(|(a, b)| (a + end, b + end)).collect()
+            spans = if end < text.len() {
+                code_spans(&text[end..]).into_iter().map(|(a, b, f)| (a + end, b + end, f)).collect()
             } else {
                 Vec::new()
             };
+            ranges = plain(&spans);
         }
         settled = end;
         i = end;
     }
-    push_code_cuts(&mut cuts, &ranges, settled, text.len());
+    push_code_cuts(&mut cuts, &spans, settled, text.len());
     if cuts.is_empty() {
         return Cow::Borrowed(text);
     }
     cuts.sort_unstable();
     let mut out = String::with_capacity(text.len());
     let mut pos = 0usize;
-    for (a, b) in cuts {
+    for (a, b, block) in cuts {
         if a < pos {
             continue; // can't happen (cuts never overlap), belt and braces
         }
         out.push_str(&text[pos..a]);
-        out.push('\n');
+        out.push(if block { '\n' } else { inline });
         pos = b;
     }
     out.push_str(&text[pos..]);
@@ -145,22 +169,141 @@ pub fn map_card_text(
     out
 }
 
-/// The code ranges that fall inside the prose run `from..to`, clipped to it.
-fn push_code_cuts(cuts: &mut Vec<(usize, usize)>, ranges: &[(usize, usize)], from: usize, to: usize) {
-    for &(a, b) in ranges {
+/// One card island of a text, cut the way the client's splitter cuts it
+/// (`splitCards`): the card a reader sees there, whatever its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Island<'a> {
+    /// The tag as written: `owner/slug`, or a bare tag.
+    pub name: &'a str,
+    /// The rest of the open tag — its raw attributes, trimmed, without a
+    /// leaf's `/`.
+    pub attrs: &'a str,
+    /// The whole island, open tag to close tag — or to the end of the text
+    /// when nothing closes it.
+    pub span: std::ops::Range<usize>,
+    /// What the card is handed as its body: `None` for a leaf (`{% x /%}`).
+    /// Runs to the matching close, else to the close its author misspelled,
+    /// else to the end of the text.
+    pub body: Option<std::ops::Range<usize>>,
+    /// Where the text run right before it starts: the end of the island
+    /// before it at its level, else the start of what holds it.
+    /// `text[lead..span.start]` is what the reader sees just above the card.
+    pub lead: usize,
+}
+
+/// The card islands at the top of `text`, in order — the same cut as
+/// [`visible_prose`] and the client: a tag inside code is text, a stray close
+/// is text, a container runs to its close, else to the close its author
+/// misspelled (or a re-open of the same tag), else to the end. Nested cards
+/// are part of their container's body (see [`cards_named`]).
+pub fn card_islands(text: &str) -> Vec<Island<'_>> {
+    let mut out = Vec::new();
+    let mut ranges = code_ranges(text);
+    let mut lead = 0usize;
+    let mut i = 0usize;
+    while let Some(rel) = text[i..].find("{%") {
+        let start = i + rel;
+        let Some(tag) = parse_tag(text, start) else {
+            i = start + 2;
+            continue;
+        };
+        i = tag.end;
+        if tag.is_close || in_code(start, &ranges) {
+            continue;
+        }
+        let (body, end) = if tag.self_close {
+            (None, tag.end)
+        } else {
+            match close_at(text, tag.end, tag.name).or_else(|| orphan_close(text, tag.end, &ranges, tag.name)) {
+                Some((at, end)) => (Some(tag.end..at), end),
+                None => (Some(tag.end..text.len()), text.len()),
+            }
+        };
+        let attrs = tag.attrs.trim();
+        let attrs = if tag.self_close { attrs.strip_suffix('/').unwrap_or(attrs).trim_end() } else { attrs };
+        out.push(Island { name: tag.name, attrs, span: start..end, body, lead });
+        if text[start..end].contains(['`', '~']) {
+            ranges = code_ranges(&text[end..]).into_iter().map(|(a, b)| (a + end, b + end)).collect();
+        }
+        lead = end;
+        i = end;
+    }
+    out
+}
+
+/// How deep [`cards_named`] looks into containers. Real messages nest two or
+/// three levels (a trace holding a run holding a tool); this only stops a
+/// text built to nest thousands deep from walking the stack off.
+const NEST_MAX: usize = 32;
+
+/// The containers whose cards draw the cards in their body — the only ones
+/// [`cards_named`] looks inside. The client hands EVERY container its body
+/// re-split into `children` (`renderBody` in
+/// `mafold-web/src/app/app/cards/CardHost.tsx`, `mafold-rn/src/cards/CardIsland.tsx`),
+/// but only a card that puts `children` on screen shows them: `cards/trace`
+/// and `cards/run` do. Every other container draws its body its own way —
+/// `cards/only` as plain text (`splitMarkers`), a tool or a diff as output —
+/// so a card tag in there reads as its source (review 10-09). A container
+/// whose `card.tsx` starts rendering `children` belongs here.
+const NESTS: &[&str] = &["mafold/trace", "mafold/run"];
+
+/// Every card named `name` a reader sees in `text`, at any depth, in reading
+/// order: at the top, or in the body of a container that draws its body's
+/// cards ([`NESTS`]) — an HTML card under a folded `{% mafold/trace %}` is on
+/// screen just like one at the top; one inside a `{% mafold/only %}` is text.
+/// A matching card's own body is its content (an HTML card's page), not more
+/// cards: it is not searched. Every offset (`lead` too) is into `text`.
+pub fn cards_named<'a>(text: &'a str, name: &str) -> Vec<Island<'a>> {
+    fn walk<'a>(text: &'a str, from: usize, to: usize, name: &str, depth: usize, out: &mut Vec<Island<'a>>) {
+        for mut island in card_islands(&text[from..to]) {
+            island.span = island.span.start + from..island.span.end + from;
+            island.body = island.body.map(|b| b.start + from..b.end + from);
+            island.lead += from;
+            if island.name == name {
+                out.push(island);
+            } else if let Some(body) = island.body.filter(|_| depth < NEST_MAX && NESTS.contains(&island.name)) {
+                walk(text, body.start, body.end, name, depth + 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(text, 0, text.len(), name, 0, &mut out);
+    out
+}
+
+/// Whether `text` holds an open tag of the card `name` anywhere — `{%`, any
+/// whitespace, the name — in code or not, nested or not. A scan for the name
+/// that never parses: whatever [`cards_named`] finds, this saw first, so a
+/// body without it needn't be cut at all. Tag-shaped, so a close tag or a
+/// sentence that only says the name doesn't count (review 10-09).
+pub fn opens_card(text: &str, name: &str) -> bool {
+    // Back over whitespace from each mention to its `{%`: each run of it lies
+    // between two mentions, so the whole scan stays linear.
+    !name.is_empty() && text.match_indices(name).any(|(at, _)| text[..at].trim_end().ends_with("{%"))
+}
+
+/// The code spans that fall inside the prose run `from..to`, clipped to it,
+/// each keeping whether it is a block (a fence).
+fn push_code_cuts(cuts: &mut Vec<(usize, usize, bool)>, spans: &[(usize, usize, bool)], from: usize, to: usize) {
+    for &(a, b, fence) in spans {
         if b > from && a < to {
-            cuts.push((a.max(from), b.min(to)));
+            cuts.push((a.max(from), b.min(to), fence));
         }
     }
 }
 
-struct Tag<'a> {
-    name: &'a str,
-    attrs: &'a str,
-    is_close: bool,
-    self_close: bool,
+/// [`code_spans`] without the tag — what `in_code` and the tag search take.
+fn plain(spans: &[(usize, usize, bool)]) -> Vec<(usize, usize)> {
+    spans.iter().map(|&(a, b, _)| (a, b)).collect()
+}
+
+pub(crate) struct Tag<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) attrs: &'a str,
+    pub(crate) is_close: bool,
+    pub(crate) self_close: bool,
     /// Byte offset just past the tag's `%}`.
-    end: usize,
+    pub(crate) end: usize,
 }
 
 /// A byte that can sit inside a tag name: `[\w:-]`.
@@ -180,7 +323,7 @@ fn skip_ws(text: &str, mut p: usize) -> usize {
 
 /// The tag opening at `at` (which must be a `{%`), or `None` where the client's
 /// `TAG_RE` would not match either: no name, or no `%}` anywhere after.
-fn parse_tag(text: &str, at: usize) -> Option<Tag<'_>> {
+pub(crate) fn parse_tag(text: &str, at: usize) -> Option<Tag<'_>> {
     let b = text.as_bytes();
     let mut p = skip_ws(text, at + 2);
     let is_close = b.get(p) == Some(&b'/');
@@ -211,7 +354,12 @@ fn parse_tag(text: &str, at: usize) -> Option<Tag<'_>> {
 
 /// End offset of the first `{% /NAME %}` at or after `from` — the same fixed-tag
 /// search `splitCards` runs, code or not.
-fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
+pub(crate) fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
+    close_at(text, from, name).map(|(_, end)| end)
+}
+
+/// [`find_close`] with where the close tag starts: `(start, end)`.
+pub(crate) fn close_at(text: &str, from: usize, name: &str) -> Option<(usize, usize)> {
     let b = text.as_bytes();
     let mut i = from;
     while let Some(rel) = text[i..].find("{%") {
@@ -227,7 +375,7 @@ fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
         }
         p = skip_ws(text, p + name.len());
         if text[p..].starts_with("%}") {
-            return Some(p + 2);
+            return Some((start, p + 2));
         }
     }
     None
@@ -236,7 +384,7 @@ fn find_close(text: &str, from: usize, name: &str) -> Option<usize> {
 /// `(start, end)` of the first close tag after `from` that nothing inside the
 /// body opened — the close the author meant for the unclosed container but
 /// misspelled. Depth-tracked so a nested container's own close isn't taken.
-fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)], name: &str) -> Option<(usize, usize)> {
+pub(crate) fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)], name: &str) -> Option<(usize, usize)> {
     // Match the client's recovery: an unmatched tag-shaped mention inside a
     // body is not another container, and a same-name re-open can be a typo.
     let mut last_close = std::collections::HashMap::new();
@@ -285,6 +433,21 @@ fn orphan_close(text: &str, from: usize, ranges: &[(usize, usize)], name: &str) 
 /// backtick spans. The client splitter's rule (`codeRanges` in `cards/split.ts`),
 /// so every Rust scanner agrees with the renderer on which `{% … %}` are live.
 pub fn code_ranges(s: &str) -> Vec<(usize, usize)> {
+    plain(&code_spans(s))
+}
+
+/// Only the fenced blocks of [`code_ranges`] (`fencedRanges` in
+/// `cards/split.ts`): what keeps a line from being a table row — GFM splits a
+/// table into rows and cells before it reads any inline code.
+pub fn fenced_ranges(s: &str) -> Vec<(usize, usize)> {
+    code_spans(s).into_iter().filter(|&(_, _, fenced)| fenced).map(|(a, b, _)| (a, b)).collect()
+}
+
+/// [`code_ranges`], each tagged `true` for a fenced block and `false` for an
+/// inline backtick span — inline even when it runs over a line break (as
+/// CommonMark lets it): in the bubble it sits inside its paragraph, so it must
+/// not end a line in [`visible_lines`].
+fn code_spans(s: &str) -> Vec<(usize, usize, bool)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     // Fenced blocks: a line whose start (≤3 blanks in) is ``` or ~~~ opens; the
     // next fence line of the same char and at least as long closes it.
@@ -336,11 +499,12 @@ pub fn code_ranges(s: &str) -> Vec<(usize, usize)> {
             _ => {}
         }
     }
-    ranges
+    let fences = fenced.len();
+    ranges.into_iter().enumerate().map(|(k, (a, b))| (a, b, k < fences)).collect()
 }
 
 /// `(fence byte, run length)` when the line opens or closes a fence.
-fn fence_mark(line: &str) -> Option<(u8, usize)> {
+pub(crate) fn fence_mark(line: &str) -> Option<(u8, usize)> {
     let indent = line.bytes().take_while(|c| *c == b' ' || *c == b'\t').count();
     if indent > 3 {
         return None;
@@ -420,6 +584,27 @@ mod tests {
     }
 
     #[test]
+    fn visible_lines_keeps_inline_code_inside_its_line() {
+        let lines = |s: &str| visible_lines(s).into_owned();
+        // An inline span stays in its line; blocks still break it.
+        assert_eq!(lines("改的是 `fire_bots` @a 那条路"), "改的是 \u{FFFC} @a 那条路");
+        assert_eq!(lines("`x` @a"), "\u{FFFC} @a");
+        assert_eq!(lines("看\n```\n@a\n```\n@b 你来"), "看\n\n\n@b 你来");
+        assert_eq!(lines("see {% mafold/kline symbol=\"BTC\" /%} @a"), "see \n @a");
+        // A backtick span may run over a line break (CommonMark) and is still
+        // inline: it must not end up opening the line after it.
+        assert_eq!(lines("用 ` 分隔。\n下一行 ` @a 也走"), "用 \u{FFFC} @a 也走");
+        assert_eq!(prose("用 ` 分隔。\n下一行 ` @a 也走"), "用 \n @a 也走", "visible_prose unchanged");
+        // An indented fence and a `~~~` fence are blocks.
+        assert_eq!(lines("x\n   ```\n@a\n   ```\n@b"), "x\n\n\n@b");
+        assert_eq!(lines("~~~\n@a\n~~~\n@b"), "\n\n@b");
+        // Same cuts as visible_prose, only the inline stand-in differs.
+        let s = "`@ops` and\n```\n@ops\n```\nbut {% x /%}@ops";
+        assert_eq!(lines(s).replace(INLINE_CUT, "\n"), prose(s));
+        assert!(matches!(visible_lines("plain @a"), Cow::Borrowed(_)));
+    }
+
+    #[test]
     fn a_tag_inside_code_is_literal() {
         // The fence is cut anyway; the point is the tag inside doesn't open a
         // container that would swallow "after".
@@ -438,6 +623,117 @@ mod tests {
         // No name, or no `%}` anywhere after: the client leaves it as text.
         assert_eq!(prose("看这个 {% 符号 @ops"), "看这个 {% 符号 @ops");
         assert_eq!(prose("{% mafold/html @ops"), "{% mafold/html @ops");
+    }
+
+    /// `(name, attrs, body)` of each top-level island.
+    fn islands(s: &str) -> Vec<(&str, &str, Option<&str>)> {
+        card_islands(s).into_iter().map(|i| (i.name, i.attrs, i.body.map(|b| &s[b]))).collect()
+    }
+
+    /// The bodies of every HTML card a reader sees.
+    fn html(s: &str) -> Vec<&str> {
+        cards_named(s, "mafold/html").into_iter().map(|i| &s[i.body.expect("a container")]).collect()
+    }
+
+    #[test]
+    fn islands_are_what_the_client_renders() {
+        // Closed, with its prose around it.
+        let s = "做好了\n{% mafold/html %}<p>a</p>{% /mafold/html %}\n收工";
+        let got = card_islands(s);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].name, got[0].lead), ("mafold/html", 0));
+        assert_eq!(&s[got[0].span.clone()], "{% mafold/html %}<p>a</p>{% /mafold/html %}");
+        assert_eq!(&s[got[0].body.clone().unwrap()], "<p>a</p>");
+        // Unclosed: the body runs to the end of the text.
+        assert_eq!(html("看\n{% mafold/html %}\n<h1>半截</h1>"), ["\n<h1>半截</h1>"]);
+        // No card at all.
+        assert!(card_islands("纯文字 50% {not a tag} `{%`").is_empty());
+        assert!(html("").is_empty());
+    }
+
+    #[test]
+    fn a_card_inside_code_is_text() {
+        assert!(html("write `{% mafold/html %}<b>x</b>{% /mafold/html %}` to embed").is_empty());
+        assert!(html("```html\n{% mafold/html %}\n<b>x</b>\n{% /mafold/html %}\n```\n完").is_empty());
+        // A quoted open tag doesn't swallow the real card after it.
+        assert_eq!(html("用 `{% mafold/html %}` 包起来:\n{% mafold/html %}<i>真</i>{% /mafold/html %}"), ["<i>真</i>"]);
+        // A fence inside a card says nothing about code after it.
+        assert_eq!(html("{% mafold/html %}<pre>\n```\n</pre>{% /mafold/html %}\n{% mafold/html %}<b>2</b>{% /mafold/html %}").len(), 2);
+    }
+
+    #[test]
+    fn a_close_the_client_recovers_ends_the_card() {
+        // Spacing the client's close pattern allows.
+        assert_eq!(html("{%mafold/html%}<b>x</b>{%/mafold/html%} 后"), ["<b>x</b>"]);
+        assert_eq!(html("{%  mafold/html  %}<b>x</b>{%  /  mafold/html\t%} 后"), ["<b>x</b>"]);
+        // Misspelt: the first close nothing inside opened.
+        let s = "{% mafold/html %}<b>x</b>{% /mafell/html %} 后 {% mafold/ask %}q{% /mafold/ask %}";
+        assert_eq!(islands(s), [("mafold/html", "", Some("<b>x</b>")), ("mafold/ask", "", Some("q"))]);
+        // The close written as a second open.
+        assert_eq!(html("{% mafold/html %}<b>x</b>{% mafold/html %} 后"), ["<b>x</b>"]);
+    }
+
+    #[test]
+    fn two_cards_in_order_each_with_its_lead() {
+        let s = "第一张\n{% mafold/html %}A{% /mafold/html %}\n## 第二张\n{% mafold/html %}B{% /mafold/html %}";
+        let got = cards_named(s, "mafold/html");
+        assert_eq!(got.iter().map(|i| &s[i.body.clone().unwrap()]).collect::<Vec<_>>(), ["A", "B"]);
+        assert_eq!(&s[got[0].lead..got[0].span.start], "第一张\n");
+        assert_eq!(&s[got[1].lead..got[1].span.start], "\n## 第二张\n", "from the end of the card before");
+    }
+
+    #[test]
+    fn leaves_and_their_attrs() {
+        let s = "{% mafold/kline symbol=\"BTC\" /%} 和 {% mafold/result duration=\"1s\"/%}";
+        assert_eq!(islands(s), [("mafold/kline", "symbol=\"BTC\"", None), ("mafold/result", "duration=\"1s\"", None)]);
+    }
+
+    #[test]
+    fn cards_named_looks_inside_containers_but_not_inside_a_match() {
+        // Under a folded trace, in a run inside it: on screen all the same.
+        // Inside an `only` block the client draws its body as text: no card.
+        let s = "{% mafold/trace summary=\"s\" %}\n先做一版\n{% mafold/html %}<b>1</b>{% /mafold/html %}\n\
+                 {% mafold/run %}{% mafold/html %}<b>跑</b>{% /mafold/html %}{% /mafold/run %}\n{% /mafold/trace %}\n\
+                 {% mafold/only for=\"owner\" %}{% mafold/html %}<b>2</b>{% /mafold/html %}{% /mafold/only %}\n\
+                 {% mafold/html %}<i>{% mafold/run summary=\"Read 9 files\" %}</i>{% /mafold/html %}";
+        assert_eq!(html(s), ["<b>1</b>", "<b>跑</b>", "<i>{% mafold/run summary=\"Read 9 files\" %}</i>"]);
+        let nested = &cards_named(s, "mafold/html")[0];
+        assert_eq!(&s[nested.lead..nested.span.start], "\n先做一版\n", "its lead starts inside the trace");
+        assert_eq!(card_islands(s).iter().map(|i| i.name).collect::<Vec<_>>(), ["mafold/trace", "mafold/only", "mafold/html"]);
+        // Only `only` blocks, at any spot: never a card, whoever it's for.
+        for only in ["{% mafold/only for=\"owner\" %}", "{% mafold/only for=\"@ops\" hidden=\"true\" %}"] {
+            let s = format!("{only}{{% mafold/html %}}<b>x</b>{{% /mafold/html %}}{{% /mafold/only %}}");
+            assert!(html(&s).is_empty(), "{s}");
+            let s = format!("{{% mafold/trace %}}{s}{{% /mafold/trace %}}");
+            assert!(html(&s).is_empty(), "{s}");
+        }
+        // Nor in any other container that draws its body its own way.
+        assert!(html("{% mafold/tool name=\"Write\" %}{% mafold/html %}<b>x</b>{% /mafold/html %}{% /mafold/tool %}").is_empty());
+        assert!(html("{% acme/box %}{% mafold/html %}<b>x</b>{% /mafold/html %}{% /acme/box %}").is_empty());
+        // A bare `{% html %}` is not the card (the client never resolves it).
+        assert!(html("{% html %}<b>x</b>{% /html %}").is_empty());
+    }
+
+    #[test]
+    fn opens_card_sees_every_open_tag_and_nothing_else() {
+        for s in [
+            "{% mafold/html %}<b>x</b>{% /mafold/html %}",
+            "{%mafold/html%}<b>x</b>",
+            "{%  mafold/html  %}",
+            "{%\n\t mafold/html attr=\"1\" %}",
+            "{% mafold/trace %}\n{% mafold/run %}{% mafold/html %}x{% /mafold/html %}{% /mafold/run %}{% /mafold/trace %}",
+            "说 mafold/html 的时候 {% mafold/html %}",
+            "`{% mafold/html %}`",
+        ] {
+            assert!(opens_card(s, "mafold/html"), "{s}");
+        }
+        for s in ["", "用 mafold/html 卡", "{% /mafold/html %}", "{%/mafold/html%}", "{% x %}mafold/html", "{% amafold/html %}"] {
+            assert!(!opens_card(s, "mafold/html"), "{s}");
+        }
+        // Never narrower than the cut.
+        for s in ["{%mafold/html%}a", "{%  mafold/html %}b{% /mafold/html %}", "{% mafold/trace %}{% mafold/html %}c"] {
+            assert!(!html(s).is_empty() && opens_card(s, "mafold/html"), "{s}");
+        }
     }
 
     /// The shapes that lit `@` badges in the Mafold DEV forum with no visible

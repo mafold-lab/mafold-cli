@@ -13,6 +13,46 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod connections;
+/// A person's computers and their agents at work on them: the machine report,
+/// the computers list, presence (`computers.rs`).
+pub mod computers;
+/// D1 databases: names, wire shapes (`d1.rs`, `.docs/d1-v1.md`).
+pub mod d1;
+/// Who can send me messages: the setting, what it decides, why a sender is
+/// turned away (`dm_privacy.rs`).
+pub mod dm_privacy;
+pub mod drive;
+/// The feature-flag registry — keys, defaults, who reads each, and what the
+/// server decides without a record (`flags.rs`, `.docs/feature-flags.md`).
+pub mod flags;
+/// A handle's address at mafold.com and back — the one mapping the rcpt hook,
+/// the mail methods, @mail and the cli share (`mail.rs`).
+pub mod mail;
+/// What a document's name says it is — the one extension → type table the cli
+/// declares from and the api guesses from (`mime.rs`).
+pub mod mime;
+/// What agents did for a person, one row per reply — the activity center's
+/// receipts card (`receipts.rs`).
+pub mod receipts;
+/// A mafold.app site's own Worker (`sites.rs`, `.docs/site-workers-v1.md`).
+pub mod sites;
+/// Which addresses a request to somebody else's URL may reach — the api's
+/// fetches and a daemon's `mafold app call` (`net.rs`).
+pub mod net;
+/// Mid-turn words: which running turn takes them, and how they are framed —
+/// one rule for the daemon and the hosted brains (`steer.rs`).
+pub mod steer;
+/// How a number reads — durations, counts, dollars, sizes, "how long ago" —
+/// the Rust half of `client-shared/units.ts`, tested against the same table
+/// (`units.rs`).
+pub mod units;
+/// Seedance on ModelArk: which aspect ratio a job may ask for, by model and
+/// ref roles — one rule for the api's `videoSubmit` and the core's
+/// `ark-video` driver (`video.rs`).
+pub mod video;
+/// What may sign a new agent in, by where it runs and its runtime — the Rust
+/// half of `client-shared/newAgent.ts`, tested against the same table.
+pub mod agent_setup;
 pub use connections::{
     provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
     PROVIDERS,
@@ -353,6 +393,12 @@ pub struct Conversation {
     /// how many. Same walk as `unread_count`, so it obeys the same read marker.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread_mention: bool,
+    /// How many messages the requester can see in the main timeline (#all —
+    /// a channel's and a thread's messages aren't in it). Per requester like
+    /// `unread_count`. Clients show it where there's nobody to be online:
+    /// Saved Messages' header. Server-set at list time.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub message_count: u32,
     /// Group avatar (None for direct chats — clients use the peer's avatar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<FileRef>,
@@ -635,6 +681,11 @@ pub struct Channel {
     /// Channel icon: a single emoji. None = the default "#" tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Created without a name: `name` is a placeholder in the creator's
+    /// language until the first real name lands. Clients show it as an
+    /// untitled channel; anyone who may post in it may name it once.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub untitled: bool,
     /// Pinned message ids in THIS channel, newest first.
     ///
     /// A pin belongs to the timeline it was made in. `Conversation::
@@ -669,6 +720,12 @@ pub struct Message {
     /// `None` on non-replies and on messages stored before this field shipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_sender: Option<String>,
+    /// Set by the SERVER, never by a client: this message is the server's
+    /// receipt of the sender's action on card `receipt_of` — the server wrote
+    /// its words, not the sender. Cleared when the sender edits it (then the
+    /// words are theirs). See [`answers_own_request`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_of: Option<Uuid>,
     /// Slack-style thread root. `None` = top-level message (lives in the main
     /// channel timeline). `Some(root)` = a thread reply: HIDDEN from the main
     /// timeline, shown only in the thread pane for `root`, and it does NOT bump
@@ -726,10 +783,194 @@ pub struct Message {
     /// typically empty; the pill text lives in `ServiceNotice.text`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceNotice>,
+    /// What is kept beside this message's text (`Sidecar`).
+    /// Absent on the wire while empty. A plain field, not `flatten`: flatten
+    /// sends every message through serde's buffered map path, and this struct
+    /// is loaded wholesale at boot and serialized on every event.
+    #[serde(default, skip_serializing_if = "Sidecar::is_empty", deserialize_with = "lenient_sidecar")]
+    pub sidecar: Sidecar,
+}
+
+/// A sidecar that fails to parse costs the sidecar, never the message — the
+/// same bargain `lenient_attachments` strikes. A client older than a state
+/// shape shows the card without it instead of losing a whole history page.
+fn lenient_sidecar<'de, D>(d: D) -> Result<Sidecar, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
+}
+
+/// What is kept BESIDE a message's (or post's) text — the text itself is never
+/// rewritten (`.docs/card-state-v1.md`). Pictures and pages for links are not
+/// here: a card asks for them (`resolveMedia` / `resolvePage`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Sidecar {
+    /// Controlled state (`.docs/card-state-v1.md`): key → item. The server has
+    /// already left out every item this reader may not read.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub state: std::collections::BTreeMap<String, StateItem>,
+    /// How many writes this message's state has taken (§3.6).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub rev: u64,
+    /// This reader's items were too many to carry with the message (over
+    /// 32KB): `state` is left out and `getCardState` has them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub state_more: bool,
+}
+
+impl Sidecar {
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty() && !self.state_more
+    }
+}
+
+/// `resolveMedia { urls }`: one slot per URL the server would answer, keyed as
+/// asked. Empty when the asker's `inlineMedia` flag is off.
+///
+/// THIS IS THE WIRE FORM: the server stores each file as `"mf-file:<id>"` and
+/// every response expands it into a full [`FileRef`] — or `null` when the file
+/// is gone — so file fields are `Option<FileRef>` read through
+/// [`opt_file_ref`], which also takes a bare id.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResolveMediaResponse {
+    #[serde(default)]
+    pub media: std::collections::BTreeMap<String, MediaSlot>,
+}
+
+/// `resolvePage { urls }`, as [`ResolveMediaResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResolvePageResponse {
+    #[serde(default)]
+    pub pages: std::collections::BTreeMap<String, PageSlot>,
+}
+
+/// One controlled-state item beside a message (`.docs/card-state-v1.md` §3.1).
+/// A reader never gets `read` / `write` of an item they may not read — the item
+/// is not sent at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateItem {
+    #[serde(default)]
+    pub v: serde_json::Value,
+    #[serde(default)]
+    pub read: Vec<String>,
+    #[serde(default)]
+    pub write: Vec<String>,
+    /// Who wrote it last; `@server` for the server's own writes.
+    #[serde(default)]
+    pub by: String,
+    /// Unix seconds of the last write.
+    #[serde(default)]
+    pub at: i64,
+    /// The message's state revision at this item's last write — what
+    /// `setCardState`'s `if_rev` compares; `0` on items from before (§3.6).
+    #[serde(default)]
+    pub rev: u64,
+}
+
+/// One picture: re-hosted on our CDN, still being fetched, or not to be had.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MediaSlot {
+    /// `file` is `None` only when the registry no longer has it.
+    Ready {
+        #[serde(default, deserialize_with = "opt_file_ref")]
+        file: Option<FileRef>,
+    },
+    Pending,
+    /// Refused for good (not public, not a picture, too large, gone) or given
+    /// up on — `reason` is for logs, never shown verbatim.
+    Failed {
+        #[serde(default)]
+        reason: String,
+    },
+    /// A state newer than this build: shown as nothing, never an error.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotState {
+    Ready,
+    #[default]
+    Pending,
+    Failed,
+    /// A state newer than this build.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One page: the name a source pill shows and the pictures it offers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageSlot {
+    #[serde(default)]
+    pub state: SlotState,
+    /// What a pill / source list shows — computed by the server (the
+    /// registrable domain unless the page's own site name matches it), never
+    /// taken from the author.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The re-hosted icon.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "opt_file_ref")]
+    pub icon: Option<FileRef>,
+    /// The re-hosted og:image.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "opt_file_ref")]
+    pub image: Option<FileRef>,
 }
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+/// Is this message `bot`'s OWN request coming back — the server's receipt of
+/// someone's action on a card `bot` posted? ONE rule for both access gates:
+/// the daemon's allow-list (`mafold-cli` `agent.rs`, who may drive a turn on
+/// the owner's machine) and the server's draft-time billing
+/// (`mafold-api` `metering::authorize_draft`, who pays for it).
+///
+/// Both gates exist to stop a stranger's WORDS from driving the bot. A receipt
+/// carries none: the server wrote it (`receipt_of` is server-only, and an edit
+/// clears it). What it reports is that something `bot` asked for has arrived —
+/// a secret its `{% mafold/connection-create %}` card requested from a named
+/// person, who may well be someone the bot otherwise doesn't take orders from.
+/// The turn it starts is the bot following up on its own request, so it passes
+/// the allow-list and nobody is billed for it. A blacklist still wins: each
+/// gate checks that first.
+///
+/// `I` is the id type: uuids in the api, strings in the daemon.
+pub fn answers_own_request<I: PartialEq + ?Sized>(
+    receipt_of: Option<&I>,
+    reply_to_id: Option<&I>,
+    reply_to_sender: Option<&str>,
+    bot: &str,
+) -> bool {
+    receipt_of.is_some()
+        && receipt_of == reply_to_id
+        && reply_to_sender.is_some_and(|s| s.eq_ignore_ascii_case(bot))
+}
+
+#[cfg(test)]
+mod answers_own_request_tests {
+    use super::answers_own_request;
+
+    #[test]
+    fn only_a_receipt_replying_to_the_bots_own_card() {
+        let card = "card-1";
+        assert!(answers_own_request(Some(card), Some(card), Some("Ops:Claude"), "ops:claude"));
+        // A typed reply to the same card: no receipt, no pass.
+        assert!(!answers_own_request(None, Some(card), Some("ops:claude"), "ops:claude"));
+        // Someone else's card.
+        assert!(!answers_own_request(Some(card), Some(card), Some("eve:bot"), "ops:claude"));
+        // A receipt that doesn't answer the message it replies to.
+        assert!(!answers_own_request(Some(card), Some("other"), Some("ops:claude"), "ops:claude"));
+        assert!(!answers_own_request(Some(card), None, None, "ops:claude"));
+    }
 }
 
 /// A service-message payload — a ready-to-render centered pill (see
@@ -1083,14 +1324,19 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-// MARK: - App update (in-app APK distribution for the RN Android client)
+// MARK: - App update(RN 壳本身:安卓 APK + iOS 商店版本)
 
 /// server → client answer to `appUpdateCheck`. The metadata fields are filled
 /// whenever ANY release is live (so the UI can say "you're on the latest,
-/// which is X"); `available` alone decides whether an update is offered. `abi`
-/// echoes which of the client's ABIs the server matched — pass it back to
-/// `appUpdateDownload`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// which is X"); `available` alone decides whether an update is offered.
+///
+/// 没有 `version` = 服务端还不知道,绝不是「已是最新」。
+///
+/// 安卓(我们自己发的 APK):`version_code`、`abi`、`size`、`sha256` —— `abi` 是服务端
+/// 从客户端的 ABI 里挑中的那个,下载时原样传回 `appUpdateDownload`。
+/// iPhone(App Store 上的版本):`version`、`size`、`notes`、`store_url`、`min_os`;
+/// 客户端报的 iOS 版本服务端已经算进 `available` 了,`min_os` 只给界面解释用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppUpdateInfo {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1105,6 +1351,12 @@ pub struct AppUpdateInfo {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// iPhone:去哪儿装(`itms-apps://apps.apple.com/app/id…`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_url: Option<String>,
+    /// iPhone:这一版最低要哪个 iOS。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_os: Option<String>,
 }
 
 // MARK: - CLI update (release metadata for mafold-cli's self-updater)
@@ -1143,6 +1395,144 @@ pub struct CliReleaseInfo {
     /// this must fall back rather than proceed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+}
+
+// MARK: - App bundle update (OTA for the RN client's JS bundle)
+
+/// server → client answer to `appBundleCheck`: what the client should do.
+/// `stale_binary` is always on the wire, `false` included — the client tells
+/// "nothing new" from "this binary is too old" by it alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppBundleInfo {
+    /// A bundle for THIS abi, newer than what the caller runs.
+    pub available: bool,
+    /// THE ANSWER THAT PREVENTS A SILENT DEAD END: nothing is published for the
+    /// caller's abi, but something is published for a newer one. The binary is
+    /// behind, not the JS — say so, because "no update" and "you can no longer
+    /// receive updates" look identical from the client and mean opposite things.
+    pub stale_binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub js_rev: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[cfg(test)]
+mod update_check_wire_tests {
+    use super::*;
+
+    /// The answer as this type alone writes it (declared field order — the
+    /// api's envelope re-sorts the keys, and its handler tests pin THOSE bytes),
+    /// and the same answer read back: a client decoding the wire gets what was sent.
+    fn pin<T: Serialize + serde::de::DeserializeOwned>(answer: &T, want: &str) {
+        assert_eq!(serde_json::to_string(answer).unwrap(), want);
+        let back: T = serde_json::from_str(want).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), want, "decodes back to the same answer");
+    }
+
+    #[test]
+    fn app_update_info_keeps_its_wire_shape() {
+        let none = AppUpdateInfo {
+            available: false,
+            version: None,
+            version_code: None,
+            abi: None,
+            size: None,
+            sha256: None,
+            notes: None,
+            store_url: None,
+            min_os: None,
+        };
+        pin(&none, r#"{"available":false}"#);
+        let offered = AppUpdateInfo {
+            available: true,
+            version: Some("1.1.13".into()),
+            version_code: Some(113),
+            abi: Some("arm64-v8a".into()),
+            size: Some(39_845_888),
+            sha256: Some("5e884898da28047151d0e56f8dc62927".into()),
+            notes: Some("Fixes the blank first frame.".into()),
+            store_url: None,
+            min_os: None,
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"version":"1.1.13","version_code":113,"abi":"arm64-v8a","size":39845888,"sha256":"5e884898da28047151d0e56f8dc62927","notes":"Fixes the blank first frame."}"#,
+        );
+    }
+
+    /// iPhone 收到的:App Store 上的版本、去哪儿装、要哪个 iOS —— APK 那几个字段一个都没有。
+    #[test]
+    fn app_update_info_from_the_app_store() {
+        let offered = AppUpdateInfo {
+            available: true,
+            version: Some("1.1.9".into()),
+            size: Some(42_971_136),
+            store_url: Some("itms-apps://apps.apple.com/app/id6778362401".into()),
+            min_os: Some("15.1".into()),
+            ..AppUpdateInfo::default()
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"version":"1.1.9","size":42971136,"store_url":"itms-apps://apps.apple.com/app/id6778362401","min_os":"15.1"}"#,
+        );
+        pin(&AppUpdateInfo::default(), r#"{"available":false}"#);
+    }
+
+    #[test]
+    fn cli_release_info_keeps_its_wire_shape() {
+        let unknown = CliReleaseInfo {
+            known: false,
+            channel: "stable".into(),
+            version: None,
+            url: None,
+            size: None,
+            sha256: None,
+        };
+        pin(&unknown, r#"{"known":false,"channel":"stable"}"#);
+        let known = CliReleaseInfo {
+            known: true,
+            channel: "stable".into(),
+            version: Some("0.9.148".into()),
+            url: Some("https://github.com/mafold-lab/mafold-cli/releases/download/v0.9.148/mafold-aarch64-apple-darwin".into()),
+            size: Some(12_345),
+            sha256: Some("2c26b46b68ffc68ff99b453c1d304134".into()),
+        };
+        pin(
+            &known,
+            r#"{"known":true,"channel":"stable","version":"0.9.148","url":"https://github.com/mafold-lab/mafold-cli/releases/download/v0.9.148/mafold-aarch64-apple-darwin","size":12345,"sha256":"2c26b46b68ffc68ff99b453c1d304134"}"#,
+        );
+    }
+
+    #[test]
+    fn app_bundle_info_keeps_its_wire_shape() {
+        let none = |stale_binary: bool| AppBundleInfo {
+            available: false,
+            stale_binary,
+            js_rev: None,
+            size: None,
+            sha256: None,
+            notes: None,
+        };
+        pin(&none(false), r#"{"available":false,"stale_binary":false}"#);
+        pin(&none(true), r#"{"available":false,"stale_binary":true}"#);
+        let offered = AppBundleInfo {
+            available: true,
+            stale_binary: false,
+            js_rev: Some(23),
+            size: Some(1_234_567),
+            sha256: Some("cafebabe".into()),
+            notes: Some("Input bar moves with the keyboard.".into()),
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"stale_binary":false,"js_rev":23,"size":1234567,"sha256":"cafebabe","notes":"Input bar moves with the keyboard."}"#,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1366,6 +1756,74 @@ impl HarnessCaps {
             || !self.modes.is_empty()
             || self.models.iter().any(|m| !m.efforts.is_empty())
             || self.source == CapsSource::None
+    }
+}
+
+#[cfg(test)]
+mod sidecar_wire_tests {
+    use super::*;
+
+    fn message_with(sidecar: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "conversation_id": "00000000-0000-0000-0000-000000000002",
+            "sender": { "username": "mafold", "display_name": "Mafold", "kind": "bot" },
+            "content": "TITAN {% mafold/cite src=\"https://fuse.energy\" /%}",
+            "created_at": "2026-10-12T00:00:00Z",
+            "reactions": [],
+            "sidecar": sidecar,
+        })
+    }
+
+    /// What `resolveMedia` / `resolvePage` SEND: egress has expanded
+    /// `"mf-file:<id>"` into a FileRef, or into null when the file is gone.
+    #[test]
+    fn resolved_slots_decode() {
+        let media: ResolveMediaResponse = serde_json::from_value(serde_json::json!({ "media": {
+            "https://fuse.energy/titan.jpg": { "state": "ready", "file": { "id": "f1", "mime": "image/jpeg", "w": 1600, "h": 1200 } },
+            "https://fuse.energy/gone.jpg": { "state": "ready", "file": null },
+            "https://fuse.energy/wait.jpg": { "state": "pending" },
+            "https://fuse.energy/svg.svg": { "state": "failed", "reason": "not a picture" },
+            "https://a.b/x.jpg": { "state": "quarantined", "until": 3 }
+        } }))
+        .expect("decodes");
+        let titan = &media.media["https://fuse.energy/titan.jpg"];
+        assert!(matches!(titan, MediaSlot::Ready { file: Some(f) } if f.id == "f1" && f.w == Some(1600)));
+        assert!(matches!(media.media["https://fuse.energy/gone.jpg"], MediaSlot::Ready { file: None }));
+        assert_eq!(media.media["https://a.b/x.jpg"], MediaSlot::Unknown, "a newer state is nothing, not an error");
+
+        let pages: ResolvePageResponse = serde_json::from_value(serde_json::json!({ "pages": {
+            "https://fuse.energy": { "state": "ready", "label": "Fuse", "domain": "fuse.energy", "icon": { "id": "i1" }, "image": "bare-id" },
+            "https://a.b": { "state": "archived" }
+        } }))
+        .expect("decodes");
+        let page = &pages.pages["https://fuse.energy"];
+        assert_eq!(page.label, "Fuse");
+        assert_eq!(page.icon.as_ref().map(|f| f.id.as_str()), Some("i1"));
+        assert_eq!(page.image.as_ref().map(|f| f.id.as_str()), Some("bare-id"), "a bare id reads too");
+        assert_eq!(pages.pages["https://a.b"].state, SlotState::Unknown);
+    }
+
+    /// A sidecar from before (pictures and pages kept per message) or one that
+    /// does not parse at all costs the sidecar, never the message.
+    #[test]
+    fn old_or_broken_sidecars_never_cost_the_message() {
+        let v = message_with(serde_json::json!({
+            "media": { "https://a.b/x.jpg": { "state": "ready", "file": { "id": "f1" } } },
+            "pages": { "https://a.b": { "state": "ready" } }
+        }));
+        let m: Message = serde_json::from_value(v).expect("decodes");
+        assert!(m.sidecar.is_empty());
+
+        let broken: Message = serde_json::from_value(message_with(serde_json::json!({ "state": [1, 2, 3] }))).expect("decodes");
+        assert!(broken.sidecar.is_empty());
+        let absent: Message = serde_json::from_value({
+            let mut v = message_with(serde_json::Value::Null);
+            v.as_object_mut().unwrap().remove("sidecar");
+            v
+        })
+        .expect("decodes");
+        assert!(absent.sidecar.is_empty());
     }
 }
 

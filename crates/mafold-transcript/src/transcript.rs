@@ -74,9 +74,21 @@ fn has_own_card(md: &str) -> bool {
             continue; // a close tag names a card already counted at its open
         }
         let name = inner.split_whitespace().next().unwrap_or("");
-        if !name.is_empty() && !DRIVER_CARDS.contains(&name) {
-            return true;
+        if name.is_empty() {
+            continue;
         }
+        if DRIVER_CARDS.contains(&name) || render::NOTICE_CARDS.contains(&name) {
+            // What a stamp or a notice HOLDS is the stamp's too: the compaction
+            // card wraps its summary in `{% mafold/only %}`, and that inner tag
+            // is not the model answering in cards.
+            if !inner.ends_with('/') {
+                if let Some(end) = rest.find(&format!("{{% /{name} %}}")) {
+                    rest = &rest[end..];
+                }
+            }
+            continue;
+        }
+        return true;
     }
     false
 }
@@ -89,6 +101,10 @@ fn verbatim(full: &str) -> String {
     full.to_string()
 }
 
+/// `Clone` so a driver can keep the reply as it stood and put it back: a
+/// hosted step whose stream broke is asked again from the top, and what it
+/// had said is taken back first (mafold-api's `ChatEvent::Restart`).
+#[derive(Clone)]
 pub struct Transcript {
     stats: Option<crate::RunStats>,
     stats_started: std::time::Instant,
@@ -131,6 +147,9 @@ pub struct Transcript {
     /// summary has to stop counting it, and the whole-turn `totals` can't say
     /// which share to drop.
     last_group: (HashMap<&'static str, usize>, usize),
+    /// Parts of cards this turn rendered that only some readers may read —
+    /// state for whoever posts the reply to write ([`Transcript::take_private`]).
+    private: Vec<crate::render::PrivateItem>,
 }
 
 impl Default for Transcript {
@@ -170,6 +189,52 @@ mod stats_tests {
         assert!(data["input_tokens"].is_null());
         assert!(data["captured_at_ms"].as_u64().unwrap() > 0);
     }
+    /// A wallet reply's card carries what the ledger charged, per currency,
+    /// and no dollar figure of the runtime's own — not one it streamed, not
+    /// one it reported at Done (PR 4c, 10-31).
+    #[test]
+    fn a_wallet_reply_carries_the_ledgers_charge_and_no_runtime_price() {
+        use crate::WalletCharge;
+        let mut tx = Transcript::new();
+        tx.push(&AgentEvent::Stats(RunStats {
+            cost_usd: Some(0.42),
+            cost_kind: Some("estimated".into()),
+            total_tokens: Some(9000),
+            ..Default::default()
+        }));
+        tx.push(&AgentEvent::Stats(RunStats {
+            wallet: Some(vec![
+                WalletCharge { currency: "deepseek-v4-flash".into(), charged: 1234 },
+                WalletCharge { currency: "deepseek-v4-pro".into(), charged: 56 },
+            ]),
+            wallet_partial: Some(true),
+            ..Default::default()
+        }));
+        tx.push(&AgentEvent::Done { duration_ms: Some(1000.0), cost_usd: Some(0.5), tokens: None });
+        let md = tx.snapshot();
+        let result = &md[md.rfind("{% mafold/result").unwrap()..];
+        let (tag, rest) = result.split_once("%}").unwrap();
+        assert!(!tag.contains("cost="), "no dollar attribute: {tag}");
+        let data: Value = serde_json::from_str(rest.split("{% /mafold/result %}").next().unwrap()).unwrap();
+        assert_eq!(
+            data["wallet"],
+            json!([{"currency":"deepseek-v4-flash","charged":1234},{"currency":"deepseek-v4-pro","charged":56}])
+        );
+        assert_eq!(data["wallet_partial"], true);
+        assert!(data["cost_usd"].is_null() && data["cost_kind"].is_null(), "{data}");
+        assert_eq!(data["total_tokens"], 9000, "the rest of the stats are untouched");
+    }
+
+    /// Every other turn's body reads exactly as before: no wallet keys at all.
+    #[test]
+    fn a_turn_off_the_wallet_has_no_wallet_keys() {
+        let mut tx = Transcript::new();
+        tx.push(&AgentEvent::Stats(RunStats { cost_usd: Some(0.42), ..Default::default() }));
+        let data = details(&mut tx);
+        assert!(data.get("wallet").is_none() && data.get("wallet_partial").is_none(), "{data}");
+        assert_eq!(data["cost_usd"], 0.42);
+    }
+
     #[test]
     fn unknown_tool_outcome_does_not_claim_zero_failures() {
         let mut tx = Transcript::new();
@@ -212,6 +277,7 @@ impl Transcript {
             steps: 0,
             groups: 0,
             last_group: (HashMap::new(), 0),
+            private: Vec::new(),
         }
     }
 
@@ -311,6 +377,21 @@ impl Transcript {
         self.close_group();
     }
 
+    /// The private parts of cards rendered since the last call: controlled
+    /// state the poster of this reply writes onto it, as its sender, once the
+    /// message is there (`render::PrivateItem`). Drained — each is handed out
+    /// once.
+    pub fn take_private(&mut self) -> Vec<crate::render::PrivateItem> {
+        std::mem::take(&mut self.private)
+    }
+
+    /// Hand the transcript a private part of a card the CALLER drew (a hosted
+    /// brain's failure card, appended after the answer): it goes out with the
+    /// rest through [`Transcript::take_private`].
+    pub fn keep_private(&mut self, item: crate::render::PrivateItem) {
+        self.private.push(item);
+    }
+
     /// Append markdoc the caller assembled itself — the daemon's
     /// `{% mafold/bgtasks %}` notice, or a one-line apology for something that
     /// failed out-of-band. Pending narration and the open group are committed
@@ -328,6 +409,31 @@ impl Transcript {
         self.full.push_str(md);
     }
 
+    /// Start from a reply another process was writing when it died — `prior`
+    /// is what that reply says ([`render::strip_trailing_generating`] of its
+    /// last snapshot) — so this one goes on below it instead of over it.
+    ///
+    /// Its run groups count as this turn's: the fold at the end puts the WHOLE
+    /// trail under one lid, labelled with all of it, the same as a reply no
+    /// restart ever touched. Counted from the text, since the text is all that
+    /// is left of the process that wrote it ([`render::run_groups`]).
+    pub fn continue_from(&mut self, prior: &str) {
+        let prior = prior.trim_end();
+        if prior.is_empty() {
+            return;
+        }
+        self.push_raw(prior);
+        self.full.push_str("\n\n");
+        for (counts, items) in render::run_groups(prior) {
+            for (k, n) in &counts {
+                *self.totals.entry(k).or_insert(0) += n;
+            }
+            self.groups += 1;
+            self.steps += items;
+            self.last_group = (counts, items);
+        }
+    }
+
     /// Stamp an answer into the pending `{% mafold/ask %}` card. False when
     /// there is no unanswered one.
     pub fn stamp_ask(&mut self, answer: &str) -> bool {
@@ -341,7 +447,15 @@ impl Transcript {
                 self.first_text_ms = Some(self.stats_started.elapsed().as_millis() as u64);
             }
             AgentEvent::ToolCall { id, .. } => { self.stat_calls.insert(id.clone()); }
-            AgentEvent::Compacted { .. } => { self.compactions += 1; }
+            AgentEvent::Compacted { pre_tokens, post_tokens, summary, flagged } => {
+                self.compactions += 1;
+                // The card `render` draws for this event names its private part
+                // by the same `sid`; this is the part.
+                if let Some(s) = summary {
+                    let (_, item) = crate::render::compact_card(*pre_tokens, *post_tokens, true, s, flagged);
+                    self.private.extend(item);
+                }
+            }
             _ => {}
         }
         match ev {
@@ -419,6 +533,13 @@ impl Transcript {
                     stats.cost_usd = cost_usd.or(stats.cost_usd);
                     if stats.cost_usd.is_some() && stats.cost_kind.is_none() {
                         stats.cost_kind = Some("reported".into());
+                    }
+                    // A wallet reply's bill is `wallet`, the ledger's figure. The
+                    // runtime's own dollar estimate would be a second, different
+                    // price for the same reply, so it isn't written at all.
+                    if stats.wallet.is_some() {
+                        stats.cost_usd = None;
+                        stats.cost_kind = None;
                     }
                     stats.total_tokens = stats.total_tokens.or(*tokens);
                     stats.first_text_ms = stats.first_text_ms.or(self.first_text_ms);
@@ -648,7 +769,15 @@ impl Transcript {
                     }
                     counts.retain(|_, n| *n > 0);
                     let steps = self.steps.saturating_sub(self.last_group.1);
-                    (&self.full[..j], &self.full[j..], counts, steps)
+                    // …and so does what was said in the same breath: the lid
+                    // closes where the group BEFORE it ended, not where the last
+                    // one starts. Cut at the start and a model that wrote its
+                    // answer and then made one more call (naming the channel)
+                    // had that answer shut under the lid, the call's pill the
+                    // only thing left on show. (Field case: conv df712566,
+                    // 2026-10-10 00:46Z — rescued only by having one group.)
+                    let cut = self.full[..j].rfind(CLOSE).map_or(j, |k| k + CLOSE.len());
+                    (&self.full[..cut], &self.full[cut..], counts, steps)
                 }
                 _ => return plain(&self.full),
             }
@@ -795,7 +924,7 @@ mod tests {
         let group = md.find("{% mafold/run").expect("group");
         let res = md.find("{% mafold/result").expect("result");
         assert!(group < res, "the result stamp goes last: {md}");
-        assert!(md.contains("duration=\"18.3s\"") && md.contains("tokens=\"4.2k\""), "{md}");
+        assert!(md.contains("duration=\"18.3s\"") && md.contains("tokens=\"4.2K\""), "{md}");
     }
 
     /// Spliced markdoc lands after everything already said — and, at
@@ -999,6 +1128,73 @@ mod fold_tests {
         assert!(md.find("{% mafold/result").expect("stamp") > answer, "{md}");
     }
 
+    /// A turn a restart cut in two finishes looking like one that ran straight
+    /// through: the process that picks it up starts from what the reply already
+    /// says (`continue_from`), and the lid covers — and counts — the work done
+    /// before the cut as well as after it. Both shapes of the second half: more
+    /// tools, and only the answer.
+    #[test]
+    fn a_turn_continued_after_a_restart_folds_like_one_that_never_stopped() {
+        let before = |t: &mut Transcript| {
+            t.push(&AgentEvent::Text("Let me look at the tests.".into()));
+            t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+            t.push(&result("a", "x\ny"));
+            t.push(&AgentEvent::Thinking("which one fails".into()));
+            t.push(&AgentEvent::Text("Now running them.".into()));
+            t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+            // Output that looks like markup is escaped into its card's body —
+            // it is not an item of the group.
+            t.push(&result("b", "{% mafold/run summary=\"x\" %}\n49 passed, 1 failed"));
+        };
+        let more_tools = |t: &mut Transcript| {
+            t.push(&AgentEvent::Text("Fixing the one that fails.".into()));
+            t.push(&call("c", "Edit", json!({"file_path": "a.rs", "old_string": "a", "new_string": "b"})));
+            t.push(&result("c", "ok"));
+            t.push(&AgentEvent::Text("All 50 pass.".into()));
+            t.push(&done());
+        };
+        let answer_only = |t: &mut Transcript| {
+            t.push(&AgentEvent::Text("All 50 pass.".into()));
+            t.push(&done());
+        };
+        let lid = |md: &str| {
+            let open = md.find("{% mafold/trace").unwrap_or_else(|| panic!("not folded:\n{md}"));
+            let tag = &md[open..open + md[open..].find("%}").unwrap()];
+            let close = md.find("{% /mafold/trace %}").unwrap();
+            let answer = md.find("All 50 pass").unwrap();
+            assert!(close < answer, "answer under the lid:\n{md}");
+            assert!(md.find("Let me look").unwrap() < close, "trail before the cut escaped the lid:\n{md}");
+            tag.to_string()
+        };
+        for second in [&more_tools as &dyn Fn(&mut Transcript), &answer_only] {
+            let mut straight = Transcript::new();
+            before(&mut straight);
+            second(&mut straight);
+
+            let mut killed = Transcript::new();
+            before(&mut killed);
+            // What the draft said when its daemon died: the live snapshot, the
+            // open group rendered as a run card like every other push.
+            let said = killed.snapshot();
+            let mut picked_up = Transcript::new();
+            picked_up.continue_from(&said);
+            second(&mut picked_up);
+
+            assert_eq!(lid(&picked_up.finish_folded()), lid(&straight.finish_folded()));
+        }
+    }
+
+    /// Nothing written yet is nothing to continue from.
+    #[test]
+    fn continuing_from_an_empty_reply_is_a_fresh_one() {
+        let mut t = Transcript::new();
+        t.continue_from("  \n");
+        t.push(&AgentEvent::Text("hi".into()));
+        let mut fresh = Transcript::new();
+        fresh.push(&AgentEvent::Text("hi".into()));
+        assert_eq!(t.finish_folded(), fresh.finish_folded());
+    }
+
     /// The pill says what the WHOLE turn did, not what its last group did.
     #[test]
     fn the_summary_counts_every_group() {
@@ -1062,6 +1258,8 @@ mod fold_tests {
         let close = md.find("{% /mafold/trace %}").expect("folded");
         assert!(md.find("cargo test").expect("last group") > close, "{md}");
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
+        // The sentence that introduced the last group goes out with it.
+        assert!(md.find("Now the edit").expect("its narration") > close, "{md}");
         // The group left on show is no longer the lid's to claim: the trail
         // holds the Read and says so, and the Bash below it is counted once.
         let lid = &md[..close];
@@ -1106,6 +1304,32 @@ mod fold_tests {
         let close = md.find("{% /mafold/trace %}").expect("lid");
         assert!(md[open..close].contains("{% mafold/run "), "lid holds a group:\n{md}");
         assert!(md.find("cargo test").unwrap() > close, "{md}");
+    }
+
+    /// The answer written in the same step as one last call — a hosted agent
+    /// replying and then naming its untitled channel — with nothing said after
+    /// the call. The answer is the reply; it must not go under the lid with the
+    /// research, leaving only the naming pill on show. (Field shape: conv
+    /// df712566, 2026-10-10 00:46Z, which escaped only by having one group.)
+    #[test]
+    fn an_answer_given_with_the_last_call_stays_in_the_open() {
+        let mut t = Transcript::new();
+        t.push(&call("s", "web_search", json!({"query": "台北市長 民調"})));
+        t.push(&result("s", "3014 chars"));
+        t.push(&call("o", "open_url", json!({"url": "https://example.com/poll"})));
+        t.push(&result("o", "2110 chars"));
+        t.push(&AgentEvent::Text("最新一份是 TVBS 10 月 8 日的：蒋 49%，沈 41%。".into()));
+        t.push(&call("n", "name_channel", json!({"name": "台北市长选举民调"})));
+        t.push(&result("n", "Named the channel #台北市长选举民调."));
+        t.push(&done());
+        let md = t.finish_folded();
+        let open = md.find("{% mafold/trace").expect("folded");
+        let close = md.find("{% /mafold/trace %}").expect("lid");
+        let answer = md.find("最新一份是 TVBS").expect("answer kept");
+        assert!(answer > close, "the answer went under the lid:\n{md}");
+        assert!(md.find("name=\"name_channel\"").unwrap() > answer, "{md}");
+        assert!(md[open..close].contains("web_search"), "the research is the lid's:\n{md}");
+        assert!(md[open..close].contains("steps=\"2\""), "lid counts its own two steps:\n{md}");
     }
 
     /// A reply that answers in a CARD (`{% mafold/html %}`) has an answer just
@@ -1177,6 +1401,61 @@ mod fold_tests {
         assert!(first < steer && steer < second, "{md}");
     }
 
+    /// Every paragraph of `md` as a reader gets it, with how many quotes deep
+    /// it sits — read by a CommonMark parser, the rules a client's
+    /// react-markdown / remark render with.
+    fn paragraphs(md: &str) -> Vec<(usize, String)> {
+        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+        let (mut out, mut depth, mut open) = (Vec::new(), 0usize, None::<String>);
+        for ev in Parser::new(md) {
+            match ev {
+                Event::Start(Tag::BlockQuote(_)) => depth += 1,
+                Event::End(TagEnd::BlockQuote(_)) => depth -= 1,
+                Event::Start(Tag::Paragraph) => open = Some(String::new()),
+                Event::End(TagEnd::Paragraph) => out.push((depth, open.take().unwrap_or_default())),
+                Event::Text(t) | Event::Code(t) => open.iter_mut().for_each(|p| p.push_str(&t)),
+                Event::SoftBreak | Event::HardBreak => open.iter_mut().for_each(|p| p.push(' ')),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// 2026-10-11: on every reply that took a steer, the answer's first
+    /// paragraph rendered grey, INSIDE the `↩︎ …` seam — the seam ended on a
+    /// single newline, and text right after a `> …` line is a lazy
+    /// continuation of the quote. The notice line has the same shape; the
+    /// compaction line (`_🗜️ …_`, no quote) merged into its neighbours' paragraph
+    /// instead. Each of the transcript's own lines, with prose right against it
+    /// on both sides, must stay a block of its own and leave the prose out.
+    #[test]
+    fn prose_next_to_a_seam_notice_or_compaction_line_stays_its_own_paragraph() {
+        let marks: [(&str, AgentEvent); 3] = [
+            ("↩︎ no, the other file", AgentEvent::Steered("no, the other file".into())),
+            ("⚠︎ parked by policy", AgentEvent::Notice("parked by policy".into())),
+            (
+                "🗜️ Context auto-compacted",
+                AgentEvent::Compacted { pre_tokens: Some(90_000), post_tokens: None, summary: None, flagged: vec![] },
+            ),
+        ];
+        for (mark, ev) in marks {
+            let mut t = Transcript::new();
+            t.push(&AgentEvent::Text("Working on it.".into()));
+            t.push(&ev);
+            t.push(&AgentEvent::Text("Here is the answer.".into()));
+            let md = t.finish();
+            let paras = paragraphs(&md);
+            let find = |needle: &str| paras.iter().find(|(_, p)| p.contains(needle)).cloned();
+            let (answer_depth, answer) = find("Here is the answer.").unwrap_or_else(|| panic!("{md:?}"));
+            assert_eq!(answer_depth, 0, "the answer is inside the {mark:?} quote: {md:?} → {paras:?}");
+            assert_eq!(answer, "Here is the answer.", "the answer ran into the {mark:?} line: {md:?} → {paras:?}");
+            let (_, before) = find("Working on it.").unwrap();
+            assert_eq!(before, "Working on it.", "the {mark:?} line ran into the prose before it: {md:?} → {paras:?}");
+            let (_, line) = find(mark).unwrap_or_else(|| panic!("{mark:?} missing: {paras:?}"));
+            assert!(!line.contains("answer") && !line.contains("Working"), "{mark:?} → {line:?}");
+        }
+    }
+
     /// An empty steer says nothing and must not punch a hole in the narration.
     #[test]
     fn an_empty_steer_is_a_no_op() {
@@ -1203,7 +1482,7 @@ mod fold_tests {
         t.push(&result("b", "y"));
         t.push(&AgentEvent::Text("Here is the answer.".into()));
         assert_eq!(
-            t.push(&AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into() }),
+            t.push(&AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into(), fallback: None }),
             Advance::Immediate
         );
         t.push(&done());
@@ -1212,7 +1491,7 @@ mod fold_tests {
         let answer = md.find("Here is the answer").expect("answer");
         assert!(answer > close, "answer buried under the lid:\n{md}");
         assert!(!md.contains("summary=\"Details\""), "a notice is not a tool group:\n{md}");
-        assert!(md.find("Usage limit").expect("notice") > answer, "notice keeps its time order:\n{md}");
+        assert!(md.find("{% mafold/ratelimit").expect("notice") > answer, "notice keeps its time order:\n{md}");
         assert_eq!(md.matches("{% mafold/run ").count(), 2, "{md}");
     }
 
@@ -1223,7 +1502,7 @@ mod fold_tests {
         let mut t = Transcript::new();
         t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
         t.push(&result("a", "x"));
-        t.push(&AgentEvent::Compacted { pre_tokens: Some(90_000) });
+        t.push(&AgentEvent::Compacted { pre_tokens: Some(90_000), post_tokens: None, summary: None, flagged: vec![] });
         t.push(&call("b", "Read", json!({"file_path": "b.rs"})));
         t.push(&result("b", "y"));
         t.push(&AgentEvent::Text("Done.".into()));
@@ -1249,14 +1528,54 @@ mod fold_tests {
         t.push(&AgentEvent::Text("Now the edit.".into()));
         t.push(&call("b", "Bash", json!({"command": "cargo test"})));
         t.push(&result("b", "ok"));
-        t.push(&AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into() });
+        t.push(&AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into(), fallback: None });
         t.push(&done());
         let md = t.finish_folded();
         let close = md.find("{% /mafold/trace %}").expect("folded");
         let last = md.find("cargo test").expect("last group");
         assert!(last > close, "last group must stay visible:\n{md}");
-        assert!(md.find("Usage limit").expect("notice") > last, "{md}");
+        assert!(md.find("{% mafold/ratelimit").expect("notice") > last, "{md}");
         assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
+    }
+
+    /// The compaction CARD (a compaction whose summary is known) keeps the
+    /// notice line's contract: bookkeeping, never the answer. Mid-turn it goes
+    /// under the lid with the rest of the trail; last, it doesn't pull the whole
+    /// trail under a lid with nothing left outside it.
+    #[test]
+    fn a_compaction_card_is_trail_not_answer() {
+        let card = || AgentEvent::Compacted {
+            pre_tokens: Some(900_000),
+            post_tokens: Some(3_000),
+            summary: Some("ops asked to fix the bugs".into()),
+            flagged: vec![],
+        };
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Fixing it.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&card());
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        t.push(&AgentEvent::Text("All green.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        assert!(md.find("{% mafold/compact").expect("card") < close, "mid-turn card is trail:\n{md}");
+        assert!(md.find("All green.").unwrap() > close, "{md}");
+
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Fixing it.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("Now the edit.".into()));
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        t.push(&card());
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        assert!(md.find("cargo test").unwrap() > close, "last group must stay visible:\n{md}");
     }
 
     /// The SAME contract for a driver [`AgentEvent::Notice`] — the newest member

@@ -19,15 +19,21 @@
 //! They differ only in transport — snapshots vs. append-only deltas — which is
 //! the one axis [`Transcript`] deliberately leaves to the caller.
 
+pub mod catalog;
 pub mod event;
+pub mod failure;
+pub mod fold;
 pub mod lint;
+pub mod mention;
+pub mod only;
 pub mod prose;
 pub mod preview;
 pub mod render;
+pub mod scopes;
 pub mod transcript;
 pub mod stats;
 
 pub use event::AgentEvent;
 pub use render::step_line;
-pub use stats::RunStats;
+pub use stats::{RunStats, WalletCharge};
 pub use transcript::{Advance, Boundary, Qualify, Transcript};

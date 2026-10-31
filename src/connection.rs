@@ -108,7 +108,20 @@ pub enum ConnectionCmd {
         reveal: bool,
     },
     /// Print `export VAR=…` lines for a connection, to feed a local tool.
+    /// Refused in a bot's turn — there, what is printed is posted to the chat.
     Env { name: String },
+    /// Run a command with connections' secrets in its environment and their
+    /// values masked out of everything it prints:
+    /// `mafold connection run notion -- sh -c 'curl -H "Authorization: Bearer $NOTION_TOKEN" …'`.
+    Run {
+        /// Connections to inject (each as its provider's variable, e.g. `NOTION_TOKEN`).
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// The command, after `--`. Quote it for `sh -c` when the command line
+        /// itself needs the value — your own shell would expand `$VAR` first.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// What a connection can do — its methods, straight from the provider.
     Methods {
         name: String,
@@ -149,7 +162,13 @@ pub enum ConnectionCmd {
         no_rotate: bool,
     },
     /// Fetch this machine's wrapped master key once another device approves it.
-    Unlock,
+    Unlock {
+        /// One JSON line for a program (the desktop app):
+        /// `{"state":"unlocked",…}`, `{"state":"waiting"}` (no device has handed
+        /// this one the key yet — retry later), or `{"state":"error",…}`.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stay online and answer connection calls addressed to your devices.
     ///
     /// While this runs, bots you've granted a connection to get their calls
@@ -183,6 +202,132 @@ fn as_array(v: &Value, key: &str) -> Vec<Value> {
 
 fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+/// `mafold connection call`/`env`/`show --reveal` all run on the HUMAN session
+/// (`human_client`), because the vault only opens for its owner. But a
+/// self-hosted bot's turn shells out as that very human — so without this,
+/// every bot the owner runs (and therefore anyone who can drive that bot) could
+/// use any connection and read raw tokens, with none of the `connection.use:`
+/// grant the relayed `callConnection` path checks server-side. `MAFOLD_BOT_TOKEN`
+/// in the environment is how a turn says "I am acting as a bot": when it is set,
+/// the same grant is required here, and the denial reads exactly like the
+/// relay's so the two paths can't be told apart by probing.
+///
+/// Pure, so the decision is testable without a network: `bot` is `None` for a
+/// human at their own terminal (no gate), `Some(handle)` for a bot turn.
+/// `grants` is the owner's `(grantee, connection, can_use)` rows. Returns the
+/// denial message when the bot may not use `name`, else `None`.
+fn connection_use_denied(
+    bot: Option<&str>,
+    owner: &str,
+    name: &str,
+    grants: &[(String, String, bool)],
+) -> Option<String> {
+    let bot = bot?; // no bot token → the person's own terminal, their own vault
+    let granted = grants.iter().any(|(grantee, connection, can_use)| {
+        *can_use && grantee.eq_ignore_ascii_case(bot) && connection.eq_ignore_ascii_case(name)
+    });
+    if granted {
+        None
+    } else {
+        Some(format!(
+            "@{owner} hasn't allowed @{bot} to use their `{name}` — \
+             ask with requestConnectionAccess and let them approve the card"
+        ))
+    }
+}
+
+/// Enforce [`connection_use_denied`] against the live account, but only when a
+/// bot token is present in the environment. Fails CLOSED: a bot token we can't
+/// resolve, or grants we can't fetch, denies rather than falling through to the
+/// vault — the whole point is that a bot turn is not implicitly the owner.
+async fn require_connection_use(
+    base: &str,
+    human: &Client,
+    owner: &str,
+    name: &str,
+) -> Result<()> {
+    let Some(token) = std::env::var("MAFOLD_BOT_TOKEN").ok().filter(|t| !t.trim().is_empty())
+    else {
+        return Ok(()); // a human at a real terminal — the vault is theirs to open
+    };
+    let bot = match Client::new(base.to_string(), token).call("getMe", json!({})).await {
+        Ok(v) => s(&v, "username"),
+        Err(e) => bail!(
+            "running as a bot but couldn't confirm which one ({e}); \
+             refusing to touch @{owner}'s `{name}` without checking the grant"
+        ),
+    };
+    if bot.is_empty() {
+        bail!("running as a bot with no resolvable identity; refusing to touch @{owner}'s `{name}`");
+    }
+    let rows = use_grants(human)
+        .await
+        .context("couldn't check connection grants; refusing rather than assuming access")?;
+    if let Some(msg) = connection_use_denied(Some(&bot), owner, name, &rows) {
+        bail!(msg);
+    }
+    Ok(())
+}
+
+/// The owner's `(grantee, connection, can_use)` rows — what
+/// [`connection_use_denied`] judges. On the HUMAN session: the api answers
+/// `listConnectionGrants` to the person and nobody else.
+async fn use_grants(human: &Client) -> Result<Vec<(String, String, bool)>> {
+    Ok(as_array(&human.call("listConnectionGrants", json!({})).await?, "items")
+        .iter()
+        .map(|g| {
+            (
+                s(g, "grantee"),
+                s(g, "connection"),
+                g.get("can_use").and_then(|b| b.as_bool()).unwrap_or(false),
+            )
+        })
+        .collect())
+}
+
+/// Whether this process is a bot's turn (the daemon sets `MAFOLD_BOT_TOKEN`
+/// for every turn it runs) — the same test [`require_connection_use`] makes.
+fn bot_turn() -> bool {
+    std::env::var("MAFOLD_BOT_TOKEN").is_ok_and(|t| !t.trim().is_empty())
+}
+
+/// `env` and `show --reveal` print a connection's raw secret. At a person's
+/// own terminal that is the point; in a bot's turn everything printed becomes
+/// the trace card, posted to the conversation for everyone in it — which is
+/// how `export NOTION_TOKEN=…` ended up in a group of two dozen (2026-10-05).
+/// The grant check doesn't help: a bot that IS allowed to use the connection
+/// still must not publish it. Refused before the vault is touched; `run` is
+/// the way to hand the value to a command.
+fn plaintext_refused(bot_turn: bool, command: &str, name: &str) -> Option<String> {
+    bot_turn.then(|| {
+        format!(
+            "`mafold connection {command}` would print `{name}`'s secret, and in a bot's turn \
+             everything printed is posted to the conversation. Use \
+             `mafold connection run {name} -- <command>` instead: the secret goes into that \
+             command's environment, and anything it prints comes back with the secret masked."
+        )
+    })
+}
+
+/// The `(VAR, value)` a connection is fed to a local tool as.
+fn env_pair(spec: &ProviderInfo, fields: &serde_json::Map<String, Value>, name: &str) -> Result<(String, String)> {
+    // A provider that names no variable but holds exactly one value — a secret
+    // someone typed into a card — is fed as the CONNECTION's name: the bot
+    // asked for `db_password`, it gets `$DB_PASSWORD`. Read off the row's
+    // shape, not the provider's id (`.docs/secure-input-v1.md` §8).
+    let var = match (&spec.env_var, spec.fields.len()) {
+        (Some(v), _) => v.clone(),
+        (None, 1) => name.to_uppercase().replace('-', "_"),
+        (None, _) => bail!("{} is an OAuth bag, not a single env var — use `mafold connection call {name} …`", spec.id),
+    };
+    let primary = spec.fields.first().map(|f| f.key.as_str()).unwrap_or("api_key");
+    let val = fields
+        .get(primary)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("connection has no `{primary}`"))?;
+    Ok((var, val.to_string()))
 }
 
 /// Mask everything but the last 4 — the same shape the api uses for bot
@@ -283,6 +428,19 @@ async fn auto_approve_pending(client: &Client, umk: &Key, key_id: &str) {
 }
 
 pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(Key, String, DeviceKey)> {
+    open_vault(client, sess, true).await
+}
+
+/// [`unlock`], with its one branch that STARTS a vault behind `mint`.
+///
+/// `mafold video` opens the owner's vault to reach a ModelArk key it has
+/// already seen in their connection list — so a vault exists somewhere, and
+/// minting a fresh one here would orphan it. The mint is also the only branch
+/// that prints, and `mafold video` answers in JSON on stdout: a "✓ vault
+/// created" line there is a broken answer for the agent reading it. With
+/// `mint` false a machine that holds no key gets [`KeyNotHandedOver`], and
+/// nothing is said.
+async fn open_vault(client: &Client, sess: &session::Session, mint: bool) -> Result<(Key, String, DeviceKey)> {
     let dev = vault::device_key()?;
     let reg = register(client, sess, &dev).await?;
 
@@ -299,7 +457,7 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
         vault::forget_cached_umk();
     }
 
-    if reg["first"].as_bool() == Some(true) {
+    if mint && reg["first"].as_bool() == Some(true) {
         // Nobody can approve us because nobody holds a key yet: this account's
         // vault starts here.
         let umk = Key::random();
@@ -340,14 +498,43 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
         // this message only appears when none of them has been online since
         // this machine registered, so the only accurate instruction is to open
         // Mafold somewhere and come back.
-        Err(_) => bail!(
+        Err(e) => Err(no_key_yet(e)),
+    }
+}
+
+/// What a failed `getVaultKey` means. The server SAYING no key is wrapped for
+/// this machine (its 404, or any other answer it gives) is
+/// [`KeyNotHandedOver`]. A request that died on the way, or a server that fell
+/// over (502/503/504/429 — [`crate::video::retryable`]), is not an answer
+/// about the key at all, and stays the typed blink it is (2026-10-10): read as
+/// "this machine doesn't hold the vault key", one 502 ended `mafold video
+/// status --wait` on a job that was still running, with a sentence that sent
+/// the owner looking for a device.
+fn no_key_yet(e: anyhow::Error) -> anyhow::Error {
+    if crate::video::retryable(&e) {
+        e
+    } else {
+        anyhow::Error::new(KeyNotHandedOver)
+    }
+}
+
+/// `unlock` found no key wrapped for this machine yet: a state to wait out,
+/// not a failure — typed, so `connection unlock --json` can say "waiting".
+#[derive(Debug)]
+pub(crate) struct KeyNotHandedOver;
+
+impl std::fmt::Display for KeyNotHandedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
             "this machine doesn't have your vault key yet.\n\n  \
              open Mafold on a device that already has it (web, mac or iOS) and it \
              will hand the key over — then run this again.\n  \
-             no other device? recover with your passphrase:  mafold connection recover"
-        ),
+             no other device? recover with your passphrase:  mafold connection recover",
+        )
     }
 }
+
+impl std::error::Error for KeyNotHandedOver {}
 
 /// Open a connection's payload.
 ///
@@ -356,6 +543,26 @@ pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(
 /// AEAD would surface "wrong key or corrupt data", which reads like the
 /// credential was damaged rather than that the caller needs to re-unlock.
 fn open_payload(umk: &Key, key_id: &str, conn: &Value) -> Result<serde_json::Map<String, Value>> {
+    // Secure input (`.docs/secure-input-v1.md` §7): sealed by someone holding
+    // no master key, to each of the owner's devices. Only this device's own
+    // wrap opens with its secret, so trying them all needs no device id.
+    if s(conn, "wrapped_dek").is_empty() {
+        let wraps = conn.get("device_wraps").and_then(|w| w.as_object());
+        let dev = vault::device_key()?;
+        let plain = wraps
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, w)| w.as_str())
+            .find_map(|w| mafold_core::vault::open_for_device(&dev.secret, &s(conn, "blob"), w).ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "`{}` was handed over to this account's devices before this one joined the vault — \
+                     ask for it again (it's a card in the chat), this machine can't open the copy that exists",
+                    s(conn, "name")
+                )
+            })?;
+        return serde_json::from_str(&plain).context("connection payload is not JSON");
+    }
     let want = s(conn, "key_id");
     if !want.is_empty() && !key_id.is_empty() && want != key_id {
         bail!(
@@ -397,8 +604,11 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
             add(&client, &sess, &name, &provider, import, from_env, oauth, url, auth_header, label)
                 .await
         }
-        ConnectionCmd::Show { name, reveal } => show(&client, &sess, &name, reveal).await,
-        ConnectionCmd::Env { name } => env(&client, &sess, &name).await,
+        ConnectionCmd::Show { name, reveal } => show(base, &client, &sess, &name, reveal).await,
+        ConnectionCmd::Env { name } => env(base, &client, &sess, &name).await,
+        ConnectionCmd::Run { names, command } => {
+            run_with(base, &client, &sess, &names, &command).await
+        }
         ConnectionCmd::Methods { name, schema } => {
             methods(base, &client, &sess, &name, schema).await
         }
@@ -412,7 +622,7 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
             revoke(&client, &sess, &device_id, no_rotate).await
         }
         ConnectionCmd::Listen => listen(base, &client, &sess).await,
-        ConnectionCmd::Unlock => {
+        ConnectionCmd::Unlock { json: false } => {
             let (_, key_id, dev) = unlock(&client, &sess).await?;
             println!(
                 "✓ unlocked on {} — key {} · fingerprint {}",
@@ -422,6 +632,18 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
             );
             Ok(())
         }
+        ConnectionCmd::Unlock { json: true } => {
+            let out = match unlock(&client, &sess).await {
+                Ok((_, key_id, dev)) => json!({ "state": "unlocked", "key_id": key_id, "fingerprint": vault::fingerprint(&dev.public) }),
+                Err(e) if e.downcast_ref::<KeyNotHandedOver>().is_some() => json!({ "state": "waiting" }),
+                Err(e) => json!({ "state": "error", "message": format!("{e:#}") }),
+            };
+            println!("{out}");
+            if out["state"] == "error" {
+                anyhow::bail!("unlock failed");
+            }
+            Ok(())
+        }
         ConnectionCmd::SetRecovery => set_recovery(&client, &sess).await,
         ConnectionCmd::Recover => recover(&client, &sess).await,
     }
@@ -429,6 +651,18 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
 
 async fn providers(client: &Client) -> Result<()> {
     let rows = registry(client).await?;
+    // A row behind a flag, only where that flag is on for this account — what
+    // the web and the phone offer (`offeredProviders`), and what
+    // `putConnection` takes. No answer ⇒ the flags' defaults.
+    let flags = client
+        .call("getFlags", json!({}))
+        .await
+        .ok()
+        .and_then(|v| serde_json::from_value::<mafold_core::mafold_types::FlagState>(v).ok())
+        .map(|s| s.values)
+        .unwrap_or_default();
+    let on = |f: &str| flags.get(f).copied().unwrap_or_else(|| mafold_core::flags::prod_default(f));
+    let rows: Vec<ProviderInfo> = rows.into_iter().filter(|p| p.flag.as_deref().is_none_or(on)).collect();
     println!("{:<20} {:<26} {:<8} {}", "ID", "PROVIDER", "AUTH", "LINK VIA");
     for p in &rows {
         let how = match (p.import_path.as_deref(), p.env_var.as_deref()) {
@@ -470,19 +704,48 @@ async fn list(client: &Client) -> Result<()> {
         return Ok(());
     }
     println!("{:<16} {:<20} {:<10} {}", "NAME", "PROVIDER", "STATUS", "LABEL");
-    for c in items {
-        // The provider is printed VERBATIM and the row always reads `linked`,
-        // because that is exactly what the server asserted by returning it. It
-        // used to say `unknown` whenever this binary's compiled-in table had no
-        // such id — which described the CLI's build, not the connection, and
-        // told a user whose link had just succeeded that it hadn't.
+    let mut dead = Vec::new();
+    for c in &items {
+        // The provider is printed VERBATIM, because that is exactly what the
+        // server asserted by returning it. The status used to say `unknown`
+        // whenever this binary's compiled-in table had no such id — which
+        // described the CLI's build, not the connection. It says something
+        // other than `linked` only when a device has LEARNED otherwise: a
+        // renewal the provider refused (`relink_at`).
+        let expired = c.get("relink_at").and_then(Value::as_i64).is_some();
+        if expired {
+            dead.push((s(c, "name"), s(c, "relink_reason")));
+        }
+        // A value someone handed over through a card says who and until when —
+        // and how a bot spends it, since its variable is the row's own name.
+        let handed = s(c, "provided_by");
+        let note = if handed.is_empty() {
+            String::new()
+        } else {
+            let until = c
+                .get("expires_at")
+                .and_then(Value::as_i64)
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|t| format!(" until {}", t.format("%Y-%m-%d %H:%M UTC")))
+                .unwrap_or_default();
+            let name = s(c, "name");
+            format!(
+                "  from @{handed}{until} · use: mafold connection run {name} -- <cmd> (as ${})",
+                name.to_uppercase().replace('-', "_")
+            )
+        };
         println!(
-            "{:<16} {:<20} {:<10} {}",
-            s(&c, "name"),
-            s(&c, "provider"),
-            "linked",
-            s(&c, "label")
+            "{:<16} {:<20} {:<10} {}{}",
+            s(c, "name"),
+            s(c, "provider"),
+            if expired { "expired" } else { "linked" },
+            s(c, "label"),
+            note
         );
+    }
+    for (name, why) in dead {
+        let why = if why.is_empty() { String::new() } else { format!(" ({why})") };
+        println!("\n  {name}: the provider no longer accepts this sign-in{why} — reconnect it in Settings ▸ Connections");
     }
     Ok(())
 }
@@ -494,25 +757,11 @@ fn collect(spec: &ProviderInfo, import: bool, from_env: bool)
     let mut out = serde_json::Map::new();
 
     if import {
-        let path = spec
-            .import_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("{} has no local credential file to import", spec.id))?;
-        let full = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(path);
-        let raw = std::fs::read_to_string(&full)
-            .with_context(|| format!("read {} — log in with that tool first", full.display()))?;
-        let parsed: Value = serde_json::from_str(&raw)
-            .with_context(|| format!("{} is not JSON", full.display()))?;
-        // Vendors nest their bag differently; search rather than hard-code a
-        // path per vendor, so a layout change costs nothing here.
-        for key in &spec.payload_keys {
-            if let Some(v) = find_key(&parsed, key) {
-                out.insert(key.to_string(), v);
-            }
-        }
-        if out.is_empty() {
-            bail!("found no recognizable fields in {}", full.display());
-        }
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let claude = crate::accounts::Account::default_login().store();
+        // A person clicked Connect: ask the Keychain now, not what it said a
+        // minute ago — they may have just unlocked it.
+        out = import_fields(spec, &home, &claude, crate::accounts::keychain_now())?;
     } else if from_env {
         let var = spec
             .env_var
@@ -540,6 +789,59 @@ fn collect(spec: &ProviderInfo, import: bool, from_env: bool)
         if f.required && !out.contains_key(&f.key) {
             bail!("{} is required for {}", f.label, spec.id);
         }
+    }
+    Ok(out)
+}
+
+/// The `--import` half of [`collect`], with what depends on where it runs
+/// passed in: `$HOME`, where this machine's Claude Code login actually is
+/// (`claude`), and the Keychain.
+fn import_fields(
+    spec: &ProviderInfo,
+    home: &std::path::Path,
+    claude: &crate::accounts::LoginStore,
+    keychain: Option<crate::accounts::Keychain>,
+) -> Result<serde_json::Map<String, Value>> {
+    let path = spec
+        .import_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("{} has no local credential file to import", spec.id))?;
+    let full = home.join(path);
+    // The path that names Claude Code's own login (`~/.claude`'s) is read
+    // where Claude Code actually keeps it: on a Mac the Keychain rather than
+    // this file, and under `CLAUDE_CONFIG_DIR` another directory altogether.
+    let (parsed, source) = if full == crate::accounts::LoginStore::default_in(home).file {
+        let store: Value = serde_json::from_str(&claude.read_with(keychain)?)
+            .context("the Claude Code login is not JSON")?;
+        // That store is a bag: Claude Code's own sign-in under `claudeAiOauth`,
+        // and beside it every MCP server's OAuth grant (`mcpOAuth.<server>`,
+        // the same `accessToken` names). Only the sign-in is searched, or a
+        // signed-out login would import some MCP server's token as this one.
+        let login = store
+            .get("claudeAiOauth")
+            .filter(|o| o.get("accessToken").and_then(Value::as_str).is_some_and(|t| !t.is_empty()))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("no Claude Code login on this machine — sign in with `claude` first (its stored credential holds no sign-in)")
+            })?;
+        (login, "the Claude Code login".to_string())
+    } else {
+        let raw = std::fs::read_to_string(&full)
+            .with_context(|| format!("read {} — log in with that tool first", full.display()))?;
+        let parsed: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("{} is not JSON", full.display()))?;
+        (parsed, full.display().to_string())
+    };
+    // Vendors nest their bag differently; search rather than hard-code a
+    // path per vendor, so a layout change costs nothing here.
+    let mut out = serde_json::Map::new();
+    for key in &spec.payload_keys {
+        if let Some(v) = find_key(&parsed, key) {
+            out.insert(key.to_string(), v);
+        }
+    }
+    if out.is_empty() {
+        bail!("found no recognizable fields in {source}");
     }
     Ok(out)
 }
@@ -1187,7 +1489,7 @@ fn machine_binding(sess: &session::Session) -> serde_json::Map<String, Value> {
     fields
 }
 
-async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool) -> Result<()> {
+async fn show(base: &str, client: &Client, sess: &session::Session, name: &str, reveal: bool) -> Result<()> {
     let conn = fetch(client, name).await?;
     println!("name      {}", s(&conn, "name"));
     println!("provider  {}", s(&conn, "provider"));
@@ -1197,6 +1499,13 @@ async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool
         println!("\n(secret withheld — `mafold connection show {name} --reveal` to decrypt here)");
         return Ok(());
     }
+    // `--reveal` decrypts the raw secret on this machine — same gate as `env`.
+    if let Some(msg) = plaintext_refused(bot_turn(), "show --reveal", name) {
+        bail!(msg);
+    }
+    require_connection_use(base, client, &sess.username, name).await?;
+    let spec = descriptor(client, &s(&conn, "provider")).await?;
+    refuse_if_spend_only(name, &spec)?;
     let (umk, key_id, _) = unlock(client, sess).await?;
     let fields = open_payload(&umk, &key_id, &conn)?;
     println!();
@@ -1212,25 +1521,70 @@ async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool
     Ok(())
 }
 
+/// A spend-only row (see `credential_stays_inside`) is used through its
+/// methods and never printed — checked before the vault is even opened.
+fn refuse_if_spend_only(name: &str, spec: &ProviderInfo) -> Result<()> {
+    if mafold_core::connections::credential_stays_inside(spec) {
+        return Err(anyhow!(
+            "`{name}` ({}) is never revealed or exported: its token is only used inside \
+             `mafold connection call {name} …`, so nothing that runs here ever holds it. \
+             See what it can do: `mafold connection methods {name}`",
+            spec.display
+        ));
+    }
+    Ok(())
+}
+
 /// Shell exports for a connection, so a local tool can consume it without a
 /// bespoke integration. Deliberately not written to any file: piping into
 /// `eval` keeps the plaintext in a process, not on disk.
-async fn env(client: &Client, sess: &session::Session, name: &str) -> Result<()> {
+async fn env(base: &str, client: &Client, sess: &session::Session, name: &str) -> Result<()> {
+    if let Some(msg) = plaintext_refused(bot_turn(), "env", name) {
+        bail!(msg);
+    }
+    require_connection_use(base, client, &sess.username, name).await?;
     let conn = fetch(client, name).await?;
     let provider = s(&conn, "provider");
     let spec = descriptor(client, &provider).await?;
+    refuse_if_spend_only(name, &spec)?;
     let (umk, key_id, _) = unlock(client, sess).await?;
     let fields = open_payload(&umk, &key_id, &conn)?;
-    let var = spec
-        .env_var
-        .ok_or_else(|| anyhow!("{} is an OAuth bag, not a single env var — use `show --reveal`", spec.id))?;
-    let primary = spec.fields.first().map(|f| f.key.as_str()).unwrap_or("api_key");
-    let val = fields
-        .get(primary)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("connection has no `{primary}`"))?;
+    let (var, val) = env_pair(&spec, &fields, name)?;
     println!("export {var}={val}");
     Ok(())
+}
+
+/// `mafold connection run <name>… -- <command>`: the secrets go into the
+/// command's environment, never into this process's output — see
+/// [`crate::conceal`]. Same grant as `call` in a bot's turn; exits with the
+/// command's own status so `&&` chains behave.
+async fn run_with(
+    base: &str,
+    client: &Client,
+    sess: &session::Session,
+    names: &[String],
+    command: &[String],
+) -> Result<()> {
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut opened: Option<(Key, String)> = None;
+    for name in names {
+        require_connection_use(base, client, &sess.username, name).await?;
+        let conn = fetch(client, name).await?;
+        let spec = descriptor(client, &s(&conn, "provider")).await?;
+        refuse_if_spend_only(name, &spec)?;
+        if opened.is_none() {
+            let (umk, key_id, _) = unlock(client, sess).await?;
+            opened = Some((umk, key_id));
+        }
+        let (umk, key_id) = opened.as_ref().expect("unlocked above");
+        let fields = open_payload(umk, key_id, &conn)?;
+        vars.push(env_pair(&spec, &fields, name)?);
+    }
+    let command = command.to_vec();
+    let code = tokio::task::spawn_blocking(move || crate::conceal::run(&command, &vars))
+        .await
+        .context("the command's runner panicked")??;
+    std::process::exit(code);
 }
 
 /// A device-side runtime, unlocked.
@@ -1335,6 +1689,8 @@ pub async fn handle_link_event(
     let p = env.get("params").cloned().unwrap_or(Value::Null);
     let link_id = s(&p, "link_id");
     let provider = s(&p, "provider");
+    let reconnect = p["reconnect"].as_str().map(str::to_owned);
+    let reconnect_label = reconnect.as_ref().and_then(|_| p["label"].as_str()).map(str::to_owned);
     if link_id.is_empty() {
         return false;
     }
@@ -1376,8 +1732,9 @@ pub async fn handle_link_event(
                 &sp,
                 &endpoint,
                 &link_id,
-                typed("name"),
+                reconnect.clone().or_else(|| typed("name")),
                 typed("label"),
+                reconnect.is_some(),
             )
             .await;
             return true;
@@ -1387,7 +1744,7 @@ pub async fn handle_link_event(
         // connection instead of a URL, and `startConnectionLink` reads that as
         // "already linked".
         Some(sp) if is_device_binding(&sp) => {
-            let outcome = bind_for_link(client, sess, umk, key_id, &sp).await;
+            let outcome = bind_for_link(client, sess, umk, key_id, &sp, reconnect.as_deref(), reconnect_label.as_deref()).await;
             match &outcome {
                 Ok(name) => {
                     let _ = answer(
@@ -1416,7 +1773,7 @@ pub async fn handle_link_event(
             return true;
         }
         Some(sp) if sp.import_path.is_some() && sp.oauth_fixed.is_none() => {
-            let outcome = import_for_link(client, umk, key_id, &sp).await;
+            let outcome = import_for_link(client, umk, key_id, &sp, reconnect.as_deref(), reconnect_label.as_deref()).await;
             match &outcome {
                 Ok(name) => { let _ = answer(json!({ "authorize_url": "", "device": sess.device_name, "connection": name }), None).await; }
                 Err(e) => { let _ = answer(Value::Null, Some(format!("{e:#}"))).await; }
@@ -1473,7 +1830,7 @@ pub async fn handle_link_event(
     let umk = umk.clone();
     let key_id = key_id.to_string();
     tokio::spawn(async move {
-        let outcome = finish_linking(&client, &spec, leg, &umk, &key_id).await;
+        let outcome = finish_linking(&client, &spec, leg, &umk, &key_id, reconnect.as_deref(), reconnect_label.as_deref()).await;
         let body = match &outcome {
             Ok(name) => json!({ "link_id": link_id, "connection": name }),
             Err(e) => json!({ "link_id": link_id, "error": format!("{e:#}") }),
@@ -1500,20 +1857,22 @@ async fn bind_for_link(
     umk: &Key,
     key_id: &str,
     spec: &ProviderInfo,
+    reconnect: Option<&str>,
+    reconnect_label: Option<&str>,
 ) -> Result<String> {
     let fields = machine_binding(sess);
     let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
-    let name = free_name(client, &spec.id).await;
+    let name = match reconnect { Some(name) => name.to_owned(), None => free_name(client, &spec.id).await };
     client
         .call(
             "putConnection",
             json!({
                 "name": name,
                 "provider": spec.id,
-                "label": sess.device_name,
+                "label": reconnect_label.unwrap_or(&sess.device_name),
                 "blob": blob,
                 "wrapped_dek": wrapped_dek,
-                "key_id": key_id, "create_only": true,
+                "key_id": key_id, "create_only": reconnect.is_none(),
             }),
         )
         .await
@@ -1523,14 +1882,14 @@ async fn bind_for_link(
 
 /// Import the provider's declared local login into one new sealed connection.
 /// The same collection path as `connection add --import`, callable from a card.
-async fn import_for_link(client: &Client, umk: &Key, key_id: &str, spec: &ProviderInfo) -> Result<String> {
+async fn import_for_link(client: &Client, umk: &Key, key_id: &str, spec: &ProviderInfo, reconnect: Option<&str>, reconnect_label: Option<&str>) -> Result<String> {
     let mut fields = collect(spec, true, false)?;
     enrich_oauth_payload(spec, &mut fields);
     let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
-    let name = free_name(client, &spec.id).await;
+    let name = match reconnect { Some(name) => name.to_owned(), None => free_name(client, &spec.id).await };
     client.call("putConnection", json!({
-        "name": name, "provider": spec.id, "label": spec.display,
-        "blob": blob, "wrapped_dek": wrapped_dek, "key_id": key_id, "create_only": true,
+        "name": name, "provider": spec.id, "label": reconnect_label.unwrap_or(&spec.display),
+        "blob": blob, "wrapped_dek": wrapped_dek, "key_id": key_id, "create_only": reconnect.is_none(),
     })).await.context("putConnection failed")?;
     Ok(name)
 }
@@ -1543,11 +1902,13 @@ async fn finish_linking(
     leg: OauthLeg,
     umk: &Key,
     key_id: &str,
+    reconnect: Option<&str>,
+    reconnect_label: Option<&str>,
 ) -> Result<String> {
     let (mut fields, suggested) = oauth_finish(spec, leg).await?;
     enrich_oauth_payload(&spec, &mut fields);
     let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
-    let name = free_name(client, &spec.id).await;
+    let name = match reconnect { Some(name) => name.to_owned(), None => free_name(client, &spec.id).await };
     let label = suggested.unwrap_or_else(|| {
         fields
             .get("account_id")
@@ -1561,10 +1922,10 @@ async fn finish_linking(
             json!({
                 "name": name,
                 "provider": spec.id,
-                "label": label,
+                "label": reconnect_label.unwrap_or(&label),
                 "blob": blob,
                 "wrapped_dek": wrapped_dek,
-                "key_id": key_id, "create_only": true,
+                "key_id": key_id, "create_only": reconnect.is_none(),
             }),
         )
         .await
@@ -1579,8 +1940,34 @@ async fn finish_linking(
 /// it, opens the vault, calls the provider, answers. Nothing here inspects the
 /// event beyond handing it over — the whole point is that every device answers
 /// with the same Rust.
+/// The server pings every 25s. A link that has said NOTHING for this long is
+/// dead whatever the socket says: a laptop that slept, a proxy that dropped the
+/// flow, an api restart whose RST never arrived. Both listeners used to wait on
+/// such a link forever — process alive, calls unanswered, "listening" to no
+/// one (@fei_pota's Mac, 2026-09-27: a Connect sent to it went 20s unanswered;
+/// this Mac on 2026-09-23: seven hours of silence in supervisor.log).
+const LISTEN_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The next frame of a listener's link, or `None` once the link is over:
+/// closed, errored, or silent for `idle`. The caller reconnects on `None`.
+async fn next_live<S>(
+    ws: &mut S,
+    idle: std::time::Duration,
+) -> Option<tokio_tungstenite::tungstenite::Message>
+where
+    S: futures_util::Stream<
+            Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+        > + Unpin,
+{
+    use futures_util::StreamExt;
+    match tokio::time::timeout(idle, ws.next()).await {
+        Ok(Some(Ok(frame))) => Some(frame),
+        _ => None,
+    }
+}
+
 async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<()> {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
     // Unlocked once, used twice: the core answers calls with the key, and a
@@ -1600,9 +1987,9 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
                 continue;
             }
         };
-        while let Some(frame) = ws.next().await {
+        while let Some(frame) = next_live(&mut ws, LISTEN_IDLE).await {
             match frame {
-                Ok(WsMsg::Text(t)) => {
+                WsMsg::Text(t) => {
                     if mafold_core::connections::handle_event(&mut rt, &t).await {
                         println!("· answered a connection call");
                     } else if handle_link_event(client, sess, &umk, &key_id, &t).await {
@@ -1612,14 +1999,14 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
                 // The server pings every 25s and treats silence as death; an
                 // unanswered ping here would look like "listen is on but calls
                 // time out", which is the worst version of off.
-                Ok(WsMsg::Ping(p)) => {
+                WsMsg::Ping(p) => {
                     let _ = ws.send(WsMsg::Pong(p)).await;
                 }
-                Ok(WsMsg::Close(_)) | Err(_) => break,
-                Ok(_) => {}
+                WsMsg::Close(_) => break,
+                _ => {}
             }
         }
-        eprintln!("ws dropped — reconnecting in 2s");
+        eprintln!("ws dropped or went silent — reconnecting in 2s");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
@@ -1629,93 +2016,147 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
 /// no second command to know about.
 ///
 /// QUIET by construction: it only serves when this machine already holds a
-/// cached, still-current vault key — it never creates a vault, never prompts,
-/// never prints. Locked (or logged-out) machines just re-check on a slow tick,
-/// so running `mafold connection unlock` later brings this to life without
-/// restarting the supervisor.
+/// still-current vault key, fetching an approved wrap when the cache is empty.
+/// It never creates a vault or prompts. Waiting machines retry automatically.
+const VAULT_RECHECK: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Keep the socket alive even before a key is available. Requests are retained
+/// in this loop, so the request that wakes a locked device is also answered.
+fn key_refresh_event(envelope: &str, device_id: &str, locked: bool) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(envelope) else { return false; };
+    match v.get("method").and_then(Value::as_str) {
+        Some("events.connectionCall" | "events.connectionLink") => locked,
+        Some("events.vaultReset") => true,
+        Some("events.vaultDeviceApproved") => v["params"]["device_id"].as_str() == Some(device_id),
+        _ => false,
+    }
+}
+
+async fn listener_frame<S>(ws: &mut S, retry: &mut tokio::time::Interval)
+    -> Result<Option<tokio_tungstenite::tungstenite::Message>, ()>
+where S: futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin {
+    tokio::select! {
+        frame = next_live(ws, LISTEN_IDLE) => Ok(frame),
+        _ = retry.tick() => Err(()),
+    }
+}
+
 pub async fn supervise_listener(base: String, username: String) {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message as WsMsg;
-    let mut said_locked = false;
     loop {
-        // By NAME, never "the current session": this machine can hold several
-        // logins and one listener belongs to exactly one of them. Re-read each
-        // pass so a re-login (new token) is picked up, and so the listener
-        // stands down on its own once that account is removed.
         let Some(sess) = session::load_named(&username) else {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             continue;
         };
         let client = Client::new(base.clone(), sess.token.clone());
-        let (mut rt, umk, key_id) = match quiet_runtime(&base, &client, &sess).await {
-            Some(rt) => {
-                said_locked = false;
-                rt
-            }
-            None => {
-                if !said_locked {
-                    println!("· connections: vault locked here — `mafold connection unlock` lets granted bots use your connections on this machine");
-                    said_locked = true;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                continue;
-            }
-        };
-        println!("· connections: answering granted calls as @{}", sess.username);
-        loop {
-            let mut ws = match client.ws_connect().await {
-                Ok((ws, _)) => ws,
-                Err(e) => {
-                    let _ = e;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    break; // re-check session + key, then come back
-                }
-            };
-            while let Some(frame) = ws.next().await {
-                match frame {
-                    Ok(WsMsg::Text(t)) => {
-                        if mafold_core::connections::handle_event(&mut rt, &t).await {
-                            println!("· connections: answered a call");
-                        } else {
-                            // A Connect button somewhere else (the web pane, a
-                            // phone) asking this machine to run a consent
-                            // screen it can and the asker can't.
-                            handle_link_event(&client, &sess, &umk, &key_id, &t).await;
-                        }
-                    }
-                    Ok(WsMsg::Ping(p)) => {
-                        let _ = ws.send(WsMsg::Pong(p)).await;
-                    }
-                    Ok(WsMsg::Close(_)) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Ok(dev) = vault::device_key() {
+            let _ = listener_session(&base, &client, &sess, &dev, true).await;
         }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
+async fn listener_session(base: &str, client: &Client, sess: &session::Session, dev: &DeviceKey, persist_cache: bool) -> Result<()> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+    let mut said_locked = false;
+        // Subscribe BEFORE enrollment, so an approval during the first fetch
+        // is queued rather than lost until the two-minute fallback.
+        let (mut ws, _) = client.ws_connect().await?;
+        let mut runtime = quiet_runtime_for_device(base, client, sess, dev, persist_cache).await;
+        let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + VAULT_RECHECK, VAULT_RECHECK);
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if runtime.is_none() && !said_locked {
+                println!("· connections: waiting for this computer's vault key — open Settings → Connections on a device that already holds it; this computer will pick it up automatically");
+                said_locked = true;
+            } else if runtime.is_some() && said_locked {
+                println!("· connections: answering granted calls as @{}", sess.username);
+                said_locked = false;
+            }
+            let frame = match listener_frame(&mut ws, &mut retry).await {
+                Err(()) => {
+                    if runtime.is_none() { runtime = quiet_runtime_for_device(base, client, sess, dev, persist_cache).await; }
+                    continue;
+                }
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+            };
+            match frame {
+                WsMsg::Text(t) => {
+                    let reset = serde_json::from_str::<Value>(&t).ok()
+                        .is_some_and(|v| v["method"] == "events.vaultReset");
+                    if reset { runtime = None; }
+                    if key_refresh_event(&t, &sess.device_id, runtime.is_none()) {
+                        // Preserve the runtime and MCP tool cache on ordinary calls.
+                        // Reconnect, reset and local approval revalidate the key.
+                        runtime = quiet_runtime_for_device(base, client, sess, dev, persist_cache).await;
+                        retry.reset();
+                    }
+                    if let Some((rt, umk, key_id)) = runtime.as_mut() {
+                        if mafold_core::connections::handle_event(rt, &t).await {
+                            println!("· connections: answered a call");
+                        } else {
+                            handle_link_event(&client, &sess, umk, key_id, &t).await;
+                        }
+                    }
+                }
+                WsMsg::Ping(p) => { let _ = ws.send(WsMsg::Pong(p)).await; }
+                WsMsg::Close(_) => break,
+                _ => {}
+            }
+        }
+    Ok(())
+}
+
 /// The unlocked runtime IF this machine can produce one silently: registered
-/// device + cached UMK that still matches the server's recorded generation.
-/// Anything less returns None — enrollment is `unlock`'s interactive job.
+/// device + a cached or newly fetched UMK in the server's recorded generation.
+/// Missing approval stays pending; this path never mints a replacement key.
 ///
 /// The key comes back alongside the runtime because answering a call and
 /// SEALING a new grant (a link this device runs for another surface) are the
 /// same permission — a machine that can do one can do the other, and handing
 /// out both from one place is what keeps that true.
-async fn quiet_runtime(
-    base: &str,
-    client: &Client,
-    sess: &session::Session,
+async fn quiet_runtime_for_device(
+    base: &str, client: &Client, sess: &session::Session, dev: &DeviceKey, persist_cache: bool,
 ) -> Option<(mafold_core::connections::Runtime, Key, String)> {
-    let dev = vault::device_key().ok()?;
-    let reg = register(client, sess, &dev).await.ok()?;
-    let (umk, key_id) = vault::cached_umk(&dev)?;
-    if key_id.is_empty() || s(&reg["device"], "key_id") != key_id {
-        return None;
+    let reg = register(client, sess, dev).await.ok()?;
+    let cached = if persist_cache { vault::cached_umk(dev) } else { None };
+    let cached_id = cached.as_ref().map(|(_, id)| id.clone());
+    let (umk, key_id) = quiet_key(client, sess, dev, &reg, cached).await?;
+    if cached_id.as_deref() != Some(key_id.as_str()) {
+        if persist_cache { vault::cache_umk(&umk, dev, &key_id).ok()?; }
+        auto_approve_pending(client, &umk, &key_id).await;
     }
     let rt = core_runtime(base, sess, umk.clone());
     Some((rt, umk, key_id))
+}
+
+/// Kept separate from the disk cache so pending → approved can be exercised
+/// without touching the host machine's real vault.
+async fn quiet_key(
+    client: &Client,
+    sess: &session::Session,
+    dev: &DeviceKey,
+    reg: &Value,
+    cached: Option<(Key, String)>,
+) -> Option<(Key, String)> {
+    let registered_id = s(&reg["device"], "key_id");
+    if reg["device"]["approved"].as_bool() != Some(true) || registered_id.is_empty() {
+        return None;
+    }
+    if let Some((key, id)) = cached {
+        if id == registered_id {
+            return Some((key, id));
+        }
+    }
+    let v = client.call("getVaultKey", json!({ "device_id": sess.device_id })).await.ok()?;
+    let key_id = s(&v, "key_id");
+    // Approval may have changed during the request. Retry on the next tick.
+    if key_id != registered_id {
+        return None;
+    }
+    let key = vault::unwrap_key(&dev.secret, &s(&v, "sealed_umk")).ok()?;
+    Some((key, key_id))
 }
 
 /// What a connection can do, asked of the provider itself.
@@ -1796,20 +2237,12 @@ async fn call(
     if !args.is_object() {
         bail!("--params must be a JSON object, e.g. --params '{{\"query\":\"roadmap\"}}'");
     }
+    // A bot turn must hold the grant before the local vault runs the call — the
+    // relayed path checks it server-side, and the local fast-path must not be
+    // the way around that.
+    require_connection_use(base, client, &sess.username, name).await?;
     let mut rt = runtime(base, client, sess).await?;
-    // Two places this can run, and the runtime already knows which: a
-    // credential opens HERE (that is the whole vault), but a machine of yours
-    // answers on ITSELF. Asking the relay for something this process could have
-    // done would be a round trip to reach your own shell; running locally
-    // something bound to another laptop would be worse than a round trip.
-    let out = if rt.can_serve(name, method).await {
-        rt.call_any("cli", name, method, &args, false)
-            .await
-            .map_err(|e| anyhow!("{e}"))?
-    } else {
-        eprintln!("· {name} lives on another machine of yours — relaying");
-        relay(client, name, method, &args).await?
-    };
+    let out = call_native(&mut rt, client, name, method, &args).await?;
 
     // MCP wraps results in `content: [{type, text}]`. Unwrap the common
     // all-text case so a shell pipeline gets the payload rather than the
@@ -1833,6 +2266,347 @@ async fn call(
     }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+/// Run one method on a connection and hand back what it answered: the half of
+/// [`call`] that `mafold video` needs too, without the printing (its stdout is
+/// JSON an agent reads) and without the grant check (the caller makes it, once,
+/// before a loop of reads rather than on every one).
+///
+/// Two places this can run, and the runtime already knows which: a credential
+/// opens HERE (that is the whole vault), but a machine of yours answers on
+/// ITSELF. Asking the relay for something this process could have done would
+/// be a round trip to reach your own shell; running locally something bound to
+/// another laptop would be worse than a round trip.
+pub(crate) async fn call_native(
+    rt: &mut mafold_core::connections::Runtime,
+    client: &Client,
+    name: &str,
+    method: &str,
+    args: &Value,
+) -> Result<Value> {
+    if rt.can_serve(name, method).await {
+        rt.call_any("cli", name, method, args, false)
+            .await
+            .map_err(|e| anyhow!("{e}"))
+    } else {
+        eprintln!("· {name} lives on another machine of yours — relaying");
+        relay(client, name, method, args).await
+    }
+}
+
+// ── a key an agent was signed in with (`fuel::go`) ──────────────────────────
+//
+// OpenCode Go (ops 10-31): an agent New Agent signed in with OpenCode Go runs
+// on its owner's Go key, pasted once in Settings ▸ Connections. The agent's
+// stored fuel IS the owner's say-so — they picked it for this agent — so no
+// per-connection grant is asked for, as none is for the wallet's fuel. What
+// stays the vault's rule: it opens only on a machine where its owner is signed
+// in, and only with a key this machine already holds (never by starting one).
+
+/// Why an agent's own key couldn't be opened for a reply, in the words the
+/// reply says it with.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OwnerKeyIssue {
+    /// The owner has linked nothing of this provider.
+    None,
+    /// The owner isn't signed in on this machine.
+    NotHere,
+    /// This machine doesn't hold the owner's vault key yet.
+    NoVaultKey,
+    /// The list or the vault failed on the way; the reason, in words.
+    Failed(String),
+}
+
+/// The owner's own key for `provider` — an API-key row in their Connections —
+/// opened on this machine. The newest row of that provider wins, so a pasted
+/// replacement takes over from the next reply. Never prints.
+pub(crate) async fn open_owner_key(base: &str, owner: &str, provider: &str) -> std::result::Result<String, OwnerKeyIssue> {
+    let Some(sess) = session::load_named(owner) else {
+        return Err(OwnerKeyIssue::NotHere);
+    };
+    let human = Client::new(base.to_string(), sess.token.clone());
+    let listed = human.call("listConnections", json!({})).await.map_err(|e| OwnerKeyIssue::Failed(format!("{e:#}")))?;
+    let mut rows: Vec<Value> = as_array(&listed, "items").into_iter().filter(|c| s(c, "provider") == provider).collect();
+    rows.sort_by_key(|c| std::cmp::Reverse(c.get("updated_at").and_then(Value::as_i64).unwrap_or(0)));
+    let Some(conn) = rows.into_iter().next() else {
+        return Err(OwnerKeyIssue::None);
+    };
+    let (umk, key_id, _) = open_vault(&human, &sess, false).await.map_err(|e| {
+        if e.downcast_ref::<KeyNotHandedOver>().is_some() {
+            OwnerKeyIssue::NoVaultKey
+        } else {
+            OwnerKeyIssue::Failed(format!("{e:#}"))
+        }
+    })?;
+    let fields = open_payload(&umk, &key_id, &conn).map_err(|e| OwnerKeyIssue::Failed(format!("{e:#}")))?;
+    fields
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| OwnerKeyIssue::Failed(format!("`{}` holds no key", s(&conn, "name"))))
+}
+
+// ── the owner's own video key (`mafold video`) ─────────────────────────────
+//
+// 2026-10-10, the cofounder:「我都连接了我自己的key，肯定是默认走我的key啊」.
+// A ModelArk key the owner linked as a connection is what `mafold video` runs
+// on by default, and the Mafold wallet stays out of it
+// (`.docs/connection-backed-models-v1.md`: "wallet 完全不参与"). What follows
+// answers the three questions that takes — is there such a key, may THIS turn
+// use it, can THIS machine open it — and prints nothing while doing it:
+// `mafold video` speaks JSON on stdout.
+//
+// The connections are listed on the OWNER's session, the same way `connection
+// call` in a bot's turn reaches them: `listConnections` and
+// `listConnectionGrants` answer the person and nobody else, so a bot daemon
+// sees its owner's key only on a machine its owner signed in to — which a
+// self-hosted bot's machine is.
+
+/// One of the owner's connections a `mafold video` run may use, with the
+/// owner's own session on this machine that can open it.
+pub(crate) struct KeyHolder {
+    /// The connection, as `listConnections` names it.
+    pub name: String,
+    /// Whose it is — the bot's owner, or the person themself.
+    pub owner: String,
+    base: String,
+    human: Client,
+    sess: session::Session,
+}
+
+impl KeyHolder {
+    /// Open the owner's vault here — never by starting one, never with a word
+    /// on stdout ([`open_vault`]). A machine the server says holds no key yet
+    /// answers [`KeyNotHandedOver`]; a blink on the way stays a typed blink.
+    pub(crate) async fn open(self) -> Result<OwnerVault> {
+        let (umk, _, _) = open_vault(&self.human, &self.sess, false).await?;
+        let KeyHolder { name, owner, base, human, sess } = self;
+        Ok(OwnerVault { name, owner, base, human, sess, umk })
+    }
+}
+
+/// The owner's vault, open on this machine for one connection — what `mafold
+/// video status --wait` holds across its reads, so the key is fetched once and
+/// not on every tick.
+pub(crate) struct OwnerVault {
+    pub name: String,
+    pub owner: String,
+    base: String,
+    human: Client,
+    sess: session::Session,
+    umk: Key,
+}
+
+impl OwnerVault {
+    /// One method on this connection ([`call_native`]). A fresh runtime per
+    /// call costs nothing a read would notice and keeps this `&self`: a wait
+    /// loop's reader is a plain closure, not a lock.
+    pub(crate) async fn call(&self, method: &str, args: &Value) -> Result<Value> {
+        let mut rt = core_runtime(&self.base, &self.sess, self.umk.clone());
+        call_native(&mut rt, &self.human, &self.name, method, args).await
+    }
+}
+
+/// Where a `mafold video` run stands with the owner's own key.
+pub(crate) enum OwnKey {
+    /// The owner has linked nothing driven by `ark-video` (or nothing by the
+    /// name asked for).
+    None { owner: String },
+    /// This machine can't tell — the owner isn't signed in here, the server
+    /// refused a list, or a bot turn couldn't say which bot it is. `why`, in
+    /// words. Not a reason to touch the wallet on its own: the server refuses a
+    /// house submit for an owner with a linked key (`own_key_linked`). Never a
+    /// network blink: that is [`own_ark_key`]'s `Err`, typed, so it is read
+    /// again rather than taken for an answer.
+    Unseen { why: String },
+    /// Usable by whoever is asking.
+    Use(KeyHolder),
+    /// Linked, but `bot` hasn't been allowed to use it. `asker` speaks as that
+    /// bot — the one who may ask the owner (`requestConnectionAccess`).
+    Denied { name: String, owner: String, bot: String, asker: Client },
+}
+
+/// Which of the owner's ModelArk rows a run lands on. `rows` are `(name,
+/// usable)`; `want` is a name the caller insists on (`--via own:<name>`, or
+/// the one inside an `own:` job id). By name, so two runs never pick two
+/// different ModelArk accounts for no reason; a row this turn may not use is
+/// reported only when no row is usable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Pick {
+    None,
+    Use(String),
+    Denied(String),
+}
+
+fn pick_ark(rows: &[(String, bool)], want: Option<&str>) -> Pick {
+    let mut rows: Vec<&(String, bool)> = rows
+        .iter()
+        .filter(|(name, _)| want.is_none_or(|w| name.eq_ignore_ascii_case(w.trim())))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some((name, _)) = rows.iter().find(|(_, usable)| *usable) {
+        return Pick::Use(name.clone());
+    }
+    rows.first().map_or(Pick::None, |(name, _)| Pick::Denied(name.clone()))
+}
+
+/// The owner's own ModelArk key for this run. Never prints. What the server
+/// answered it couldn't find out is [`OwnKey::Unseen`], with the reason in
+/// words; the one failure is a blink — a request that died on the way, or a
+/// server that fell over ([`crate::video::retryable`]) — handed back as the
+/// typed error it is (2026-10-10). Folded into `Unseen`, one 502 on
+/// `listConnections` read as "this machine can't reach the owner's key" and
+/// ended `status --wait` on a job that was still running; the caller reads
+/// again instead (`video::patiently`).
+///
+/// Who asks decides who owns: a bot's key holder is its owner (`getMe` →
+/// `parent_username`, else the part of the handle before `:`), a person's is
+/// themself. A bot is held to its grant; the person at their own terminal is
+/// not — the same rule as [`connection_use_denied`], and like
+/// [`require_connection_use`] it keys off `MAFOLD_BOT_TOKEN`, so a bot's turn
+/// speaking with a person's token (`--account`) is still a bot's turn.
+pub(crate) async fn own_ark_key(client: &Client, want: Option<&str>) -> Result<OwnKey> {
+    let me = match client.call("getMe", json!({})).await {
+        Ok(v) => v,
+        Err(e) => return unseen_unless_blink(e, "couldn't tell who is asking"),
+    };
+    let username = s(&me, "username");
+    let speaker_is_bot = s(&me, "kind") == "bot";
+    let owner = if speaker_is_bot {
+        Some(s(&me, "parent_username"))
+            .filter(|p| !p.trim().is_empty())
+            .or_else(|| username.split_once(':').map(|(o, _)| o.to_string()))
+            .unwrap_or_default()
+    } else {
+        username.clone()
+    };
+    let owner = owner.trim().to_lowercase();
+    if owner.is_empty() {
+        return Ok(OwnKey::Unseen { why: format!("@{username} has no owner on record") });
+    }
+    let as_bot: Option<(String, Client)> = if speaker_is_bot {
+        Some((username.clone(), client.clone()))
+    } else if bot_turn() {
+        let asker = Client::new(client.base.clone(), std::env::var("MAFOLD_BOT_TOKEN").unwrap_or_default());
+        let bot = match asker.call("getMe", json!({})).await {
+            Ok(v) => s(&v, "username"),
+            Err(e) if crate::video::retryable(&e) => return Err(e),
+            Err(_) => String::new(),
+        };
+        if bot.is_empty() {
+            return Ok(OwnKey::Unseen {
+                why: "this is a bot's turn and the bot couldn't be confirmed, so its grant on the \
+                      owner's key couldn't be checked"
+                    .into(),
+            });
+        }
+        Some((bot, asker))
+    } else {
+        None
+    };
+    let sess = if speaker_is_bot {
+        session::load_named(&owner)
+    } else {
+        // The person asking IS the owner, and this command already speaks
+        // with their session: use it as it is, saved here or not.
+        let (device_id, device_name) = session::machine();
+        Some(session::Session { token: client.token.clone(), username: username.clone(), device_id, device_name })
+    };
+    let Some(sess) = sess else {
+        // The known limit (2026-10-10): the vault opens only where its owner
+        // is signed in, and nothing yet relays a bot's video call to another
+        // of the owner's machines. Said as exactly that, because what follows
+        // is the server's `own_key_linked` refusal, and "use the wallet
+        // instead" is the owner's call, not the bot's.
+        return Ok(OwnKey::Unseen {
+            why: format!(
+                "@{owner} isn't signed in to Mafold on this machine, and a bot can use its owner's own key \
+                 only on a machine where the owner is (`mafold login` as @{owner} here fixes it)"
+            ),
+        });
+    };
+    let human = Client::new(client.base.clone(), sess.token.clone());
+    let bot = as_bot.as_ref().map(|(b, _)| b.as_str());
+    let picked = match ark_pick(&human, &owner, bot, want).await {
+        Ok(picked) => picked,
+        Err(e) => return unseen_unless_blink(e, &format!("couldn't read @{owner}'s connections")),
+    };
+    Ok(match picked {
+        Pick::None => OwnKey::None { owner },
+        Pick::Use(name) => OwnKey::Use(KeyHolder { name, owner, base: client.base.clone(), human, sess }),
+        Pick::Denied(name) => match as_bot {
+            Some((bot, asker)) => OwnKey::Denied { name, owner, bot, asker },
+            // Only a bot is ever denied; a person's own rows are theirs.
+            None => OwnKey::Use(KeyHolder { name, owner, base: client.base.clone(), human, sess }),
+        },
+    })
+}
+
+/// A lookup [`own_ark_key`] couldn't finish: the server's answer (a refusal,
+/// an expired session) is [`OwnKey::Unseen`] with `what` and the words; a
+/// blink ([`crate::video::retryable`]) is no answer, and goes back as the
+/// typed error it is.
+fn unseen_unless_blink(e: anyhow::Error, what: &str) -> Result<OwnKey> {
+    if crate::video::retryable(&e) {
+        return Err(e);
+    }
+    Ok(OwnKey::Unseen { why: format!("{what} ({e:#})") })
+}
+
+/// The provider pack's failure, typed again. `providers::ensure` answers in
+/// words — the core's `RpcError` flattened to its Display — so a request that
+/// died on the way is read back out of them (`connect failed: …` /
+/// `transport failed: …`), the way `video::own_failure` reads the ark
+/// driver's sentences. Anything else stays the sentence it was.
+fn registry_failure(e: anyhow::Error) -> anyhow::Error {
+    use mafold_core::RpcError;
+    let msg = format!("{e:#}");
+    let typed = if let Some((_, rest)) = msg.split_once("connect failed: ") {
+        RpcError::Connect(rest.to_string())
+    } else if let Some((_, rest)) = msg.split_once("transport failed: ") {
+        RpcError::Transport(rest.to_string())
+    } else {
+        return e;
+    };
+    anyhow::Error::new(typed).context("getConnectionProviders failed")
+}
+
+/// The network half of [`own_ark_key`], on the owner's session: their rows
+/// whose provider is driven by `ark-video` — read off the served registry, not
+/// off a slug — and which of them `bot` may use. Grants are only fetched for a
+/// bot, and only once there is a ModelArk row to ask about. Every failure
+/// keeps its type, so a blink is told from an answer by the caller.
+async fn ark_pick(human: &Client, owner: &str, bot: Option<&str>, want: Option<&str>) -> Result<Pick> {
+    let rows = as_array(&human.call("listConnections", json!({})).await?, "items");
+    let registry = registry(human).await.map_err(registry_failure)?;
+    let ark: Vec<String> = rows
+        .iter()
+        .filter(|c| {
+            let provider = s(c, "provider");
+            registry
+                .iter()
+                .any(|p| p.id == provider && p.native_api.as_deref() == Some(mafold_core::ark::DRIVER))
+        })
+        .map(|c| s(c, "name"))
+        .collect();
+    if ark.is_empty() {
+        return Ok(Pick::None);
+    }
+    let grants = match bot {
+        Some(_) => use_grants(human).await?,
+        None => Vec::new(),
+    };
+    let judged: Vec<(String, bool)> = ark
+        .into_iter()
+        .map(|name| {
+            let usable = connection_use_denied(bot, owner, &name, &grants).is_none();
+            (name, usable)
+        })
+        .collect();
+    Ok(pick_ark(&judged, want))
 }
 
 async fn rm(client: &Client, name: &str) -> Result<()> {
@@ -1972,6 +2746,18 @@ async fn rotate(client: &Client, sess: &session::Session) -> Result<()> {
     // leave devices holding a key that opens nothing.
     for c in &conns {
         let name = s(c, "name");
+        // A value handed over through a card is wrapped per device, and the
+        // device being revoked may hold one of those wraps. Re-sealing can't
+        // take a wrap back, and these rows live for days — so they go, and
+        // whoever needs one asks again.
+        if s(c, "wrapped_dek").is_empty() {
+            client
+                .call("deleteConnection", json!({ "name": name }))
+                .await
+                .with_context(|| format!("drop handed-over `{name}`"))?;
+            eprintln!("  dropped `{name}` (handed over through a card; ask for it again)");
+            continue;
+        }
         let fields = open_payload(&old_umk, &old_key_id, c)
             .with_context(|| format!("re-key {name}: could not open it with the current key"))?;
         let (blob, wrapped_dek) = seal_payload(&new_umk, &fields)?;
@@ -2098,6 +2884,203 @@ async fn recover(client: &Client, sess: &session::Session) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Real CLI event loop for browser → API → native-device E2E. No mock
+    /// transport and no host account/key files. The browser enrolls/approves
+    /// this generated device through the dev api, then clicks Connect.
+    /// Driven by `mafold-e2e`: the account is the run's own test account
+    /// (`MAFOLD_TEST_USER`, token `dev:<user>`), never a shared or seeded one.
+    #[tokio::test]
+    #[ignore = "requires the dev api (mafold-e2e) and a browser E2E driver"]
+    async fn live_resident_listener_for_browser_e2e() {
+        let base = std::env::var("MAFOLD_TEST_API_ORIGIN").expect("dev API origin");
+        assert!(base.starts_with("http://127.0.0.1:"));
+        let user = std::env::var("MAFOLD_TEST_USER").expect("the e2e run's test account");
+        let generated = mafold_core::vault::generate_device();
+        let dev = DeviceKey { secret: generated.secret, public: generated.public };
+        let sess = session::Session { token: format!("dev:{user}"), username: user, device_id: "e2e-native-device".into(), device_name: "E2E Mac CLI".into() };
+        let client = Client::new(base.clone(), sess.token.clone());
+        let run = async { loop {
+            let _ = listener_session(&base, &client, &sess, &dev, false).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }};
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(900), run).await;
+    }
+
+    #[test]
+    fn unlocked_listener_keeps_runtime_for_calls_and_links() {
+        for method in ["events.connectionCall", "events.connectionLink"] {
+            let event = json!({"method": method}).to_string();
+            assert!(!key_refresh_event(&event, "local", false));
+            assert!(key_refresh_event(&event, "local", true));
+        }
+        for method in ["events.vaultReset", "events.vaultDeviceApproved"] {
+            let event = json!({"method": method, "params": {"device_id": "local"}}).to_string();
+            assert!(key_refresh_event(&event, "local", false));
+        }
+        let other = json!({"method": "events.vaultDeviceApproved", "params": {"device_id": "other"}}).to_string();
+        assert!(!key_refresh_event(&other, "local", false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_waits_two_minutes_but_requests_and_approval_wake_immediately() {
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let start = tokio::time::Instant::now();
+        let mut retry = tokio::time::interval_at(start + VAULT_RECHECK, VAULT_RECHECK);
+        // Real sockets receive server pings every 25s. Those frames keep the
+        // idle watchdog alive without causing register/getVaultKey calls.
+        for seconds in [5, 25, 50, 75, 100, 119] {
+            tokio::time::advance(std::time::Duration::from_secs(seconds) - start.elapsed()).await;
+            let mut ping = futures_util::stream::iter([Ok(WsMsg::Ping(vec![]))]);
+            assert!(matches!(listener_frame(&mut ping, &mut retry).await, Ok(Some(WsMsg::Ping(_)))));
+            assert_eq!(start.elapsed().as_secs(), seconds);
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let mut idle = futures_util::stream::pending();
+        assert!(listener_frame(&mut idle, &mut retry).await.is_err());
+        assert_eq!(start.elapsed(), VAULT_RECHECK);
+        for method in ["events.connectionCall", "events.connectionLink", "events.vaultDeviceApproved"] {
+            let request = json!({"method":method,"params":{"device_id":"this-device","call_id":"same-request"}}).to_string();
+            let mut incoming = futures_util::stream::iter([Ok(WsMsg::Text(request.clone()))]);
+            let Ok(Some(WsMsg::Text(received))) = listener_frame(&mut incoming, &mut retry).await else { panic!("request was lost") };
+            assert_eq!(received, request, "handle the waking request, not a second click");
+            assert!(key_refresh_event(&received, "this-device", true));
+            assert_eq!(start.elapsed(), VAULT_RECHECK, "events do not wait for a timer");
+        }
+        assert!(!key_refresh_event(r#"{"method":"events.vaultDeviceApproved","params":{"device_id":"other"}}"#, "this-device", true));
+        assert!(!key_refresh_event(r#"{"method":"events.vaultDevicePending"}"#, "this-device", true));
+    }
+
+    #[tokio::test]
+    async fn quiet_key_picks_up_approval_without_unlock_or_a_local_cache() {
+        let generated = mafold_core::vault::generate_device();
+        let dev = DeviceKey { secret: generated.secret, public: generated.public };
+        let umk = Key::random();
+        let api = spawn_api(vec![("getVaultKey", json!({
+            "key_id": "generation-2",
+            "sealed_umk": vault::wrap_key_for(&dev.public, &umk).unwrap(),
+        }))]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let sess = a_session();
+        let pending = json!({"device": {"approved": false, "key_id": ""}});
+        assert!(quiet_key(&client, &sess, &dev, &pending, None).await.is_none());
+        assert!(api.calls("getVaultKey").is_empty());
+
+        let approved = json!({"device": {"approved": true, "key_id": "generation-2"}});
+        let (key, id) = quiet_key(&client, &sess, &dev, &approved, None).await.unwrap();
+        assert_eq!(id, "generation-2");
+        let sealed = vault::wrap_key_for(&dev.public, &key).unwrap();
+        assert!(vault::unwrap_key(&dev.secret, &sealed).is_ok());
+        assert_eq!(api.calls("getVaultKey")[0]["device_id"], sess.device_id);
+        assert!(quiet_key(&client, &sess, &dev, &approved, Some((key, id))).await.is_some());
+        assert_eq!(api.calls("getVaultKey").len(), 1, "current cache needs no fetch");
+        assert!(quiet_key(&client, &sess, &dev, &approved,
+            Some((Key::random(), "retired-generation".into()))).await.is_some());
+        assert_eq!(api.calls("getVaultKey").len(), 2, "stale cache fetches replacement");
+        let rotated = json!({"device": {"approved": true, "key_id": "generation-3"}});
+        assert!(quiet_key(&client, &sess, &dev, &rotated, None).await.is_none());
+        assert!(api.calls("approveVaultDevice").is_empty(), "never creates a vault");
+    }
+
+    /// 2026-10-05: `mafold connection env notion` in a bot's turn put
+    /// `export NOTION_TOKEN=…` into the trace card of a 24-person group. In a
+    /// bot turn the two commands that print a raw secret refuse — even for a
+    /// bot that holds the grant — and name the way that doesn't print it.
+    #[test]
+    fn a_bot_turn_never_prints_a_connections_secret() {
+        for cmd in ["env", "show --reveal"] {
+            let msg = plaintext_refused(true, cmd, "notion").expect("refused in a bot turn");
+            assert!(msg.contains("posted to the conversation"), "{msg}");
+            assert!(msg.contains("mafold connection run notion -- "), "points at run: {msg}");
+            assert_eq!(plaintext_refused(false, cmd, "notion"), None, "a person's own terminal");
+        }
+    }
+
+    #[test]
+    fn run_takes_names_then_a_command_after_the_double_dash() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: ConnectionCmd,
+        }
+        let cli = Cli::try_parse_from([
+            "x", "run", "notion", "figma", "--", "sh", "-c", "curl -H \"Authorization: Bearer $NOTION_TOKEN\"",
+        ])
+        .unwrap();
+        match cli.cmd {
+            ConnectionCmd::Run { names, command } => {
+                assert_eq!(names, ["notion", "figma"]);
+                assert_eq!(command[..2], ["sh", "-c"]);
+            }
+            _ => panic!("not run"),
+        }
+        assert!(Cli::try_parse_from(["x", "run", "notion"]).is_err(), "a command is required");
+    }
+
+    #[test]
+    fn env_pair_names_the_providers_variable() {
+        let spec = provider_infos()
+            .into_iter()
+            .find(|p| p.env_var.is_some() && !p.fields.is_empty())
+            .expect("a single-variable provider");
+        let mut fields = serde_json::Map::new();
+        fields.insert(spec.fields[0].key.clone(), json!("v4lue-1234"));
+        let (var, val) = env_pair(&spec, &fields, "x").unwrap();
+        assert_eq!(Some(var), spec.env_var);
+        assert_eq!(val, "v4lue-1234");
+
+        // One value and no variable of its own: the connection's name is the
+        // variable — what a bot asked for in a secure-input card.
+        let mut secret = spec.clone();
+        secret.env_var = None;
+        secret.fields.truncate(1);
+        let (var, _) = env_pair(&secret, &fields, "db-password").unwrap();
+        assert_eq!(var, "DB_PASSWORD");
+    }
+
+    /// A row a card handed over is sealed to the owner's DEVICES, not the
+    /// master key; this machine opens its own wrap and no other.
+    #[test]
+    fn a_handed_over_row_opens_with_this_devices_own_wrap() {
+        let me = mafold_core::vault::generate_device();
+        let other = mafold_core::vault::generate_device();
+        let (blob, wraps) = mafold_core::vault::seal_for_devices(
+            &[("other".into(), other.public.clone()), ("me".into(), me.public.clone())],
+            r#"{"value":"hunter2-42"}"#,
+        )
+        .unwrap();
+        let mine = wraps.values().find_map(|w| mafold_core::vault::open_for_device(&me.secret, &blob, w).ok());
+        assert_eq!(mine.as_deref(), Some(r#"{"value":"hunter2-42"}"#));
+        let stranger = mafold_core::vault::generate_device();
+        assert!(wraps.values().all(|w| mafold_core::vault::open_for_device(&stranger.secret, &blob, w).is_err()));
+    }
+
+    /// A link that goes silent ends, so the listener reconnects — instead of
+    /// waiting forever on a socket nobody is at the other end of (@fei_pota's
+    /// Mac, 2026-09-27). A link that keeps talking is left alone.
+    #[tokio::test]
+    async fn a_silent_link_ends_and_a_talking_one_does_not() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{protocol::Role, Message as WsMsg};
+        use tokio_tungstenite::WebSocketStream;
+        let idle = std::time::Duration::from_millis(150);
+
+        let (a, b) = tokio::io::duplex(4096);
+        let mut listener = WebSocketStream::from_raw_socket(a, Role::Client, None).await;
+        let _server = WebSocketStream::from_raw_socket(b, Role::Server, None).await; // says nothing
+        let over = tokio::time::timeout(std::time::Duration::from_secs(2), next_live(&mut listener, idle))
+            .await
+            .expect("a silent link must end, not hang");
+        assert!(over.is_none());
+
+        let (a, b) = tokio::io::duplex(4096);
+        let mut listener = WebSocketStream::from_raw_socket(a, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(b, Role::Server, None).await;
+        server.send(WsMsg::Ping(vec![1].into())).await.unwrap();
+        let frame = next_live(&mut listener, idle).await;
+        assert!(matches!(frame, Some(WsMsg::Ping(_))), "{frame:?}");
+    }
+
     /// The registry is served now, so a test that links must have one in the
     /// process — the mock api serves connection calls, not packs.
     fn seat_registry() {
@@ -2195,6 +3178,39 @@ mod tests {
         enrich_oauth_payload(&spec, &mut fields);
         assert_eq!(fields["account_id"], "acc-original");
         assert_eq!(fields["expires_at"], "777");
+    }
+
+    /// The security property behind B: a bot turn (`MAFOLD_BOT_TOKEN` set →
+    /// `bot = Some`) may only touch a connection it was granted `connection.use`
+    /// for; a human at their own terminal (`bot = None`) is never gated. The
+    /// gate exists because the local vault would otherwise run the call as the
+    /// owner regardless of any grant.
+    #[test]
+    fn bot_needs_connection_use_grant_human_never_does() {
+        let grants = vec![
+            ("opsdu:8964".into(), "notion".into(), true),   // 8964 may use notion
+            ("opsdu:codex".into(), "figma".into(), false),  // present, but use=false
+        ];
+
+        // Human at a terminal: no bot token, no gate, ever.
+        assert_eq!(connection_use_denied(None, "opsdu", "notion", &grants), None);
+        assert_eq!(connection_use_denied(None, "opsdu", "stripe", &grants), None);
+
+        // Granted bot → allowed. Handle/name compare case-insensitively.
+        assert_eq!(connection_use_denied(Some("opsdu:8964"), "opsdu", "notion", &grants), None);
+        assert_eq!(connection_use_denied(Some("OPSDU:8964"), "opsdu", "NOTION", &grants), None);
+
+        // Bot with NO grant for that connection → denied, with the relay's words.
+        let d = connection_use_denied(Some("opsdu:8964"), "opsdu", "stripe", &grants)
+            .expect("a bot without the grant must be denied");
+        assert!(d.contains("@opsdu hasn't allowed @opsdu:8964 to use their `stripe`"), "{d}");
+        assert!(d.contains("requestConnectionAccess"), "{d}");
+
+        // A grant that exists but is `can_use=false` does NOT authorize.
+        assert!(connection_use_denied(Some("opsdu:codex"), "opsdu", "figma", &grants).is_some());
+
+        // A grant to a DIFFERENT bot doesn't carry over.
+        assert!(connection_use_denied(Some("linsky:opus48"), "opsdu", "notion", &grants).is_some());
     }
 
     /// Providers without a fixed OAuth client must pass through untouched —
@@ -2331,7 +3347,13 @@ mod tests {
                         .find(|(m, _)| path == format!("/api/{m}"))
                         .map(|(_, v)| v.clone())
                         .unwrap_or_else(|| json!({}));
-                    let payload = json!({ "ok": true, "result": result }).to_string();
+                    // A reply carrying `__envelope` goes out as that whole
+                    // envelope: how a test makes the api refuse (`ok: false`
+                    // with a 4xx) or fall over (a 5xx) instead of answering.
+                    let payload = match result.get("__envelope") {
+                        Some(envelope) => envelope.to_string(),
+                        None => json!({ "ok": true, "result": result }).to_string(),
+                    };
                     let _ = sock
                         .write_all(
                             format!(
@@ -2455,6 +3477,144 @@ mod tests {
         assert_eq!(answer["result"]["device"], "ops-mbp");
     }
 
+    #[tokio::test]
+    async fn reconnecting_a_machine_replaces_the_original_connection_name() {
+        let api = spawn_api(vec![]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let spec = provider_infos().into_iter().find(|p| p.id == "computer").unwrap();
+        let name = bind_for_link(&client, &a_session(), &Key::random(), "new-key", &spec, Some("original-computer"), Some("My office computer")).await.unwrap();
+        assert_eq!(name, "original-computer");
+        let writes = api.calls("putConnection");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["name"], "original-computer");
+        assert_eq!(writes[0]["key_id"], "new-key");
+        assert_eq!(writes[0]["label"], "My office computer");
+        assert_eq!(writes[0]["create_only"], false);
+        assert!(api.calls("listConnections").is_empty(), "reconnect must not choose a free name");
+    }
+
+    /// `mafold video` lands on one ModelArk row, the same one every time: the
+    /// first usable by name, or the one asked for. A row this turn may not use
+    /// is reported only when no row is usable.
+    #[test]
+    fn video_picks_one_ark_row_by_name() {
+        let rows = |r: &[(&str, bool)]| r.iter().map(|(n, ok)| (n.to_string(), *ok)).collect::<Vec<_>>();
+        let two = rows(&[("ark-b", true), ("ark-a", true)]);
+        assert_eq!(pick_ark(&two, None), Pick::Use("ark-a".into()));
+        assert_eq!(pick_ark(&two, Some("ARK-B")), Pick::Use("ark-b".into()), "asked for by name");
+        assert_eq!(pick_ark(&two, Some("ark-c")), Pick::None, "a name that isn't there is no key");
+        let one_allowed = rows(&[("ark-a", false), ("ark-b", true)]);
+        assert_eq!(pick_ark(&one_allowed, None), Pick::Use("ark-b".into()));
+        assert_eq!(pick_ark(&one_allowed, Some("ark-a")), Pick::Denied("ark-a".into()));
+        assert_eq!(pick_ark(&rows(&[("ark-b", false), ("ark-a", false)]), None), Pick::Denied("ark-a".into()));
+        assert_eq!(pick_ark(&[], None), Pick::None);
+    }
+
+    /// Against the owner's own lists: their ModelArk rows are found by the
+    /// DRIVER their provider names (`ark-video`), not by slug; a person at
+    /// their own terminal uses theirs without a grant (and none is fetched); a
+    /// bot only what it was granted.
+    #[tokio::test]
+    async fn video_finds_the_owners_own_ark_key_and_who_may_use_it() {
+        seat_registry();
+        let api = spawn_api(vec![
+            (
+                "listConnections",
+                json!({ "items": [
+                    { "name": "notion", "provider": "notion" },
+                    { "name": "ark-b", "provider": "modelark" },
+                    { "name": "ark-a", "provider": "modelark" },
+                ]}),
+            ),
+            (
+                "listConnectionGrants",
+                json!({ "items": [
+                    { "grantee": "ops:cam", "connection": "ark-b", "can_use": true },
+                    { "grantee": "ops:cam", "connection": "notion", "can_use": true },
+                ]}),
+            ),
+        ]);
+        let human = Client::new(api.base.clone(), "s_test".into());
+        assert_eq!(ark_pick(&human, "ops", None, None).await.unwrap(), Pick::Use("ark-a".into()));
+        assert!(api.calls("listConnectionGrants").is_empty(), "the owner needs no grant to use their own key");
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), None).await.unwrap(), Pick::Use("ark-b".into()));
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), Some("ark-a")).await.unwrap(), Pick::Denied("ark-a".into()));
+        assert_eq!(ark_pick(&human, "ops", Some("ops:other"), None).await.unwrap(), Pick::Denied("ark-a".into()));
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), Some("notion")).await.unwrap(), Pick::None, "not a video key");
+
+        let none = spawn_api(vec![("listConnections", json!({ "items": [ { "name": "notion", "provider": "notion" } ] }))]);
+        let human = Client::new(none.base.clone(), "s_test".into());
+        assert_eq!(ark_pick(&human, "ops", Some("ops:cam"), None).await.unwrap(), Pick::None);
+        assert!(none.calls("listConnectionGrants").is_empty(), "no ModelArk row, no grant to ask about");
+    }
+
+    /// 2026-10-10: a blink while `mafold video` looks for — or opens — the
+    /// owner's key comes back as the typed error it is, which `--wait` reads
+    /// again; only what the server actually SAID is an answer (`Unseen`,
+    /// `KeyNotHandedOver`). Folded into those, one 502 ended a wait on a job
+    /// that was still running, saying this machine had no key.
+    #[tokio::test]
+    async fn video_tells_a_blink_from_an_answer_about_the_owners_key() {
+        use crate::video::retryable;
+        use mafold_core::RpcError;
+        seat_registry();
+        let fell_over = |code: u16| json!({ "__envelope": { "ok": false, "error_code": code, "description": "upstream down" } });
+        let human = |api: &MockApi| Client::new(api.base.clone(), "s_test".into());
+
+        // Who is asking: the api fell over, or nobody is listening at all.
+        let api = spawn_api(vec![("getMe", fell_over(502))]);
+        let e = own_ark_key(&human(&api), None).await.err().expect("a 502 is not an answer");
+        assert!(retryable(&e), "{e:#}");
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let e = own_ark_key(&Client::new(closed, "s_test".into()), None).await.err().expect("nothing answered");
+        assert!(retryable(&e), "{e:#}");
+
+        // The owner's lists, on their session.
+        let api = spawn_api(vec![("listConnections", fell_over(503))]);
+        assert!(retryable(&ark_pick(&human(&api), "ops", None, None).await.unwrap_err()));
+        let api = spawn_api(vec![
+            ("listConnections", json!({ "items": [ { "name": "ark", "provider": "modelark" } ] })),
+            ("listConnectionGrants", fell_over(429)),
+        ]);
+        assert!(retryable(&ark_pick(&human(&api), "ops", Some("ops:cam"), None).await.unwrap_err()));
+
+        // …which `own_ark_key` hands back as they are; a refusal is an answer.
+        let said = |code: u16, method: &str| {
+            anyhow::Error::new(RpcError::Api(format!(
+                r#"{{"ok":false,"error_code":{code},"description":"said {code}"}}"#
+            )))
+            .context(format!("{method} failed"))
+        };
+        match unseen_unless_blink(said(401, "listConnections"), "couldn't read @ops's connections") {
+            Ok(OwnKey::Unseen { why }) => assert!(why.contains("said 401"), "{why}"),
+            _ => panic!("the server's refusal is an answer"),
+        }
+        assert!(matches!(unseen_unless_blink(said(502, "listConnections"), "x"), Err(ref e) if retryable(e)));
+
+        // The provider pack's failure arrives flattened to words.
+        let e = registry_failure(anyhow!("no provider registry yet, and fetching one failed: connect failed: tcp connect error"));
+        assert!(retryable(&e) && format!("{e:#}").contains("tcp connect error"), "{e:#}");
+        assert!(retryable(&registry_failure(anyhow!(
+            "no provider registry yet, and fetching one failed: transport failed: getConnectionProviders: HTTP 502 — bad gateway"
+        ))));
+        assert!(!retryable(&registry_failure(anyhow!("pack signature doesn't verify"))));
+
+        // Opening the vault: "no key wrapped for this machine" only when the
+        // server said so.
+        assert!(no_key_yet(said(404, "getVaultKey")).downcast_ref::<KeyNotHandedOver>().is_some());
+        for blink in [
+            said(502, "getVaultKey"),
+            said(503, "getVaultKey"),
+            anyhow::Error::new(RpcError::Transport("connection reset".into())).context("getVaultKey failed"),
+        ] {
+            let e = no_key_yet(blink);
+            assert!(e.downcast_ref::<KeyNotHandedOver>().is_none() && retryable(&e), "{e:#}");
+        }
+    }
+
     /// Names don't collide: a second Codex account makes a second row.
     #[tokio::test]
     async fn a_free_name_steps_around_what_is_already_linked() {
@@ -2464,5 +3624,204 @@ mod tests {
         )]);
         let client = Client::new(api.base.clone(), "s_test".into());
         assert_eq!(free_name(&client, "codex-oauth").await, "codex-3");
+    }
+
+    // ── importing a vendor CLI's own login (`--import`, the web's Connect) ──
+
+    fn provider(id: &str) -> ProviderInfo {
+        provider_infos()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("no provider {id}"))
+    }
+
+    /// A `$HOME` of its own per test, empty unless the test writes into it.
+    fn import_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("mafold-import-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        home
+    }
+
+    /// Claude Code's store as it really is on a Mac (key names read off one,
+    /// 2026-10-14): MCP grants first, its own sign-in beside them.
+    fn claude_login(access: &str) -> String {
+        json!({
+            "mcpOAuth": { "linear|abc123": {
+                "serverName": "linear", "accessToken": "mcp-linear-token", "clientId": "c",
+            }},
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": format!("{access}-refresh"),
+                "expiresAt": 1_760_000_000_000_i64,
+                "scopes": ["user:inference"],
+            },
+        })
+        .to_string()
+    }
+
+    type KeychainFn = dyn Fn(&str) -> Result<Option<String>, String>;
+
+    /// [`import_fields`] on a machine where Claude Code's login is where it
+    /// is by default (`~/.claude`, the bare Keychain item).
+    fn import_default(
+        spec: &ProviderInfo,
+        home: &std::path::Path,
+        keychain: Option<crate::accounts::Keychain>,
+    ) -> Result<serde_json::Map<String, Value>> {
+        import_fields(spec, home, &crate::accounts::LoginStore::default_in(home), keychain)
+    }
+
+    /// fei's Mac, 2026-10-14: `claude` → `/login` succeeded, then Settings ▸
+    /// Connections ▸ Claude Code (OAuth) answered `read
+    /// /Users/feixia/.claude/.credentials.json — No such file or directory`.
+    /// On macOS Claude Code writes a login into the login Keychain (item
+    /// `Claude Code-credentials`) and deletes the plaintext file once that
+    /// write lands, so a reader that only knows the file finds nothing on
+    /// every Mac with a working login.
+    #[test]
+    fn a_mac_login_that_lives_only_in_the_keychain_imports() {
+        let home = import_home("keychain-only");
+        let keychain = |service: &str| match service {
+            "Claude Code-credentials" => Ok(Some(claude_login("sk-ant-oat01-kc"))),
+            _ => Ok(None),
+        };
+        let fields = import_default(&provider("claude-code-oauth"), &home, Some(&keychain))
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(fields["access_token"], "sk-ant-oat01-kc");
+        assert_eq!(fields["refresh_token"], "sk-ant-oat01-kc-refresh");
+        assert_eq!(fields["expires_at"], 1_760_000_000_000_i64);
+    }
+
+    /// Where both exist, the Keychain is the login Claude Code itself runs on
+    /// (it reads the Keychain first and only falls back to the file), so the
+    /// file is a leftover and importing it hands the vault a stale grant.
+    #[test]
+    fn the_keychain_wins_over_a_leftover_file() {
+        let home = import_home("both");
+        std::fs::write(home.join(".claude/.credentials.json"), claude_login("sk-ant-oat01-old")).unwrap();
+        let keychain = |_: &str| Ok(Some(claude_login("sk-ant-oat01-new")));
+        let fields = import_default(&provider("claude-code-oauth"), &home, Some(&keychain)).unwrap();
+        assert_eq!(fields["access_token"], "sk-ant-oat01-new");
+    }
+
+    /// The store also holds every MCP server's OAuth grant under the same
+    /// `accessToken` name. With no sign-in of Claude Code's own (an API-key
+    /// user, or a login Claude Code wiped when its refresh token ran out) the
+    /// import must say so — not hand the vault a Linear token labelled
+    /// Claude Code.
+    #[test]
+    fn an_mcp_grant_is_never_imported_as_the_claude_login() {
+        let home = import_home("mcp-only");
+        for store in [
+            json!({ "mcpOAuth": { "linear|abc": { "accessToken": "mcp-linear-token", "refreshToken": "mcp-r" } } }),
+            json!({ "mcpOAuth": { "linear|abc": { "accessToken": "mcp-linear-token" } },
+                    "claudeAiOauth": { "refreshTokenExpiresAt": 1_759_000_000_000_i64 } }),
+        ] {
+            let keychain = move |_: &str| Ok(Some(store.to_string()));
+            let err = import_default(&provider("claude-code-oauth"), &home, Some(&keychain)).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("sign in with `claude` first"), "{msg}");
+            assert!(!msg.contains("mcp-linear-token"), "{msg}");
+        }
+    }
+
+    /// Linux, Windows, and a Mac whose Keychain write failed: the file is the
+    /// login, exactly as before.
+    #[test]
+    fn a_login_file_imports_where_the_keychain_has_none() {
+        let home = import_home("file-only");
+        std::fs::write(home.join(".claude/.credentials.json"), claude_login("sk-ant-oat01-file")).unwrap();
+        let empty = |_: &str| Ok(None);
+        for keychain in [None, Some(&empty as &KeychainFn)] {
+            let fields = import_default(&provider("claude-code-oauth"), &home, keychain).unwrap();
+            assert_eq!(fields["access_token"], "sk-ant-oat01-file");
+        }
+    }
+
+    /// Signed in nowhere: the error names BOTH places it looked, so «run
+    /// `claude` and /login» is not answered with a file the Mac never had.
+    #[test]
+    fn no_login_anywhere_says_where_it_looked() {
+        let home = import_home("none");
+        let empty = |_: &str| Ok(None);
+        let err = import_default(&provider("claude-code-oauth"), &home, Some(&empty)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sign in with `claude` first"), "{msg}");
+        assert!(msg.contains("Claude Code-credentials"), "{msg}");
+        assert!(msg.contains(&home.join(".claude/.credentials.json").display().to_string()), "{msg}");
+    }
+
+    /// Signed in, but the Keychain wouldn't answer (locked, or a session with
+    /// no GUI login): say that, not "sign in" — `/login` again fixes nothing.
+    #[test]
+    fn a_locked_keychain_is_not_reported_as_signed_out() {
+        let home = import_home("locked");
+        let locked = |_: &str| Err("no answer from the Keychain in 2s — is it locked?".to_string());
+        let msg = format!("{:#}", import_default(&provider("claude-code-oauth"), &home, Some(&locked)).unwrap_err());
+        assert!(msg.contains("couldn't read the Claude Code login") && msg.contains("is it locked?"), "{msg}");
+        assert!(!msg.contains("sign in"), "{msg}");
+    }
+
+    /// `CLAUDE_CONFIG_DIR=<dir>` moves Claude Code's login with the rest of its
+    /// config: the file to `<dir>/.credentials.json`, the Keychain item to
+    /// `Claude Code-credentials-<sha256(dir)[..8]>`. The provider still names
+    /// `~/.claude/.credentials.json` — that is "Claude Code's own login", and
+    /// it is read wherever Claude Code put it.
+    #[test]
+    fn a_login_under_claude_config_dir_imports() {
+        let home = import_home("config-dir");
+        let config = home.join("elsewhere");
+        std::fs::create_dir_all(&config).unwrap();
+        let config = config.to_str().unwrap().to_string();
+        let claude = crate::accounts::Account::default_login().store_in(&home, Some(&config));
+        let item = format!("Claude Code-credentials-{}", crate::accounts::hash8(&config));
+
+        // A Mac: only the item named after the directory holds it.
+        let keychain = |service: &str| Ok((service == item).then(|| claude_login("sk-ant-oat01-cfg-kc")));
+        let fields = import_fields(&provider("claude-code-oauth"), &home, &claude, Some(&keychain))
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(fields["access_token"], "sk-ant-oat01-cfg-kc");
+
+        // Linux: the file inside that directory.
+        std::fs::write(std::path::Path::new(&config).join(".credentials.json"), claude_login("sk-ant-oat01-cfg-file")).unwrap();
+        let fields = import_fields(&provider("claude-code-oauth"), &home, &claude, None)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(fields["access_token"], "sk-ant-oat01-cfg-file");
+    }
+
+    /// This Mac, for real: `$HOME` and the login Keychain as they are, through
+    /// `collect` itself (the wiring, not just the seam). Without the Keychain
+    /// the import fails the way fei's did; with it the sign-in is found — and
+    /// is Claude Code's (`sk-ant-o…`), not one of the MCP grants beside it.
+    /// Prints field NAMES only. Needs a Mac signed in with `claude` and no
+    /// `~/.claude/.credentials.json`, so not in CI:
+    /// `cargo test --bin mafold -- --ignored this_macs_own_login`.
+    #[test]
+    #[ignore = "reads this Mac's real Claude Code login out of the Keychain"]
+    fn this_macs_own_login_imports_from_the_keychain() {
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        assert!(!home.join(".claude/.credentials.json").exists(), "the case is a Mac WITHOUT the file");
+        let spec = provider("claude-code-oauth");
+        let file_only = format!("{:#}", import_default(&spec, &home, None).unwrap_err());
+        println!("file only → {file_only}");
+        assert!(file_only.contains("no ") && file_only.contains(".credentials.json"), "{file_only}");
+        let fields = collect(&spec, true, false).unwrap_or_else(|e| panic!("{e:#}"));
+        println!("collect --import → fields {:?}", fields.keys().collect::<Vec<_>>());
+        assert!(fields["access_token"].as_str().is_some_and(|t| t.starts_with("sk-ant-o")));
+        assert!(fields["refresh_token"].as_str().is_some_and(|t| t.starts_with("sk-ant-o")));
+    }
+
+    /// The Keychain is asked about Claude Code's login and nothing else: a
+    /// file that is some other tool's (Codex keeps `~/.codex/auth.json`) is
+    /// read as the file it is.
+    #[test]
+    fn another_tools_file_never_asks_the_keychain() {
+        let home = import_home("codex");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), r#"{"tokens":{"access_token":"codex-at","refresh_token":"codex-rt"}}"#).unwrap();
+        let keychain = |service: &str| -> Result<Option<String>, String> { panic!("asked the Keychain for {service}") };
+        let fields = import_default(&provider("codex-oauth"), &home, Some(&keychain)).unwrap();
+        assert_eq!(fields["access_token"], "codex-at");
     }
 }
