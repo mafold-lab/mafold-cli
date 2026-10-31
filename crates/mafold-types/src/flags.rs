@@ -705,6 +705,29 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // OpenCode Go (ops 10-31): Mafold Harness and your own OpenCode install,
+    // signed in with your OpenCode Go plan. The key is pasted once in
+    // Settings ▸ Connections (the one pasted-key exception, ops 10-29) and
+    // opened by your computer for each reply; your own OpenCode may use the
+    // Go login it already has. Server-read on the owner: createBot takes
+    // `sign_in: opencode-go`, and listHarnessHosts offers your own OpenCode,
+    // only where this is on.
+    FlagMeta {
+        key: "openCodeGo",
+        default: false,
+        dev_default: false,
+        label: "New Agent: OpenCode Go",
+        description: "New Agent on one of your computers offers OpenCode Go as the sign-in for \
+                      Mafold Harness and for your own OpenCode install, which becomes a runtime of \
+                      its own. The Go key is pasted once in Settings ▸ Connections and opened by \
+                      your computer for each reply; your own OpenCode may use the Go login it \
+                      already has. The api takes createBot with OpenCode Go, and offers your own \
+                      OpenCode, only where this is on for the owner.",
+        owner: "ops",
+        added: "2026-10",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
     // Passes (ops 10-30, "build it now"): credit only its holder can spend.
     // The api reads it on the SUBSCRIBER: where it's on, a paid Premium
     // period lands as a Premium Pass instead of ordinary, sendable credit
@@ -937,6 +960,19 @@ mod tests {
         // createBot and mintReplyKey read it on the owner; dev too stays off
         // until a record opens it, since a dev wallet call spends a real seat.
         let k = "walletOnComputers";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn opencode_go_is_a_server_gate_that_ships_dark() {
+        // createBot and listHarnessHosts read it on the owner; dev stays off
+        // too until a record opens it for someone.
+        let k = "openCodeGo";
         let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
         assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
         assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");

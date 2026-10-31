@@ -46,6 +46,10 @@ pub mod steer;
 /// the Rust half of `client-shared/units.ts`, tested against the same table
 /// (`units.rs`).
 pub mod units;
+/// Seedance on ModelArk: which aspect ratio a job may ask for, by model and
+/// ref roles — one rule for the api's `videoSubmit` and the core's
+/// `ark-video` driver (`video.rs`).
+pub mod video;
 /// What may sign a new agent in, by where it runs and its runtime — the Rust
 /// half of `client-shared/newAgent.ts`, tested against the same table.
 pub mod agent_setup;

@@ -2283,6 +2283,60 @@ pub(crate) async fn call_native(
     }
 }
 
+// ── a key an agent was signed in with (`fuel::go`) ──────────────────────────
+//
+// OpenCode Go (ops 10-31): an agent New Agent signed in with OpenCode Go runs
+// on its owner's Go key, pasted once in Settings ▸ Connections. The agent's
+// stored fuel IS the owner's say-so — they picked it for this agent — so no
+// per-connection grant is asked for, as none is for the wallet's fuel. What
+// stays the vault's rule: it opens only on a machine where its owner is signed
+// in, and only with a key this machine already holds (never by starting one).
+
+/// Why an agent's own key couldn't be opened for a reply, in the words the
+/// reply says it with.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OwnerKeyIssue {
+    /// The owner has linked nothing of this provider.
+    None,
+    /// The owner isn't signed in on this machine.
+    NotHere,
+    /// This machine doesn't hold the owner's vault key yet.
+    NoVaultKey,
+    /// The list or the vault failed on the way; the reason, in words.
+    Failed(String),
+}
+
+/// The owner's own key for `provider` — an API-key row in their Connections —
+/// opened on this machine. The newest row of that provider wins, so a pasted
+/// replacement takes over from the next reply. Never prints.
+pub(crate) async fn open_owner_key(base: &str, owner: &str, provider: &str) -> std::result::Result<String, OwnerKeyIssue> {
+    let Some(sess) = session::load_named(owner) else {
+        return Err(OwnerKeyIssue::NotHere);
+    };
+    let human = Client::new(base.to_string(), sess.token.clone());
+    let listed = human.call("listConnections", json!({})).await.map_err(|e| OwnerKeyIssue::Failed(format!("{e:#}")))?;
+    let mut rows: Vec<Value> = as_array(&listed, "items").into_iter().filter(|c| s(c, "provider") == provider).collect();
+    rows.sort_by_key(|c| std::cmp::Reverse(c.get("updated_at").and_then(Value::as_i64).unwrap_or(0)));
+    let Some(conn) = rows.into_iter().next() else {
+        return Err(OwnerKeyIssue::None);
+    };
+    let (umk, key_id, _) = open_vault(&human, &sess, false).await.map_err(|e| {
+        if e.downcast_ref::<KeyNotHandedOver>().is_some() {
+            OwnerKeyIssue::NoVaultKey
+        } else {
+            OwnerKeyIssue::Failed(format!("{e:#}"))
+        }
+    })?;
+    let fields = open_payload(&umk, &key_id, &conn).map_err(|e| OwnerKeyIssue::Failed(format!("{e:#}")))?;
+    fields
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| OwnerKeyIssue::Failed(format!("`{}` holds no key", s(&conn, "name"))))
+}
+
 // ── the owner's own video key (`mafold video`) ─────────────────────────────
 //
 // 2026-10-10, the cofounder:「我都连接了我自己的key，肯定是默认走我的key啊」.

@@ -24,14 +24,28 @@ real money is spent, real files must survive, and the chat is the record.
   `last_frame`, `reference_image`, `reference_video`, `reference_audio`.
   `first_frame`/`last_frame` can't be mixed with the `reference_*` roles in one
   job (the vendor refuses; nothing is spent).
-  With any ref the ratio must be `adaptive` (the vendor follows the image), so
-  give every reference image the film's shape: if the film is 16:9, put the
-  subject on a 16:9 canvas with a plain background.
+  `--ratio` is the film's shape — pass it on every generation; it holds with
+  `reference_*` refs on every model. One exception: on Seedance 2.5 a job with
+  `first_frame`/`last_frame` keeps the first frame's shape, so only `adaptive`
+  goes with them (the tool refuses anything else before anything is spent) —
+  give that frame the film's shape. On 2.0 a frame of another shape is
+  center-cropped to the ratio.
   The tool refuses known-bad combinations before anything is spent.
+  **Every clip carries its own sound** — the default, and the same price as a
+  silent one on Seedance 2.5 / 2.0. `--no-audio` only when the person asked for
+  a silent clip, never on a shot with lines or a sound the story needs (a
+  10-30 film came back silent end to end because sound was off by default).
 - The same command with `--dry-run` runs the same checks and prints the same
   `estimate` without submitting — nothing is held or spent, and nobody is
   asked for anything (it never posts a card). This is how a plan gets real
   numbers before anyone says yes. Only a real `submit` asks the owner (below).
+  The estimate counts what ModelArk counts: the clip's frames, plus a
+  `reference_video`'s own seconds (read off the file when you pass a local
+  path; a link or file id is counted as long as the clip, and
+  `input_video_assumed` says so — then say "about"). With a reference video
+  the per-token rate is lower but the count roughly doubles; quote the tool's
+  figure, never the plain clip's. On the owner's own key `estimate.usd` is
+  ModelArk's list price (`usd_per_m`).
 - Who pays — the tool decides, and the answer says which:
   - **The owner's own ModelArk key** (`billing.via: "own"`, job id `own:…`).
     When the bot's owner has linked their own key, it is used by default: the
@@ -67,7 +81,10 @@ real money is spent, real files must survive, and the chat is the record.
   vendor's count (`usage.output`, in `usage.unit`) and `cost_usd`; on Mafold's
   key also what the wallet was charged (`wallet.charged`), on their own key
   `billing` (ModelArk bills them; `cost_usd` is at list price). Without
-  `--wait` it only reads.
+  `--wait` it only reads. Beside the bill: `estimate` (what was quoted) and
+  `check` — `match`; `close: …` (a few percent: an `adaptive` clip took its
+  first frame's shape); `OFF: …` — the quote missed something. Say an `OFF` to
+  the person with both numbers, and quote the bill, not the plan.
 - `mafold video cancel <job_id>` — only a job still queued can be cancelled.
 - `mafold pin` pins the reply you are writing (prints its id); `mafold edit <id> --file <path>`
   replaces the text of a message you sent earlier. `mafold read --json` shows
@@ -146,7 +163,7 @@ the crops before using them. A subject without a reference will drift.
 |---|---|
 | Cut (new place or time) | Nothing extra — the bible carries identity. |
 | Continuous (the action carries on) | The earlier scene's last frame as one more `reference_image`, with its own sentence `使用@图片3作为首帧。` and one saying what that frame fixes (positions, poses, camera direction); then `镜头从@图片3定义的首帧自然开始，…`. The bible stays in the same call. So the scenes on either side of a continuous seam are shot one after the other. |
-| Jars once both exist | A 4 s bridge: `--ref first_frame=<A's last frame> --ref last_frame=<B's first frame>`, one transition move (`镜头穿过…`). These two roles take no other references, so the bridge carries identity only through its two frames. |
+| Jars once both exist | A 4 s bridge: `--ref first_frame=<A's last frame> --ref last_frame=<B's first frame>`, one transition move (`镜头穿过…`). These two roles take no other references, so the bridge carries identity only through its two frames. On 2.5 it goes with `--ratio adaptive` (it keeps A's frame's shape — already the film's). |
 
 - Never chain scene after scene off last frames alone: one frame carries no
   motion and the errors add up — that is how a 40 s video drifts. The bible goes
@@ -262,6 +279,7 @@ scenes exist, list them under the second rule with their seams
 | `ark 400 …InvalidParameter…` | The vendor refused a parameter (a scene longer than the model's cap, frame roles mixed with reference roles); fix it, same rule. |
 | job `failed` / `InternalServiceError` | The vendor bills only succeeded jobs. Offer one retry, ideally at another resolution or ratio. |
 | a content-policy refusal (codes with `Sensitive`) | Don't resubmit the same words. Explain plainly; offer a rephrase that keeps their intent. |
+| `OutputVideoSensitiveContentDetected.PolicyViolation` ("may be related to copyright") | Nothing is billed, but each one is minutes of waiting (2–7 on 10-28…10-30), and they come in runs. Seen when a style is named after a studio, film or a genre's famous look ("写实风格的日本动画电影") in the same prompt as a real landmark and an anime-looking character. Describe the look in your own words (line, light, palette, lens) instead of naming where it comes from, keep real places generic unless the place is the point, and say what you changed. Two blocks in a row on one scene: tell the person before trying a third. |
 | `succeeded` but `landing_error` | The clip didn't make it into the chat. Read the job once more later; if the vendor's 24 h copy is gone, offer to re-run that scene (it costs again). |
 | `hasn't allowed @… to use it` from `submit` (a consent card was posted) | The owner has their own ModelArk key and hasn't let this bot use it yet. Nothing was submitted or spent. Say a card is waiting for them; their Allow brings you back — then run the same command. Don't switch to `--via house` on your own. |
 | `hasn't allowed @… ` from `status` / `cancel` | No card was posted. The job is untouched at ModelArk; tell the owner they can allow you under Settings ▸ Connections, then read it again. |

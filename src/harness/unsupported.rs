@@ -32,7 +32,9 @@ pub fn display_name(id: &str) -> String {
         "claude-code" => "Claude Code".into(),
         "codex" => "Codex".into(),
         "kimi-code" => "Kimi Code".into(),
-        "opencode" => "OpenCode".into(),
+        // Mafold's pinned OpenCode, and your own OpenCode install.
+        "opencode" => "Mafold Harness".into(),
+        "opencode-own" => "OpenCode".into(),
         "openclaw" => "OpenClaw".into(),
         other => other.into(),
     }

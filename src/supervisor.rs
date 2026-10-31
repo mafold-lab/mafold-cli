@@ -1876,13 +1876,15 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
         // too: Claude Code's installer adds it to the user's PATH, which a
         // running supervisor never sees.
         if let Some(home) = crate::platform::home_dir() {
-            let local = std::path::Path::new(&home).join(".local/bin");
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            if local.is_dir() && !std::env::split_paths(&path).any(|p| p == local) {
-                let mut parts = vec![local];
-                parts.extend(std::env::split_paths(&path));
-                if let Ok(joined) = std::env::join_paths(parts) {
-                    std::env::set_var("PATH", joined);
+            for dir in crate::install::HOME_BIN_DIRS {
+                let local = std::path::Path::new(&home).join(dir);
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                if local.is_dir() && !std::env::split_paths(&path).any(|p| p == local) {
+                    let mut parts = vec![local];
+                    parts.extend(std::env::split_paths(&path));
+                    if let Ok(joined) = std::env::join_paths(parts) {
+                        std::env::set_var("PATH", joined);
+                    }
                 }
             }
         }
@@ -2941,6 +2943,7 @@ pub async fn status_json() -> serde_json::Value {
                 health: serde_json::from_value(h["health"].clone()).ok(),
                 accounts: Vec::new(),
                 runs: h["runs"].as_bool(),
+                sign_ins: serde_json::from_value(h["sign_ins"].clone()).ok().flatten(),
             })
         })
         .collect();

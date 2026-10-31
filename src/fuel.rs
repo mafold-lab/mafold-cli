@@ -48,6 +48,71 @@ pub fn is_wallet(fuel: Option<&str>) -> bool {
     fuel.is_some_and(|f| f.trim().eq_ignore_ascii_case(WALLET))
 }
 
+// ── OpenCode Go (ops 10-31) ─────────────────────────────────────────────────
+//
+// An agent New Agent signed in with OpenCode Go — Mafold Harness, or the
+// owner's own OpenCode — runs on the owner's Go plan. Its key is the one the
+// owner pasted in Settings ▸ Connections, opened on this computer for each
+// reply (`connection::open_owner_key`) and handed to the harness through the
+// turn's env alone, masked out of everything the turn writes while it holds
+// it. The owner's own OpenCode that is already signed in to Go here needs no
+// key from Mafold at all. Go bills the owner's plan, not the wallet: there is
+// no draft key, no gate on who may start a reply, no total to read back.
+
+/// `getBot`'s `fuel` for an agent on its owner's OpenCode Go plan.
+pub const GO: &str = "opencode-go";
+
+/// The hand-off of the Go key to the OpenCode harnesses (`Turn.env`).
+pub const GO_KEY_ENV: &str = "MAFOLD_GO_KEY";
+
+/// Is `fuel` OpenCode Go?
+pub fn is_go(fuel: Option<&str>) -> bool {
+    fuel.is_some_and(|f| f.trim().eq_ignore_ascii_case(GO))
+}
+
+/// The turn's Go step, for an agent on OpenCode Go running `harness`: the
+/// owner's key joins `env`, and the guard that masks it comes back for the
+/// turn to hold — or nothing, for the owner's own OpenCode that is signed in
+/// to Go on this computer already. `Err` is the turn's error, in the words
+/// the reply ends with.
+pub async fn go_step(
+    base: &str,
+    owner: Option<&str>,
+    harness: &str,
+    env: &mut Vec<(String, String)>,
+) -> Result<Option<crate::conceal::LiveSecret>, String> {
+    if harness == crate::harness::opencode::OWN && crate::harness::opencode::own_go_login() {
+        return Ok(None);
+    }
+    let Some(owner) = owner.map(crate::agent::norm_user).filter(|o| !o.is_empty()) else {
+        return Err("This agent runs on its owner's OpenCode Go plan, and this computer can't tell who its owner \
+                    is, so it starts no replies."
+            .into());
+    };
+    let key = crate::connection::open_owner_key(base, &owner, GO).await.map_err(|issue| go_issue(&owner, issue))?;
+    let masked = crate::conceal::hide_while_live(&key);
+    env.push((GO_KEY_ENV.to_string(), key));
+    println!("🔑 OpenCode Go: @{owner}'s key is open for this reply");
+    Ok(Some(masked))
+}
+
+/// What a reply ends with when its Go key couldn't be opened here.
+pub fn go_issue(owner: &str, issue: crate::connection::OwnerKeyIssue) -> String {
+    use crate::connection::OwnerKeyIssue as I;
+    match issue {
+        I::None => "No OpenCode Go key yet: add yours in Settings ▸ Connections ▸ OpenCode Go, then send this again.".into(),
+        I::NotHere => format!(
+            "This agent runs on @{owner}'s OpenCode Go key, which opens only on a computer where @{owner} is signed \
+             in to Mafold, and @{owner} isn't signed in on this one."
+        ),
+        I::NoVaultKey => "This computer doesn't hold your Connections key yet, so it can't open your OpenCode Go key. \
+                          Open Mafold on a device that has it (the web, or your phone) and it hands the key over by \
+                          itself, then send this again."
+            .into(),
+        I::Failed(why) => format!("Couldn't open your OpenCode Go key on this computer: {why}"),
+    }
+}
+
 /// May this turn start a reply on the owner's wallet? Only a message the
 /// owner sent: not a guest's, not someone else's relayed by a bot (the owner's
 /// own bots included — whose words they carry is theirs to say, and the api
@@ -277,6 +342,26 @@ mod tests {
         for other in [None, Some(""), Some("claude"), Some("opencode-go")] {
             assert!(!is_wallet(other), "{other:?}");
         }
+    }
+
+    #[test]
+    fn only_opencode_go_is_go() {
+        assert!(is_go(Some("opencode-go")) && is_go(Some(" OpenCode-Go ")));
+        for other in [None, Some(""), Some("wallet"), Some("claude"), Some("opencode")] {
+            assert!(!is_go(other), "{other:?}");
+        }
+    }
+
+    /// Each way a Go key can't be opened says what to do about it — the
+    /// missing key names where to add it, a machine without the vault key
+    /// says how it gets one — and none of them prints a key.
+    #[test]
+    fn a_go_key_that_cant_be_opened_says_what_to_do() {
+        use crate::connection::OwnerKeyIssue as I;
+        assert!(go_issue("ops", I::None).contains("Settings ▸ Connections ▸ OpenCode Go"));
+        assert!(go_issue("ops", I::NotHere).contains("@ops isn't signed in on this one"));
+        assert!(go_issue("ops", I::NoVaultKey).contains("hands the key over by itself"));
+        assert!(go_issue("ops", I::Failed("boom".into())).ends_with("boom"));
     }
 
     /// Who starts a reply on the owner's wallet: the owner, with a message of

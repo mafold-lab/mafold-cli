@@ -102,7 +102,42 @@ pub struct HarnessInfo {
     /// through [`HarnessInfo::runs`], never directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runs: Option<bool>,
+    /// What Mafold on that computer can run this runtime on (OpenCode Go and
+    /// on, 10-31): each sign-in, whether the computer itself holds a login for
+    /// it, and the models it can run there. `None` from older CLIs: read it
+    /// through [`HarnessInfo::sign_ins`], never directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_ins: Option<Vec<HostSignIn>>,
 }
+
+/// One sign-in a computer can run a runtime on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSignIn {
+    /// A New Agent sign-in id (`mafold_types::agent_setup::SIGN_INS`).
+    pub id: String,
+    /// The computer holds a login for it of its own — your own OpenCode's
+    /// OpenCode Go login. `None` = it doesn't keep one there (Mafold Harness
+    /// takes OpenCode Go from Connections) or can't tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_in: Option<bool>,
+    /// The models it can run on this sign-in there, in the runtime's order.
+    /// Empty when the sign-in brings its own list (the wallet's rates).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<HostModel>,
+}
+
+/// A model a computer can run, as its runtime names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostModel {
+    /// Without the provider: `kimi-k2.7-code`.
+    pub id: String,
+    pub name: String,
+}
+
+/// What a CLI that predates [`HarnessInfo::sign_ins`] could run each runtime
+/// on: its own login, and Mafold Harness on the wallet alone (cli@0.9.153).
+pub const SIGN_INS_BEFORE_REPORT: &[(&str, &str)] =
+    &[("claude-code", "claude"), ("codex", "codex"), ("kimi-code", "kimi"), ("opencode", "wallet")];
 
 /// The runtimes every CLI before `HarnessInfo::runs` could drive. An older CLI
 /// reported `opencode` and `openclaw` too, and quietly ran Claude Code for
@@ -113,6 +148,24 @@ impl HarnessInfo {
     /// Can Mafold on the reporting computer run this runtime?
     pub fn runs(&self) -> bool {
         self.runs.unwrap_or_else(|| RUNTIMES_BEFORE_RUNS.contains(&self.id.as_str()))
+    }
+
+    /// What Mafold on the reporting computer can run this runtime on — an
+    /// older CLI's silence read as what it could ([`SIGN_INS_BEFORE_REPORT`]).
+    pub fn sign_ins(&self) -> Vec<HostSignIn> {
+        match &self.sign_ins {
+            Some(list) => list.clone(),
+            None => SIGN_INS_BEFORE_REPORT
+                .iter()
+                .filter(|(rt, _)| *rt == self.id)
+                .map(|(_, s)| HostSignIn { id: s.to_string(), signed_in: None, models: Vec::new() })
+                .collect(),
+        }
+    }
+
+    /// Can Mafold on the reporting computer run this runtime on `sign_in`?
+    pub fn runs_on(&self, sign_in: &str) -> bool {
+        self.runs() && self.sign_ins().iter().any(|s| s.id == sign_in)
     }
 }
 
@@ -188,6 +241,10 @@ pub struct HarnessHost {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessHostsResult {
     pub items: Vec<HarnessHost>,
+    /// The sign-ins whose key your Connections hold (`opencode-go`): a
+    /// runtime that takes one from there is signed in on every computer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected: Vec<String>,
 }
 
 // ───────────────── presence (`getUserStatus`) ─────────────────
@@ -304,8 +361,9 @@ mod tests {
                     }),
                     accounts: vec![AccountSeat { name: "default".into(), email: Some("a@b.c".into()), health: None }],
                     runs: None,
+                    sign_ins: None,
                 },
-                HarnessInfo { id: "codex".into(), available: false, version: None, health: None, accounts: vec![], runs: None },
+                HarnessInfo { id: "codex".into(), available: false, version: None, health: None, accounts: vec![], runs: None, sign_ins: None },
             ],
             cli_version: Some("0.9.147".into()),
             reported_at: 1760000002,
@@ -325,7 +383,7 @@ mod tests {
 
     fn heartbeat(version: Option<&str>, available: bool) -> DeviceHarnesses {
         let mut d = host();
-        d.harnesses = vec![HarnessInfo { id: "claude-code".into(), available, version: version.map(Into::into), health: None, accounts: vec![], runs: None }];
+        d.harnesses = vec![HarnessInfo { id: "claude-code".into(), available, version: version.map(Into::into), health: None, accounts: vec![], runs: None, sign_ins: None }];
         d
     }
 
@@ -373,7 +431,7 @@ mod tests {
     /// for it: what it doesn't say is read as the runtimes it really ran.
     #[test]
     fn a_runtime_runs_when_its_computer_says_so_or_an_older_cli_could() {
-        let row = |id: &str, runs: Option<bool>| HarnessInfo { id: id.into(), available: true, version: None, health: None, accounts: vec![], runs };
+        let row = |id: &str, runs: Option<bool>| HarnessInfo { id: id.into(), available: true, version: None, health: None, accounts: vec![], runs, sign_ins: None };
         for id in ["claude-code", "codex", "kimi-code"] {
             assert!(row(id, None).runs(), "{id} from an older CLI");
         }
@@ -398,6 +456,36 @@ mod tests {
         assert!(serde_json::from_str::<DeviceHarnesses>(DEVICE).unwrap().os.is_none(), "a stored row without it still loads");
     }
 
+    /// A CLI from before the sign-in report said nothing about it: each
+    /// runtime runs on its own login, and Mafold Harness on the wallet alone
+    /// (cli@0.9.153) — never on OpenCode Go, which only a CLI that says so can.
+    #[test]
+    fn sign_ins_from_an_older_cli_are_what_it_could_run() {
+        let row = |id: &str, sign_ins: Option<Vec<HostSignIn>>| HarnessInfo {
+            id: id.into(),
+            available: true,
+            version: None,
+            health: None,
+            accounts: vec![],
+            runs: Some(true),
+            sign_ins,
+        };
+        assert!(row("claude-code", None).runs_on("claude"));
+        assert!(row("opencode", None).runs_on("wallet"));
+        assert!(!row("opencode", None).runs_on("opencode-go"), "only a CLI that says so runs Go");
+        assert!(row("opencode-own", None).sign_ins().is_empty(), "a runtime an older CLI never had");
+        let go = HostSignIn { id: "opencode-go".into(), signed_in: Some(true), models: vec![] };
+        let said = row("opencode", Some(vec![go.clone()]));
+        assert!(said.runs_on("opencode-go") && !said.runs_on("wallet"), "what it says is all it runs");
+        let parsed: HarnessInfo = serde_json::from_str(
+            r#"{"id":"opencode-own","available":true,"runs":true,
+                "sign_ins":[{"id":"opencode-go","signed_in":true,"models":[{"id":"kimi-k2.7-code","name":"Kimi K2.7 Code"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.sign_ins()[0].models[0].name, "Kimi K2.7 Code");
+        assert_eq!(parsed.sign_ins()[0].signed_in, Some(true));
+    }
+
     #[test]
     fn hosts_list_bytes_unchanged() {
         let d = host();
@@ -406,6 +494,7 @@ mod tests {
                 HarnessHost { device_id: d.device_id.clone(), device_name: d.device_name.clone(), harnesses: d.harnesses.clone(), cli_version: d.cli_version.clone(), online: true, reported_at: d.reported_at, os: None },
                 HarnessHost { device_id: "dev-2".into(), device_name: "PC".into(), harnesses: vec![], cli_version: None, online: false, reported_at: 5, os: None },
             ],
+            connected: vec![],
         };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),

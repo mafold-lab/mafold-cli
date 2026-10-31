@@ -109,9 +109,28 @@ const TOOLS: &[Tool] = &[
             install: crate::harness::opencode_pin::ensure_blocking,
         },
         fallback: "check that this computer can reach registry.npmjs.org or registry.npmmirror.com, then run `mafold install opencode` again",
-        auth_hint: "nothing to sign in to — Mafold runs it on your Mafold wallet",
+        auth_hint: "nothing to sign in to — Mafold runs it on OpenCode Go (your key in Connections) or your Mafold wallet",
+    },
+    Tool {
+        id: "opencode-own",
+        aliases: &["opencode-own", "own-opencode"],
+        name: "OpenCode",
+        bin: "opencode",
+        // Your own OpenCode, as OpenCode installs it: its installer takes the
+        // OpenCode 1 line (npm's `latest`), which is the one Mafold drives.
+        how: How::Official {
+            unix: "curl -fsSL https://opencode.ai/install | bash",
+            windows: Win::PowerShell("npm install -g opencode-ai"),
+        },
+        fallback: "see https://opencode.ai/docs",
+        auth_hint: "sign it in to OpenCode Go with `/connect` in `opencode`, or add your Go key in Mafold ▸ Settings ▸ Connections",
     },
 ];
+
+/// Where official installers put a runtime in the user's home, which a
+/// service's PATH predates: Claude Code's native installer's `~/.local/bin`,
+/// and OpenCode's `~/.opencode/bin`.
+pub const HOME_BIN_DIRS: &[&str] = &[".local/bin", ".opencode/bin"];
 
 /// A runtime's Windows install.
 #[derive(Clone, Copy)]
@@ -181,14 +200,19 @@ fn powershell_args(cmd: &str) -> Vec<String> {
 
 /// Where an installer that installs into the user's home puts `bin`, as a
 /// launchable file name: `~/.local/bin/<bin>` (Claude Code's native installer,
-/// on every OS).
+/// on every OS), `~/.opencode/bin/<bin>` (OpenCode's) — [`HOME_BIN_DIRS`].
 fn home_install(home: &std::path::Path, bin: &str, windows: bool) -> Vec<std::path::PathBuf> {
-    let dir = home.join(".local").join("bin");
-    if windows {
-        [".exe", ".cmd"].iter().map(|e| dir.join(format!("{bin}{e}"))).collect()
-    } else {
-        vec![dir.join(bin)]
-    }
+    HOME_BIN_DIRS
+        .iter()
+        .flat_map(|d| {
+            let dir = home.join(d);
+            if windows {
+                [".exe", ".cmd"].iter().map(|e| dir.join(format!("{bin}{e}"))).collect::<Vec<_>>()
+            } else {
+                vec![dir.join(bin)]
+            }
+        })
+        .collect()
 }
 
 fn find(tool: &str) -> Option<&'static Tool> {
@@ -216,7 +240,7 @@ pub fn run_within(tool: &str, yes: bool, limit: Option<std::time::Duration>) -> 
     install(t, yes, limit)
 }
 
-/// `mafold install` with no argument: the four runtimes + their install state.
+/// `mafold install` with no argument: the runtimes + their install state.
 fn list() -> Result<()> {
     println!("runtimes:");
     for t in TOOLS {
@@ -301,7 +325,8 @@ fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()
         // case, not an error.
         let home = crate::platform::home_dir().unwrap_or_else(|| ".".into());
         if let Some(local) = home_install(&home, t.bin, cfg!(windows)).into_iter().find(|p| p.is_file()) {
-            println!("✓ installed to {} — open a new terminal (or add ~/.local/bin to PATH) so `{}` resolves", local.display(), t.bin);
+            let dir = local.parent().map(|d| d.display().to_string()).unwrap_or_default();
+            println!("✓ installed to {} — open a new terminal (or add {dir} to PATH) so `{}` resolves", local.display(), t.bin);
         } else {
             bail!("installer finished but `{}` isn't on PATH — open a new terminal and re-check, or: {}", t.bin, t.fallback);
         }
@@ -525,8 +550,27 @@ mod windows_installer_tests {
         let home = std::path::Path::new("/h");
         assert_eq!(
             home_install(home, "claude", true),
-            vec![home.join(".local/bin/claude.exe"), home.join(".local/bin/claude.cmd")]
+            vec![
+                home.join(".local/bin/claude.exe"),
+                home.join(".local/bin/claude.cmd"),
+                home.join(".opencode/bin/claude.exe"),
+                home.join(".opencode/bin/claude.cmd"),
+            ]
         );
-        assert_eq!(home_install(home, "claude", false), vec![home.join(".local/bin/claude")]);
+        assert_eq!(home_install(home, "claude", false), vec![home.join(".local/bin/claude"), home.join(".opencode/bin/claude")]);
+        // OpenCode's own installer puts it in ~/.opencode/bin.
+        assert!(home_install(home, "opencode", false).contains(&home.join(".opencode/bin/opencode")));
+    }
+
+    /// Mafold Harness is Mafold's pinned OpenCode; `opencode-own` is OpenCode's
+    /// own installer — the OpenCode 1 line it hands out, the one Mafold drives.
+    #[test]
+    fn both_opencodes_install_and_never_as_each_other() {
+        let harness = find("opencode").unwrap();
+        assert!(matches!(harness.how, How::Pinned { .. }));
+        let own = find("opencode-own").unwrap();
+        assert_eq!(own.id, "opencode-own");
+        assert!(matches!(own.how, How::Official { unix, .. } if unix.contains("opencode.ai/install")));
+        assert!(find("own-opencode").is_some_and(|t| t.id == "opencode-own"));
     }
 }

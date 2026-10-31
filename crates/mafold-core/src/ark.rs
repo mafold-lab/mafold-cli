@@ -53,12 +53,12 @@ pub fn catalog() -> Value {
                     "model": { "type": "string", "description": "e.g. dreamina-seedance-2-5-260628" },
                     "prompt": { "type": "string" },
                     "resolution": { "type": "string", "enum": ["480p", "720p", "1080p"], "default": "720p" },
-                    "ratio": { "type": "string", "description": "adaptive | 16:9 | 4:3 | 1:1 | 3:4 | 9:16 | 21:9 (forced adaptive when refs are given)", "default": "adaptive" },
-                    "duration": { "type": "integer", "description": "seconds 4–30, or -1", "default": 5 },
+                    "ratio": { "type": "string", "description": "adaptive | 16:9 | 4:3 | 1:1 | 3:4 | 9:16 | 21:9 — any with reference_* refs; Seedance 2.5 with a first_frame / last_frame takes adaptive only (it keeps the first frame's aspect)", "default": "adaptive" },
+                    "duration": { "type": "integer", "description": "seconds: 4–30 on Seedance 2.5, 4–15 on the 2.0 family, or -1", "default": 5 },
                     "refs": { "type": "array", "items": { "type": "object", "required": ["role", "url"], "properties": {
                         "role": { "type": "string", "enum": ["first_frame", "last_frame", "reference_image", "reference_video", "reference_audio"] },
                         "url": { "type": "string" } } } },
-                    "generate_audio": { "type": "boolean", "default": false },
+                    "generate_audio": { "type": "boolean", "description": "the clip carries its own sound unless false — same price either way on 2.5 / 2.0", "default": true },
                     "watermark": { "type": "boolean", "default": false },
                     "draft": { "type": "boolean", "description": "cheap draft render where the model supports it" },
                     "seed": { "type": "integer", "description": "-1 (random) … 4294967295; the task echoes it, so `video.list` finds a submit whose reply was lost" }
@@ -236,7 +236,8 @@ impl ListFilter {
 
 /// Build the vendor request. Shapes only; the model table's judgement (known
 /// bad combos, draft support) lives on the server's house-key path, and the
-/// vendor answers for itself here.
+/// vendor answers for itself here. The one rule both sides check is which
+/// ratio may go with which refs (`mafold_types::video::check_ratio`).
 fn submit_body(params: &Value) -> Result<Value, String> {
     let model = params
         .get("model")
@@ -277,18 +278,19 @@ fn submit_body(params: &Value) -> Result<Value, String> {
             content.push(json!({ "type": kind, kind: { "url": url }, "role": role }));
         }
     }
-    let has_refs = content.len() > 1;
     let ratio = params.get("ratio").and_then(Value::as_str).unwrap_or("adaptive");
-    if has_refs && ratio != "adaptive" {
-        return Err("with a first frame or reference, ratio must be adaptive".into());
-    }
+    // Only Seedance 2.5 with a first / last frame is held to adaptive (ModelArk's
+    // own table); references take any ratio on every model. The same rule the
+    // server's `videoSubmit` checks, written once in mafold-types.
+    let roles = content.iter().filter_map(|c| c.get("role").and_then(Value::as_str));
+    mafold_types::video::check_ratio(model, ratio, roles)?;
     let mut body = json!({
         "model": model,
         "content": content,
         "resolution": params.get("resolution").and_then(Value::as_str).unwrap_or("720p"),
         "ratio": ratio,
         "duration": params.get("duration").and_then(Value::as_i64).unwrap_or(5),
-        "generate_audio": params.get("generate_audio").and_then(Value::as_bool).unwrap_or(false),
+        "generate_audio": params.get("generate_audio").and_then(Value::as_bool).unwrap_or(true),
         "watermark": params.get("watermark").and_then(Value::as_bool).unwrap_or(false),
     });
     if params.get("draft").and_then(Value::as_bool) == Some(true) {
@@ -322,13 +324,40 @@ mod tests {
     }
 
     #[test]
-    fn refs_force_adaptive_and_reject_odd_roles() {
-        let e = submit_body(&json!({ "model": "m", "prompt": "p", "ratio": "9:16",
-            "refs": [{ "role": "first_frame", "url": "https://a/b.jpg" }] })).unwrap_err();
-        assert!(e.contains("adaptive"));
+    fn odd_roles_are_refused() {
         let e = submit_body(&json!({ "model": "m", "prompt": "p",
             "refs": [{ "role": "hero", "url": "https://a/b.jpg" }] })).unwrap_err();
         assert!(e.contains("unknown role"));
+    }
+
+    /// ModelArk's own table (2026-10-30): references take a fixed ratio on
+    /// every model — a vertical film from four reference images on 2.5 was
+    /// refused here before; 2.5 keeps a first frame's aspect, so only adaptive
+    /// goes with one; 2.0 center-crops the frame. Adaptive always goes.
+    #[test]
+    fn a_fixed_ratio_goes_with_references_but_not_with_a_2_5_first_frame() {
+        let (v25, v20) = ("dreamina-seedance-2-5-260628", "dreamina-seedance-2-0-260128");
+        fn shot(model: &str, ratio: &str, roles: &[&str]) -> Result<Value, String> {
+            let refs: Vec<Value> = roles.iter().map(|r| json!({ "role": r, "url": "https://a/girl.png" })).collect();
+            submit_body(&json!({ "model": model, "prompt": "p", "ratio": ratio, "refs": refs }))
+        }
+
+        let b = shot(v25, "9:16", &["reference_image"; 4]).expect("2.5 + reference images + 9:16");
+        assert_eq!(b["ratio"], "9:16");
+        assert_eq!(b["content"].as_array().unwrap().len(), 5);
+        assert_eq!(shot(v25, "9:16", &["reference_video"]).unwrap()["ratio"], "9:16");
+
+        let e = shot(v25, "9:16", &["first_frame"]).unwrap_err();
+        assert!(e.contains("Seedance 2.5 with a first_frame") && e.contains("adaptive"), "{e}");
+        assert!(shot(v25, "16:9", &["first_frame", "last_frame"]).is_err());
+
+        assert_eq!(shot(v20, "9:16", &["first_frame"]).unwrap()["ratio"], "9:16", "2.0 crops the frame");
+        assert_eq!(shot(v20, "9:16", &["first_frame", "last_frame"]).unwrap()["ratio"], "9:16");
+
+        let adaptive: [(&str, &[&str]); 3] = [(v25, &["first_frame"]), (v25, &["reference_image"]), (v20, &["first_frame"])];
+        for (m, roles) in adaptive {
+            assert_eq!(shot(m, "adaptive", roles).unwrap()["ratio"], "adaptive", "{m} {roles:?}");
+        }
     }
 
     /// An inline image is something ModelArk reads (the house path sends it);

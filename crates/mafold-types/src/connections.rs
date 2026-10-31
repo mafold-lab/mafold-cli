@@ -207,6 +207,12 @@ pub struct ProviderSpec {
     /// — which is exactly where the vault wants a credential born. `None` for
     /// providers linked by paste, env, import, or MCP dynamic registration.
     pub oauth_client: Option<OAuthClientSpec>,
+    /// A flag that must be on for the account before any surface offers this
+    /// provider (`mafold_types::flags`). The pack goes live on every client the
+    /// moment it is published — no release in between — so a provider still
+    /// behind a flag rides in it named, and the clients and `putConnection`
+    /// hold it back. `None` for everything shipped to all.
+    pub flag: Option<&'static str>,
 }
 
 /// See [`ProviderSpec::oauth_client`].
@@ -790,6 +796,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -807,6 +814,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -827,6 +835,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // server's `ingestUrl`. The house-key path (server env) stays as is.
         native_api: Some("ark-video"),
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -844,6 +853,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     // Secure input (`.docs/secure-input-v1.md`): a value only the person knows
@@ -868,6 +878,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -893,6 +904,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // step, and is what makes this grantable to other agents.
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -910,6 +922,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: Some("codex-responses"),
         device_bound: false,
+        flag: None,
         oauth_client: Some(OAuthClientSpec {
             client_id: codex::CLIENT_ID,
             authorize_url: codex::AUTHORIZE_URL,
@@ -942,6 +955,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://mcp.notion.com/mcp"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     ProviderSpec {
@@ -964,6 +978,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://mcp.figma.com/mcp"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
     // Figma twice, and NOT a duplicate: the two rows hold different
@@ -993,6 +1008,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://mcp.figma.com/mcp"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: Some(OAuthClientSpec {
             client_id: figma::CLIENT_ID,
             authorize_url: figma::AUTHORIZE_URL,
@@ -1044,6 +1060,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: Some("https://api.githubcopilot.com/mcp/"),
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: Some(OAuthClientSpec {
             client_id: github::CLIENT_ID,
             authorize_url: github::AUTHORIZE_URL,
@@ -1088,6 +1105,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: Some("google-workspace"),
         device_bound: false,
+        flag: None,
         oauth_client: Some(OAuthClientSpec {
             client_id: google::CLIENT_ID,
             authorize_url: google::AUTHORIZE_URL,
@@ -1146,6 +1164,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: Some("computer"),
         device_bound: true,
+        flag: None,
         oauth_client: None,
     },
     // Any MCP server the user can name — the one row that is not a vendor.
@@ -1186,6 +1205,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         mcp_url: None,
         native_api: None,
         device_bound: false,
+        flag: None,
         oauth_client: None,
     },
 ];
@@ -1354,6 +1374,9 @@ pub struct ProviderInfo {
     /// pretend. The only part of a provider that a release still gates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_api: Option<String>,
+    /// [`ProviderSpec::flag`]: offered only to an account with it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
 }
 
 impl ProviderInfo {
@@ -1568,6 +1591,7 @@ pub fn provider_infos() -> Vec<ProviderInfo> {
             import_path: p.import_path.map(str::to_string),
             env_var: p.env_var.map(str::to_string),
             native_api: p.native_api.map(str::to_string),
+            flag: p.flag.map(str::to_string),
         })
         .collect()
 }

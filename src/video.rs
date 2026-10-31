@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 
 use crate::client::Client;
 use crate::connection::{KeyHolder, OwnKey, OwnerVault};
+use mafold_core::mafold_types::video as cost;
 
 #[derive(Subcommand)]
 pub enum VideoCmd {
@@ -61,7 +62,8 @@ pub enum VideoCmd {
         /// 480p | 720p | 1080p — the user's choice on the plan card
         #[arg(long, default_value = "720p")]
         resolution: String,
-        /// adaptive | 16:9 | 9:16 | … (forced adaptive when a ref is given)
+        /// adaptive | 16:9 | 9:16 | … — any with reference_* refs; Seedance 2.5
+        /// with a first_frame / last_frame takes adaptive only (keeps the frame's shape)
         #[arg(long, default_value = "adaptive")]
         ratio: String,
         /// seconds (4–30, or -1 = model picks)
@@ -71,7 +73,12 @@ pub enum VideoCmd {
         /// reference_video=https://… — a local path (e.g. what the user sent) is uploaded for you
         #[arg(long = "ref")]
         refs: Vec<String>,
+        /// a silent clip. Every clip carries its own sound by default — same
+        /// price either way on Seedance 2.5 / 2.0; never on a shot with lines
         #[arg(long)]
+        no_audio: bool,
+        /// sound on — the default already; kept so older calls still run
+        #[arg(long, hide = true, conflicts_with = "no_audio")]
         audio: bool,
         #[arg(long)]
         watermark: bool,
@@ -116,7 +123,7 @@ pub async fn run(cmd: VideoCmd, client: &Client) -> Result<()> {
             let v = client.call("videoModels", json!({})).await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        VideoCmd::Submit { model, prompt, resolution, ratio, duration, refs, audio, watermark, draft, dry_run, via } => {
+        VideoCmd::Submit { model, prompt, resolution, ratio, duration, refs, no_audio, audio: _, watermark, draft, dry_run, via } => {
             // Whose key, settled before a byte is uploaded: a run refused here
             // (not allowed yet, no key on this machine) has nothing worth
             // sending, and a typo in `--via` isn't worth a round trip.
@@ -155,15 +162,24 @@ pub async fn run(cmd: VideoCmd, client: &Client) -> Result<()> {
                 }
             };
             let mut rs = Vec::new();
+            // ModelArk bills a reference video's own frames: its length, read
+            // off the file when it is one on this machine (an animatic the
+            // director stage rendered, a clip the user sent). `None` once any
+            // reference video can't be measured — the estimate then says it
+            // assumed one as long as the clip.
+            let mut ref_video_secs = Some(0.0);
+            let mut ref_videos = 0;
             for r in &refs {
                 let (role, val) = r
                     .split_once('=')
                     .with_context(|| format!("--ref wants role=<path|url|mf:id>, got {r}"))?;
                 let (role, val) = (role.trim(), val.trim());
-                if val.starts_with("http://") || val.starts_with("https://") {
+                let measured = if val.starts_with("http://") || val.starts_with("https://") {
                     rs.push(json!({ "role": role, "url": val }));
+                    None
                 } else if let Some(id) = val.strip_prefix("mf:") {
                     rs.push(json!({ "role": role, "file": id }));
+                    None
                 } else {
                     // A path on this machine — typically an attachment the user
                     // sent, which the daemon saved locally. Upload it so the
@@ -175,12 +191,21 @@ pub async fn run(cmd: VideoCmd, client: &Client) -> Result<()> {
                     let up = client.upload_path(p).await.with_context(|| format!("uploading {val}"))?;
                     let id = up["id"].as_str().context("upload returned no file id")?;
                     rs.push(json!({ "role": role, "file": id }));
+                    if role == "reference_video" { mp4_secs(p) } else { None }
+                };
+                if role == "reference_video" {
+                    ref_videos += 1;
+                    ref_video_secs = ref_video_secs.zip(measured).map(|(a, b)| a + b);
                 }
             }
+            let ref_video_secs = ref_video_secs.filter(|_| ref_videos > 0);
             let mut body = json!({
                 "model": model, "prompt": prompt, "resolution": resolution, "ratio": ratio,
-                "duration": duration, "refs": rs, "generate_audio": audio, "watermark": watermark,
+                "duration": duration, "refs": rs, "generate_audio": !no_audio, "watermark": watermark,
             });
+            if let Some(secs) = ref_video_secs {
+                body["ref_video_secs"] = json!(secs);
+            }
             if draft {
                 body["draft"] = json!(true);
             }
@@ -194,8 +219,8 @@ pub async fn run(cmd: VideoCmd, client: &Client) -> Result<()> {
                 // hasn't said yes — and nobody is asked.
                 Plan::Quote { name, owner, bot } => {
                     body["dry_run"] = json!(true);
-                    let checked = client.call("videoSubmit", body).await?;
-                    own_priced(checked, billing(&name, &owner, Some(&bot)))
+                    let checked = client.call("videoSubmit", body.clone()).await?;
+                    own_priced(checked, &body, billing(&name, &owner, Some(&bot)))
                 }
                 Plan::House { explicit, why_not_own } => {
                     if explicit {
@@ -458,12 +483,40 @@ fn billing(connection: &str, owner: &str, waiting_on: Option<&str>) -> Value {
     })
 }
 
-/// The server's estimate, labelled for the bill it stands in for here:
-/// ModelArk's, on the owner's own account.
-fn own_estimate(checked: &Value) -> Value {
-    let mut estimate = checked["estimate"].clone();
-    if estimate.is_object() {
-        estimate["note"] = json!(OWN_ESTIMATE_NOTE);
+/// The quote on the owner's own key: ModelArk's own count at ModelArk's list
+/// price (`mafold_types::video`, the rule the api's estimate uses too), for
+/// the job as the server checked it. Not the server's dollar figure: that is
+/// the WALLET's rate, which bills nobody on this path — and is `null` where no
+/// wallet price is set, so the 10-30 film was planned on quotes without a
+/// dollar in them — and an api from before 10-31 left a reference video out of
+/// the count (48,437 quoted, 100,858 billed).
+fn own_estimate(checked: &Value, body: &Value) -> Value {
+    let model = checked["model"].as_str().unwrap_or_default();
+    let resolution = checked["resolution"].as_str().unwrap_or("720p");
+    let duration = checked["duration"].as_i64().unwrap_or(5);
+    let has_video = body["refs"].as_array().is_some_and(|rs| rs.iter().any(|r| r["role"] == "reference_video"));
+    let (input, assumed) = match (has_video, body["ref_video_secs"].as_f64()) {
+        (false, _) => (None, false),
+        (true, Some(secs)) => (Some(secs), false),
+        (true, None) => (Some(if duration <= 0 { 5.0 } else { duration as f64 }), true),
+    };
+    let tokens = cost::clip_tokens(model, resolution, duration, input);
+    let per_m = cost::list_usd_per_m(model, resolution, input.is_some());
+    let mut estimate = json!({
+        "tokens": tokens,
+        "usd": per_m.map(|p| (tokens as f64) * p / 1e6),
+        "usd_per_m": per_m,
+        "audio": if body["generate_audio"] == false { "off" } else { "on — the same price as a silent clip" },
+        "note": OWN_ESTIMATE_NOTE,
+    });
+    if let Some(secs) = input {
+        estimate["input_video_secs"] = json!(secs);
+    }
+    if assumed {
+        estimate["input_video_assumed"] = json!(
+            "the reference video's length couldn't be read here, so it is counted as long as the clip — \
+             `status` puts the real count beside this"
+        );
     }
     estimate
 }
@@ -474,8 +527,8 @@ fn own_estimate(checked: &Value) -> Value {
 /// model a wallet price, would a house submit be refused) and plumbing go:
 /// none of it bears on a clip ModelArk bills the owner for, and `walletable:
 /// false` would read as "can't".
-fn own_priced(mut checked: Value, billing: Value) -> Value {
-    let estimate = own_estimate(&checked);
+fn own_priced(mut checked: Value, body: &Value, billing: Value) -> Value {
+    let estimate = own_estimate(&checked, body);
     if let Some(o) = checked.as_object_mut() {
         for k in ["configured", "walletable", "ref_urls", "own_key_linked"] {
             o.remove(k);
@@ -504,10 +557,10 @@ async fn own_submit(client: &Client, key: KeyHolder, mut body: Value, dry_run: b
     body["dry_run"] = json!(true);
     let checked = client.call("videoSubmit", body.clone()).await?;
     if dry_run {
-        return Ok(own_priced(checked, billing(&key.name, &key.owner, None)));
+        return Ok(own_priced(checked, &body, billing(&key.name, &key.owner, None)));
     }
     let billing = billing(&key.name, &key.owner, None);
-    let estimate = own_estimate(&checked);
+    let estimate = own_estimate(&checked, &body);
     let sent = body["refs"].as_array().cloned().unwrap_or_default();
     let refs = vendor_refs(&sent, &checked)?;
     let (name, owner) = (key.name.clone(), key.owner.clone());
@@ -589,6 +642,10 @@ async fn own_submit(client: &Client, key: KeyHolder, mut body: Value, dry_run: b
     if let Some(note) = recovered {
         v["recovered"] = json!(note);
     }
+    // Kept for `status`, which puts the bill beside it: no server holds an
+    // own-key job, so the quote stays where the job was sent from.
+    let job = own_job_id(&name, id);
+    landed_put(&quotes_path(), &landed_key(&client.base, &job), &v["estimate"]);
     Ok(v)
 }
 
@@ -750,13 +807,9 @@ async fn own_status(client: &Client, vault: &OwnerVault, job: &str, task: &str) 
         .call("video.status", &json!({ "job_id": task }))
         .await
         .map_err(|e| own_failure(e, "video.status"))?;
-    let succeeded = v["status"] == "succeeded";
-    let price = match v["model"].as_str() {
-        Some(model) if succeeded => list_price(client, model).await,
-        _ => None,
-    };
-    let mut out = own_status_view(job, &vault.name, &vault.owner, &v, price);
-    if succeeded {
+    let quote = quote_get(&quotes_path(), &landed_key(&client.base, job));
+    let mut out = own_status_view(job, &vault.name, &vault.owner, &v, quote.as_ref());
+    if v["status"] == "succeeded" {
         land(client, job, task, &v, &mut out).await;
     }
     Ok(out)
@@ -769,7 +822,14 @@ async fn own_status(client: &Client, vault: &OwnerVault, job: &str, task: &str) 
 /// figure at list price, the vendor's error on a job that ended badly.
 /// `billing` stands where `wallet` stands: nothing was held, nothing is
 /// charged here. The 24 h `video_url` is never handed out — it is landed.
-fn own_status_view(job: &str, connection: &str, owner: &str, v: &Value, price: Option<f64>) -> Value {
+///
+/// The dollar figure is ModelArk's list price for the model and tier, at the
+/// lower rate when the input included a video — which the `quote` this
+/// machine kept at submit says, or, for a job sent from elsewhere, a count
+/// well over the clip's own frames can only mean. The quote stands beside the
+/// bill with a `check` (`mafold_types::video::check_bill`), so a gap shows on
+/// the job it happens on (ops, 10-30).
+fn own_status_view(job: &str, connection: &str, owner: &str, v: &Value, quote: Option<&Value>) -> Value {
     let status = v["status"].as_str().unwrap_or("unknown");
     let output = v["usage"]["completion_tokens"].as_u64();
     let usage = match output {
@@ -780,6 +840,19 @@ fn own_status_view(job: &str, connection: &str, owner: &str, v: &Value, price: O
         }),
         None => Value::Null,
     };
+    let model = v["model"].as_str().unwrap_or_default();
+    let resolution = v["resolution"].as_str().unwrap_or("720p");
+    let plain = cost::clip_tokens(model, resolution, v["duration"].as_i64().unwrap_or(5), None);
+    let video_input = match quote {
+        Some(q) => q["input_video_secs"].is_number(),
+        None => output.is_some_and(|t| t as f64 > plain as f64 * 1.05),
+    };
+    let price = output.and(cost::list_usd_per_m(model, resolution, video_input));
+    let check = match (quote.and_then(|q| q["tokens"].as_u64()), output) {
+        (Some(quoted), Some(billed)) => json!(cost::check_bill(quoted, billed)),
+        (None, Some(_)) => json!("no quote kept on this machine for this job — nothing to compare the bill with"),
+        _ => Value::Null,
+    };
     let mut out = json!({
         "job_id": job,
         "model": v["model"].clone(),
@@ -787,6 +860,8 @@ fn own_status_view(job: &str, connection: &str, owner: &str, v: &Value, price: O
         "usage": usage,
         "cost_usd": output.zip(price).map(|(t, p)| (t as f64) * p / 1e6),
         "price_usd_per_m": price,
+        "estimate": quote.cloned().unwrap_or(Value::Null),
+        "check": check,
         "billing": billing(connection, owner, None),
         "seed": v["seed"].clone(),
         "created_at": v["created_at"].clone(),
@@ -800,15 +875,6 @@ fn own_status_view(job: &str, connection: &str, owner: &str, v: &Value, price: O
         };
     }
     out
-}
-
-/// The model's list price per million tokens — `videoModels`' figure, which is
-/// the wallet's price and, by the launch checklist, ModelArk's list price.
-/// Only to put a dollar figure beside the vendor's count; nothing is charged
-/// from it. Best effort: no figure is `null`, not an error.
-async fn list_price(client: &Client, model: &str) -> Option<f64> {
-    let v = client.call("videoModels", json!({})).await.ok()?;
-    v["models"].as_array()?.iter().find(|m| m["id"] == model)?["price_usd_per_m"].as_f64()
 }
 
 /// Land a finished clip through the server's `ingestUrl` — the one door every
@@ -880,12 +946,69 @@ fn landed_key(base: &str, job: &str) -> String {
 /// The landed file for `key` in the cache's text. Text this can't read holds
 /// nothing.
 fn landed_find(text: &str, key: &str) -> Option<Value> {
-    serde_json::from_str::<Vec<Value>>(text)
-        .ok()?
-        .into_iter()
-        .find(|e| e["key"] == key)
-        .map(|e| e["file"].clone())
-        .filter(|f| f["id"].is_string())
+    entry(text, key).filter(|f| f["id"].is_string())
+}
+
+/// What a cache's text holds under `key` — the same layout for both caches.
+fn entry(text: &str, key: &str) -> Option<Value> {
+    serde_json::from_str::<Vec<Value>>(text).ok()?.into_iter().find(|e| e["key"] == key).map(|e| e["file"].clone())
+}
+
+/// The quotes own-key jobs were submitted on, for `status` to set the bill
+/// beside — kept the way landed clips are ([`landed_put`]: same key, lock and
+/// whole-file rename, the oldest past [`LANDED_KEEP`] dropped), in a file of
+/// their own.
+fn quotes_path() -> std::path::PathBuf {
+    landed_path().with_file_name("video-quotes.json")
+}
+
+fn quote_get(path: &std::path::Path, key: &str) -> Option<Value> {
+    entry(&std::fs::read_to_string(path).ok()?, key).filter(|q| q["tokens"].is_u64())
+}
+
+/// How long an mp4 / mov runs, from its `moov`/`mvhd` box — enough to price a
+/// reference video without ffprobe. `None` for anything this can't read.
+fn mp4_secs(path: &std::path::Path) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    // Walk `[start, end)`'s boxes for `want`: (payload start, payload end).
+    fn find(f: &mut std::fs::File, mut at: u64, end: u64, want: &[u8; 4]) -> Option<(u64, u64)> {
+        while at + 8 <= end {
+            f.seek(SeekFrom::Start(at)).ok()?;
+            let mut h = [0u8; 8];
+            f.read_exact(&mut h).ok()?;
+            let mut size = u64::from(u32::from_be_bytes(h[..4].try_into().ok()?));
+            let mut head = 8;
+            if size == 1 {
+                let mut big = [0u8; 8];
+                f.read_exact(&mut big).ok()?;
+                size = u64::from_be_bytes(big);
+                head = 16;
+            } else if size == 0 {
+                size = end - at;
+            }
+            if size < head || at + size > end {
+                return None;
+            }
+            if &h[4..] == want {
+                return Some((at + head, at + size));
+            }
+            at += size;
+        }
+        None
+    }
+    let (moov, moov_end) = find(&mut f, 0, len, b"moov")?;
+    let (mvhd, _) = find(&mut f, moov, moov_end, b"mvhd")?;
+    f.seek(SeekFrom::Start(mvhd)).ok()?;
+    let mut b = [0u8; 32];
+    f.read_exact(&mut b).ok()?;
+    let (scale, dur) = if b[0] == 1 {
+        (u32::from_be_bytes(b[20..24].try_into().ok()?), u64::from_be_bytes(b[24..32].try_into().ok()?))
+    } else {
+        (u32::from_be_bytes(b[12..16].try_into().ok()?), u64::from(u32::from_be_bytes(b[16..20].try_into().ok()?)))
+    };
+    (scale > 0 && dur > 0).then(|| dur as f64 / f64::from(scale))
 }
 
 /// The cache's next text: `text` (`None` = no cache yet) with `key → file` in
@@ -1533,7 +1656,8 @@ mod tests {
             "own_key_linked": true,
             "estimate": { "tokens": 39749, "usd": 0.47, "note": "估算：按钱包价 × 公式" },
         });
-        let quoted = own_priced(checked.clone(), billing("ark", "ops", Some("ops:cam")));
+        let body = json!({ "refs": [{ "role": "first_frame", "file": "f_1" }], "generate_audio": true });
+        let quoted = own_priced(checked.clone(), &body, billing("ark", "ops", Some("ops:cam")));
         assert_eq!(quoted["billing"]["via"], "own");
         assert_eq!(quoted["billing"]["connection"], "ark");
         assert_eq!(quoted["billing"]["owner"], "ops");
@@ -1541,12 +1665,16 @@ mod tests {
         let note = quoted["billing"]["note"].as_str().unwrap();
         assert!(note.contains("@ops:cam") && note.contains("consent card"), "says what a real submit does: {note}");
         assert_eq!(quoted["dry_run"], true);
-        assert_eq!(quoted["estimate"]["tokens"], 39749, "the server's figure");
+        // ModelArk's count and list price, not the server's wallet figure.
+        assert_eq!(quoted["estimate"]["tokens"], 38830, "the vendor's count for 2.5 · 480p · 4 s");
+        assert_eq!(quoted["estimate"]["usd_per_m"], 10.7, "list price at 480p");
         assert_eq!(quoted["estimate"]["note"], OWN_ESTIMATE_NOTE, "labelled for ModelArk's bill");
+        assert!(quoted["estimate"]["audio"].as_str().unwrap().starts_with("on"));
+        assert!(quoted["estimate"].get("input_video_secs").is_none(), "a first frame adds nothing");
         for house_fact in ["configured", "walletable", "ref_urls", "own_key_linked", "wallet"] {
             assert!(quoted.get(house_fact).is_none(), "{house_fact} is the house key's");
         }
-        let allowed = own_priced(checked, billing("ark", "ops", None));
+        let allowed = own_priced(checked, &body, billing("ark", "ops", None));
         assert_eq!(allowed["billing"]["allowed"], true);
         assert!(!allowed["billing"]["note"].as_str().unwrap().contains("consent card"));
     }
@@ -1638,15 +1766,19 @@ mod tests {
     fn an_own_key_status_reads_like_a_house_one_minus_the_wallet() {
         let task = json!({
             "id": "cgt-1", "model": "dreamina-seedance-2-5-260628", "status": "succeeded",
+            "resolution": "480p", "duration": 4,
             "content": { "video_url": "https://ark-cdn.example/v.mp4" },
             "usage": { "completion_tokens": 39749, "total_tokens": 39749 },
             "seed": 7, "created_at": 1, "updated_at": 2,
         });
-        let v = own_status_view("own:ark:cgt-1", "ark", "ops", &task, Some(11.7));
+        let quote = json!({ "tokens": 38830, "usd": 0.415, "usd_per_m": 10.7 });
+        let v = own_status_view("own:ark:cgt-1", "ark", "ops", &task, Some(&quote));
         assert_eq!(v["job_id"], "own:ark:cgt-1");
         assert_eq!(v["status"], "succeeded");
         assert_eq!(v["usage"], json!({ "unit": "token", "output": 39749, "total": 39749 }));
-        assert!((v["cost_usd"].as_f64().unwrap() - 39749.0 * 11.7 / 1e6).abs() < 1e-9);
+        assert!((v["cost_usd"].as_f64().unwrap() - 39749.0 * 10.7 / 1e6).abs() < 1e-9, "list price at 480p");
+        assert_eq!(v["estimate"], quote, "the quote beside the bill");
+        assert!(v["check"].as_str().unwrap().starts_with("close"), "{}", v["check"]);
         assert_eq!(v["billing"]["via"], "own");
         assert_eq!(v["billing"]["connection"], "ark");
         assert!(v.get("wallet").is_none(), "nothing was held, nothing is charged here");
@@ -1654,7 +1786,7 @@ mod tests {
 
         let queued = own_status_view("own:ark:cgt-2", "ark", "ops", &json!({ "status": "queued" }), None);
         assert_eq!(queued["status"], "queued");
-        assert!(queued["usage"].is_null() && queued["cost_usd"].is_null());
+        assert!(queued["usage"].is_null() && queued["cost_usd"].is_null() && queued["check"].is_null());
         assert!(queued.get("error").is_none());
 
         let failed = own_status_view(
@@ -1662,11 +1794,96 @@ mod tests {
             "ark",
             "ops",
             &json!({ "status": "failed", "error": { "code": "InternalServiceError", "message": "boom" } }),
-            Some(11.7),
+            Some(&quote),
         );
         assert_eq!(failed["error"], json!({ "code": "InternalServiceError", "message": "boom" }));
         assert!(failed["cost_usd"].is_null(), "no count, no figure");
         assert_eq!(own_status_view("j", "ark", "ops", &json!({}), None)["status"], "unknown");
+    }
+
+    /// 2026-10-30, director stage C: Seedance 2.0 · 480p · 5 s with a 5 s
+    /// animatic. The old quote said 48,437 and ModelArk billed 100,858 at its
+    /// with-video rate — the gap now shows on the job, and a quote that counts
+    /// the animatic matches.
+    #[test]
+    fn a_reference_video_is_in_the_quote_and_the_bill_is_checked_against_it() {
+        let checked = json!({ "model": "dreamina-seedance-2-0-260128", "resolution": "480p", "duration": 5 });
+        let refs = json!([{ "role": "reference_video", "file": "f_animatic" }, { "role": "reference_image", "file": "f_girl" }]);
+        let measured = json!({ "refs": refs.clone(), "ref_video_secs": 5.0, "generate_audio": false });
+        let q = own_estimate(&checked, &measured);
+        assert_eq!(q["tokens"], 100_858);
+        assert_eq!(q["usd_per_m"], 4.3, "the with-video rate");
+        assert_eq!(q["input_video_secs"], 5.0);
+        assert!(q.get("input_video_assumed").is_none());
+        assert_eq!(q["audio"], "off");
+        // Not measured (a link, a file id): counted as long as the clip, and said.
+        let unmeasured = own_estimate(&checked, &json!({ "refs": refs }));
+        assert_eq!(unmeasured["tokens"], 100_858);
+        assert!(unmeasured["input_video_assumed"].is_string());
+
+        let task = json!({
+            "model": "dreamina-seedance-2-0-260128", "status": "succeeded", "resolution": "480p", "duration": 5,
+            "usage": { "completion_tokens": 100858, "total_tokens": 100858 },
+        });
+        let v = own_status_view("own:ark:cgt-c", "ark", "ops", &task, Some(&q));
+        assert_eq!(v["check"], "match");
+        assert!((v["cost_usd"].as_f64().unwrap() - 100858.0 * 4.3 / 1e6).abs() < 1e-9);
+        let old = json!({ "tokens": 48437 });
+        let v = own_status_view("own:ark:cgt-c", "ark", "ops", &task, Some(&old));
+        assert!(v["check"].as_str().unwrap().starts_with("OFF"), "{}", v["check"]);
+        // No quote kept here: a count that far over the clip's own frames is a
+        // reference video's, priced at the with-video rate.
+        let v = own_status_view("own:ark:cgt-c", "ark", "ops", &task, None);
+        assert_eq!(v["price_usd_per_m"], 4.3);
+        assert!(v["check"].as_str().unwrap().starts_with("no quote"));
+    }
+
+    /// `--no-audio` is the only way to a silent clip; `--audio` still parses.
+    #[test]
+    fn sound_is_on_unless_asked_off() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: VideoCmd,
+        }
+        let audio_of = |extra: &[&str]| -> bool {
+            let mut args = vec!["x", "submit", "--model", "m", "p"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).expect("parses").cmd {
+                VideoCmd::Submit { no_audio, .. } => !no_audio,
+                _ => unreachable!(),
+            }
+        };
+        assert!(audio_of(&[]), "on by default");
+        assert!(audio_of(&["--audio"]), "the old flag still runs");
+        assert!(!audio_of(&["--no-audio"]));
+        assert!(Cli::try_parse_from(["x", "submit", "--model", "m", "p", "--audio", "--no-audio"]).is_err());
+    }
+
+    /// A reference video's length, off the file's own `mvhd`.
+    #[test]
+    fn an_mp4s_length_is_read_off_its_header() {
+        fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut b = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(kind);
+            b.extend_from_slice(payload);
+            b
+        }
+        let mut mvhd = vec![0u8; 100];
+        mvhd[12..16].copy_from_slice(&1000u32.to_be_bytes()); // timescale
+        mvhd[16..20].copy_from_slice(&5040u32.to_be_bytes()); // duration
+        let mut file = bx(b"ftyp", b"isom0000");
+        file.extend(bx(b"moov", &[bx(b"trak", &[0u8; 16]), bx(b"mvhd", &mvhd)].concat()));
+        file.extend(bx(b"mdat", &[0u8; 64]));
+        let dir = std::env::temp_dir().join(format!("mvhd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.mp4");
+        std::fs::write(&p, &file).unwrap();
+        assert_eq!(mp4_secs(&p), Some(5.04));
+        std::fs::write(&p, b"not a video").unwrap();
+        assert_eq!(mp4_secs(&p), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The driver's blinks get #826's backoff exactly as the house path's do;

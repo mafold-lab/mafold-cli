@@ -677,6 +677,14 @@ pub trait Harness: Send + Sync {
         true
     }
 
+    /// Can this build drive the version of it installed here (`None` = not
+    /// installed)? Your own OpenCode is driven on its 1 line only; every other
+    /// runtime, whatever is installed.
+    fn runs_version(&self, version: Option<&str>) -> bool {
+        let _ = version;
+        true
+    }
+
     /// Can a turn of this harness be CORRECTED while it runs — i.e. does it read
     /// [`Turn::steer_file`] and deliver what it finds to the model mid-flight?
     ///
@@ -825,7 +833,7 @@ pub trait Harness: Send + Sync {
 
 /// Every harness id the CLI knows about (installed or not) — what it probes
 /// and reports, whether or not it can drive it ([`Harness::runs`]).
-pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw", "kimi-code"];
+pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw", "kimi-code", "opencode-own"];
 
 /// The default when a bot doesn't specify one.
 #[allow(dead_code)]
@@ -843,6 +851,7 @@ pub fn select(id: &str) -> Arc<dyn Harness> {
         "codex" | "codex-cli" => Arc::new(codex::Codex),
         "kimi-code" | "kimi" | "kimi-cli" | "kimicode" => Arc::new(kimi_code::KimiCode),
         "opencode" | "open-code" => Arc::new(opencode::OpenCode),
+        "opencode-own" | "own-opencode" => Arc::new(opencode::OwnOpenCode),
         other => Arc::new(unsupported::Unsupported { id: intern(other) }),
     }
 }
@@ -874,6 +883,9 @@ enum Bin {
     /// passes for it. Its version is the pin's: only a build that matched
     /// the pinned hash and said so is ever put there (`opencode_pin`).
     Pinned { path: fn() -> PathBuf, version: &'static str },
+    /// The vendor's own install, found where its installer puts it as well as
+    /// on `$PATH` (your own OpenCode: `~/.opencode/bin`).
+    Found(fn() -> Option<PathBuf>),
 }
 
 impl Bin {
@@ -882,6 +894,8 @@ impl Bin {
         match self {
             Bin::OnPath(bin) => bin.to_string(),
             Bin::Pinned { path, .. } => path().to_string_lossy().into_owned(),
+            // Where it was found, else its name (spawning that says it's missing).
+            Bin::Found(find) => find().map_or_else(|| "opencode".to_string(), |p| p.to_string_lossy().into_owned()),
         }
     }
 
@@ -890,6 +904,7 @@ impl Bin {
         match self {
             Bin::OnPath(bin) => bin_version(bin),
             Bin::Pinned { version, .. } => Some(version.to_string()),
+            Bin::Found(find) => find().and_then(|p| version_of(&p)),
         }
     }
 }
@@ -901,6 +916,7 @@ const BINS: &[(&str, Bin)] = &[
     ("codex", Bin::OnPath("codex")),
     ("openclaw", Bin::OnPath("openclaw")),
     ("kimi-code", Bin::OnPath("kimi")),
+    ("opencode-own", Bin::Found(opencode::own_binary)),
 ];
 
 /// Probe which known harnesses are installed on THIS machine (their CLI is on
@@ -908,7 +924,15 @@ const BINS: &[(&str, Bin)] = &[
 /// capability report for New-Bot recommendation. Returns `(id, available)`.
 /// Extend `BINS` as more harness impls land.
 pub fn probe() -> Vec<(&'static str, bool)> {
-    BINS.iter().map(|(id, bin)| (*id, on_path(&bin.program()))).collect()
+    BINS.iter()
+        .map(|(id, bin)| {
+            let installed = match bin {
+                Bin::Found(find) => find().is_some(),
+                other => on_path(&other.program()),
+            };
+            (*id, installed)
+        })
+        .collect()
 }
 
 /// `probe_with_versions` cache: version probes spawn subprocesses, so results
@@ -980,7 +1004,7 @@ pub async fn report_rows() -> Vec<Value> {
         // Ask the harness itself (`runs`) instead of keeping a second list of
         // "ids that are implemented" (§9).
         let h = select(id);
-        let runs = h.runs();
+        let runs = h.runs() && h.runs_version(version.as_deref());
         let implemented = available && runs;
         let (health, accounts) = if implemented {
             // Only Claude Code keys logins by directory today; every other
@@ -1012,9 +1036,38 @@ pub async fn report_rows() -> Vec<Value> {
             "version": version,
             "health": health,
             "accounts": accounts,
+            // What it can be signed in with here (`HarnessInfo::sign_ins`).
+            "sign_ins": sign_ins_of(id, implemented).await,
         }));
     }
     rows
+}
+
+/// What Mafold here can run `id` on, as the report says it: each runtime's
+/// own login; Mafold Harness on OpenCode Go and the wallet; your own OpenCode
+/// on OpenCode Go, saying whether it is signed in to Go here. Go's models are
+/// the ones that OpenCode lists (`opencode::go_models`), once it's installed.
+async fn sign_ins_of(id: &str, installed: bool) -> Value {
+    let models = |bin: Option<PathBuf>, isolated: bool| async move {
+        match bin.filter(|_| installed) {
+            Some(bin) => tokio::task::spawn_blocking(move || opencode::go_models(&bin, isolated)).await.unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    match id {
+        "claude-code" => serde_json::json!([{ "id": "claude" }]),
+        "codex" => serde_json::json!([{ "id": "codex" }]),
+        "kimi-code" => serde_json::json!([{ "id": "kimi" }]),
+        "opencode" => {
+            let m = models(Some(opencode_pin::binary()), true).await;
+            serde_json::json!([{ "id": crate::fuel::GO, "models": m }, { "id": crate::fuel::WALLET }])
+        }
+        opencode::OWN => {
+            let m = models(opencode::own_binary(), false).await;
+            serde_json::json!([{ "id": crate::fuel::GO, "signed_in": opencode::own_go_login(), "models": m }])
+        }
+        _ => serde_json::json!([]),
+    }
 }
 
 /// The whole `reportHarnesses` body for this machine as `sess` — what
@@ -1281,6 +1334,16 @@ fn bin_version(bin: &str) -> Option<String> {
         .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .unwrap_or(line);
     (!v.is_empty()).then(|| v.chars().take(32).collect())
+}
+
+/// [`bin_version`] of a binary at a path.
+pub(crate) fn version_of(path: &Path) -> Option<String> {
+    bin_version(&path.to_string_lossy())
+}
+
+/// Could `Command` start the file at `p`?
+pub(crate) fn is_launchable(p: &Path) -> bool {
+    launchable(p)
 }
 
 /// Is `bin` resolvable on `$PATH`? Windows-aware: also tries each `PATHEXT`
@@ -1638,7 +1701,7 @@ mod select_tests {
         assert_eq!(
             unsupported::refusal("openclaw"),
             "This agent is set to run OpenClaw, which Mafold on this computer can't run, so nothing ran. \
-             Mafold runs Claude Code, OpenCode, Codex and Kimi Code: make a new agent on one of them."
+             Mafold runs Claude Code, Mafold Harness, Codex, Kimi Code and OpenCode: make a new agent on one of them."
         );
     }
 

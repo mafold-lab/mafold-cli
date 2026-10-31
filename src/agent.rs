@@ -1759,6 +1759,11 @@ impl OwnerConfig {
     fn on_wallet(&self) -> bool {
         crate::fuel::is_wallet(self.fuel.as_deref())
     }
+
+    /// The agent runs on its owner's OpenCode Go plan.
+    fn on_go(&self) -> bool {
+        crate::fuel::is_go(self.fuel.as_deref())
+    }
 }
 
 /// The owner config this daemon runs under — the one `botConfigUpdated` and a
@@ -1771,6 +1776,14 @@ static OWNER_CONFIG: std::sync::OnceLock<Arc<RwLock<OwnerConfig>>> = std::sync::
 async fn on_wallet() -> bool {
     match OWNER_CONFIG.get() {
         Some(c) => c.read().await.on_wallet(),
+        None => false,
+    }
+}
+
+/// Does this agent run on its owner's OpenCode Go plan right now?
+async fn on_go() -> bool {
+    match OWNER_CONFIG.get() {
+        Some(c) => c.read().await.on_go(),
         None => false,
     }
 }
@@ -2614,6 +2627,8 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         // Mafold Harness brings its own pinned OpenCode (`opencode_pin`): not
         // having it yet is not a failure — the first reply installs it.
         println!("OpenCode {} isn't on this computer yet — the first reply installs it.", crate::harness::opencode_pin::VERSION);
+    } else if !harness.available() && harness.id() == crate::harness::opencode::OWN {
+        eprintln!("⚠️  OpenCode isn't installed on this computer — replies will fail until it is (`mafold install opencode-own`).");
     } else if !harness.available() {
         eprintln!("⚠️  harness `{}` CLI not found on PATH — replies will fail until it's installed.", harness.id());
         if harness.id() == "claude-code" {
@@ -2691,6 +2706,9 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // model/effort/prompt in Customization) without a daemon restart.
     if owner.on_wallet() {
         println!("fuel: @{my_username} runs on its owner's wallet — one key per reply, replies to its owner only");
+    }
+    if owner.on_go() {
+        println!("fuel: @{my_username} runs on its owner's OpenCode Go plan — the key from their Connections, opened per reply");
     }
     let owner = Arc::new(RwLock::new(owner));
     let _ = OWNER_CONFIG.set(owner.clone());
@@ -7610,6 +7628,27 @@ pub(crate) fn handover_cause(o: &crate::harness::TurnOutcome) -> Option<Handover
         .map(|_| Handover::SignedOut)
 }
 
+/// The pauses before each run a network cut gets ([`net_cut`]): claude has
+/// already retried for a minute or two by the time its run ends on one, so
+/// these wait longer — a proxy or Wi-Fi that drops for minutes comes back
+/// inside them.
+const NET_PAUSES: [std::time::Duration; 3] =
+    [std::time::Duration::from_secs(45), std::time::Duration::from_secs(120), std::time::Duration::from_secs(300)];
+
+/// The run ended because the NETWORK did: the connection to the model broke,
+/// or the provider was briefly down or overloaded (`failure::classify` —
+/// Network, Unavailable). Never a usage wall or a refused sign-in (the
+/// failover above takes those), a stop, or anything about the conversation.
+fn net_cut(o: &crate::harness::TurnOutcome) -> bool {
+    use mafold_transcript::failure::{classify, FailureKind};
+    if o.stopped || seat_trouble(o) {
+        return false;
+    }
+    o.error
+        .as_deref()
+        .is_some_and(|e| matches!(classify(e).kind, FailureKind::Network | FailureKind::Unavailable))
+}
+
 /// The run ended on the ACCOUNT, not the conversation: a full window or a
 /// refused sign-in. Such a session is intact and must never be dropped.
 fn seat_trouble(o: &crate::harness::TurnOutcome) -> bool {
@@ -9742,6 +9781,23 @@ async fn handle(
     };
     // What each renderer reads the reply's total for before its result card.
     let wallet_draft = fuel.as_ref().map(|f| f.draft.clone());
+    // An agent on its owner's OpenCode Go plan (`fuel::go_step`): the owner's
+    // key, opened here from their Connections — or nothing, for their own
+    // OpenCode already signed in to Go on this computer. Same road as a
+    // refused wallet key: the reply says why and nothing starts. Held to the
+    // turn's end, which is how long the key stays masked.
+    let _go_key = if refused.is_none() && !no_usable_account && !stopped_in_setup && !is_held_draft(&msg_id) && on_go().await {
+        match crate::fuel::go_step(&client.base, bot_owner().await.as_deref(), harness.id(), &mut env).await {
+            Ok(k) => k,
+            Err(why) => {
+                eprintln!("opencode go: no key for reply {msg_id} — {}", crate::logfile::one_line(&why));
+                refused = Some(why);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Which process is running this turn, for the generating card's heartbeat
     // (`Heartbeat::keepalive`). One for the whole turn: every attempt below —
@@ -9985,6 +10041,94 @@ async fn handle(
         drop_turn(chat_states, chat_id, &cancel).await;
         seat_produced |= matches!(&result, Ok(o) if o.produced);
         seat = Some(next);
+    }
+    // A run the NETWORK ended — the connection to the model dropped
+    // (ECONNRESET) or the provider was down for a moment, after claude's own
+    // retries gave up. Nothing about the conversation is wrong: the session is
+    // on disk, so the same turn goes again on the same login after a pause,
+    // instead of ending on an error card that waits for somebody to type 继续
+    // (2026-10-30: a video agent's edit of a 90 s film died that way mid-cut
+    // and sat until a person spoke; the owner typed 继续 after this kind of
+    // drop again and again that month). At most `NET_PAUSES.len()` more runs.
+    // The turn stays registered through each pause, so `/stop` ends it there.
+    let mut net_tries = 0;
+    while let Some(pause) = NET_PAUSES.get(net_tries) {
+        let Ok(o) = &result else { break };
+        if !net_cut(o) {
+            break;
+        }
+        net_tries += 1;
+        println!(
+            "↻ the network cut this run off ({}) — going again in {}s ({net_tries}/{})",
+            o.error.as_deref().unwrap_or_default(),
+            pause.as_secs(),
+            NET_PAUSES.len()
+        );
+        {
+            let mut states = chat_states.lock().await;
+            let st = states.entry(chat_id.to_string()).or_default();
+            st.turns.insert(
+                live_draft.lock().unwrap().clone(),
+                TurnHandle {
+                    cancel: cancel.clone(),
+                    ask_file: None,
+                    perm: None,
+                    owner: turn_sender.to_string(),
+                    channel: channel_id.map(str::to_string),
+                    thread: thread_root.map(str::to_string),
+                    events: ev_keep.clone(),
+                    steer_file: steer_file.clone(),
+                    can_steer: harness.can_steer(),
+                    pays,
+                    guest,
+                },
+            );
+        }
+        let stopped = tokio::select! {
+            _ = tokio::time::sleep(*pause) => false,
+            _ = cancel.notified() => true,
+        };
+        if stopped {
+            drop_turn(chat_states, chat_id, &cancel).await;
+            if let Ok(o) = &mut result {
+                o.stopped = true;
+            }
+            break;
+        }
+        let again = Turn {
+            prompt: if seat_produced {
+                format!(
+                    "(your previous run on this message was cut off by a network error — the \
+                     connection to the model dropped. The session and everything you did so far \
+                     are intact. Continue from where you left off; don't redo work that already \
+                     landed. The message you are answering is repeated below.)\n\n{full_prompt}"
+                )
+            } else {
+                full_prompt.clone()
+            },
+            conv: chat_id.to_string(),
+            surface: surface.clone(),
+            draft: msg_id.clone(),
+            workdir: workdir.to_string(),
+            session: last_good_session.clone().or_else(|| prior.clone()),
+            model: model.clone(),
+            effort: effort.clone(),
+            thinking,
+            cancel: cancel.clone(),
+            system: system.clone(),
+            ask_file: Some(ask_file.clone()),
+            steer_file: Some(steer_file.clone()),
+            env: env.clone(),
+            mount: mount.clone(),
+            skill_plugins: skill_plugins.clone(),
+            proc: turn_proc.clone(),
+        };
+        result = harness.run(again, ev_keep.clone()).await;
+        if let Ok(o) = &result {
+            retain_attempt_session(&mut last_good_session, o);
+        }
+        drop_turn(chat_states, chat_id, &cancel).await;
+        seat_produced |= matches!(&result, Ok(o) if o.produced);
     }
     if let Ok(o) = &mut result {
         // What the earlier attempt(s) put on screen is still on screen.
@@ -17699,6 +17843,37 @@ mod wall_footer_tests {
 
     fn ended_on(error: &str) -> crate::harness::TurnOutcome {
         crate::harness::TurnOutcome { error: Some(error.into()), produced: true, ..Default::default() }
+    }
+
+    /// 2026-10-30: a run that died on the network goes again by itself; a run
+    /// that ended for any other reason does not.
+    #[test]
+    fn only_a_network_cut_goes_again_by_itself() {
+        use super::net_cut;
+        for cut in [
+            "Connection dropped (ECONNRESET)",
+            "API Error: Connection error.",
+            "API Error: 529 overloaded",
+            "error sending request for url (https://api.anthropic.com/v1/messages): operation timed out",
+        ] {
+            assert!(net_cut(&ended_on(cut)), "{cut}");
+        }
+        for not in [
+            "API Error: 401 Invalid API key · Please run /login",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+            "claude exited unsuccessfully: a new unknown provider failure",
+        ] {
+            assert!(!net_cut(&ended_on(not)), "{not}");
+        }
+        let full = crate::harness::TurnOutcome {
+            limit: Some(crate::harness::LimitHit { kind: "five_hour".into(), resets_at: None }),
+            ..ended_on("You've hit your session limit")
+        };
+        assert!(!net_cut(&full), "a usage wall is the failover's");
+        let stopped = crate::harness::TurnOutcome { stopped: true, ..ended_on("Connection dropped (ECONNRESET)") };
+        assert!(!net_cut(&stopped), "a stop is a stop");
+        assert!(!net_cut(&crate::harness::TurnOutcome::default()), "a clean end");
+        assert!(super::NET_PAUSES.iter().all(|p| p.as_secs() >= 30), "longer than claude's own retries");
     }
 
     /// The owner's rule (2026-09-27): a run refused on sign-in moves to the
