@@ -728,6 +728,28 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // The python tool (ops 10-30 plan, "build first, start it" 11-01): one
+    // Cloudflare Container per reply, network off, billed at cost in the
+    // `sandbox` currency. The api reads it on the PAYER — the agent's owner —
+    // so a record of `Accounts[opsdu]` opens every `opsdu:*` agent at once.
+    // No screen reads it: the tool is the agent's. The daemon does, as the
+    // bot (its owner's record covers it), to tell its agent about `mafold
+    // sandbox` — an agent told of a tool it can't use goes and tries it.
+    FlagMeta {
+        key: "pySandbox",
+        default: false,
+        dev_default: false,
+        label: "Agents: run Python",
+        description: "Your agents can run Python on the files in a chat: each reply gets its own \
+                      sandbox (1 vCPU, 3 GiB, network off) that ends with the reply, and the files \
+                      it writes come back on the reply. It bills your wallet at Cloudflare's price \
+                      in the sandbox currency. The api runs code (sandboxRun) only for agents whose \
+                      owner has this on.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Daemon],
+        server: ClosedWithoutRecord,
+    },
     // Passes (ops 10-30, "build it now"): credit only its holder can spend.
     // The api reads it on the SUBSCRIBER: where it's on, a paid Premium
     // period lands as a Premium Pass instead of ordinary, sendable credit
@@ -1031,6 +1053,20 @@ mod tests {
         let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
         assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
         assert_eq!(m.clients, &[Daemon], "{k}: the daemon words its agents' tool list on it; web and phone see only cards");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn py_sandbox_is_a_server_gate_that_ships_dark() {
+        // The api runs code only for agents whose owner has it; the daemon
+        // tells its agent about `mafold sandbox` on the same answer, so an
+        // agent is never told of a tool the api would refuse it.
+        let k = "pySandbox";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert_eq!(m.clients, &[Daemon], "{k}: the daemon words its agents' prompt on it; no screen reads it");
         assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
         assert!(!server_default(k), "{k}: shut without a record");
         assert_eq!(server_key(k), k);

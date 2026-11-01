@@ -50,6 +50,9 @@ pub mod units;
 /// ref roles — one rule for the api's `videoSubmit` and the core's
 /// `ark-video` driver (`video.rs`).
 pub mod video;
+/// How a Python sandbox run reads to the agent that ran it — one copy for the
+/// hosted `python` tool and `mafold sandbox run` (`sandbox.rs`).
+pub mod sandbox;
 /// What may sign a new agent in, by where it runs and its runtime — the Rust
 /// half of `client-shared/newAgent.ts`, tested against the same table.
 pub mod agent_setup;

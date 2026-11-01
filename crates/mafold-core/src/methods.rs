@@ -344,6 +344,8 @@ pub static KNOWN_METHODS: &[&str] = &[
     "routerRelease",
     "routerSettle",
     "routerVerify",
+    "sandboxEnd",
+    "sandboxRun",
     "saveDraft",
     "saveFolder",
     "searchMessages",

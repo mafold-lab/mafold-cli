@@ -124,11 +124,20 @@ const RPC_TIMEOUT_MS: u64 = 60_000;
 /// A little over the server's deadline, so its own refusal arrives first.
 const LANDING_RPC_TIMEOUT_MS: u64 = 610_000;
 
+/// The budget for `sandboxRun` (`mafold sandbox run`): the code itself may
+/// take 300 s, and the api gives the Worker 140 s on top for a cold start and
+/// the runner's grace (`RUN_OVERHEAD`, mafold-api/src/sandbox_api.rs) — 440 s
+/// before the api answers — plus room for the files going in and out. A
+/// caller that hung up sooner would lose the answer of a run that still
+/// happened and is still billed: what it printed, and what it attached.
+const SANDBOX_RUN_RPC_TIMEOUT_MS: u64 = 600_000;
+
 /// How long `method` may go without an answer. One table for every platform,
 /// for the same reason as [`RPC_TIMEOUT_MS`].
 fn budget_ms(method: &str) -> u64 {
     match method {
         "ingestUrl" | "videoStatus" => LANDING_RPC_TIMEOUT_MS,
+        "sandboxRun" => SANDBOX_RUN_RPC_TIMEOUT_MS,
         _ => RPC_TIMEOUT_MS,
     }
 }
@@ -647,9 +656,16 @@ mod tests {
         for m in ["ingestUrl", "videoStatus"] {
             assert!(budget_ms(m) > 600_000, "{m} must outlast INGEST_URL_DEADLINE");
         }
-        for m in ["getMe", "videoSubmit", "videoCancel", "botEditDraft", "sendMessage"] {
+        for m in ["getMe", "videoSubmit", "videoCancel", "botEditDraft", "sendMessage", "sandboxEnd"] {
             assert_eq!(budget_ms(m), RPC_TIMEOUT_MS, "{m} keeps the one-minute floor");
         }
+    }
+
+    /// A Python run waits out its longest run and the api's allowance for the
+    /// Worker (300 s + 140 s), with room left for its files.
+    #[test]
+    fn a_sandbox_run_outwaits_its_longest_run() {
+        assert!(budget_ms("sandboxRun") >= (300 + 140 + 60) * 1000);
     }
 
     // ── envelope unwrap (pure) ──

@@ -54,6 +54,7 @@ mod pending;
 mod permission_mcp;
 mod platform;
 mod runtime_login;
+mod sandbox;
 mod session;
 mod session_life;
 mod sites;
@@ -394,6 +395,14 @@ enum Cmd {
     Video {
         #[command(subcommand)]
         cmd: video::VideoCmd,
+    },
+    /// Python in the reply's own sandbox (agent tool surface): run / end. One
+    /// sandbox per reply — 1 vCPU, 3 GiB, no network — that ends with it; what
+    /// the code writes to /mnt/data/out lands on the reply. The server decides
+    /// who may run code and bills the agent's owner (flag `pySandbox`).
+    Sandbox {
+        #[command(subcommand)]
+        cmd: sandbox::SandboxCmd,
     },
     /// Feature flags, with this identity's own token: list / show / add /
     /// remove / set / delete / check. The server decides who may
@@ -1038,6 +1047,7 @@ async fn main() -> Result<()> {
         Cmd::D1 { cmd } => d1::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Sites { cmd } => sites::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Video { cmd } => video::run(cmd, &Client::new(cli.base, token?)).await?,
+        Cmd::Sandbox { cmd } => sandbox::run(cmd, &Client::new(cli.base, token?)).await?,
         Cmd::Pin { message, chat, unpin } => {
             msgops::pin(&Client::new(cli.base, token?), message.as_deref(), chat.as_deref(), unpin).await?
         }

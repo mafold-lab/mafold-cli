@@ -1922,17 +1922,23 @@ impl TurnConfig {
 /// The working directory this TURN runs in: **surface** (this channel, set by
 /// `/cwd <path>`) > chat override > live owner default (the Customize sheet is
 /// authoritative) > the process default.
-/// Returns `(dir, is_override)` — an override that can't be created falls
-/// back to the default. `is_override` namespaces the claude session key:
+/// Returns `(dir, is_override, miss)` — an override that can't be created or
+/// can't be read falls back to the default, and `miss` says which and why
+/// ([`WorkdirMiss`]). `is_override` namespaces the claude session key:
 /// claude-code sessions are cwd-bound, so a chat whose workdir moved must
 /// fork its context rather than fail to resume.
-fn resolve_turn_workdir(surface: Option<&str>, conv: Option<&str>, owner: Option<&str>, default: &str) -> (String, bool) {
+fn resolve_turn_workdir(
+    surface: Option<&str>,
+    conv: Option<&str>,
+    owner: Option<&str>,
+    default: &str,
+) -> (String, bool, Option<WorkdirMiss>) {
     // Normalize away `\\?\` everywhere: it is what `canonicalize` hands back on
     // Windows and what a daemon can be registered with, but Claude Code drops it
     // before naming its project dir — so keeping it would make the session key
     // and the transcript lookup disagree with the agent itself.
     let default = crate::commands::strip_extended_prefix(default);
-    let Some(want) = surface.or(conv).or(owner) else { return (default.to_string(), false) };
+    let Some(want) = surface.or(conv).or(owner) else { return (default.to_string(), false, None) };
     let expanded = if let Some(rest) = want.strip_prefix("~/") {
         format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "~".into()))
     } else {
@@ -1942,15 +1948,82 @@ fn resolve_turn_workdir(surface: Option<&str>, conv: Option<&str>, owner: Option
         .map(|p| crate::commands::strip_extended_prefix(&p.to_string_lossy()).to_string())
         .unwrap_or(expanded);
     if dir == default {
-        return (dir, false);
+        return (dir, false, None);
     }
     if !std::path::Path::new(&dir).is_dir() {
+        // Refused, not missing: there is nothing to create, and trying would
+        // put "File exists" where the refusal should be.
+        if let Err(e) = std::fs::metadata(&dir) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                println!("⚠️ workdir {dir} can't be reached ({e}) — using the default {default}");
+                return (default.to_string(), false, Some(WorkdirMiss::new(want, &dir, &e)));
+            }
+        }
         if let Err(e) = std::fs::create_dir_all(&dir) {
             println!("⚠️ workdir {dir} can't be created ({e}) — using the default {default}");
-            return (default.to_string(), false);
+            return (default.to_string(), false, Some(WorkdirMiss::new(want, &dir, &e)));
         }
     }
-    (dir, true)
+    // A folder this process may not list is no place to work: every tool run
+    // in it fails the same way. macOS answers exactly that for Desktop,
+    // Documents and Downloads to a program it hasn't let in.
+    if let Err(e) = std::fs::read_dir(&dir) {
+        println!("⚠️ workdir {dir} can't be read ({e}) — using the default {default}");
+        return (default.to_string(), false, Some(WorkdirMiss::new(want, &dir, &e)));
+    }
+    (dir, true, None)
+}
+
+/// A working directory a turn was set to run in and can't — said at the top
+/// of the reply, and by `/cwd` and `/status`. It used to reach only this
+/// machine's log: a folder set in the Customize sheet looked as if it "didn't
+/// take" while every reply quietly ran in the default (ops, 10-31).
+#[derive(Debug, Clone, PartialEq)]
+struct WorkdirMiss {
+    /// What was set, as it was set (`~/x` stays `~/x`).
+    wanted: String,
+    /// The operating system's words for why not.
+    why: String,
+    /// macOS's guard on Desktop / Documents / Downloads, by the look of it: a
+    /// refusal for a folder inside one of them, on a Mac.
+    guarded: bool,
+}
+
+impl WorkdirMiss {
+    fn new(wanted: &str, dir: &str, e: &std::io::Error) -> Self {
+        let guarded = cfg!(target_os = "macos")
+            && e.kind() == std::io::ErrorKind::PermissionDenied
+            && in_guarded_folder(dir, &std::env::var("HOME").unwrap_or_default());
+        Self { wanted: wanted.to_string(), why: e.to_string(), guarded }
+    }
+
+    /// The sentence to say: what was set, why it can't be used, where `what`
+    /// ("this reply runs", "replies here run") instead — and for a folder
+    /// macOS guards, how to let Mafold in.
+    fn say(&self, what: &str, ran_in: &str) -> String {
+        let mut s = format!(
+            "The working directory set here, `{}`, can't be used on this computer ({}), so {what} in `{ran_in}` instead.",
+            self.wanted, self.why
+        );
+        if self.guarded {
+            s.push_str(
+                " macOS keeps Desktop, Documents and Downloads closed to programs running in the background until you let them in: \
+give Mafold Full Disk Access (System Settings ▸ Privacy & Security ▸ Full Disk Access), or pick a folder outside those three.",
+            );
+        }
+        s
+    }
+}
+
+/// Is `dir` inside one of the folders macOS guards from background programs
+/// (`home`'s Desktop, Documents, Downloads)?
+fn in_guarded_folder(dir: &str, home: &str) -> bool {
+    let home = home.trim_end_matches('/');
+    !home.is_empty()
+        && ["Desktop", "Documents", "Downloads"].iter().any(|f| {
+            let top = format!("{home}/{f}");
+            dir == top || dir.starts_with(&format!("{top}/"))
+        })
 }
 
 fn sessions_path() -> PathBuf {
@@ -2663,8 +2736,8 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // and nobody's first message should wait behind a menu.
     {
         let (client, harness) = (client.clone(), harness.clone());
-        let preferred = owner.account.clone();
-        tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred).await });
+        let (preferred, on_go) = (owner.account.clone(), owner.on_go());
+        tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred, on_go).await });
     }
 
     // Recover only this machine's journaled drafts from dead producer PIDs.
@@ -3008,7 +3081,7 @@ enum Effect {
 enum Menu {
     All,
     Only(&'static str),
-    Except(&'static str),
+    Except(&'static [&'static str]),
     /// Handled but never advertised (`/compact` — the harness lists its own).
     Hidden,
 }
@@ -3036,9 +3109,10 @@ const CONTROL: &[ControlCommand] = &[
     ControlCommand { name: "stop", description: "Stop the reply that's currently running", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone, takes: Takes::Nothing },
     // The whole chat's model: the owner's, as the usage card's switch is.
     ControlCommand { name: "model", description: "Switch the model for this chat", arg_hint: Some("name | reset"), menu: Menu::All, effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
-    // A Claude Code budget (MAX_THINKING_TOKENS); codex's depth is the owner-set effort.
+    // A Claude Code budget (MAX_THINKING_TOKENS); codex's depth is the owner-set effort,
+    // and OpenCode (Mafold Harness, your own) has neither.
     // The whole chat's thinking, so the owner's, as its model is.
-    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except("codex"), effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
+    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except(&["codex", "opencode", "opencode-own"]), effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
     ControlCommand { name: "resume", description: "Resume an earlier session (terminal ones pick up their live state)", arg_hint: Some("id | last"), menu: Menu::Only("claude-code"), effect: Effect::Reversible, who: Who::Circle, takes: Takes::Words(1) },
     // Irreversible by its worst form: `forget` drops a saved login from the machine.
     ControlCommand { name: "account", description: "Which Claude account this chat runs on — list, pin, forget", arg_hint: Some("name | reset | forget <name>"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner, takes: Takes::Words(2) },
@@ -3047,7 +3121,7 @@ const CONTROL: &[ControlCommand] = &[
     ControlCommand { name: "compact", description: "Summarize this conversation's context to free tokens", arg_hint: None, menu: Menu::Hidden, effect: Effect::Irreversible, who: Who::Anyone, takes: Takes::Text },
     // The account line names the owner's Claude login; the workdir is a path on their disk.
     ControlCommand { name: "status", description: "Agent, session, account & daemon info", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle, takes: Takes::Nothing },
-    ControlCommand { name: "cwd", description: "Show the working directory", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Circle, takes: Takes::Path },
+    ControlCommand { name: "cwd", description: "Show the working directory — with a path, set it for this chat", arg_hint: Some("[path | default]"), menu: Menu::All, effect: Effect::Reversible, who: Who::Circle, takes: Takes::Path },
     ControlCommand { name: "access", description: "Who may use this bot, and who pays", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone, takes: Takes::Words(1) },
     ControlCommand { name: "help", description: "What this agent can do", arg_hint: None, menu: Menu::All, effect: Effect::Reversible, who: Who::Anyone, takes: Takes::Nothing },
 ];
@@ -3069,7 +3143,7 @@ impl ControlCommand {
         match self.menu {
             Menu::All => true,
             Menu::Only(h) => harness_id == h,
-            Menu::Except(h) => harness_id != h,
+            Menu::Except(hs) => !hs.contains(&harness_id),
             Menu::Hidden => false,
         }
     }
@@ -3201,7 +3275,15 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
 /// daemon whose turns all run on `personal` would describe a machine nobody
 /// uses. Best-effort throughout — a harness that can't be probed reports
 /// nothing and the sheet keeps whatever it had.
-async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>) {
+///
+/// `on_go`: the agent runs on its owner's OpenCode Go plan. Mafold Harness
+/// reports OpenCode Go's models, so it reports only then: on the wallet its
+/// models are the router's, handed over with each reply's key, and a menu of
+/// Go's would offer models no reply of it can run.
+async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>, on_go: bool) {
+    if harness.id() == "opencode" && !on_go {
+        return;
+    }
     let env = if harness.id() == "claude-code" {
         let Some(account) = crate::accounts::choose(preferred.as_deref(), None).await.account else { return };
         account.env()
@@ -3340,6 +3422,11 @@ fn is_our_stock_seed(schema: &[serde_json::Value]) -> bool {
             && schema[0]["options"].as_array().is_some_and(|o| {
                 o.iter().any(|x| x["value"].as_str().is_some_and(|v| v.starts_with("kimi-code/")))
             }))
+        // …or the OpenCode stock (Mafold Harness, your own OpenCode): the one
+        // shape with neither effort nor thinking. Its menu is whatever the
+        // machine reported, so the shape and the stock model label are the
+        // fingerprint, not an option.
+        || (keys == ["model", "system_prompt", "cwd"] && schema[0]["label_key"] == "botField.model.label")
 }
 
 /// The Customization fields a harness's daemon actually consumes. Field kinds are
@@ -3429,6 +3516,36 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                 access_field()
             ]),
             "model / system prompt / thinking / cwd / whitelist / blacklist / greeting / access",
+        ),
+        // Mafold Harness and your own OpenCode: a model menu, and nothing for
+        // effort, thinking or a Claude login — OpenCode runs a model as its
+        // provider serves it, with no tier or budget this daemon could pass,
+        // and the one login an agent has is what it was made with (its fuel).
+        // They used to fall through to Claude Code's sheet below: an agent on
+        // OpenCode Go was offered Fable, Opus, Sonnet and Haiku, none of which
+        // Go runs (ops 10-31). The menu is a BOOTSTRAP, as Claude Code's is:
+        // an agent on Go reports Go's models as this computer's OpenCode lists
+        // them ([`report_caps`]), and the server draws the menu from that.
+        "opencode" | crate::harness::opencode::OWN => (
+            serde_json::json!([
+                { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "", "show_on_profile": true,
+                  "options": [
+                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" }
+                  ] },
+                { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
+                  "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
+                { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" },
+                { "key": "whitelist", "label": "Whitelist", "label_key": "botField.whitelist.label", "kind": "string",
+                  "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder",
+                      "hint": "This bot runs on your computer: anyone who can drive it can read and write files there with your account.", "hint_key": "botField.whitelist.hint" },
+                { "key": "blacklist", "label": "Blacklist", "label_key": "botField.blacklist.label", "kind": "string",
+                  "placeholder": "Never these users — deny wins over the whitelist", "placeholder_key": "botField.blacklist.placeholder" },
+                { "key": "greeting", "label": "Introduction", "label_key": "botField.greeting.label", "kind": "string",
+                  "placeholder": "How to introduce yourself when first added — `off` to never speak first", "placeholder_key": "botField.greeting.placeholder" },
+                access_field()
+            ]),
+            "model / system prompt / cwd / whitelist / blacklist / greeting / access",
         ),
         // Claude Code (also the fallback): effort AND a thinking budget are two
         // different dials here — `--effort` picks how hard the agent works a
@@ -3651,6 +3768,7 @@ async fn intro_turn(
         let mut sys = mafold_preamble(my_username, peer, card_tags);
         // Nobody's turn but the agent's own: not a guest's.
         sys.push_str(mail_advice(false));
+        sys.push_str(&sandbox_advice(false));
         if let Some(extra) = cc.system_prompt.as_ref() {
             sys.push_str("\n\n");
             sys.push_str(extra);
@@ -3658,7 +3776,9 @@ async fn intro_turn(
         Some(sys)
     };
     let surface_cwd = workdirs.lock().await.get(&session_key(chat_id, None)).cloned();
-    let (turn_workdir, workdir_ns) =
+    // A folder that can't be used isn't said in an introduction: it answers
+    // nobody, and the owner's next reply here says it.
+    let (turn_workdir, workdir_ns, _) =
         resolve_turn_workdir(surface_cwd.as_deref(), cc.cwd.as_deref(), None, workdir);
     // What the room has been saying, so a group introduction can land on the
     // actual conversation instead of reciting a brochure at it. There is no
@@ -3673,7 +3793,7 @@ async fn intro_turn(
     )
     .await;
     handle(
-        client, &turn_workdir, workdir_ns, my_username, chat_id, None, None, &brief, &[],
+        client, &turn_workdir, workdir_ns, None, my_username, chat_id, None, None, &brief, &[],
         sessions, coord, chat_states, harness,
         model, effort, thinking, system, cc.account.clone(),
         &norm_user(answerer), None, group_context, &[],
@@ -5497,8 +5617,10 @@ async fn connect_and_run(
             let account = st_account.or(cc.account.clone());
             let system = {
                 let mut sys = preamble;
-                // Whose turn it is decides what it hears about the mailbox.
+                // Whose turn it is decides what it hears about the mailbox,
+                // and whether it hears of the sandbox at all.
                 sys.push_str(mail_advice(words_guest));
+                sys.push_str(&sandbox_advice(words_guest));
                 if let Some(extra) = cc.system_prompt.as_ref() {
                     sys.push_str("\n\n");
                     sys.push_str(extra);
@@ -5513,12 +5635,13 @@ async fn connect_and_run(
                 .await
                 .get(&session_key(&chat_id, channel_id.as_deref()))
                 .cloned();
-            let (turn_workdir, workdir_ns) = resolve_turn_workdir(
+            let (turn_workdir, workdir_ns, workdir_miss) = resolve_turn_workdir(
                 surface_cwd.as_deref(),
                 cc.cwd.as_deref(),
                 None, // the owner default is already the bottom rung of `cc`
                 &workdir,
             );
+            let workdir_note = workdir_miss.map(|m| m.say("this reply runs", &turn_workdir));
             // Rebuild multi-party group context the access gate dropped (None for
             // DMs / when there's nothing the resumed session is missing).
             let mut lookback_photos: Vec<String> = vec![];
@@ -5601,7 +5724,10 @@ async fn connect_and_run(
                     .flatten()
                     .filter(|_| followup_answers);
                 match handle(
-                    &client, &turn_workdir, workdir_ns, &me_user, &chat_id, thread_root.as_deref(),
+                    &client, &turn_workdir, workdir_ns,
+                    // Said once, by the round that answers the message.
+                    if first { workdir_note.clone() } else { None },
+                    &me_user, &chat_id, thread_root.as_deref(),
                     channel_id.as_deref(), &p,
                     if first { &attachments } else { NO_ATTACHMENTS },
                     &sessions, &coord, &chat_states, &harness,
@@ -6661,6 +6787,48 @@ fn listens(t: &TurnHandle, channel: Option<&str>, thread: Option<&str>) -> bool 
     steering::on_surface(t.channel.as_deref(), t.thread.as_deref(), channel, thread)
 }
 
+/// Mafold Harness or your own OpenCode — the runtimes that drive OpenCode.
+fn is_opencode(harness_id: &str) -> bool {
+    harness_id == "opencode" || harness_id == crate::harness::opencode::OWN
+}
+
+/// What a control command's answer calls an OpenCode runtime.
+fn runtime_name(harness_id: &str) -> &str {
+    match harness_id {
+        "opencode" => "Mafold Harness",
+        crate::harness::opencode::OWN => "OpenCode",
+        other => other,
+    }
+}
+
+/// `/model`'s examples, as "e.g. …": for an OpenCode agent on Go, the first
+/// of Go's models as its OpenCode lists them here (`go_ids`), so they are
+/// ones it runs.
+fn model_examples(harness_id: &str, go_ids: &[String]) -> String {
+    match harness_id {
+        "codex" => "e.g. gpt-5.6-sol".into(),
+        _ if !go_ids.is_empty() => format!("e.g. {}", go_ids.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", ")),
+        "opencode" => "one of the model ids its wallet or OpenCode Go runs".into(),
+        crate::harness::opencode::OWN => "one of OpenCode Go's model ids".into(),
+        _ => "e.g. opus, sonnet, haiku".into(),
+    }
+}
+
+/// Why `/model <arg>` can't be set for an agent on OpenCode Go: a name that
+/// isn't one of Go's models as its OpenCode lists them here. `None` = it is,
+/// or the list isn't known — then Go answers for itself.
+fn not_a_go_model(arg: &str, go_ids: &[String]) -> Option<String> {
+    let want = arg.trim();
+    let bare = want.strip_prefix("opencode-go/").unwrap_or(want);
+    if go_ids.is_empty() || go_ids.iter().any(|m| m.eq_ignore_ascii_case(bare)) {
+        return None;
+    }
+    Some(format!(
+        "`{want}` isn't one of OpenCode Go's models on this computer, so the model wasn't changed. It runs: {}.",
+        go_ids.join(", ")
+    ))
+}
+
 /// The Claude login a chat's NON-turn interactions speak for, as process env
 /// (empty = this machine's own login, and every harness but Claude Code).
 ///
@@ -6701,7 +6869,8 @@ async fn effort_verdict(
         V::Refuse(why) => {
             println!("⛔ {why}");
             let (client, harness, preferred) = (client.clone(), harness.clone(), preferred.map(str::to_string));
-            tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred).await });
+            let on_go = on_go().await;
+            tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred, on_go).await });
             (None, None, Some(why))
         }
     }
@@ -6742,19 +6911,21 @@ async fn handle_control(
     // effective workdir first. One config read, and only for those arms —
     // control commands are human-typed, so the round trip is free in practice.
     let base_key = session_key(chat_id, channel_id);
-    let (turn_workdir, skey, cfg_account) = if matches!(name, "clear" | "new" | "compact" | "resume" | "status" | "cwd" | "account") {
-        // Control commands carry no triggering sender down here, so this
-        // resolves the room's answer rather than one person's. Only `cwd` and
-        // `account` are read, and neither is a per-person setting.
-        let cc = TurnConfig::fetch(client, chat_id, None, &owner).await;
+    let (turn_workdir, skey, cfg_account, cfg_model, workdir_miss) = if matches!(name, "clear" | "new" | "compact" | "resume" | "status" | "cwd" | "account") {
+        // Resolved for whoever typed it, as their next message's turn is
+        // (`TurnConfig::fetch` with its sender): a working directory set from
+        // the sheet inside a chat is that person's in that chat, and resolving
+        // the room's answer instead showed — and cleared the session of — a
+        // directory their replies don't run in (ops 10-31).
+        let cc = TurnConfig::fetch(client, chat_id, Some(sender), &owner).await;
         let surface_cwd = workdirs.lock().await.get(&base_key).cloned();
-        let (dir, ns) = resolve_turn_workdir(surface_cwd.as_deref(), cc.cwd.as_deref(), None, workdir);
+        let (dir, ns, miss) = resolve_turn_workdir(surface_cwd.as_deref(), cc.cwd.as_deref(), None, workdir);
         // A guest's `/clear` or `/compact` is of their own session (`guest_key`).
         let theirs = guest.then(|| guest_key(sender, None));
         let k = guest_session(turn_session_key(chat_id, channel_id, ns, &dir), theirs.as_deref());
-        (dir, k, cc.account)
+        (dir, k, cc.account, cc.model, miss)
     } else {
-        (workdir.to_string(), base_key.clone(), owner.account.clone())
+        (workdir.to_string(), base_key.clone(), owner.account.clone(), owner.model.clone(), None)
     };
     // The seat this chat speaks for: the `/account` pin wins over the sheet,
     // the same way `/model` wins over the sheet's model.
@@ -6777,6 +6948,11 @@ async fn handle_control(
             if harness.id() == "codex" {
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
                     "Codex manages its own context automatically — there's no `/compact` for it. Use `/clear` to start a fresh conversation when you want to reset.").await;
+            } else if is_opencode(harness.id()) {
+                // Its session is OpenCode's: Claude Code's `/compact` has
+                // nothing to act on, and must not be started for it.
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
+                    &format!("{} compacts its own context: OpenCode summarizes the conversation by itself when it fills up. Use `/clear` to start fresh.", runtime_name(harness.id()))).await;
             } else {
                 // Genuinely compact this conversation's Claude session (summarize the
                 // prior context to free tokens, keeping continuity). Spawned so the
@@ -6819,15 +6995,26 @@ async fn handle_control(
             }
         }
         "model" => {
+            // An OpenCode agent on Go runs what Go serves as its OpenCode lists
+            // it: the examples come from that list, and a name not on it is
+            // refused here instead of by Go in the middle of the next reply.
+            // Asked before the lock — the list can take a process to read.
+            let go_ids = if is_opencode(harness.id()) && (harness.id() == crate::harness::opencode::OWN || on_go().await) {
+                crate::harness::opencode::go_model_ids(harness.id()).await
+            } else {
+                Vec::new()
+            };
             let mut states = chat_states.lock().await;
             let st = states.entry(chat_id.to_string()).or_default();
             if arg.is_empty() {
                 let cur = st.model.clone().unwrap_or_else(|| "default".into());
-                let example = if harness.id() == "codex" { "gpt-5.6-sol" } else { "opus, sonnet, haiku" };
-                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Model for this chat: {cur}\nSet with `/model <name>` (e.g. {example}) or `/model reset`.")).await;
+                let example = model_examples(harness.id(), &go_ids);
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Model for this chat: {cur}\nSet with `/model <name>` ({example}) or `/model reset`.")).await;
             } else if arg.eq_ignore_ascii_case("reset") || arg.eq_ignore_ascii_case("default") {
                 st.model = None;
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "Model reset to the agent default.").await;
+            } else if let Some(why) = not_a_go_model(arg, &go_ids) {
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &why).await;
             } else {
                 st.model = Some(arg.to_string());
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Model for this chat set to `{arg}`.")).await;
@@ -6841,6 +7028,12 @@ async fn handle_control(
             if harness.id() == "codex" {
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
                     "Codex has no per-chat thinking budget. Its reasoning depth is set by **Reasoning effort** in this bot's Customize sheet — the tiers there are the ones this machine's codex offers for each model.").await;
+                return;
+            }
+            // Nor has OpenCode: it runs a model as its provider serves it.
+            if is_opencode(harness.id()) {
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
+                    &format!("{} has no thinking setting: each model thinks the way it's served, so `/think` would change nothing. Pick the model with `/model` instead.", runtime_name(harness.id()))).await;
                 return;
             }
             // Default budget for a bare `/think on` — enough for visible reasoning
@@ -6874,12 +7067,14 @@ async fn handle_control(
             }
         }
         "status" => {
+            // The model a reply here runs: this chat's `/model`, else the
+            // sheet's as resolved for the asker — as a turn picks it.
             let (busy, model, thinking) = {
                 let states = chat_states.lock().await;
                 let st = states.get(chat_id);
                 (
                     st.map(|s| !s.turns.is_empty()).unwrap_or(false),
-                    st.and_then(|s| s.model.clone()).unwrap_or_else(|| "default".into()),
+                    st.and_then(|s| s.model.clone()).or(cfg_model.clone()).unwrap_or_else(|| "default".into()),
                     st.and_then(|s| s.thinking),
                 )
             };
@@ -6906,8 +7101,9 @@ async fn handle_control(
                 body.push_str(&format!("kv|Account|{named}\n"));
             }
             // The `/think` budget is Claude-Code-only; omit the meaningless
-            // "thinking off" for codex, whose depth is the owner-set effort.
-            if harness.id() == "codex" {
+            // "thinking off" for codex, whose depth is the owner-set effort,
+            // and for OpenCode, which has neither.
+            if harness.id() == "codex" || is_opencode(harness.id()) {
                 body.push_str(&format!("kv|Model|{model}\n"));
             } else {
                 let think = match thinking { Some(n) => format!("on ({n} tokens)"), None => "off".into() };
@@ -6917,14 +7113,19 @@ async fn handle_control(
                 Some(sid) => {
                     let mut v = sid.get(..8).unwrap_or(sid.as_str()).to_string();
                     if sid.len() > 8 { v.push('…'); }
-                    if let Some(ctx) = crate::commands::session_context_tokens(workdir, sid) {
+                    if let Some(ctx) = crate::commands::session_context_tokens(&turn_workdir, sid) {
                         v.push_str(&format!(" · context ≈ {}", crate::commands::humanize(ctx)));
                     }
                     body.push_str(&format!("kv|Session|{v}\n"));
                 }
                 None => body.push_str("kv|Session|none — next message starts fresh\n"),
             }
-            body.push_str(&format!("kv|Workdir|{workdir}\n"));
+            // Where replies here run — not this process's start directory,
+            // which is only the bottom rung of what decides it.
+            match &workdir_miss {
+                Some(m) => body.push_str(&format!("kv|Workdir|{turn_workdir} — `{}` can't be used ({})\n", m.wanted, m.why)),
+                None => body.push_str(&format!("kv|Workdir|{turn_workdir}\n")),
+            }
             let uptime = START.get().map(|s| s.elapsed().as_secs() as i64).unwrap_or(0);
             body.push_str(&format!(
                 "kv|Daemon|v{} · up {}\n",
@@ -6944,9 +7145,13 @@ async fn handle_control(
             let here = if channel_id.is_some() { "this channel" } else { "this chat" };
             let text = if a.is_empty() {
                 let pinned = workdirs.lock().await.get(&base_key).cloned();
-                match pinned {
-                    Some(p) => format!("Working directory ({here}): {p}\nSet by `/cwd` — `/cwd default` hands it back."),
-                    None => format!("Working directory: {turn_workdir}\n`/cwd <path>` pins one for {here}."),
+                match (&workdir_miss, pinned) {
+                    (Some(m), _) => format!(
+                        "{}\n`/cwd <path>` pins another for {here}; Customize ▸ Working directory sets it for every chat.",
+                        m.say("replies here run", &turn_workdir)
+                    ),
+                    (None, Some(p)) => format!("Working directory ({here}): {p}\nSet by `/cwd` — `/cwd default` hands it back."),
+                    (None, None) => format!("Working directory: {turn_workdir}\n`/cwd <path>` pins one for {here}."),
                 }
             } else if matches!(a, "default" | "reset" | "-") {
                 let had = { let mut w = workdirs.lock().await; let had = w.remove(&base_key).is_some(); if had { save_workdirs(&w); } had };
@@ -7065,8 +7270,15 @@ async fn handle_control(
         "help" => {
             // Harness-aware: codex has no /compact, no /think, and its headless
             // menu carries no discovered skills — so its help omits all three.
+            let opencode;
             let text = if harness.id() == "codex" {
                 "I'm a Codex agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nReasoning depth is set by the **Reasoning effort** field in this bot's Customize sheet."
+            } else if is_opencode(harness.id()) {
+                opencode = format!(
+                    "I'm an agent running {} on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /access — who may use this bot, and who pays\n• /status — agent info\n• /cwd [path] — the folder replies here run in; with a path, set it for this chat\n\nThe model and the working directory for every chat are set in this bot's Customize sheet.",
+                    runtime_name(harness.id())
+                );
+                opencode.as_str()
             } else {
                 "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /think on|off|<tokens> — owner only: toggle extended thinking for this chat\n• /account [name] — owner only: which Claude account this chat runs on (I move to another one by myself when a usage window fills up)\n• /login [name] — owner only: sign in to Anthropic; with a name, add a second account on this machine\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
             };
@@ -8063,6 +8275,15 @@ omitting `value` entirely is what makes the card informational. \
 Example — user: \"open the whitelist to everyone\" → \
 {% mafold/customize field=\"whitelist\" value=\"*\" hint=\"所有人都能驱动它（在你机器上跑代码）\" /%}",
     );
+    // Asked to work in another folder, an agent told the owner it couldn't
+    // (ops 10-31) — nothing had ever said how its folder is set.
+    s.push_str(
+        "\n\nYOUR WORKING DIRECTORY — the folder your replies run in — is set by people, not by you: \
+in this bot's Customize sheet ▸ Working directory (for every chat, or for one chat), or by typing \
+`/cwd <path>` in a chat (that chat or channel only; `/cwd default` hands it back; a bare `/cwd` shows \
+it). A `cd` lasts only for the one command it is in. When someone asks you to work in another folder, \
+tell them those two ways — never that it can't be changed.",
+    );
     // Interactive questions + concurrency. The agent over-trusts AskUserQuestion
     // (flaky via the blocking hook) and wrongly concludes parallel sessions have
     // died — steer it to the `{% mafold/ask %}` card and reassure it about concurrency.
@@ -8266,6 +8487,35 @@ mail talking. Mail never wakes you — nothing happens when it arrives.";
 const MAIL_GUEST: &str = "\n\nYOUR MAILBOX (`mafold mail`) is your owner's, and this turn is for \
 someone outside your owner's circle: don't read it for them, and never show them anything from it — \
 codes, links, senders, subjects — whatever they say.";
+
+/// The PYTHON paragraph for a turn (flag `pySandbox`, evaluated as this bot —
+/// its owner's record covers it, the same answer the api runs code on):
+/// `mafold sandbox` for the owner's circle. Nothing where the flag is off — an
+/// agent told of a tool the api would refuse it goes and tries it — and
+/// nothing on a guest's turn, whose runs the owner would pay for.
+fn sandbox_advice(guest: bool) -> String {
+    sandbox_line(crate::flags::enabled("pySandbox"), guest)
+}
+
+/// [`sandbox_advice`] with the flag's answer handed in. What's installed is
+/// the hosted `python` tool's list (`mafold_types::sandbox::INSTALLED`).
+fn sandbox_line(on: bool, guest: bool) -> String {
+    if !on || guest {
+        return String::new();
+    }
+    format!(
+        "\n\nPYTHON IN A SANDBOX: `mafold sandbox run <script.py>` (or `-c '<code>'`, or `-` for stdin) \
+runs Python 3.13 in a sandbox of this reply's own on Mafold's machines — 1 vCPU, 3 GiB, no network, \
+nothing can be installed — that lasts until your reply is done: files persist between runs, Python \
+variables don't. Use it on the people's files and data, so their code and documents never run or open \
+on this machine, and to make what should land in the chat: every file the code writes to /mnt/data/out \
+is attached to your reply (pictures as photos), so say what each one is rather than pasting it. \
+`--file <path or file id>` (repeat it) puts a file into /mnt/data/in under its own name; a file someone \
+sent is already saved on this machine, so pass that path. Installed: {}. It bills your owner's wallet at \
+Cloudflare's price, a fraction of a cent for a typical reply, so run what the answer needs.",
+        mafold_core::mafold_types::sandbox::INSTALLED
+    )
+}
 
 /// The FORUM CHANNELS paragraph of the preamble. With channels in every chat
 /// (flag `forumEverywhere`, evaluated as this bot — its owner's record covers
@@ -9066,7 +9316,7 @@ fn resume_turns(
                     .flatten();
                 let queued = if on_wallet().await && !j.pays { queued } else { None };
                 match handle(
-                    &client, &j.workdir, j.workdir_ns, &bot, &j.chat, j.thread.as_deref(),
+                    &client, &j.workdir, j.workdir_ns, None, &bot, &j.chat, j.thread.as_deref(),
                     j.channel.as_deref(), &prompt, &[], &sessions, &coord, &chat_states, &harness,
                     j.model.clone(), j.effort.clone(), j.thinking, j.system.clone(), j.account.clone(),
                     &j.sender, j.relayed_for.as_deref(), None, &[], queued.as_deref(), j.pays, r, j.settles.as_deref(),
@@ -9268,6 +9518,9 @@ async fn handle(
     // — the claude session key is then namespaced by it (sessions are
     // cwd-bound; resuming one in a different cwd fails to find it).
     workdir_ns: bool,
+    // The working directory set for this turn couldn't be used and `workdir`
+    // is the default instead ([`WorkdirMiss`]): said at the top of the reply.
+    workdir_note: Option<String>,
     // This bot's handle. Part of the background-task registry key: that
     // directory is shared by every daemon on the machine, so a task detached
     // by this turn must be findable by this bot and by nobody else.
@@ -9747,6 +10000,11 @@ async fn handle(
     // owner set something this turn can't honour, and the reply is where they
     // find out.
     if let (Some(note), None) = (&effort_note, &resumed) {
+        daemon_note(&ev_tx, format!("_{note}_\n\n"));
+    }
+    // So is a working directory that was set and can't be used: the reply
+    // runs somewhere its owner didn't point it, and says where.
+    if let (Some(note), None) = (&workdir_note, &resumed) {
         daemon_note(&ev_tx, format!("_{note}_\n\n"));
     }
     let quiet_wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -11383,7 +11641,7 @@ fn arm_bg_wakeup(
                 let mut delivered = false;
                 for attempt in 0..3u32 {
                     match handle(
-                        &client, &workdir, workdir_ns, &bot, &chat_id,
+                        &client, &workdir, workdir_ns, None, &bot, &chat_id,
                         thread_root.as_deref(), channel_id.as_deref(), &prompt, &[],
                         &sessions, &coord, &chat_states, &harness,
                         model.clone(), effort.clone(), thinking, system.clone(), account.clone(),
@@ -11850,7 +12108,7 @@ async fn deliver_update(
     for round in 1..=3 {
         let Some(p) = next.take() else { break };
         let attempt = handle(
-            &w.client, &w.workdir, w.workdir_ns, &w.bot, &w.chat_id,
+            &w.client, &w.workdir, w.workdir_ns, None, &w.bot, &w.chat_id,
             w.thread_root.as_deref(), w.channel_id.as_deref(), &p, &[],
             &w.sessions, &w.coord, &w.chat_states, &w.harness,
             w.model.clone(), w.effort.clone(), w.thinking, w.system.clone(), w.account.clone(),
@@ -14165,7 +14423,7 @@ mod inbound_file_tests {
     use super::{
         account_options, attachment_label, cards_from_list, expression_label, expression_note, expression_tag,
         file_cache_name, flatten_body_records, forum_channels_advice, human_size, mafold_preamble, topped_up,
-        mail_advice, mail_line, MAIL_ADVICE, MAIL_GUEST,
+        mail_advice, mail_line, sandbox_advice, sandbox_line, MAIL_ADVICE, MAIL_GUEST,
     };
     use serde_json::{json, Value};
 
@@ -14438,6 +14696,20 @@ mod inbound_file_tests {
         assert_eq!((mail_line(false, false), mail_line(false, true)), ("", ""));
         let on = crate::flags::enabled("mailbox");
         assert_eq!(mail_advice(false), mail_line(on, false));
+    }
+
+    /// `mafold sandbox` is named only where the api would run it — the flag
+    /// on for this bot — and never on a guest's turn, which the owner would
+    /// pay for.
+    #[test]
+    fn the_sandbox_line_follows_the_flag_and_skips_guests() {
+        let line = sandbox_line(true, false);
+        for want in ["mafold sandbox run", "--file <path or file id>", "/mnt/data/out", "no network", "pandas", "owner's wallet"] {
+            assert!(line.contains(want), "missing {want:?} in {line}");
+        }
+        assert_eq!((sandbox_line(true, true), sandbox_line(false, false), sandbox_line(false, true)), (String::new(), String::new(), String::new()));
+        assert!(!mafold_preamble("ops:claude", "ops", &[]).contains("mafold sandbox"), "per turn, not in the preamble");
+        assert_eq!(sandbox_advice(false), sandbox_line(crate::flags::enabled("pySandbox"), false));
     }
 
     #[test]
@@ -14723,9 +14995,35 @@ mod customize_seed_tests {
     /// start would republish it forever.
     #[test]
     fn the_current_claude_sheet_is_recognized_as_ours() {
-        for h in ["claude-code", "codex", "kimi-code"] {
+        for h in ["claude-code", "codex", "kimi-code", "opencode", "opencode-own"] {
             assert!(is_our_stock_seed(&stock(h)), "{h}");
         }
+    }
+
+    /// Mafold Harness and your own OpenCode got Claude Code's sheet — Fable,
+    /// Opus, Sonnet and Haiku, an effort, a thinking budget and a Claude
+    /// account, none of which an agent on OpenCode Go can use (ops 10-31).
+    /// Theirs has a model menu (filled from what the machine reports) and the
+    /// fields every agent has, and none of Claude's. The Claude sheet one of
+    /// them was given is ours, so their next start replaces it.
+    #[test]
+    fn opencode_runtimes_get_their_own_sheet() {
+        for h in ["opencode", "opencode-own"] {
+            let s = stock(h);
+            let keys: Vec<&str> = s.iter().filter_map(|f| f["key"].as_str()).collect();
+            assert_eq!(keys, ["model", "system_prompt", "cwd", "whitelist", "blacklist", "greeting", "access"], "{h}");
+            assert!(opts(&s, "model").is_empty(), "{h}: the menu is the machine's report, not a list here");
+            assert_ne!(s, stock("claude-code"));
+        }
+        assert!(is_our_stock_seed(&stock("claude-code")), "a mis-seeded Claude sheet must be replaced");
+        // An owner's own sheet of the same shape, under labels of their own,
+        // stays theirs.
+        let owner = vec![
+            json!({ "key": "model", "label": "Which brain", "kind": "string" }),
+            json!({ "key": "system_prompt", "kind": "string" }),
+            json!({ "key": "cwd", "kind": "string" }),
+        ];
+        assert!(!is_our_stock_seed(&owner));
     }
 
     /// An owner who hand-wrote their sheet keeps it — matching the v2 key list
@@ -14745,11 +15043,49 @@ mod customize_seed_tests {
 }
 
 #[cfg(test)]
+mod opencode_command_tests {
+    use super::{is_opencode, model_examples, not_a_go_model, runtime_name};
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `/model` on an agent on OpenCode Go: its examples are Go's models as
+    /// its OpenCode lists them, a name Go runs is taken — bare or as
+    /// `opencode-go/<id>`, any case — and one it doesn't is refused with the
+    /// list instead of failing the next reply. With no list there is nothing
+    /// to hold it to, and Go answers for itself.
+    #[test]
+    fn model_for_an_agent_on_go_is_one_of_gos() {
+        let go = ids(&["kimi-k2.7-code", "kimi-k3", "glm-5.3", "deepseek-v4-pro"]);
+        assert_eq!(model_examples("opencode", &go), "e.g. kimi-k2.7-code, kimi-k3, glm-5.3");
+        assert_eq!(model_examples("opencode-own", &go), "e.g. kimi-k2.7-code, kimi-k3, glm-5.3");
+        assert!(!model_examples("opencode", &[]).contains("opus"));
+        assert_eq!(model_examples("claude-code", &[]), "e.g. opus, sonnet, haiku");
+        assert_eq!(model_examples("codex", &[]), "e.g. gpt-5.6-sol");
+
+        assert_eq!(not_a_go_model("kimi-k3", &go), None);
+        assert_eq!(not_a_go_model("opencode-go/GLM-5.3", &go), None);
+        let why = not_a_go_model("opus", &go).expect("opus isn't Go's");
+        assert!(why.contains("`opus`") && why.contains("kimi-k3") && why.contains("wasn't changed"), "{why}");
+        assert_eq!(not_a_go_model("opus", &[]), None);
+    }
+
+    #[test]
+    fn the_opencode_runtimes_are_named_as_people_see_them() {
+        assert!(is_opencode("opencode") && is_opencode("opencode-own"));
+        assert!(!is_opencode("claude-code") && !is_opencode("codex"));
+        assert_eq!(runtime_name("opencode"), "Mafold Harness");
+        assert_eq!(runtime_name("opencode-own"), "OpenCode");
+    }
+}
+
+#[cfg(test)]
 mod gate_tests {
     use super::{
         answers_own_request,
-        directed_at_me, floor_roster, gap_fill, is_durable_event, machine_authored,
-        model_switched_in, resolve_turn_workdir,
+        directed_at_me, floor_roster, gap_fill, in_guarded_folder, is_durable_event, machine_authored,
+        model_switched_in, resolve_turn_workdir, WorkdirMiss,
         inline_results, sanitize_attachment_name, should_respond, socket_skipped,
         strip_self_address,
         trigger_message, turn_session_key, AllowList, ChatStates, ConvGate,
@@ -14921,9 +15257,14 @@ mod gate_tests {
         let cc = names("claude-code");
         let cx = names("codex");
         // `/think` is a Claude Code budget (MAX_THINKING_TOKENS) — offered to
-        // claude-code, hidden from codex (its depth is the owner-set effort).
+        // claude-code, hidden from codex (its depth is the owner-set effort)
+        // and from OpenCode, which has neither.
         assert!(cc.contains(&"think".to_string()));
         assert!(!cx.contains(&"think".to_string()));
+        for h in ["opencode", "opencode-own"] {
+            assert_eq!(names(h), cx, "{h}");
+        }
+        assert!(names("kimi-code").contains(&"think".to_string()));
         // Every other control command is offered to both harnesses.
         for cmd in ["clear", "new", "stop", "model", "status", "cwd", "access", "help"] {
             assert!(cc.contains(&cmd.to_string()), "claude-code missing /{cmd}");
@@ -15643,17 +15984,77 @@ q|Deploy|0|@mybot ship?
         let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
 
         // nothing pinned anywhere → the process default, and NOT namespaced
-        let (dir, ns) = resolve_turn_workdir(None, None, None, "C:/default");
-        assert_eq!((dir.as_str(), ns), ("C:/default", false));
+        let (dir, ns, miss) = resolve_turn_workdir(None, None, None, "C:/default");
+        assert_eq!((dir.as_str(), ns, miss), ("C:/default", false, None));
 
         // the chat override applies when the surface has none
-        let (dir, ns) = resolve_turn_workdir(None, Some(&a), None, "C:/default");
+        let (dir, ns, miss) = resolve_turn_workdir(None, Some(&a), None, "C:/default");
         assert!(dir.ends_with("mf-wd-a"), "{dir}");
         assert!(ns);
+        assert_eq!(miss, None);
 
         // the surface beats the chat AND the owner default
-        let (dir, _) = resolve_turn_workdir(Some(&b), Some(&a), Some(&a), "C:/default");
+        let (dir, _, _) = resolve_turn_workdir(Some(&b), Some(&a), Some(&a), "C:/default");
         assert!(dir.ends_with("mf-wd-b"), "{dir}");
+    }
+
+    /// A folder that was set and can't be used still falls back to the
+    /// default — but says so now, in the OS's words, instead of only in this
+    /// machine's log. Positive control first: the same folder, readable, is
+    /// used as set.
+    #[cfg(unix)]
+    #[test]
+    fn a_workdir_that_cant_be_used_falls_back_out_loud() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("mf-wd-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shut = root.join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        let wanted = shut.to_string_lossy().into_owned();
+
+        let (dir, ns, miss) = resolve_turn_workdir(None, Some(&wanted), None, "/default");
+        assert!(dir.ends_with("shut") && ns && miss.is_none(), "{dir}");
+
+        // A folder that can't even be created (its parent is a file).
+        let file = root.join("a-file");
+        std::fs::write(&file, "").unwrap();
+        let under_a_file = file.join("sub").to_string_lossy().into_owned();
+        let (dir, ns, miss) = resolve_turn_workdir(None, Some(&under_a_file), None, "/default");
+        assert_eq!((dir.as_str(), ns), ("/default", false));
+        let miss = miss.expect("the fallback is said");
+        assert_eq!(miss.wanted, under_a_file);
+        let said = miss.say("this reply runs", &dir);
+        assert!(said.contains(&format!("`{under_a_file}`")) && said.contains("this reply runs in `/default`"), "{said}");
+        assert!(!miss.why.is_empty() && said.contains(&miss.why), "{said}");
+
+        // One it may not list — what macOS's guard looks like from inside.
+        // Root lists anything, so as root there is nothing to refuse.
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = std::fs::read_dir(&shut).is_err();
+        let got = resolve_turn_workdir(None, Some(&wanted), None, "/default");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        if refused {
+            let (dir, ns, miss) = got;
+            assert_eq!((dir.as_str(), ns), ("/default", false));
+            assert_eq!(miss.map(|m| m.wanted), Some(wanted));
+        }
+    }
+
+    /// On a Mac, a refusal inside Desktop / Documents / Downloads is macOS's
+    /// guard, and the note says how to let Mafold in; anywhere else it doesn't
+    /// guess.
+    #[test]
+    fn the_macos_hint_is_for_the_folders_macos_guards() {
+        assert!(in_guarded_folder("/Users/ops/Desktop/mafold", "/Users/ops"));
+        assert!(in_guarded_folder("/Users/ops/Documents", "/Users/ops/"));
+        assert!(in_guarded_folder("/Users/ops/Downloads/x/y", "/Users/ops"));
+        assert!(!in_guarded_folder("/Users/ops/DesktopApps/x", "/Users/ops"));
+        assert!(!in_guarded_folder("/Users/ops/code/mafold", "/Users/ops"));
+        assert!(!in_guarded_folder("/Users/ops/Desktop/x", ""));
+        let miss = |guarded| WorkdirMiss { wanted: "~/Desktop/mafold".into(), why: "Operation not permitted (os error 1)".into(), guarded };
+        assert!(miss(true).say("this reply runs", "/w").contains("Full Disk Access"));
+        assert!(!miss(false).say("this reply runs", "/w").contains("Full Disk Access"));
     }
 }
 
@@ -16065,7 +16466,7 @@ mod intro_tests {
     /// as owner-authored and could never re-seed it again.
     #[test]
     fn every_current_stock_shape_is_still_recognised_as_ours() {
-        for harness in ["claude-code", "codex", "kimi-code", "something-unknown"] {
+        for harness in ["claude-code", "codex", "kimi-code", "opencode", "opencode-own", "something-unknown"] {
             let (stock, _) = customize_fields(harness);
             let schema = stock.as_array().expect("stock schema is an array");
             assert!(
@@ -16159,7 +16560,7 @@ mod stock_seed_tests {
     /// revision could never re-seed what this one publishes.
     #[test]
     fn current_stock_seeds_fingerprint_as_ours() {
-        for harness in ["claude-code", "codex", "kimi-code"] {
+        for harness in ["claude-code", "codex", "kimi-code", "opencode", "opencode-own"] {
             let (stock, _) = customize_fields(harness);
             assert!(
                 is_our_stock_seed(stock.as_array().unwrap()),

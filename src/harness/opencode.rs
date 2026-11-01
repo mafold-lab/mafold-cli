@@ -51,7 +51,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 
 use super::opencode_pin;
-use super::{AgentEvent, CommandOutcome, Harness, Turn, TurnOutcome};
+use super::{AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModelCap, Turn, TurnOutcome};
 use crate::client::Client;
 
 pub struct OpenCode;
@@ -162,6 +162,14 @@ impl Harness for OpenCode {
             String::new()
         }
     }
+
+    /// OpenCode Go's models, as the pinned build lists them ([`go_probe`]) —
+    /// the model menu of an agent on Go. Asked only for one: on the wallet
+    /// the models are the router's (`agent::report_caps`).
+    async fn caps(&self, _env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
+        let bin = opencode_pin::binary();
+        go_probe(tokio::task::spawn_blocking(move || go_models(&bin, true)).await.ok()?)
+    }
 }
 
 /// Your own OpenCode install, as a runtime of its own (OpenCode Go, ops
@@ -223,6 +231,12 @@ impl Harness for OwnOpenCode {
             Some(bin) => tokio::task::spawn_blocking(move || super::version_of(&bin)).await.ok().flatten().unwrap_or_default(),
             None => String::new(),
         }
+    }
+
+    /// OpenCode Go's models, as your OpenCode lists them ([`go_probe`]).
+    async fn caps(&self, _env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
+        let bin = own_binary()?;
+        go_probe(tokio::task::spawn_blocking(move || go_models(&bin, false)).await.ok()?)
     }
 }
 
@@ -385,6 +399,49 @@ fn parse_go_models(text: &str) -> Vec<Value> {
         }
     }
     models
+}
+
+/// Go's models ([`go_models`]) as a caps report: the Customize sheet's model
+/// menu, drawn by the server from what this computer's OpenCode listed. No
+/// tiers: OpenCode passes none, so the sheet offers none. `None` when the
+/// listing came back empty — a listing that failed has learned nothing, and
+/// must not empty a menu.
+fn go_probe(models: Vec<Value>) -> Option<HarnessProbe> {
+    let models: Vec<ModelCap> = models
+        .iter()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?.to_string();
+            Some(ModelCap {
+                // What `go_model` also takes for it.
+                aliases: vec![format!("{GO_PROVIDER}/{id}")],
+                display: m["name"].as_str().unwrap_or(&id).to_string(),
+                id,
+                resolved: None,
+                description: None,
+                efforts: Vec::new(),
+            })
+        })
+        .collect();
+    (!models.is_empty()).then(|| HarnessProbe { source: CapsSource::Handshake, models, ..Default::default() })
+}
+
+/// The ids of OpenCode Go's models for runtime `harness_id` (Mafold Harness,
+/// or your own OpenCode), as its OpenCode lists them on this computer —
+/// `/model`'s examples and its check. Empty when it can't tell: not
+/// installed, or the listing failed.
+pub async fn go_model_ids(harness_id: &str) -> Vec<String> {
+    let (bin, isolated) = match harness_id {
+        "opencode" => (Some(opencode_pin::binary()).filter(|b| super::launchable(b)), true),
+        OWN => (own_binary(), false),
+        _ => (None, false),
+    };
+    let Some(bin) = bin else { return Vec::new() };
+    tokio::task::spawn_blocking(move || go_models(&bin, isolated))
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// Which OpenCode a turn runs, and where agents' homes are.
@@ -2203,6 +2260,39 @@ opencode-go/chatty
             vec![json!({ "id": "beam-free", "name": "Beam Free" }), json!({ "id": "kimi-k2.7-code", "name": "Kimi K2.7 Code" })]
         );
         assert!(parse_go_models("Error: Provider not found: opencode-go").is_empty());
+    }
+
+    /// The model menu of an agent on Go is Go's models as OpenCode listed
+    /// them, by OpenCode's own names, with no tiers — and a listing that came
+    /// back empty reports nothing rather than an empty menu.
+    #[test]
+    fn go_models_become_the_agents_model_menu() {
+        let p = go_probe(vec![
+            json!({ "id": "kimi-k2.7-code", "name": "Kimi K2.7 Code" }),
+            json!({ "id": "glm-5.3", "name": "GLM-5.3" }),
+            json!({ "name": "no id" }),
+        ])
+        .expect("two models");
+        assert_eq!(p.source, CapsSource::Handshake);
+        assert_eq!(p.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["kimi-k2.7-code", "glm-5.3"]);
+        assert_eq!(p.models[0].display, "Kimi K2.7 Code");
+        assert_eq!(p.models[0].aliases, ["opencode-go/kimi-k2.7-code"]);
+        assert!(p.models.iter().all(|m| m.efforts.is_empty()) && p.efforts.is_empty() && p.modes.is_empty());
+        // What the server reads off it: a model menu, and nothing about tiers.
+        let caps = mafold_core::mafold_types::HarnessCaps {
+            harness: "opencode".into(),
+            version: "1.19.5".into(),
+            machine: "m".into(),
+            machine_name: None,
+            account: None,
+            probed_at: 0,
+            source: p.source,
+            models: p.models,
+            efforts: p.efforts,
+            modes: p.modes,
+        };
+        assert!(caps.tells_models() && !caps.tells_efforts());
+        assert!(go_probe(Vec::new()).is_none());
     }
 
     #[test]
