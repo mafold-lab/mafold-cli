@@ -39,6 +39,11 @@ pub enum DmRestriction {
     Premium,
     /// Only the accounts on its list may.
     List,
+    /// An agent over its owner's plan (`premium_perks::agent_paused`): nobody
+    /// may write to it until the owner's plan keeps it running again — its
+    /// chat locks the way a refusal does (ops 11-01: "like the blocked status,
+    /// cannot use the input"). Not the setting's doing, so `decide` never says it.
+    Paused,
 }
 
 impl DmRestriction {
@@ -48,6 +53,7 @@ impl DmRestriction {
         match self {
             DmRestriction::Premium => "DM_PREMIUM_REQUIRED",
             DmRestriction::List => "DM_LIST_ONLY",
+            DmRestriction::Paused => "AGENT_PAUSED",
         }
     }
 }
@@ -65,6 +71,10 @@ pub struct DmPrivacy {
     /// time, while the account itself is still in it.
     #[serde(default)]
     pub groups: Vec<Uuid>,
+    /// Nobody sees when the account is online or was last seen (Mafold
+    /// Premium, ops 11-01). Kept while Premium lapses; applies again with it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_last_seen: bool,
 }
 
 /// How many accounts, and how many groups, one list holds.
@@ -76,8 +86,9 @@ pub const LIST_GROUPS_MAX: usize = 50;
 pub const fn may_choose(mode: DmMode, premium: bool, verified: bool) -> bool {
     match mode {
         DmMode::Everyone => true,
-        DmMode::Premium => premium || verified,
-        DmMode::List => verified,
+        // Both are Mafold Premium's (ops 11-01: "who can message me, who
+        // can't"); verified accounts keep them as they had them.
+        DmMode::Premium | DmMode::List => premium || verified,
     }
 }
 
@@ -138,7 +149,7 @@ mod tests {
         for (p, v) in [(false, false), (true, false), (false, true), (true, true)] {
             assert!(may_choose(Everyone, p, v));
             assert_eq!(may_choose(Premium, p, v), p || v, "premium={p} verified={v}");
-            assert_eq!(may_choose(List, p, v), v, "premium={p} verified={v}");
+            assert_eq!(may_choose(List, p, v), p || v, "premium={p} verified={v}");
         }
     }
 
@@ -147,7 +158,8 @@ mod tests {
         assert_eq!(effective(Premium, true, false), Premium);
         assert_eq!(effective(Premium, false, false), Everyone, "Premium ran out");
         assert_eq!(effective(List, true, true), List);
-        assert_eq!(effective(List, true, false), Everyone, "verification taken back");
+        assert_eq!(effective(List, true, false), List, "Premium keeps a list");
+        assert_eq!(effective(List, false, false), Everyone, "Premium ran out, never verified");
     }
 
     #[test]
@@ -179,6 +191,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&Premium).unwrap(), "\"premium\"");
         assert_eq!(DmRestriction::Premium.error_key(), "DM_PREMIUM_REQUIRED");
         assert_eq!(DmRestriction::List.error_key(), "DM_LIST_ONLY");
+        assert_eq!(DmRestriction::Paused.error_key(), "AGENT_PAUSED");
+        assert_eq!(serde_json::to_string(&DmRestriction::Paused).unwrap(), "\"paused\"");
         let open = DmAccess { username: "a".into(), restricted: None };
         assert_eq!(serde_json::to_string(&open).unwrap(), r#"{"username":"a"}"#);
     }

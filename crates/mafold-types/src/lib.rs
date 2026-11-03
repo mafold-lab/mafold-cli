@@ -219,15 +219,25 @@ pub struct Account {
     /// API. Clients render a badge next to the display name; never self-serve.
     #[serde(default)]
     pub verified: bool,
-    /// Mafold Premium, a paid subscription. Orthogonal to `verified` — that one
-    /// says "this identity was checked", this one says "this person pays". Both
-    /// can be true and clients render both.
+    /// The Mafold Premium crown. Orthogonal to `verified` — that one says
+    /// "this identity was checked", this one says "this person is a member".
+    /// Both can be true and clients render both.
     ///
     /// **DERIVED, never stored.** The server computes it from the Stripe
     /// subscription row and the clock at every egress, so a missed webhook
     /// cannot leave a badge outliving the money. Nothing sets it by hand.
+    ///
+    /// A member may turn the crown off (the Premium card's switch), and then
+    /// this is false on every copy of the account — so it is NOT whether the
+    /// account holds Premium. That is [`Self::premium_member`].
     #[serde(default)]
     pub premium: bool,
+    /// Whether the account holds Premium — on the account's OWN copy only (the
+    /// socket's hello, `getMe`); every other copy omits it, or hiding the crown
+    /// would hide nothing. A server from before the switch never sends it, and
+    /// there `premium` is still the membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premium_member: Option<bool>,
 }
 
 /// A slash command a bot advertises — shown in the chat's command panel when
@@ -405,6 +415,11 @@ pub struct Conversation {
     /// Group avatar (None for direct chats — clients use the peer's avatar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<FileRef>,
+    /// Group cover — the ~3:1 picture across the top of its profile, the
+    /// account's `banner` for a group (None for direct chats — clients use the
+    /// peer's). Set with `setChatBanner`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<FileRef>,
     /// Group description / "about" text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

@@ -7,8 +7,8 @@
 //!
 //! What runs, in `agent::handle`'s order: [`fuel::step`] (the draft's key,
 //! into the turn's env — the env starts empty, as a wallet turn has no seat),
-//! the OpenCode harness as the daemon selects it (`harness::select`, the
-//! pinned build under `~/.mafold/runtimes`), and the renderer's wallet steps
+//! Mafold Harness as the daemon selects it (`harness::select("opencode")`,
+//! the loop that is part of mafold), and the renderer's wallet steps
 //! ([`fuel::before_done`] / [`fuel::without_done`]) on a transcript built the
 //! way `agent::render_loop` builds it — so the result card printed is the one
 //! the reply would end on. What doesn't run: the owner-only gate (it reads the
@@ -41,11 +41,11 @@ pub struct Ask {
     pub model: Option<String>,
     /// Stop the turn this long after its first words (text or thinking)
     /// arrive — a person who watched it start answering, then pressed Stop.
-    /// Counted from the first words, not the start: how long OpenCode takes
-    /// to come up says nothing about the case.
+    /// Counted from the first words, not the start: how long the first call
+    /// takes to answer says nothing about the case.
     pub stop_after_ms: Option<u64>,
     /// The agent's handle and the conversation, for the turn's surface
-    /// (`{conv}__{channel}__{bot}`): which agent home OpenCode runs in.
+    /// (`{conv}__{channel}__{bot}`): whose sessions the turn keeps.
     pub bot: Option<String>,
     pub chat: Option<String>,
 }
@@ -108,14 +108,13 @@ async fn turn(client: &Client, ask: Ask) -> Value {
             let (card, _) = crate::agent::failure_card(&bot, &why, None);
             return json!({
                 "outcome": "refused", "error": why, "error_card": card, "text": "", "stats": Value::Null,
-                "result_card": Value::Null, "events": [], "opencode_pid": Value::Null, "ms": ms(started),
+                "result_card": Value::Null, "events": [], "ms": ms(started),
             });
         }
     };
     let wallet = fuel.as_ref().map(|f| f.draft.clone());
 
     let cancel = Arc::new(Notify::new());
-    let proc = TurnProc::default();
     let surface = if bot.is_empty() { String::new() } else { crate::agent::surface_tag(&bot, &chat, None) };
     let turn = Turn {
         prompt: ask.prompt.clone(),
@@ -134,21 +133,7 @@ async fn turn(client: &Client, ask: Ask) -> Value {
         env,
         mount: Default::default(),
         skill_plugins: None,
-        proc: proc.clone(),
-    };
-
-    // The process serving the turn, seen at least once — whether one started.
-    let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let watcher = {
-        let (proc, watching) = (proc.clone(), watching.clone());
-        tokio::spawn(async move {
-            let mut seen = None;
-            while watching.load(std::sync::atomic::Ordering::SeqCst) {
-                seen = seen.or(proc.pid());
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            seen.or(proc.pid())
-        })
+        proc: TurnProc::default(),
     };
 
     // The renderer: `render_loop`'s transcript and its wallet steps, minus
@@ -209,8 +194,6 @@ async fn turn(client: &Client, ask: Ask) -> Value {
 
     let result = crate::harness::select("opencode").run(turn, ev_tx).await;
     let harness_ms = ms(started);
-    watching.store(false, std::sync::atomic::Ordering::SeqCst);
-    let pid = watcher.await.ok().flatten();
     let (md, kinds, text, stop_at) = renderer.await.unwrap_or_default();
     let (card, stats) = result_card(&md);
     let (outcome, error, session, produced) = match &result {
@@ -234,7 +217,6 @@ async fn turn(client: &Client, ask: Ask) -> Value {
         "stats": stats,
         "result_card": card,
         "events": folded(&kinds),
-        "opencode_pid": pid,
         "stop_sent_at_ms": stop_at,
         "harness_ms": harness_ms,
         "ms": ms(started),

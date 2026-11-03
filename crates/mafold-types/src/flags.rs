@@ -429,6 +429,22 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // Waffo Pancake, the merchant of record for Alipay and WeChat Pay (ops
+    // 11-02): its buttons on the Premium and top-up cards, and the server's
+    // `waffo|` checkout. The webhook credits whatever it was opened for.
+    FlagMeta {
+        key: "waffo",
+        default: false,
+        dev_default: false,
+        label: "Pay with Alipay / WeChat Pay",
+        description: "Offers Waffo's checkout (Alipay, WeChat Pay, cards) on the Premium and top-up \
+                      cards: monthly Premium, 1 or 12 prepaid months that don't renew, and credit. \
+                      Prices are before tax, which Waffo adds. Never offered inside the iPhone app.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     FlagMeta {
         key: "imageGen",
         default: false,
@@ -683,7 +699,7 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         server: ClosedWithoutRecord,
     },
     // The wallet fuelling an agent on your own computer (PR 4b, 10-31): New
-    // Agent offers "From your tokens" for Mafold Harness (OpenCode), and each
+    // Agent offers "From your tokens" for Mafold Harness, and each
     // reply spends through a one-reply router key the api mints for it.
     // Server-read on the owner: createBot takes `sign_in: wallet` on a
     // computer, and `mintReplyKey` answers, only where this is on — so a
@@ -694,7 +710,7 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         dev_default: false,
         label: "New Agent: the wallet on a computer",
         description: "New Agent on one of your computers offers From your tokens as the sign-in for \
-                      Mafold Harness (OpenCode). Each reply the agent starts for you gets its own \
+                      Mafold Harness. Each reply the agent starts for you gets its own \
                       router key (DeepSeek chat models only, dead when the reply ends, on Stop, or \
                       after 6 h); what it spends comes off your wallet under the agent's monthly \
                       cap and shows on the reply's result card. Only you start its wallet replies. \
@@ -744,7 +760,8 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       sandbox (1 vCPU, 3 GiB, network off) that ends with the reply, and the files \
                       it writes come back on the reply. It bills your wallet at Cloudflare's price \
                       in the sandbox currency. The api runs code (sandboxRun) only for agents whose \
-                      owner has this on.",
+                      owner has this on, and for official bots (@claude, @gemini) in turns of yours \
+                      — you pay for those, as for their tokens.",
         owner: "ops",
         added: "2026-11",
         clients: &[Daemon],
@@ -757,6 +774,37 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
     // Web and phone read it to show the Passes card, the Pass sheet and the
     // "Passes can't be sent" lines. Spending a Pass needs no flag: no Pass
     // exists until this or `walletPassIssue` makes one.
+    // Mafold Pro Pass (ops 11-01): $20 a month for $30 of Claude, a Pass that
+    // resets each renewal. Who may buy it — the team first (ops: "only team
+    // members use it" while it runs on our Claude subscription).
+    FlagMeta {
+        key: "proPass",
+        default: false,
+        dev_default: false,
+        label: "Wallet: Mafold Pro Pass",
+        description: "Sells the Mafold Pro Pass: $20 a month, $30 of Claude in a Pass only you can \
+                      spend, reset each renewal. The wallet's pill and the Pass sheet offer it, and \
+                      the api opens its checkout only where this is on.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // The launch event (ops 11-01: "buy Mafold Pro Pass, gift a Mafold
+    // Premium"): Premium free while a Pro Pass renews. Off = the gift ends
+    // for everyone at once; no end date yet.
+    FlagMeta {
+        key: "proPassGift",
+        default: false,
+        dev_default: false,
+        label: "Pro Pass gives Premium",
+        description: "While someone's Mafold Pro Pass renews, they are a Premium member too. Read \
+                      on the subscriber.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
     FlagMeta {
         key: "passes",
         default: false,
@@ -813,6 +861,27 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       keyboard, safe areas). Off = the 620/600ms genie and the phone's system sheet.",
         owner: "ops",
         added: "2026-10",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // ops 11-02: opening an app shifts the columns one place left instead of
+    // asking Full or Split. Client-only (client-shared/appBeside.ts).
+    FlagMeta {
+        key: "appBeside",
+        default: false,
+        dev_default: true,
+        label: "Apps open beside the chat",
+        description: "On a window with room for two columns (web, the desktop app, tablets in \
+                      landscape), tapping an app opens it straight away — no Full / Split \
+                      question: the chat list folds, the chat moves into the list's slot at the \
+                      list's width (never under 360), and the app slides in from the right and \
+                      takes the rest. The chat | app line drags; the list comes back as a third \
+                      column, or over the chat when there's no room; ✕ puts everything back, ⤢ \
+                      still fills the window. From the Apps tab (no chat) the app takes the big \
+                      pane and the list stays. Phones and narrow windows: unchanged. Off = the \
+                      Full / Split chooser and the 408 px column.",
+        owner: "ops",
+        added: "2026-11",
         clients: &[Web, Phone],
         server: NotRead,
     },
@@ -950,6 +1019,18 @@ mod tests {
         assert_eq!((m.owner, m.added), ("ops", "2026-10"), "{k}: owner and month");
         let at = |key: &str| KNOWN_FLAGS.iter().position(|f| f.key == key);
         assert_eq!(at(k), at("bootCurtain").map(|i| i + 1), "{k}: registered right after updatePill / bootCurtain");
+    }
+
+    #[test]
+    fn app_beside_ships_dark_on_web_and_phone() {
+        // ops 11-02: an app opens beside the chat instead of asking Full / Split.
+        // Production off until it is turned on for someone; dev builds see it.
+        let k = "appBeside";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, NotRead, "{k}: read by the clients only");
+        assert_eq!((m.owner, m.added), ("ops", "2026-11"), "{k}: owner and month");
     }
 
     #[test]

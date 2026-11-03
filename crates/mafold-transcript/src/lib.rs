@@ -36,4 +36,4 @@ pub mod stats;
 pub use event::AgentEvent;
 pub use render::step_line;
 pub use stats::{RunStats, WalletCharge};
-pub use transcript::{Advance, Boundary, Qualify, Transcript};
+pub use transcript::{Advance, Boundary, Qualify, Tap, Transcript};

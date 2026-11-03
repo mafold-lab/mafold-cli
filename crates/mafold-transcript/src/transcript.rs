@@ -57,6 +57,12 @@ pub type Boundary = fn(&str) -> usize;
 /// into bare card tags here (`{% html %}` → `{% mafold/html %}`).
 pub type Qualify = fn(&str) -> String;
 
+/// Who else hears every event a transcript is fed ([`Transcript::set_tap`]):
+/// a driver that renders the reply itself, from the events, rather than from
+/// this transcript's snapshots — mafold-cli running the Mafold Harness loop,
+/// whose daemon draws every runtime's reply from the same event stream.
+pub type Tap = std::sync::Arc<dyn Fn(&AgentEvent) + Send + Sync>;
+
 /// End-of-turn stamps the DRIVER appends after the reply is written. They are
 /// not an answer, so a tail holding nothing else is an empty message.
 const DRIVER_CARDS: [&str; 2] = ["mafold/result", "mafold/bgtasks"];
@@ -150,6 +156,9 @@ pub struct Transcript {
     /// Parts of cards this turn rendered that only some readers may read —
     /// state for whoever posts the reply to write ([`Transcript::take_private`]).
     private: Vec<crate::render::PrivateItem>,
+    /// See [`Tap`]. Kept by a clone, so a transcript put back after a broken
+    /// step goes on telling the same listener.
+    tap: Option<Tap>,
 }
 
 impl Default for Transcript {
@@ -278,7 +287,16 @@ impl Transcript {
             groups: 0,
             last_group: (HashMap::new(), 0),
             private: Vec::new(),
+            tap: None,
         }
+    }
+
+    /// Hand every event this transcript is fed — and what [`push_raw`]
+    /// splices in, as text — to `tap` as well, before it is applied here.
+    ///
+    /// [`push_raw`]: Transcript::push_raw
+    pub fn set_tap(&mut self, tap: Tap) {
+        self.tap = Some(tap);
     }
 
     /// Commit as much pending narration as the text policy allows. Called on
@@ -404,6 +422,9 @@ impl Transcript {
     ///
     /// [`seal`]: Transcript::seal
     pub fn push_raw(&mut self, md: &str) {
+        if let Some(tap) = self.tap.as_ref().filter(|_| !md.is_empty()) {
+            tap(&AgentEvent::Text(md.to_string()));
+        }
         self.flush_text();
         self.close_group();
         self.full.push_str(md);
@@ -442,6 +463,9 @@ impl Transcript {
 
     /// Feed one event.
     pub fn push(&mut self, ev: &AgentEvent) -> Advance {
+        if let Some(tap) = &self.tap {
+            tap(ev);
+        }
         match ev {
             AgentEvent::Text(t) if !t.is_empty() && self.first_text_ms.is_none() => {
                 self.first_text_ms = Some(self.stats_started.elapsed().as_millis() as u64);

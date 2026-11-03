@@ -5,8 +5,9 @@
 //!
 //! On Mafold Cloud only the wallet. On a computer a login runs only its own
 //! runtime (a Claude login runs Claude Code, a Codex login runs Codex, …).
-//! OpenCode Go runs Mafold Harness (Mafold's pinned OpenCode, `opencode`) and
-//! your own OpenCode install (`opencode-own`) where the owner has
+//! OpenCode Go runs Mafold Harness (`opencode`: the loop the official bots run
+//! on, carried by mafold-cli) and your own OpenCode install (`opencode-own`)
+//! where the owner has
 //! `openCodeGo` on; the wallet fuels Mafold Harness alone, where the owner has
 //! `walletOnComputers` on.
 
@@ -16,8 +17,8 @@ pub const RUNTIME_SIGN_INS: &[(&str, &[&str])] = &[
     ("codex", &["codex"]),
     ("kimi-code", &["kimi"]),
     // Mafold Harness: no login of its own — your OpenCode Go plan, or the
-    // wallet (the router serves it on /v1/chat/completions, which OpenCode
-    // speaks; Claude Code and Codex wait for PR 4d / 4e).
+    // wallet (the router serves it on /v1/chat/completions, which its model
+    // client speaks; Claude Code and Codex wait for PR 4d / 4e).
     ("opencode", &["opencode-go", "wallet"]),
     // Your own OpenCode: on OpenCode Go.
     ("opencode-own", &["opencode-go"]),

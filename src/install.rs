@@ -3,11 +3,10 @@
 //!
 //! Each runtime: detect an existing install, otherwise run its OFFICIAL
 //! installer (with confirmation; `--yes` for headless), re-verify, and point at
-//! the next onboarding step. OpenCode is the exception: Mafold runs its own
-//! pinned build of it on the wallet (`harness::opencode_pin`), so that is what
-//! gets installed, checked against its pinned hash, under `~/.mafold/runtimes`
-//! — whatever `opencode` the user may have on PATH is left alone and never
-//! counts. `mafold install` with no argument lists the
+//! the next onboarding step. Mafold Harness (`opencode`) is the exception: it
+//! is part of mafold itself (`harness::mafold_harness`), so there is nothing
+//! to install, and saying so is all `mafold install opencode` does — your own
+//! OpenCode is `opencode-own`. `mafold install` with no argument lists the
 //! runtimes + their install state. The web New-Bot modal's one-click install
 //! rides this too: the supervisor claims a queued install (`claimProvisions`
 //! → `installs`) and calls [`run`] with `yes = true`. @mafold teaches this
@@ -26,7 +25,7 @@ struct Tool {
     /// Human name for prints.
     name: &'static str,
     /// The binary whose presence on PATH means "installed" (an official
-    /// install; a pinned one is its own path, [`How::Pinned`]).
+    /// install; one that is part of mafold is mafold, [`How::Linked`]).
     bin: &'static str,
     /// How it gets onto this machine.
     how: How,
@@ -42,13 +41,9 @@ enum How {
     /// The vendor's own installer: `unix` run via `bash -c` (macOS, Linux),
     /// and on Windows the vendor's own one, or why there is none to run.
     Official { unix: &'static str, windows: Win },
-    /// A build Mafold pins: `install` fetches and checks it, `path` is where
-    /// it lives. The PATH is never consulted for it.
-    Pinned {
-        version: &'static str,
-        path: fn() -> std::path::PathBuf,
-        install: fn(Option<std::time::Duration>) -> Result<std::path::PathBuf>,
-    },
+    /// Part of mafold itself: nothing to download, here wherever mafold is,
+    /// at mafold's own version.
+    Linked,
 }
 
 const TOOLS: &[Tool] = &[
@@ -99,16 +94,12 @@ const TOOLS: &[Tool] = &[
     Tool {
         id: "opencode",
         aliases: &["opencode", "open-code"],
-        name: "OpenCode",
-        bin: "opencode",
-        // Mafold Harness: the one build its event mapping was measured
-        // against, never `curl | bash` of whatever is newest.
-        how: How::Pinned {
-            version: crate::harness::opencode_pin::VERSION,
-            path: crate::harness::opencode_pin::binary,
-            install: crate::harness::opencode_pin::ensure_blocking,
-        },
-        fallback: "check that this computer can reach registry.npmjs.org or registry.npmmirror.com, then run `mafold install opencode` again",
+        name: "Mafold Harness",
+        bin: "mafold",
+        // The loop the official bots run on, compiled into mafold — the id
+        // is the one its tile has always had.
+        how: How::Linked,
+        fallback: "it is part of mafold — `mafold update` brings the newest",
         auth_hint: "nothing to sign in to — Mafold runs it on OpenCode Go (your key in Connections) or your Mafold wallet",
     },
     Tool {
@@ -151,7 +142,7 @@ enum Installer {
 /// `t`'s installer on this platform; `Err` = why there's none.
 fn installer(t: &Tool, windows: bool) -> std::result::Result<Installer, &'static str> {
     let How::Official { unix, windows: win } = t.how else {
-        return Err("Mafold installs its own pinned build of it");
+        return Err("it is part of mafold, so there is nothing to install");
     };
     match (windows, win) {
         (false, _) => Ok(Installer::Bash(unix)),
@@ -160,22 +151,20 @@ fn installer(t: &Tool, windows: bool) -> std::result::Result<Installer, &'static
     }
 }
 
-/// What to look for to call `t` installed: its name on PATH, or the path of
-/// Mafold's pinned build.
+/// What to look for to call `t` installed: its name on PATH, or — for one
+/// that is part of mafold — this very program.
 fn program_of(t: &Tool) -> String {
     match t.how {
         How::Official { .. } => t.bin.to_string(),
-        How::Pinned { path, .. } => path().to_string_lossy().into_owned(),
+        How::Linked => crate::platform::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| t.bin.to_string()),
     }
 }
 
-/// An installed `t`'s version: what its CLI says, or the pin's — which is
-/// what a pinned build is by construction, and asking it would make
-/// OpenCode's folders in the user's home (`harness::opencode_pin`).
+/// An installed `t`'s version: what its CLI says, or mafold's own.
 fn installed_version(t: &Tool) -> Option<String> {
     match t.how {
         How::Official { .. } => version_of(t.bin),
-        How::Pinned { version, .. } => Some(version.to_string()),
+        How::Linked => Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }
 
@@ -250,7 +239,7 @@ fn list() -> Result<()> {
                 installed_version(t)
                     .map(|v| format!(" ({v})"))
                     .unwrap_or_default(),
-                if matches!(t.how, How::Pinned { .. }) { ", pinned by Mafold" } else { "" }
+                if matches!(t.how, How::Linked) { ", part of mafold" } else { "" }
             )
         } else {
             format!("· not installed — `mafold install {}`", t.id)
@@ -261,24 +250,17 @@ fn list() -> Result<()> {
 }
 
 fn install(t: &Tool, yes: bool, limit: Option<std::time::Duration>) -> Result<()> {
+    if matches!(t.how, How::Linked) {
+        println!("✓ {} is part of mafold ({}) — nothing to install", t.name, env!("CARGO_PKG_VERSION"));
+        next_steps(t);
+        return Ok(());
+    }
     if crate::harness::on_path(&program_of(t)) {
         println!(
             "✓ {} already installed ({})",
             t.name,
             installed_version(t).unwrap_or_else(|| "version unknown".into())
         );
-        next_steps(t);
-        return Ok(());
-    }
-    if let How::Pinned { version, path, install } = t.how {
-        println!("Mafold runs its own pinned build of {} ({version}).", t.name);
-        println!("About to download it from npm (whichever of registry.npmjs.org and registry.npmmirror.com delivers first), check it");
-        println!("against its pinned SHA-512, and install it to {}.", path().display());
-        if !yes && !confirmed()? {
-            return Ok(());
-        }
-        let bin = install(limit).map_err(|e| anyhow::anyhow!("{e:#} — {}", t.fallback))?;
-        println!("✓ {} {version} installed ({})", t.name, bin.display());
         next_steps(t);
         return Ok(());
     }
@@ -495,16 +477,19 @@ mod windows_installer_tests {
         }
     }
 
-    /// OpenCode is Mafold's pinned build on every OS: no vendor installer,
-    /// no npm -g, nothing found on PATH standing in for it.
+    /// Mafold Harness is part of mafold on every OS: no vendor installer, no
+    /// npm -g, nothing found on PATH standing in for it — it is installed
+    /// wherever mafold is, at mafold's version, and installing it says so.
     #[test]
-    fn opencode_installs_the_pinned_build_on_every_os() {
+    fn mafold_harness_is_part_of_mafold_on_every_os() {
         let t = tool("open-code");
-        let How::Pinned { version, path, .. } = t.how else { panic!("opencode is pinned") };
-        assert_eq!(version, crate::harness::opencode_pin::VERSION);
-        assert_eq!(path(), crate::harness::opencode_pin::binary());
-        assert_eq!(program_of(t), crate::harness::opencode_pin::binary().to_string_lossy());
+        assert!(matches!(t.how, How::Linked));
+        assert_eq!(t.name, "Mafold Harness");
+        assert_eq!(program_of(t), crate::platform::current_exe().unwrap().to_string_lossy());
+        assert!(crate::harness::on_path(&program_of(t)), "installed wherever mafold is");
+        assert_eq!(installed_version(t).as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert!(installer(t, false).is_err() && installer(t, true).is_err(), "no official installer is run for it");
+        assert!(install(t, false, None).is_ok(), "nothing to confirm, nothing run");
     }
 
     /// Windows runs the vendor's own installer — never bash, which a stock
@@ -562,12 +547,13 @@ mod windows_installer_tests {
         assert!(home_install(home, "opencode", false).contains(&home.join(".opencode/bin/opencode")));
     }
 
-    /// Mafold Harness is Mafold's pinned OpenCode; `opencode-own` is OpenCode's
-    /// own installer — the OpenCode 1 line it hands out, the one Mafold drives.
+    /// Mafold Harness (`opencode`) is part of mafold; `opencode-own` is
+    /// OpenCode's own installer — the OpenCode 1 line it hands out, the one
+    /// Mafold drives.
     #[test]
-    fn both_opencodes_install_and_never_as_each_other() {
+    fn mafold_harness_and_your_own_opencode_never_install_as_each_other() {
         let harness = find("opencode").unwrap();
-        assert!(matches!(harness.how, How::Pinned { .. }));
+        assert!(matches!(harness.how, How::Linked));
         let own = find("opencode-own").unwrap();
         assert_eq!(own.id, "opencode-own");
         assert!(matches!(own.how, How::Official { unix, .. } if unix.contains("opencode.ai/install")));

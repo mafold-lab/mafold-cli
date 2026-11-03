@@ -982,9 +982,6 @@ async fn main() -> Result<()> {
                     .to_string_lossy()
                     .into_owned(),
             };
-            // Mafold Harness's pinned OpenCode goes in here, with its
-            // progress on this terminal — not on the agent's first reply.
-            crate::harness::opencode_pin::install_before_add(harness.as_deref());
             supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
         Cmd::Chats => chats(&Client::new(cli.base, token?)).await?,
