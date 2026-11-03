@@ -142,6 +142,12 @@ pub fn paid_use_not_enabled(bot: &str) -> String {
     format!("paid_use_not_enabled: @{bot} can't take paid turns yet")
 }
 
+/// The agent is one of its owner's agents over their plan — paused until they
+/// have Premium again or pick it to keep running (`premium_perks`).
+pub fn agent_paused(bot: &str, owner: &str, cap: usize) -> String {
+    format!("agent_paused: @{bot} is paused — @{owner}'s plan keeps {cap} agents running")
+}
+
 /// What the model is told when its turn ended with nothing for the person to
 /// read — word for word what Claude Code says in the same spot (2.1.294's
 /// `thinking_only_retry`). Asked once; a second silence ends the turn as
@@ -239,6 +245,9 @@ pub enum FailureKind {
     /// the prompt or on what it produced). Not an outage and not the wallet:
     /// rewording is what helps.
     Blocked,
+    /// The agent is over its owner's plan ([`agent_paused`]): paused, not
+    /// broken. Its owner brings it back (Premium, or keeping it instead).
+    Paused,
     /// Nothing above. Still shown, raw text and all.
     Unknown,
 }
@@ -267,6 +276,7 @@ impl FailureKind {
             Self::NotOpen => "not_open",
             Self::OwnerOnly => "owner_only",
             Self::FuelOff => "fuel_off",
+            Self::Paused => "paused",
             Self::Blocked => "blocked",
             Self::Unknown => "unknown",
         }
@@ -436,6 +446,8 @@ pub fn classify(err: &str) -> Failure {
         Some(FailureKind::Empty)
     } else if low.contains("no_supplier") {
         Some(FailureKind::Unavailable)
+    } else if low.contains("agent_paused") {
+        Some(FailureKind::Paused)
     } else if low.contains("paid_use_not_enabled") {
         Some(FailureKind::NotOpen)
     } else if low.contains("wallet_owner_only") {
@@ -802,6 +814,8 @@ mod tests {
             // As the api's 403 reaches the daemon, envelope description and all.
             (format!("403 Forbidden: {}", wallet_owner_only("ops")), FailureKind::OwnerOnly),
             (wallet_fuel_off("ops:oc", "walletOnComputers is off for @ops"), FailureKind::FuelOff),
+            (agent_paused("ann:c", "ann", 2), FailureKind::Paused),
+            (format!("permission denied: {}", agent_paused("ann:c", "ann", 2)), FailureKind::Paused),
             // As mintReplyKey's 403 reaches the daemon (ApiError's prefix).
             (format!("permission denied: {}", wallet_fuel_off("ops:oc", "its fuel is claude")), FailureKind::FuelOff),
             (empty_reply("anthropic"), FailureKind::Empty),

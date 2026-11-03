@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.157-dev.120"
+version = "0.9.158-dev.121"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -20,6 +20,10 @@ mafold-core = { path = "crates/mafold-core" }
 # driven by a server-side brain renders as the same cards as one driven by a
 # harness here — one transcript pipeline, not one per producer.
 mafold-transcript = { path = "crates/mafold-transcript" }
+# Mafold Harness: the loop the official bots and Cloud agents run on, linked
+# in so an agent on its owner's computer runs the very same one, in this
+# process (harness/mafold_harness.rs).
+mafold-harness = { path = "crates/mafold-harness" }
 uuid = "1"
 # `io-std` is for `mafold mcp serve`: an MCP stdio server reads requests off
 # stdin while awaiting network calls to providers, so stdin has to be async —
@@ -46,6 +50,11 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # `mafold diagnose` masks what looks like a token, a JWT or an email in the
 # logs it bundles (diagnose.rs) — shapes, not values, so a pattern language.
 regex = "1"
+# Mafold Harness's Glob and Grep tools (harness/computer.rs) walk the working
+# folder the way ripgrep does — .gitignore honoured, hidden files skipped — so
+# a search never wades through node_modules or target/.
+ignore = "0.4"
+globset = "0.4"
 
 # Process/session control (detach via setsid, liveness + stop via signals) — Unix only.
 [target.'cfg(unix)'.dependencies]

@@ -18,9 +18,10 @@ mod codex_stats;
 // and reply-scoped server-request approvals.
 #[allow(dead_code)]
 pub mod codex_app_server;
+pub mod computer;
 pub mod kimi_code;
+pub mod mafold_harness;
 pub mod opencode;
-pub mod opencode_pin;
 pub mod unsupported;
 
 use async_trait::async_trait;
@@ -850,7 +851,8 @@ pub fn select(id: &str) -> Arc<dyn Harness> {
         "claude-code" | "claude" | "claudecode" | "" => Arc::new(claude_code::ClaudeCode),
         "codex" | "codex-cli" => Arc::new(codex::Codex),
         "kimi-code" | "kimi" | "kimi-cli" | "kimicode" => Arc::new(kimi_code::KimiCode),
-        "opencode" | "open-code" => Arc::new(opencode::OpenCode),
+        // Mafold Harness, by the id its tile has always had.
+        "opencode" | "open-code" => Arc::new(mafold_harness::MafoldHarness),
         "opencode-own" | "own-opencode" => Arc::new(opencode::OwnOpenCode),
         other => Arc::new(unsupported::Unsupported { id: intern(other) }),
     }
@@ -878,11 +880,9 @@ fn intern(id: &str) -> &'static str {
 enum Bin {
     /// The vendor's own install, on `$PATH` under this name.
     OnPath(&'static str),
-    /// A build Mafold pins and installs itself, at the one path it installs
-    /// to — so a same-named CLI the user put on PATH, any version, never
-    /// passes for it. Its version is the pin's: only a build that matched
-    /// the pinned hash and said so is ever put there (`opencode_pin`).
-    Pinned { path: fn() -> PathBuf, version: &'static str },
+    /// No binary: the runtime is part of this program (Mafold Harness), so it
+    /// is here wherever mafold is, at mafold's own version.
+    Linked,
     /// The vendor's own install, found where its installer puts it as well as
     /// on `$PATH` (your own OpenCode: `~/.opencode/bin`).
     Found(fn() -> Option<PathBuf>),
@@ -893,7 +893,7 @@ impl Bin {
     fn program(self) -> String {
         match self {
             Bin::OnPath(bin) => bin.to_string(),
-            Bin::Pinned { path, .. } => path().to_string_lossy().into_owned(),
+            Bin::Linked => crate::platform::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             // Where it was found, else its name (spawning that says it's missing).
             Bin::Found(find) => find().map_or_else(|| "opencode".to_string(), |p| p.to_string_lossy().into_owned()),
         }
@@ -903,7 +903,7 @@ impl Bin {
     fn version(self) -> Option<String> {
         match self {
             Bin::OnPath(bin) => bin_version(bin),
-            Bin::Pinned { version, .. } => Some(version.to_string()),
+            Bin::Linked => Some(env!("CARGO_PKG_VERSION").to_string()),
             Bin::Found(find) => find().and_then(|p| version_of(&p)),
         }
     }
@@ -912,7 +912,7 @@ impl Bin {
 // (harness id, the CLI binary whose presence signals it's installed)
 const BINS: &[(&str, Bin)] = &[
     ("claude-code", Bin::OnPath("claude")),
-    ("opencode", Bin::Pinned { path: opencode_pin::binary, version: opencode_pin::VERSION }),
+    ("opencode", Bin::Linked),
     ("codex", Bin::OnPath("codex")),
     ("openclaw", Bin::OnPath("openclaw")),
     ("kimi-code", Bin::OnPath("kimi")),
@@ -920,7 +920,7 @@ const BINS: &[(&str, Bin)] = &[
 ];
 
 /// Probe which known harnesses are installed on THIS machine (their CLI is on
-/// PATH, or Mafold's pinned build is in place) — the control plane's
+/// PATH or where its installer puts it, or it is part of mafold) — the control plane's
 /// capability report for New-Bot recommendation. Returns `(id, available)`.
 /// Extend `BINS` as more harness impls land.
 pub fn probe() -> Vec<(&'static str, bool)> {
@@ -928,6 +928,7 @@ pub fn probe() -> Vec<(&'static str, bool)> {
         .map(|(id, bin)| {
             let installed = match bin {
                 Bin::Found(find) => find().is_some(),
+                Bin::Linked => true,
                 other => on_path(&other.program()),
             };
             (*id, installed)
@@ -1046,24 +1047,22 @@ pub async fn report_rows() -> Vec<Value> {
 /// What Mafold here can run `id` on, as the report says it: each runtime's
 /// own login; Mafold Harness on OpenCode Go and the wallet; your own OpenCode
 /// on OpenCode Go, saying whether it is signed in to Go here. Go's models are
-/// the ones that OpenCode lists (`opencode::go_models`), once it's installed.
+/// the ones Mafold Harness can talk to (`mafold_harness::go_model_ids`'s
+/// list), and for your own OpenCode the ones it lists (`opencode::go_models`).
 async fn sign_ins_of(id: &str, installed: bool) -> Value {
-    let models = |bin: Option<PathBuf>, isolated: bool| async move {
-        match bin.filter(|_| installed) {
-            Some(bin) => tokio::task::spawn_blocking(move || opencode::go_models(&bin, isolated)).await.unwrap_or_default(),
-            None => Vec::new(),
-        }
-    };
     match id {
         "claude-code" => serde_json::json!([{ "id": "claude" }]),
         "codex" => serde_json::json!([{ "id": "codex" }]),
         "kimi-code" => serde_json::json!([{ "id": "kimi" }]),
         "opencode" => {
-            let m = models(Some(opencode_pin::binary()), true).await;
+            let m = mafold_harness::go_models().await;
             serde_json::json!([{ "id": crate::fuel::GO, "models": m }, { "id": crate::fuel::WALLET }])
         }
         opencode::OWN => {
-            let m = models(opencode::own_binary(), false).await;
+            let m = match opencode::own_binary().filter(|_| installed) {
+                Some(bin) => tokio::task::spawn_blocking(move || opencode::go_models(&bin)).await.unwrap_or_default(),
+                None => Vec::new(),
+            };
             serde_json::json!([{ "id": crate::fuel::GO, "signed_in": opencode::own_go_login(), "models": m }])
         }
         _ => serde_json::json!([]),
@@ -1679,19 +1678,15 @@ mod select_tests {
         assert_eq!(select("open-code").id(), "opencode");
     }
 
-    /// OpenCode is installed when Mafold's pinned build is — the binary the
-    /// harness starts, reported at the pin's version — and an `opencode` the
-    /// user has on PATH never counts.
+    /// Mafold Harness (`opencode`) is part of this program: here wherever
+    /// mafold is, at mafold's version, and no `opencode` anywhere counts.
     #[test]
-    fn opencode_is_probed_at_its_pinned_path_not_on_path() {
+    fn mafold_harness_is_here_wherever_mafold_is() {
         let (_, bin) = BINS.iter().find(|(id, _)| *id == "opencode").expect("a row");
-        assert!(matches!(bin, Bin::Pinned { version: "1.19.5", .. }));
-        assert_eq!(bin.version().as_deref(), Some(opencode_pin::VERSION));
-        let at = bin.program();
-        assert_eq!(PathBuf::from(&at), opencode_pin::binary());
-        assert!(PathBuf::from(&at).is_absolute() || at.contains(std::path::MAIN_SEPARATOR));
-        assert_eq!(on_path(&at), opencode_pin::installed());
-        assert_eq!(select("opencode").available(), opencode_pin::installed());
+        assert!(matches!(bin, Bin::Linked));
+        assert_eq!(bin.version().as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(probe().iter().find(|(id, _)| *id == "opencode").map(|(_, ok)| *ok), Some(true));
+        assert!(select("opencode").available());
     }
 
     /// The person talking to the agent is told what happened and what to do,

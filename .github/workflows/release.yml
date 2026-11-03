@@ -12,9 +12,9 @@
 # Edit it in the monorepo — an edit made in the public repo is overwritten by
 # the next release.
 #
-# Layout: the mirror vendors the two private path-deps under crates/
-# (mafold-core → mafold-types) and rewrites the ONE path in Cargo.toml, so this
-# repo builds standalone. Do NOT run `cargo test` here: the core's
+# Layout: the mirror vendors the private path-deps under crates/
+# (mafold-core → mafold-types, mafold-transcript, mafold-harness) and rewrites
+# the CLI's own `../` paths in Cargo.toml, so this repo builds standalone. Do NOT run `cargo test` here: the core's
 # registry_matches_api_route_table pins the api route table with include_str!,
 # which resolves at COMPILE time and mafold-api is not mirrored — the test
 # target would fail to build. That pin belongs to the monorepo. `cargo build`

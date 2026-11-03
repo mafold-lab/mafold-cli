@@ -1,41 +1,31 @@
-//! OpenCode harnesses — Mafold Harness (`opencode`: the pinned OpenCode build,
-//! `super::opencode_pin`, in a clean home of its own) and your own OpenCode
-//! install (`opencode-own`, [`OwnOpenCode`]) — on the owner's Mafold wallet or
-//! OpenCode Go plan. Both normalize OpenCode's server event stream into
-//! [`AgentEvent`]s, so their turns render as the same cards every other
-//! harness produces.
+//! Your own OpenCode install as a runtime (`opencode-own`, [`OwnOpenCode`]),
+//! on the owner's OpenCode Go plan. It normalizes OpenCode's server event
+//! stream into [`AgentEvent`]s, so its turns render as the same cards every
+//! other harness produces. Also here: a turn's fuel as the daemon hands it
+//! over ([`Fuel`]: the wallet, or OpenCode Go), which Mafold Harness
+//! (`super::mafold_harness`) reads the same way.
 //!
 //! What shapes this impl:
-//! - **One `opencode serve` per turn.** The wallet key in [`Turn::env`] was
-//!   minted for this one reply (`mintReplyKey`) and dies when the reply ends,
-//!   so the process holding it ends with the turn too. Nothing is pooled or
-//!   prewarmed: a warm process would be holding a dead key.
+//! - **One `opencode serve` per turn.** A key in [`Turn::env`] is the reply's
+//!   (the wallet's is minted for this one reply, `mintReplyKey`, and dies when
+//!   it ends), so the process holding it ends with the turn too. Nothing is
+//!   pooled or prewarmed: a warm process would be holding a dead key.
 //! - **A server, not a stream on stdout.** OpenCode's headless surface is an
 //!   HTTP server: a session, `prompt_async`, and one SSE stream (`/event`) for
 //!   everything that happens. It listens on loopback, where every local user
 //!   can reach it, and its tools run bash — so each turn's server gets a random
 //!   password of its own (`OPENCODE_SERVER_PASSWORD`, basic auth).
-//! - **Its fuel or nothing.** On the wallet, the one provider Mafold Harness
-//!   can see is `mafold`, the router's OpenAI-compatible door with the
-//!   reply's key; on OpenCode Go it is `opencode-go`, with the owner's key.
-//!   `enabled_providers` holds it to that one, and other providers'
-//!   credentials are scrubbed from its environment. A turn with neither is
-//!   refused, never run on something else.
-//! - **Your own OpenCode is yours.** `opencode-own` runs the `opencode` you
-//!   installed, with your config, plugins, agents and the Go login it already
-//!   has; Mafold only pins the reply to OpenCode Go (adding the key from your
+//! - **Your own OpenCode is yours.** It runs the `opencode` you installed,
+//!   with your config, plugins, agents and the Go login it already has;
+//!   Mafold only pins the reply to OpenCode Go (adding the key from your
 //!   Connections when that OpenCode has no Go login of its own) and makes it
-//!   headless. Its sessions live with your own.
-//! - **Its own home.** `XDG_*` point at `~/.mafold/runtimes/opencode/home/<bot>`,
-//!   so the user's own OpenCode config, plugins and logins never load, and
-//!   project config is off (a repo's `opencode.json` could send the key
-//!   elsewhere). Sessions live there across turns, which is how a conversation
+//!   headless. Its sessions live with your own, which is how a conversation
 //!   resumes on the next turn's fresh server.
 //! - **Headless means nothing may ask.** Every permission OpenCode would stop
 //!   to ask about is allowed, and its ask-the-user tool is off; an ask that
 //!   still arrives is answered at once instead of holding the reply forever.
-//! - **Its $ figure is not the bill.** The wallet bills by the router's ledger;
-//!   OpenCode's own estimate is never reported as a cost.
+//! - **Its $ figure is not the bill.** Go is the owner's plan; OpenCode's own
+//!   estimate is never reported as a cost.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -50,11 +40,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 
-use super::opencode_pin;
 use super::{AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModelCap, Turn, TurnOutcome};
 use crate::client::Client;
-
-pub struct OpenCode;
 
 /// What a turn without its fuel answers. The daemon puts the wallet's key, or
 /// the owner's OpenCode Go key, in [`Turn::env`] for a reply and only then;
@@ -104,78 +91,10 @@ const RETRY_GIVE_UP: u64 = 6;
 /// SSE reconnects one turn may make before its stream counts as lost.
 const RECONNECTS: usize = 5;
 
-/// Environment prefixes another provider's credentials live under, plus any
-/// OpenCode setting of the user's and any wallet value the daemon itself
-/// inherited: the child gets the wallet from [`Turn::env`] and nowhere else.
-/// Everything else (PATH, HOME, tool logins) stays, so the agent's tools work.
-const SCRUB: &[&str] =
-    &["OPENAI_", "ANTHROPIC_", "DEEPSEEK_", "GEMINI_", "OPENROUTER_", "OPENCODE_", "MAFOLD_WALLET_", "MAFOLD_GO_"];
-
-#[async_trait]
-impl Harness for OpenCode {
-    fn id(&self) -> &'static str {
-        "opencode"
-    }
-
-    /// The pinned build, never an `opencode` on PATH.
-    fn available(&self) -> bool {
-        opencode_pin::installed()
-    }
-
-    /// Yes: the session exists (and is named) before the prompt is sent.
-    fn names_session_first(&self) -> bool {
-        true
-    }
-
-    async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let pin = match opencode_pin::Source::here() {
-            Ok(pin) => pin,
-            Err(e) => return Ok(TurnOutcome { error: Some(set_up_failed(&e)), ..Default::default() }),
-        };
-        run_on(turn, sink, Place::Pinned(pin)).await
-    }
-
-    fn discover(&self, _workdir: &str) -> Value {
-        // OpenCode's own commands are a TUI feature; forwarded, a `/name` is
-        // just prompt text. The daemon's control commands are added apart.
-        Value::Array(vec![])
-    }
-
-    async fn command(
-        &self,
-        _client: &Client,
-        _chat_id: &str,
-        _name: &str,
-        _arg: &str,
-        _workdir: &str,
-        _session: Option<&str>,
-        _env: &[(String, String)],
-    ) -> CommandOutcome {
-        CommandOutcome::Forward
-    }
-
-    /// The pin's, when it is installed (`opencode_pin::installed`).
-    async fn cli_version(&self) -> String {
-        if opencode_pin::installed() {
-            opencode_pin::VERSION.to_string()
-        } else {
-            String::new()
-        }
-    }
-
-    /// OpenCode Go's models, as the pinned build lists them ([`go_probe`]) —
-    /// the model menu of an agent on Go. Asked only for one: on the wallet
-    /// the models are the router's (`agent::report_caps`).
-    async fn caps(&self, _env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
-        let bin = opencode_pin::binary();
-        go_probe(tokio::task::spawn_blocking(move || go_models(&bin, true)).await.ok()?)
-    }
-}
-
 /// Your own OpenCode install, as a runtime of its own (OpenCode Go, ops
 /// 10-31): the `opencode` on PATH, or where OpenCode's installer puts it.
-/// Driven like Mafold Harness — one `opencode serve` per turn — but in your
-/// own home, with your own config, and on OpenCode Go alone.
+/// One `opencode serve` per turn, in your own home, with your own config, and
+/// on OpenCode Go alone.
 pub struct OwnOpenCode;
 
 #[async_trait]
@@ -206,10 +125,12 @@ impl Harness for OwnOpenCode {
                 ..Default::default()
             });
         };
-        run_on(turn, sink, Place::Own { bin, xdg: None }).await
+        run_on(turn, sink, bin, None).await
     }
 
     fn discover(&self, _workdir: &str) -> Value {
+        // OpenCode's own commands are a TUI feature; forwarded, a `/name` is
+        // just prompt text. The daemon's control commands are added apart.
         Value::Array(vec![])
     }
 
@@ -236,7 +157,7 @@ impl Harness for OwnOpenCode {
     /// OpenCode Go's models, as your OpenCode lists them ([`go_probe`]).
     async fn caps(&self, _env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
         let bin = own_binary()?;
-        go_probe(tokio::task::spawn_blocking(move || go_models(&bin, false)).await.ok()?)
+        go_probe(tokio::task::spawn_blocking(move || go_models(&bin)).await.ok()?)
     }
 }
 
@@ -280,8 +201,7 @@ fn own_go_login_in(xdg_data: Option<PathBuf>, env_key: Option<String>) -> bool {
 // ── OpenCode Go's models, as an OpenCode lists them ────────────────────────
 
 /// How long your own OpenCode's list is kept (it refreshes its models from
-/// models.dev by itself); the pinned build's never changes, so it's kept for
-/// as long as the binary is the same file.
+/// models.dev by itself).
 const OWN_MODELS_FOR: Duration = Duration::from_secs(6 * 3600);
 /// A listing that failed is tried again after this.
 const MODELS_RETRY: Duration = Duration::from_secs(600);
@@ -292,20 +212,17 @@ const MODELS_LIST: Duration = Duration::from_secs(30);
 #[allow(clippy::type_complexity)]
 static GO_MODELS: Mutex<Option<HashMap<PathBuf, (u64, Option<std::time::SystemTime>, Instant, Option<Vec<Value>>)>>> = Mutex::new(None);
 
-/// The models OpenCode Go can run with the OpenCode at `bin`, as it lists
-/// them (`opencode models opencode-go --verbose`), each `{id, name}` — for the
-/// computer's report, which New Agent's model picker reads. `isolated`: the
-/// pinned build, asked in a home of its own with nothing fetched (its
-/// snapshot's list, the one its turns run on); else your own OpenCode, as
-/// your home has it. Empty when it can't tell. Blocking.
-pub fn go_models(bin: &Path, isolated: bool) -> Vec<Value> {
+/// The models OpenCode Go can run with your own OpenCode at `bin`, as it
+/// lists them in your home (`opencode models opencode-go --verbose`), each
+/// `{id, name}` — for the computer's report, which New Agent's model picker
+/// reads. Empty when it can't tell. Blocking.
+pub fn go_models(bin: &Path) -> Vec<Value> {
     let meta = std::fs::metadata(bin).ok();
     let (len, mtime) = (meta.as_ref().map_or(0, |m| m.len()), meta.as_ref().and_then(|m| m.modified().ok()));
     {
         let cache = GO_MODELS.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((l, t, at, got)) = cache.as_ref().and_then(|c| c.get(bin)) {
             let keep = match got {
-                Some(_) if isolated => true,
                 Some(_) => at.elapsed() < OWN_MODELS_FOR,
                 None => at.elapsed() < MODELS_RETRY,
             };
@@ -314,7 +231,7 @@ pub fn go_models(bin: &Path, isolated: bool) -> Vec<Value> {
             }
         }
     }
-    let got = list_go_models(bin, isolated);
+    let got = list_go_models(bin);
     GO_MODELS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -323,30 +240,15 @@ pub fn go_models(bin: &Path, isolated: bool) -> Vec<Value> {
     got.unwrap_or_default()
 }
 
-fn list_go_models(bin: &Path, isolated: bool) -> Option<Vec<Value>> {
+fn list_go_models(bin: &Path) -> Option<Vec<Value>> {
     let mut cmd = crate::platform::std_command(bin);
     cmd.args(["models", GO_PROVIDER, "--verbose"]);
     // Go lists only once it has a key; a stand-in one, which nothing calls.
     let cfg = json!({ "autoupdate": false, "provider": { GO_PROVIDER: { "options": { "apiKey": "listing-only" } } } });
-    let cwd = if isolated {
-        let home = opencode_pin::agent_home_in(&opencode_pin::Source::here().ok()?.root, "list.models");
-        for d in ["config", "data", "cache", "state"] {
-            std::fs::create_dir_all(home.join(d)).ok()?;
-        }
-        seed_config(&home).ok()?;
-        for k in scrubbed(std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned()), &Mode::Isolated) {
-            cmd.env_remove(k);
-        }
-        for (k, v) in opencode_env(&home, &Mode::Isolated, &cfg, "listing-only") {
-            cmd.env(k, v);
-        }
-        home
-    } else {
-        for (k, v) in opencode_env(&own_home(), &Mode::Own { xdg: None }, &cfg, "listing-only") {
-            cmd.env(k, v);
-        }
-        crate::platform::home_dir().unwrap_or_else(std::env::temp_dir)
-    };
+    for (k, v) in opencode_env(None, &cfg, "listing-only") {
+        cmd.env(k, v);
+    }
+    let cwd = crate::platform::home_dir().unwrap_or_else(std::env::temp_dir);
     cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().ok()?;
     let mut out = child.stdout.take()?;
@@ -406,7 +308,7 @@ fn parse_go_models(text: &str) -> Vec<Value> {
 /// tiers: OpenCode passes none, so the sheet offers none. `None` when the
 /// listing came back empty — a listing that failed has learned nothing, and
 /// must not empty a menu.
-fn go_probe(models: Vec<Value>) -> Option<HarnessProbe> {
+pub(super) fn go_probe(models: Vec<Value>) -> Option<HarnessProbe> {
     let models: Vec<ModelCap> = models
         .iter()
         .filter_map(|m| {
@@ -425,18 +327,12 @@ fn go_probe(models: Vec<Value>) -> Option<HarnessProbe> {
     (!models.is_empty()).then(|| HarnessProbe { source: CapsSource::Handshake, models, ..Default::default() })
 }
 
-/// The ids of OpenCode Go's models for runtime `harness_id` (Mafold Harness,
-/// or your own OpenCode), as its OpenCode lists them on this computer —
-/// `/model`'s examples and its check. Empty when it can't tell: not
-/// installed, or the listing failed.
-pub async fn go_model_ids(harness_id: &str) -> Vec<String> {
-    let (bin, isolated) = match harness_id {
-        "opencode" => (Some(opencode_pin::binary()).filter(|b| super::launchable(b)), true),
-        OWN => (own_binary(), false),
-        _ => (None, false),
-    };
-    let Some(bin) = bin else { return Vec::new() };
-    tokio::task::spawn_blocking(move || go_models(&bin, isolated))
+/// The ids of OpenCode Go's models, as your own OpenCode lists them on this
+/// computer — `/model`'s examples and its check. Empty when it can't tell:
+/// not installed, or the listing failed.
+pub async fn go_model_ids() -> Vec<String> {
+    let Some(bin) = own_binary() else { return Vec::new() };
+    tokio::task::spawn_blocking(move || go_models(&bin))
         .await
         .unwrap_or_default()
         .iter()
@@ -444,49 +340,12 @@ pub async fn go_model_ids(harness_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Which OpenCode a turn runs, and where agents' homes are.
-enum Place {
-    /// The pinned build, installed first if it isn't here yet. This
-    /// computer's ([`opencode_pin::Source::here`]), or a test's scratch one.
-    Pinned(opencode_pin::Source),
-    /// A given binary and homes root — the tests' door.
-    #[cfg_attr(not(test), allow(dead_code))]
-    At { bin: PathBuf, root: PathBuf },
-    /// Your own OpenCode, in your own home. `xdg` stands in for that home
-    /// (the tests' door); `None` = the user's own, as their shell has it.
-    Own { bin: PathBuf, xdg: Option<PathBuf> },
-}
-
-/// How often a reply waiting on the pinned build's install shows it is alive
-/// — well inside the generating card's 30 s keepalive.
-const INSTALL_TICK: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(5) };
-
-/// While the pinned build installs for a reply: no process serves the turn
-/// yet, so nothing else beats its generating card, which read «No signal»
-/// two minutes into a slow download and invited the Stop that threw it away.
-/// So it beats from here (`Pulse`), and the reply says how far the download
-/// is once per quarter of it. Never ends; dropped with the install.
-async fn installing(sink: &UnboundedSender<AgentEvent>, root: &Path) {
-    let mut told = 0;
-    loop {
-        tokio::time::sleep(INSTALL_TICK).await;
-        let _ = sink.send(AgentEvent::Pulse { chars: 0, tokens: None });
-        if let Some(p) = opencode_pin::progress_in(root).filter(|p| p.step() > told) {
-            told = p.step();
-            let _ = sink.send(AgentEvent::Notice(format!("Installing OpenCode {} — {}", opencode_pin::VERSION, p.mb())));
-        }
-    }
-}
-
-/// A turn's words for an install of the pinned build that didn't work.
-fn set_up_failed(e: &anyhow::Error) -> String {
-    format!("couldn't set up Mafold Harness (OpenCode {}) on this computer: {e:#}", opencode_pin::VERSION)
-}
-
-async fn run_on(turn: Turn, sink: UnboundedSender<AgentEvent>, place: Place) -> Result<TurnOutcome> {
-    // Effort and thinking: the wallet's models are run as the router serves
-    // them, with no dial wired yet. No ask hook and no steer hook either, so
-    // a mid-turn message arrives as the follow-up turn (`can_steer` false).
+/// One turn on the OpenCode at `bin`, in your own home. `xdg` stands in for
+/// that home (the tests' door); `None` = yours, as your shell has it.
+async fn run_on(turn: Turn, sink: UnboundedSender<AgentEvent>, bin: PathBuf, xdg: Option<PathBuf>) -> Result<TurnOutcome> {
+    // Effort and thinking: the models are run as OpenCode serves them, with
+    // no dial wired yet. No ask hook and no steer hook either, so a mid-turn
+    // message arrives as the follow-up turn (`can_steer` false).
     let Turn {
         prompt,
         conv,
@@ -509,8 +368,7 @@ async fn run_on(turn: Turn, sink: UnboundedSender<AgentEvent>, place: Place) -> 
     if !Path::new(&workdir).is_dir() {
         bail!("working directory does not exist: {workdir} — check --workdir");
     }
-    let own = matches!(place, Place::Own { .. });
-    let Some(fuel) = Fuel::from_env(&env, own) else {
+    let Some(fuel) = Fuel::from_env(&env, true) else {
         return Ok(TurnOutcome { error: Some(NO_WALLET_KEY.into()), ..Default::default() });
     };
     let model = match &fuel {
@@ -520,35 +378,10 @@ async fn run_on(turn: Turn, sink: UnboundedSender<AgentEvent>, place: Place) -> 
         },
         Fuel::Go { .. } => go_model(model.as_deref()),
     };
-    let name = agent_name(&surface);
-    let (bin, home, pin, mode) = match place {
-        Place::Own { bin, xdg } => (bin, own_home(), None, Mode::Own { xdg }),
-        Place::At { bin, root } => (bin, opencode_pin::agent_home_in(&root, &name), None, Mode::Isolated),
-        Place::Pinned(pin) => {
-            let bin = if super::launchable(&pin.binary()) {
-                pin.binary()
-            } else {
-                let _ = sink.send(AgentEvent::Notice(format!(
-                    "Setting up Mafold Harness (OpenCode {}) on this computer first — a one-time download of about 80 MB.",
-                    opencode_pin::VERSION
-                )));
-                tokio::select! {
-                    r = pin.ensure() => match r {
-                        Ok(b) => b,
-                        Err(e) => return Ok(TurnOutcome { error: Some(set_up_failed(&e)), ..Default::default() }),
-                    },
-                    _ = cancel.notified() => return Ok(TurnOutcome { stopped: true, ..Default::default() }),
-                    _ = installing(&sink, &pin.root) => unreachable!("never ends"),
-                }
-            };
-            (bin, opencode_pin::agent_home_in(&pin.root, &name), Some(pin), Mode::Isolated)
-        }
-    };
     let spec = Spec {
-        home,
-        mode,
+        home: xdg.clone().unwrap_or_else(own_home),
+        xdg,
         program: bin,
-        pin,
         workdir,
         prompt,
         system,
@@ -565,7 +398,7 @@ async fn run_on(turn: Turn, sink: UnboundedSender<AgentEvent>, place: Place) -> 
 
 /// What a turn runs on, as the daemon's fuel step handed it over.
 #[derive(Clone, PartialEq)]
-enum Fuel {
+pub(super) enum Fuel {
     /// The owner's wallet, through the router.
     Wallet(Wallet),
     /// The owner's OpenCode Go plan: the key from their Connections, or none —
@@ -592,7 +425,7 @@ impl Fuel {
     /// The wallet when its three variables are there; else OpenCode Go when
     /// its key is, or — for your own OpenCode, which has a Go login of its own
     /// or none — without one. `None` = nothing to run on.
-    fn from_env(env: &[(String, String)], own: bool) -> Option<Self> {
+    pub(super) fn from_env(env: &[(String, String)], own: bool) -> Option<Self> {
         if let Some(w) = Wallet::from_env(env, dev_base(env, "MAFOLD_DEV_WALLET_BASE")) {
             return (!own).then_some(Fuel::Wallet(w));
         }
@@ -614,15 +447,15 @@ impl Fuel {
     }
 
     /// Who answers a refused model call, for the reply's error.
-    fn who(&self) -> &'static str {
+    pub(super) fn who(&self) -> &'static str {
         match self {
             Fuel::Wallet(_) => "the wallet's router",
             Fuel::Go { .. } => "OpenCode Go",
         }
     }
 
-    /// The context window the result card measures against: the one Mafold
-    /// Harness tells OpenCode on the wallet; Go's models bring their own.
+    /// The context window the result card measures against: the one OpenCode
+    /// is told on the wallet; Go's models bring their own.
     fn context_limit(&self) -> Option<u64> {
         match self {
             Fuel::Wallet(_) => Some(CONTEXT_TOKENS),
@@ -643,7 +476,7 @@ impl Fuel {
 
 /// A Go model as OpenCode names it within its provider: what the agent was
 /// given (with or without the `opencode-go/` prefix), else the default.
-fn go_model(wanted: Option<&str>) -> String {
+pub(super) fn go_model(wanted: Option<&str>) -> String {
     wanted
         .map(|m| m.trim().trim_start_matches("opencode-go/").to_string())
         .filter(|m| !m.is_empty() && !m.contains('/'))
@@ -656,23 +489,14 @@ fn own_home() -> PathBuf {
     crate::platform::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".mafold").join("runtimes").join(OWN)
 }
 
-/// How OpenCode is run for a turn.
-#[derive(Debug, Clone, PartialEq)]
-enum Mode {
-    /// Mafold Harness: its own home, nothing of the user's loaded.
-    Isolated,
-    /// Your own OpenCode: your home (`xdg` stands in for it in tests).
-    Own { xdg: Option<PathBuf> },
-}
-
 /// The wallet a turn runs on, as the daemon's fuel step handed it over.
 #[derive(Clone, PartialEq)]
-struct Wallet {
-    key: String,
+pub(super) struct Wallet {
+    pub(super) key: String,
     /// The router's OpenAI-compatible base (ends in `/v1`).
-    base: String,
+    pub(super) base: String,
     /// What the key may run, in the router's order.
-    models: Vec<String>,
+    pub(super) models: Vec<String>,
 }
 
 /// Written by hand so the key never reaches a log line: the first `{:?}` of
@@ -731,7 +555,7 @@ fn dev_base(env: &[(String, String)], var: &str) -> Option<String> {
 /// The model this turn runs: the chat's pick when the wallet runs it, the
 /// wallet's first when nothing was picked — and a refusal, not a substitute,
 /// when the pick is a model this reply's key can't run.
-fn pick_model(wanted: Option<&str>, models: &[String]) -> std::result::Result<String, String> {
+pub(super) fn pick_model(wanted: Option<&str>, models: &[String]) -> std::result::Result<String, String> {
     let wanted = wanted.map(str::trim).filter(|m| !m.is_empty());
     let Some(w) = wanted else {
         return Ok(models[0].clone());
@@ -747,27 +571,12 @@ fn pick_model(wanted: Option<&str>, models: &[String]) -> std::result::Result<St
     }
 }
 
-/// Whose OpenCode home a turn uses: the bot part of its surface tag
-/// (`{conv}__{channel}__{bot}`, a guest's mark dropped), else the daemon's
-/// name.
-fn agent_name(surface: &str) -> String {
-    let parts: Vec<&str> = surface.split("__").collect();
-    let bot = match parts[..] {
-        [_, _, bot] => bot.split("--guest").next().unwrap_or(""),
-        _ => "",
-    };
-    if !bot.is_empty() {
-        return bot.to_string();
-    }
-    std::env::var("MAFOLD_DAEMON_NAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "default".into())
-}
-
 /// The config OpenCode gets in `OPENCODE_CONFIG_CONTENT`. A key is never in
 /// it — `{env:MAFOLD_WALLET_KEY}`, `{env:MAFOLD_GO_KEY}` — so the config can be
-/// logged as it is. Your own OpenCode gets only what a headless reply on Go
-/// needs on top of its own config: the model, the key when it has no Go login
-/// of its own, and every permission answered.
-fn config(fuel: &Fuel, model: &str, mode: &Mode) -> Value {
+/// logged as it is. Your own OpenCode gets only what a headless reply needs
+/// on top of its own config: the model, the key when it has no Go login of
+/// its own, and every permission answered.
+fn config(fuel: &Fuel, model: &str) -> Value {
     let id = format!("{}/{model}", fuel.provider());
     let mut cfg = json!({
         "$schema": "https://opencode.ai/config.json",
@@ -819,74 +628,36 @@ fn config(fuel: &Fuel, model: &str, mode: &Mode) -> Value {
     if let Some(p) = provider {
         cfg["provider"] = json!({ fuel.provider(): p });
     }
-    if *mode == Mode::Isolated {
-        // Its per-step git snapshot of the workdir backs a revert Mafold has
-        // no door to — on a large repo, a copy of it in the agent's home.
-        cfg["snapshot"] = json!(false);
-        cfg["enabled_providers"] = json!([fuel.provider()]);
-    }
     cfg
 }
 
-/// Which inherited variables the child must not see: for Mafold Harness,
-/// every [`SCRUB`] prefix; for your own OpenCode, only Mafold's own fuel —
-/// your OpenCode's settings and logins (`OPENCODE_API_KEY` is Go's) are its.
-fn scrubbed<I: IntoIterator<Item = String>>(names: I, mode: &Mode) -> Vec<String> {
-    let prefixes: &[&str] = if *mode == Mode::Isolated { SCRUB } else { &["MAFOLD_WALLET_", "MAFOLD_GO_"] };
+/// Which inherited variables the child must not see: only Mafold's own fuel
+/// — your OpenCode's settings and logins (`OPENCODE_API_KEY` is Go's) are
+/// its.
+fn scrubbed<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
     names
         .into_iter()
         .filter(|n| {
             let up = n.to_ascii_uppercase();
-            prefixes.iter().any(|p| up.starts_with(p))
+            ["MAFOLD_WALLET_", "MAFOLD_GO_"].iter().any(|p| up.starts_with(p))
         })
         .collect()
 }
 
-/// What OpenCode itself is told. Mafold Harness: where its home is, its
-/// config, its password, and to fetch nothing on its own. Your own OpenCode:
-/// the reply's config and password, and not to update itself mid-reply —
-/// its home, plugins and models are yours (`xdg` stands in for your home in
-/// tests).
-fn opencode_env(home: &Path, mode: &Mode, config: &Value, password: &str) -> Vec<(String, String)> {
-    if let Mode::Own { xdg } = mode {
-        let mut env = vec![
-            ("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string()),
-            ("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()),
-            ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
-        ];
-        if let Some(x) = xdg {
-            for (k, d) in [("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")] {
-                env.push((k.to_string(), x.join(d).to_string_lossy().into_owned()));
-            }
-            env.push(("OPENCODE_TEST_HOME".to_string(), x.to_string_lossy().into_owned()));
-        }
-        return env;
-    }
-    let dir = |d: &str| home.join(d).to_string_lossy().into_owned();
+/// What OpenCode itself is told: the reply's config and password, and not to
+/// update itself mid-reply — its home, plugins and models are yours (`xdg`
+/// stands in for your home in tests).
+fn opencode_env(xdg: Option<&Path>, config: &Value, password: &str) -> Vec<(String, String)> {
     let mut env = vec![
-        ("XDG_CONFIG_HOME".to_string(), dir("config")),
-        ("XDG_DATA_HOME".to_string(), dir("data")),
-        ("XDG_CACHE_HOME".to_string(), dir("cache")),
-        ("XDG_STATE_HOME".to_string(), dir("state")),
-        // OpenCode's own idea of home, apart from HOME (which the agent's
-        // tools keep). The XDG folders alone left `~/.opencode` in play: its
-        // `opencode.json` reached the model's system prompt, and the server
-        // wrote a `.gitignore` there (measured, 1.19.5).
-        ("OPENCODE_TEST_HOME".to_string(), home.to_string_lossy().into_owned()),
         ("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string()),
         ("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()),
+        ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
     ];
-    for flag in [
-        "OPENCODE_DISABLE_AUTOUPDATE",
-        "OPENCODE_DISABLE_MODELS_FETCH",
-        "OPENCODE_DISABLE_LSP_DOWNLOAD",
-        "OPENCODE_DISABLE_DEFAULT_PLUGINS",
-        "OPENCODE_DISABLE_CLAUDE_CODE",
-        "OPENCODE_DISABLE_PROJECT_CONFIG",
-        // No plugin from anywhere but the binary itself.
-        "OPENCODE_PURE",
-    ] {
-        env.push((flag.to_string(), "1".to_string()));
+    if let Some(x) = xdg {
+        for (k, d) in [("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")] {
+            env.push((k.to_string(), x.join(d).to_string_lossy().into_owned()));
+        }
+        env.push(("OPENCODE_TEST_HOME".to_string(), x.to_string_lossy().into_owned()));
     }
     env
 }
@@ -894,13 +665,10 @@ fn opencode_env(home: &Path, mode: &Mode, config: &Value, password: &str) -> Vec
 /// Everything one turn needs, resolved.
 struct Spec {
     program: PathBuf,
-    /// Where `program` came from, when it is the pinned build — what puts it
-    /// right if it won't start (`opencode_pin::repair_in`).
-    pin: Option<opencode_pin::Source>,
-    /// Mafold Harness: the agent's own OpenCode home. Your own OpenCode: where
-    /// its agents' start lock lives ([`own_home`]).
+    /// Where the agents' start lock lives ([`own_home`]; a test's `xdg`).
     home: PathBuf,
-    mode: Mode,
+    /// Stands in for your home (the tests' door); `None` = yours.
+    xdg: Option<PathBuf>,
     workdir: String,
     prompt: String,
     system: Option<String>,
@@ -921,53 +689,16 @@ async fn run_turn(
     sink: &UnboundedSender<AgentEvent>,
     proc: &super::TurnProc,
 ) -> Result<TurnOutcome> {
-    if s.mode == Mode::Isolated {
-        for d in ["config", "data", "cache", "state"] {
-            std::fs::create_dir_all(s.home.join(d)).with_context(|| format!("couldn't create {}", s.home.display()))?;
-        }
-        seed_config(&s.home).with_context(|| format!("couldn't prepare {}", s.home.display()))?;
-    } else {
-        std::fs::create_dir_all(&s.home).with_context(|| format!("couldn't create {}", s.home.display()))?;
-    }
+    std::fs::create_dir_all(&s.home).with_context(|| format!("couldn't create {}", s.home.display()))?;
     // A fresh home's database is created by the first server to start in it,
     // and two creating it at once kill one of them (measured, 1.19.5: two
     // turns of one agent starting together). Held until this turn's server
     // has used it; after that any number share it.
     let lock = start_lock(&s.home).await;
     let stopped = || Ok(TurnOutcome { stopped: true, ..Default::default() });
-    let started = tokio::select! {
-        r = Server::start(s, proc) => r,
+    let mut server = tokio::select! {
+        r = Server::start(s, proc) => r?,
         _ = cancel.notified() => return stopped(),
-    };
-    let mut server = match (started, &s.pin) {
-        (Ok(server), _) => server,
-        // The pinned build that won't start may be a damaged one (cut short by
-        // a power loss): nothing else would ever put it right, and every reply
-        // would fail here. Checked against the digest its install recorded;
-        // installed again once when it doesn't match, then tried once more.
-        (Err(e), Some(pin)) => {
-            let bin = pin.binary();
-            if tokio::task::spawn_blocking(move || opencode_pin::intact(&bin)).await.unwrap_or(false) {
-                // The pinned bytes: a new copy wouldn't start any better.
-                return Err(e);
-            }
-            let _ = sink.send(AgentEvent::Notice(format!(
-                "OpenCode {} on this computer wouldn't start, and it isn't the build Mafold installed — installing it again.",
-                opencode_pin::VERSION
-            )));
-            let repaired = tokio::select! {
-                r = pin.repair() => r,
-                _ = cancel.notified() => return stopped(),
-            };
-            if let Err(again) = repaired {
-                return Err(e.context(format!("it isn't the build Mafold installed, and installing it again failed: {again:#}")));
-            }
-            tokio::select! {
-                r = Server::start(s, proc) => r?,
-                _ = cancel.notified() => return stopped(),
-            }
-        }
-        (Err(e), None) => return Err(e),
     };
     let out = drive(&server, s, session, cancel, sink, lock).await;
     server.stop().await;
@@ -1107,25 +838,6 @@ enum End {
     Lost,
 }
 
-/// OpenCode installs its plugin SDK (`@opencode-ai/plugin`) into every config
-/// folder it reads, in the background, whenever the folder has no
-/// `node_modules`: a 27 MB npm metadata fetch into the user's own `~/.npm` —
-/// restarted every turn, because the turn's end kills the server before it
-/// finishes — for plugins this agent never loads (`OPENCODE_PURE`, none
-/// configured). It skips the install when the folder's lockfile already lists
-/// the package (measured, 1.19.5), so the agent's config folder starts with
-/// one.
-fn seed_config(home: &Path) -> std::io::Result<()> {
-    let dir = home.join("config").join("opencode");
-    std::fs::create_dir_all(dir.join("node_modules"))?;
-    let lock = dir.join("package-lock.json");
-    if !lock.exists() {
-        let deps = json!({ "@opencode-ai/plugin": opencode_pin::VERSION });
-        std::fs::write(&lock, json!({ "lockfileVersion": 3, "packages": { "": { "dependencies": deps } } }).to_string())?;
-    }
-    Ok(())
-}
-
 /// Exclusive use of `home` while a server starts in it; `None` (start anyway)
 /// when the lock can't be had in time.
 async fn start_lock(home: &Path) -> Option<std::fs::File> {
@@ -1154,17 +866,18 @@ async fn start_lock(home: &Path) -> Option<std::fs::File> {
 /// handler runs to end it. `opencode serve` is an HTTP server that never
 /// reads its stdin, so a pipe the daemon holds is no lifeline (measured,
 /// 1.19.5: still serving 15 s after its stdin pipe was closed). Left behind,
-/// it finishes the reply on the wallet's key into a session nobody reads,
+/// it finishes the reply on the owner's key into a session nobody reads,
 /// then idles at ~240 MB for good, and the next daemon can't resume the turn
-/// while it lives (`agent::pick_up`).
+/// while it lives (`agent::pick_up`). Mafold Harness's shell commands get the
+/// same lifeline (`super::computer`).
 ///
 /// SIGKILL, not SIGTERM: nobody is left to follow a SIGTERM up, and the key
-/// it holds spends the owner's wallet until it stops. Its SQLite home is
+/// it holds spends the owner's money until it stops. Its SQLite home is
 /// crash-safe. The kernel sends this when the THREAD that forked the server
 /// ends; that is a tokio worker, which lives as long as the daemon's runtime
 /// (this crate never calls `block_in_place`, which could retire one).
 #[cfg(target_os = "linux")]
-fn die_with_daemon(cmd: &mut tokio::process::Command) {
+pub(super) fn die_with_daemon(cmd: &mut tokio::process::Command) {
     let daemon = std::process::id();
     // SAFETY: between fork and exec only async-signal-safe calls are made
     // (prctl, getppid), and the errors built allocate nothing.
@@ -1186,18 +899,25 @@ fn die_with_daemon(cmd: &mut tokio::process::Command) {
 /// Elsewhere there is no such signal: a server a daemon left behind is ended
 /// by the next one instead ([`end_orphan`]).
 #[cfg(not(target_os = "linux"))]
-fn die_with_daemon(_cmd: &mut tokio::process::Command) {}
+pub(super) fn die_with_daemon(_cmd: &mut tokio::process::Command) {}
 
 /// At a daemon's start, for each process the turns of the one before it were
 /// running in (`drafts::Outbox::take_orphans`, `agent::pick_up`): when it
-/// still runs and is one of our servers, end it and wait (≤ 5 s) for it to
-/// go. Waiting for a server to exit by itself — what a restart did — waits
-/// forever, and gave the reply up. True when one was ended.
+/// still runs and is a server of the OpenCode build Mafold Harness ran on
+/// until it became part of mafold — one a daemon of an older mafold left
+/// mid-reply — end it and wait (≤ 5 s) for it to go. Waiting for a server to
+/// exit by itself — what a restart did — waits forever, and gave the reply
+/// up. True when one was ended.
 pub fn end_orphan(pid: u32, start: Option<u64>) -> bool {
-    end_orphan_under(&opencode_pin::root(), pid, start)
+    end_orphan_under(&retired_pin_root(), pid, start)
 }
 
-/// [`end_orphan`] for the pinned builds under `root`. Ours = the very process
+/// Where that OpenCode build was installed: `~/.mafold/runtimes/opencode`.
+fn retired_pin_root() -> PathBuf {
+    crate::platform::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".mafold").join("runtimes").join("opencode")
+}
+
+/// [`end_orphan`] for the builds under `root`. Ours = the very process
 /// the journal named (its start matches — a pid is soon someone else's,
 /// above all on Windows) running a binary from under `root`. Anything else —
 /// another runtime's process, the user's own OpenCode, a stranger with a
@@ -1280,7 +1000,7 @@ impl Server {
         // isn't (measured: two at once got 4096 and 43719), so the port is
         // read off what the server says, never assumed.
         cmd.args(["serve", "--hostname", "127.0.0.1", "--port", "0", "--print-logs", "--log-level", "WARN"]);
-        for k in scrubbed(std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned()), &s.mode) {
+        for k in scrubbed(std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned())) {
             cmd.env_remove(k);
         }
         for (k, v) in &s.seat {
@@ -1295,8 +1015,8 @@ impl Server {
         if let Some((k, v)) = s.fuel.key_env() {
             cmd.env(k, v);
         }
-        let cfg = config(&s.fuel, &s.model, &s.mode);
-        for (k, v) in opencode_env(&s.home, &s.mode, &cfg, &password) {
+        let cfg = config(&s.fuel, &s.model);
+        for (k, v) in opencode_env(s.xdg.as_deref(), &cfg, &password) {
             cmd.env(k, v);
         }
         cmd.current_dir(workdir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -1307,9 +1027,10 @@ impl Server {
         // The turn's process from here, not once it listens: a first start
         // in a fresh home can take a minute, and a daemon that dies in it
         // must still leave the server in the turn's journal (the render loop
-        // records whatever `proc` names) for the restart to end — on macOS
-        // and Windows nothing else ends it. Both guards go with the server,
-        // or with this future if the start fails or is dropped.
+        // records whatever `proc` names), so the restart doesn't run the turn
+        // again while it lives — on macOS and Windows nothing ends it. Both
+        // guards go with the server, or with this future if the start fails
+        // or is dropped.
         let serving = proc.serve(pid);
         let live = super::ChildGuard::new(pid);
 
@@ -2113,17 +1834,15 @@ mod tests {
         assert_eq!(map_tool("codesearch", &json!({ "query": "q" })), ("codesearch".into(), json!({ "query": "q" })));
     }
 
-    /// The model, the router door, and nothing else: the only provider, the
-    /// key by reference (never in the text), every ask allowed, the ask tool
-    /// off.
+    /// OpenCode wired to the wallet: the router door as its provider, the key
+    /// by reference (never in the text), every ask allowed, the ask tool off.
     #[test]
-    fn the_config_holds_opencode_to_the_wallet() {
+    fn the_config_wires_opencode_to_the_wallet() {
         let models = vec!["deepseek-v4-flash".to_string(), "deepseek-v4-pro".to_string()];
         let w = Fuel::Wallet(Wallet { key: "mrk_x".into(), base: "https://api.mafold.ai/v1".into(), models });
-        let c = config(&w, "deepseek-v4-pro", &Mode::Isolated);
+        let c = config(&w, "deepseek-v4-pro");
         assert_eq!(c["model"], "mafold/deepseek-v4-pro");
         assert_eq!(c["small_model"], "mafold/deepseek-v4-pro");
-        assert_eq!(c["enabled_providers"], json!(["mafold"]));
         let p = &c["provider"]["mafold"];
         assert_eq!(p["npm"], "@ai-sdk/openai-compatible");
         assert_eq!(p["options"]["baseURL"], "https://api.mafold.ai/v1");
@@ -2137,45 +1856,31 @@ mod tests {
         assert_eq!(c["tools"]["question"], false);
         assert_eq!(c["share"], "disabled");
         assert_eq!(c["autoupdate"], false);
-        assert_eq!(c["snapshot"], false);
-        assert_eq!(c.as_object().unwrap().len(), 10, "a new key is a measured one: {c:#}");
+        assert_eq!(c.as_object().unwrap().len(), 8, "a new key is a measured one: {c:#}");
         assert!(!c.to_string().contains("mrk_x"), "the key is never in the text");
-    }
-
-    /// On OpenCode Go, Mafold Harness sees OpenCode's own Go provider and
-    /// nothing else — its models and session headers are OpenCode's, the key
-    /// is the owner's, by reference — with the same headless answers.
-    #[test]
-    fn the_config_holds_mafold_harness_to_opencode_go() {
-        let go = Fuel::Go { key: Some("sk-go-secret".into()), base: None };
-        let c = config(&go, "kimi-k2.7-code", &Mode::Isolated);
-        assert_eq!(c["model"], "opencode-go/kimi-k2.7-code");
-        assert_eq!(c["small_model"], "opencode-go/kimi-k2.7-code");
-        assert_eq!(c["enabled_providers"], json!(["opencode-go"]));
-        assert_eq!(c["provider"], json!({ "opencode-go": { "options": { "apiKey": "{env:MAFOLD_GO_KEY}" } } }));
-        assert_eq!(c["permission"]["question"], "deny");
-        assert_eq!(c["snapshot"], false);
-        assert!(!c.to_string().contains("sk-go-secret"), "the key is never in the text");
-        let dev = config(&Fuel::Go { key: Some("k".into()), base: Some("http://127.0.0.1:9/v1".into()) }, "glm-5.3", &Mode::Isolated);
-        assert_eq!(dev["provider"]["opencode-go"]["options"]["baseURL"], "http://127.0.0.1:9/v1");
     }
 
     /// Your own OpenCode keeps its own config: no providers switched off, no
     /// snapshot setting of ours — only the Go model, every permission
-    /// answered, and the owner's key when that OpenCode has no Go login.
+    /// answered, and the owner's key (by reference) when that OpenCode has no
+    /// Go login.
     #[test]
     fn your_own_opencode_gets_only_what_a_headless_go_reply_needs() {
-        let own = Mode::Own { xdg: None };
-        let signed_in = config(&Fuel::Go { key: None, base: None }, "glm-5.3", &own);
+        let signed_in = config(&Fuel::Go { key: None, base: None }, "glm-5.3");
         assert_eq!(signed_in["model"], "opencode-go/glm-5.3");
+        assert_eq!(signed_in["small_model"], "opencode-go/glm-5.3");
         for k in ["enabled_providers", "snapshot", "provider"] {
             assert!(signed_in.get(k).is_none(), "{k}: yours, not ours — {signed_in:#}");
         }
         assert_eq!(signed_in["permission"]["bash"], "allow");
+        assert_eq!(signed_in["permission"]["question"], "deny");
         assert_eq!(signed_in["tools"]["question"], false);
-        let keyed = config(&Fuel::Go { key: Some("sk".into()), base: None }, "glm-5.3", &own);
+        let keyed = config(&Fuel::Go { key: Some("sk-go-secret".into()), base: None }, "glm-5.3");
         assert_eq!(keyed["provider"], json!({ "opencode-go": { "options": { "apiKey": "{env:MAFOLD_GO_KEY}" } } }));
         assert!(keyed.get("enabled_providers").is_none());
+        assert!(!keyed.to_string().contains("sk-go-secret"), "the key is never in the text");
+        let dev = config(&Fuel::Go { key: Some("k".into()), base: Some("http://127.0.0.1:9/v1".into()) }, "glm-5.3");
+        assert_eq!(dev["provider"]["opencode-go"]["options"]["baseURL"], "http://127.0.0.1:9/v1");
     }
 
     /// Fuel from the turn's env: the wallet's three variables, else the Go
@@ -2305,46 +2010,28 @@ opencode-go/chatty
         assert!(OwnOpenCode.runs_version(None), "not installed: Install is offered");
     }
 
-    /// Other providers' credentials and the user's OpenCode settings stay
-    /// behind; the agent's tools keep everything else.
+    /// Your own OpenCode keeps its settings and logins (Go's key may be in
+    /// OPENCODE_API_KEY) and its own home; only Mafold's fuel is dropped. A
+    /// test's `xdg` stands in for that home.
     #[test]
-    fn the_child_env_drops_other_providers_and_keeps_the_rest() {
-        let names = [
-            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
-            "OPENROUTER_API_KEY", "OPENCODE_CONFIG", "opencode_server_password", "MAFOLD_WALLET_KEY",
-            "PATH", "HOME", "GH_TOKEN", "AWS_PROFILE", "MAFOLD_BOT_TOKEN", "MAFOLD_CONV", "XDG_CONFIG_HOME",
-        ];
-        let gone = scrubbed(names.iter().map(|s| s.to_string()), &Mode::Isolated);
-        assert_eq!(
-            gone,
-            [
-                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
-                "OPENROUTER_API_KEY", "OPENCODE_CONFIG", "opencode_server_password", "MAFOLD_WALLET_KEY",
-            ]
-        );
-        let home = Path::new("/h/.mafold/runtimes/opencode/home/bot");
-        let env: HashMap<String, String> = opencode_env(home, &Mode::Isolated, &json!({}), "pw").into_iter().collect();
-        assert_eq!(env["XDG_CONFIG_HOME"], home.join("config").to_string_lossy());
-        assert_eq!(env["XDG_DATA_HOME"], home.join("data").to_string_lossy());
-        assert_eq!(env["XDG_STATE_HOME"], home.join("state").to_string_lossy());
-        assert_eq!(env["XDG_CACHE_HOME"], home.join("cache").to_string_lossy());
-        assert_eq!(env["OPENCODE_SERVER_PASSWORD"], "pw");
-        assert_eq!(env["OPENCODE_TEST_HOME"], home.to_string_lossy(), "not the user's ~/.opencode");
-        for f in ["OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_MODELS_FETCH", "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_PURE"] {
-            assert_eq!(env[f], "1", "{f}");
-        }
-        assert!(!env.contains_key("MAFOLD_WALLET_KEY"), "the key comes from the turn, not from here");
-        // Your own OpenCode keeps its settings and logins (Go's key may be in
-        // OPENCODE_API_KEY) and its own home; only Mafold's fuel is dropped.
-        let own = Mode::Own { xdg: None };
-        let gone = scrubbed(["OPENCODE_API_KEY", "OPENAI_API_KEY", "MAFOLD_WALLET_KEY", "MAFOLD_GO_KEY", "PATH"].map(String::from), &own);
-        assert_eq!(gone, ["MAFOLD_WALLET_KEY", "MAFOLD_GO_KEY"]);
-        let env: HashMap<String, String> = opencode_env(home, &own, &json!({}), "pw").into_iter().collect();
+    fn the_child_env_drops_only_mafolds_fuel() {
+        let names = ["OPENCODE_API_KEY", "OPENAI_API_KEY", "MAFOLD_WALLET_KEY", "mafold_wallet_base", "MAFOLD_GO_KEY", "PATH"];
+        assert_eq!(scrubbed(names.map(String::from)), ["MAFOLD_WALLET_KEY", "mafold_wallet_base", "MAFOLD_GO_KEY"]);
+        let env: HashMap<String, String> = opencode_env(None, &json!({}), "pw").into_iter().collect();
         assert_eq!(env["OPENCODE_SERVER_PASSWORD"], "pw");
         assert_eq!(env["OPENCODE_DISABLE_AUTOUPDATE"], "1");
+        assert_eq!(env["OPENCODE_CONFIG_CONTENT"], "{}");
         for k in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCODE_TEST_HOME", "OPENCODE_PURE", "OPENCODE_DISABLE_PROJECT_CONFIG"] {
             assert!(!env.contains_key(k), "{k}: your own OpenCode's");
         }
+        assert!(!env.contains_key("MAFOLD_GO_KEY"), "the key comes from the turn, not from here");
+        let you = Path::new("/h/you");
+        let env: HashMap<String, String> = opencode_env(Some(you), &json!({}), "pw").into_iter().collect();
+        assert_eq!(env["XDG_CONFIG_HOME"], you.join("config").to_string_lossy());
+        assert_eq!(env["XDG_DATA_HOME"], you.join("data").to_string_lossy());
+        assert_eq!(env["XDG_STATE_HOME"], you.join("state").to_string_lossy());
+        assert_eq!(env["XDG_CACHE_HOME"], you.join("cache").to_string_lossy());
+        assert_eq!(env["OPENCODE_TEST_HOME"], you.to_string_lossy());
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -2398,30 +2085,6 @@ opencode-go/chatty
         assert!(why.contains("`opus`") && why.contains("deepseek-v4-flash, deepseek-v4-pro") && why.contains("nothing ran"), "{why}");
     }
 
-    /// The lockfile that tells OpenCode its plugin SDK is already in place —
-    /// written once, never over one OpenCode keeps itself.
-    #[test]
-    fn the_config_folder_starts_with_the_plugin_sdk_accounted_for() {
-        let home = std::env::temp_dir().join(format!("mafold-oc-seed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        seed_config(&home).unwrap();
-        let dir = home.join("config/opencode");
-        assert!(dir.join("node_modules").is_dir());
-        let lock: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("package-lock.json")).unwrap()).unwrap();
-        assert_eq!(lock["packages"][""]["dependencies"]["@opencode-ai/plugin"], opencode_pin::VERSION);
-        std::fs::write(dir.join("package-lock.json"), "{\"kept\":true}").unwrap();
-        seed_config(&home).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("package-lock.json")).unwrap(), "{\"kept\":true}");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn each_agent_has_its_own_home() {
-        assert_eq!(agent_name("c1__ch__ops_wallet"), "ops_wallet");
-        assert_eq!(agent_name("c1____ops_wallet--guest-bob"), "ops_wallet");
-        assert_eq!(agent_name("c1____ops_wallet--guest"), "ops_wallet");
-    }
-
     #[test]
     fn the_listening_line_gives_the_url() {
         assert_eq!(listen_url("opencode server listening on http://127.0.0.1:4096").as_deref(), Some("http://127.0.0.1:4096"));
@@ -2454,115 +2117,21 @@ opencode-go/chatty
         assert_eq!(mafold_transcript::failure::classify(&go).kind, mafold_transcript::failure::FailureKind::Auth);
     }
 
-    /// A turn without the wallet is refused in the contract's words before
-    /// anything is started — no install, no server.
+    /// Your own OpenCode handed the wallet (which it doesn't run on) is
+    /// refused in the contract's words before anything is started — no
+    /// server, no home.
     #[tokio::test]
-    async fn a_turn_without_a_wallet_key_is_refused() {
+    async fn your_own_opencode_on_the_wallet_is_refused() {
         let dir = std::env::temp_dir().join(format!("mafold-oc-nokey-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut t = turn(&dir, None, "hi", Vec::new());
-        t.env = env(&[("MAFOLD_WALLET_KEY", "k"), ("MAFOLD_WALLET_MODELS", "deepseek-v4-flash")]);
-        let out = run_on(t, tx, Place::At { bin: PathBuf::from("/nonexistent/opencode"), root: dir.clone() }).await.unwrap();
+        t.env = env(&[("MAFOLD_WALLET_KEY", "k"), ("MAFOLD_WALLET_BASE", "https://x/v1"), ("MAFOLD_WALLET_MODELS", "deepseek-v4-flash")]);
+        let out = run_on(t, tx, PathBuf::from("/nonexistent/opencode"), Some(dir.join("you"))).await.unwrap();
         assert_eq!(out.error.as_deref(), Some(NO_WALLET_KEY));
         assert!(!out.produced && !out.stopped);
         assert!(rx.try_recv().is_err(), "nothing was said");
-        assert!(!dir.join("home").exists(), "nothing was set up");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The pinned binary cut short (a power loss after an install, say) can't
-    /// start, and nothing used to put it right: every wallet reply failed at
-    /// "opencode serve exited" until someone deleted the file by hand. Now a
-    /// start that fails re-checks the binary against the digest its install
-    /// recorded, installs it again once when it doesn't match, and starts it
-    /// again. (The stand-in package only answers `--version`, so the second
-    /// start fails too — on the pinned bytes, put back.)
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_damaged_pinned_binary_is_installed_again_when_it_wont_start() {
-        let dir = std::env::temp_dir().join(format!("mafold-oc-damaged-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let work = dir.join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let (bytes, integrity) = opencode_pin::tests::fake_package(&dir, opencode_pin::VERSION);
-        let (url, registry) = opencode_pin::tests::serve(bytes).await;
-        let pin = opencode_pin::Source {
-            root: dir.join("root"),
-            build: opencode_pin::Build {
-                target: "test",
-                package: "opencode-test",
-                integrity: Box::leak(integrity.into_boxed_str()),
-                path: "package/bin/opencode",
-            },
-            registries: vec![url],
-        };
-        let bin = pin.ensure().await.unwrap();
-        let good = std::fs::read(&bin).unwrap();
-        std::fs::write(&bin, b"\x7fELF cut short").unwrap();
-        let wallet = env(&[
-            ("MAFOLD_WALLET_KEY", "mrk_damaged_0123456789"),
-            ("MAFOLD_WALLET_BASE", "http://127.0.0.1:9/v1"),
-            ("MAFOLD_WALLET_MODELS", "deepseek-v4-flash"),
-        ]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let out = run_on(turn(&work, None, "hi", wallet), tx, Place::Pinned(pin.clone())).await;
-        registry.abort();
-        assert!(out.is_err(), "the stand-in can't serve");
-        assert_eq!(std::fs::read(&bin).unwrap(), good, "the pinned bytes are back");
-        assert!(opencode_pin::intact(&bin));
-        let mut notices = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            if let AgentEvent::Notice(n) = e {
-                notices.push(n);
-            }
-        }
-        assert!(notices.iter().any(|n| n.contains("installing it again")), "the reply says so: {notices:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A first reply that has to install the pinned build first keeps its
-    /// generating card alive while it does (no process serves the turn yet,
-    /// so nothing else beats and the card read «No signal» at two minutes,
-    /// inviting a Stop that threw the download away) and says how far it has
-    /// got. Here the download crawls and then turns out not to be the pinned
-    /// bytes, so the reply ends saying that.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_reply_installing_the_pinned_build_keeps_beating_and_says_how_far_it_is() {
-        let dir = std::env::temp_dir().join(format!("mafold-oc-installing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let work = dir.join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let (url, registry) = opencode_pin::tests::serve_slowly(vec![0u8; 3_000_000], Duration::ZERO, 12, Duration::from_millis(100)).await;
-        let pin = opencode_pin::Source {
-            root: dir.join("root"),
-            build: *opencode_pin::build_for("linux-x64").unwrap(),
-            registries: vec![url],
-        };
-        let wallet = env(&[
-            ("MAFOLD_WALLET_KEY", "mrk_installing_0123456789"),
-            ("MAFOLD_WALLET_BASE", "http://127.0.0.1:9/v1"),
-            ("MAFOLD_WALLET_MODELS", "deepseek-v4-flash"),
-        ]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let out = run_on(turn(&work, None, "hi", wallet), tx, Place::Pinned(pin)).await.unwrap();
-        registry.abort();
-        assert!(out.error.as_deref().is_some_and(|e| e.contains("doesn't match the pinned SHA-512")), "{:?}", out.error);
-        let (mut pulses, mut notices) = (0, Vec::new());
-        while let Ok(e) = rx.try_recv() {
-            match e {
-                AgentEvent::Pulse { .. } => pulses += 1,
-                AgentEvent::Notice(n) => notices.push(n),
-                _ => {}
-            }
-        }
-        assert!(pulses >= 5, "the card kept beating through the install: {pulses} beats");
-        assert!(
-            notices.iter().any(|n| n.starts_with(&format!("Installing OpenCode {} — ", opencode_pin::VERSION)) && n.ends_with("/3.0 MB")),
-            "{notices:?}"
-        );
-        assert!(notices.len() <= 6, "a line per quarter, not per chunk: {notices:?}");
+        assert!(!dir.join("you").exists(), "nothing was set up");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2571,8 +2140,8 @@ opencode-go/chatty
     /// journals as the turn's child — names it while a slow first start
     /// (up to 90 s) still waits for the listen line. A daemon that dies then
     /// (macOS and Windows have no parent-death signal) still leaves a
-    /// journaled child for the restart to end. A Stop during the start ends
-    /// the server and clears it.
+    /// journaled child, so the restart doesn't run the turn twice. A Stop
+    /// during the start ends the server and clears it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_starting_server_is_the_turns_process_before_it_listens() {
@@ -2584,15 +2153,10 @@ opencode-go/chatty
         // that never says it listens. (Not a script of our own exec'd: one
         // just written can read as busy while another test forks.)
         std::fs::write(work.join("serve"), "exec sleep 60\n").unwrap();
-        let wallet = env(&[
-            ("MAFOLD_WALLET_KEY", "mrk_starting_0123456789"),
-            ("MAFOLD_WALLET_BASE", "http://127.0.0.1:9/v1"),
-            ("MAFOLD_WALLET_MODELS", "deepseek-v4-flash"),
-        ]);
-        let t = turn(&work, None, "hi", wallet);
+        let t = turn(&work, None, "hi", env(&[(crate::fuel::GO_KEY_ENV, "sk-go-starting")]));
         let (proc, cancel) = (t.proc.clone(), t.cancel.clone());
         let (tx, _rx) = mpsc::unbounded_channel();
-        let running = tokio::spawn(run_on(t, tx, Place::At { bin: PathBuf::from("/bin/sh"), root: dir.clone() }));
+        let running = tokio::spawn(run_on(t, tx, PathBuf::from("/bin/sh"), Some(dir.join("you"))));
         let mut pid = None;
         for _ in 0..100 {
             pid = proc.pid();
@@ -2677,33 +2241,30 @@ opencode-go/chatty
     /// network, inside `unshare --net`).
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "needs MAFOLD_OPENCODE_BIN (the pinned OpenCode binary)"]
+    #[ignore = "needs MAFOLD_OPENCODE_BIN (an OpenCode 1 binary)"]
     fn a_real_opencode_server_dies_with_its_daemon() {
         let bin = PathBuf::from(std::env::var("MAFOLD_OPENCODE_BIN").expect("set MAFOLD_OPENCODE_BIN"));
         let dir = std::env::temp_dir().join(format!("mafold-oc-lifeline-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let work = dir.join("work");
+        let you = dir.join("you");
         std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&you).unwrap();
         let spec = Spec {
             program: bin,
-            pin: None,
-            home: dir.join("home/ops_wallet"),
-            mode: Mode::Isolated,
+            home: you.clone(),
+            xdg: Some(you),
             workdir: work.to_string_lossy().into_owned(),
             prompt: String::new(),
             system: None,
-            model: "deepseek-v4-flash".into(),
-            fuel: Fuel::Wallet(Wallet { key: "mrk_lifeline_0123456789".into(), base: "http://127.0.0.1:9/v1".into(), models: vec!["deepseek-v4-flash".into()] }),
+            model: GO_DEFAULT_MODEL.into(),
+            fuel: Fuel::Go { key: Some("sk-go-lifeline-0123456789".into()), base: Some("http://127.0.0.1:9/v1".into()) },
             seat: Vec::new(),
             conv: "c1".into(),
             surface: "c1__ch-1__ops_wallet".into(),
             reads: Default::default(),
             draft: "draft-1".into(),
         };
-        for d in ["config", "data", "cache", "state"] {
-            std::fs::create_dir_all(spec.home.join(d)).unwrap();
-        }
-        seed_config(&spec.home).unwrap();
         let t0 = Instant::now();
         let (pid, url) = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -2745,15 +2306,16 @@ opencode-go/chatty
     /// A server a daemon that is gone left running is ended at the next start
     /// (`end_orphan`): every OS, where Linux's lifeline doesn't reach. Only
     /// when it is the very process the journal named (its start matches, not
-    /// a later one given the same pid) and it runs our pinned OpenCode from
-    /// under Mafold's runtimes folder — never anything else of the user's.
+    /// a later one given the same pid) and it runs the OpenCode build Mafold
+    /// Harness used to install, from under Mafold's runtimes folder — never
+    /// anything else of the user's.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_dead_daemons_server_is_ended_and_nothing_else_is() {
         let dir = std::env::temp_dir().join(format!("mafold-oc-orphan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let root = dir.join("runtimes/opencode");
-        let pinned = opencode_pin::binary_in(&root);
+        let pinned = root.join("1.19.5").join("opencode");
         std::fs::create_dir_all(pinned.parent().unwrap()).unwrap();
         let system_sleep = ["/usr/bin/sleep", "/bin/sleep"].into_iter().map(PathBuf::from).find(|p| p.is_file()).unwrap();
         std::fs::copy(&system_sleep, &pinned).unwrap();
@@ -2926,47 +2488,32 @@ opencode-go/chatty
         }
     }
 
-    /// A real turn through the harness: the OpenCode binary at
-    /// `MAFOLD_OPENCODE_BIN` (the pinned 1.19.5), the wallet's key and base in
-    /// `Turn::env`, a fake provider behind the base. A tool call runs bash and
-    /// the answer quotes it; then, on the same session in a new server, a Stop
-    /// mid-answer ends the turn as stopped and takes its server with it.
+    /// A real turn through your own OpenCode: the OpenCode binary at
+    /// `MAFOLD_OPENCODE_BIN`, your home standing in as `xdg`, the owner's Go
+    /// key in `Turn::env` and a stand-in for Go behind `MAFOLD_DEV_GO_BASE`.
+    /// A tool call runs bash and the answer quotes it; then, on the same
+    /// session in a new server, a Stop mid-answer ends the turn as stopped and
+    /// takes its server with it; then two turns start together in a fresh
+    /// home.
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "needs MAFOLD_OPENCODE_BIN (the pinned OpenCode binary)"]
-    async fn opencode_turn_against_fake_provider() {
-        let Ok(bin) = std::env::var("MAFOLD_OPENCODE_BIN") else {
-            panic!("set MAFOLD_OPENCODE_BIN to the pinned OpenCode binary");
-        };
+    #[ignore = "needs MAFOLD_OPENCODE_BIN (an OpenCode 1 binary)"]
+    async fn your_own_opencode_turn_against_a_stand_in_for_go() {
+        let bin = PathBuf::from(std::env::var("MAFOLD_OPENCODE_BIN").expect("set MAFOLD_OPENCODE_BIN"));
         let dir = std::env::temp_dir().join(format!("mafold-oc-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let work = dir.join("work");
         std::fs::create_dir_all(&work).unwrap();
         let (base, seen, provider) = fake::start().await;
-        let key = format!("mrk_it_{}", uuid::Uuid::new_v4().simple());
-        // The user's own OpenCode, as one installed with its own installer
-        // leaves it: a `~/.opencode` whose config must never load.
-        let user_home = dir.join("user");
-        std::fs::create_dir_all(user_home.join(".opencode")).unwrap();
-        std::fs::write(dir.join("spy.md"), "SPYMARK: the user's own instructions").unwrap();
-        std::fs::write(
-            user_home.join(".opencode/opencode.json"),
-            json!({ "instructions": [dir.join("spy.md")] }).to_string(),
-        )
-        .unwrap();
-        let home = user_home.to_string_lossy().into_owned();
-        let wallet = env(&[
-            ("MAFOLD_WALLET_KEY", &key),
-            ("MAFOLD_WALLET_BASE", &base),
-            ("MAFOLD_WALLET_MODELS", "deepseek-v4-flash"),
-            ("HOME", &home),
-        ]);
-        let place = || Place::At { bin: PathBuf::from(&bin), root: dir.join("root") };
+        let key = format!("sk-go-{}", uuid::Uuid::new_v4().simple());
+        let go = env(&[(crate::fuel::GO_KEY_ENV, &key), ("MAFOLD_DEV_GO_BASE", &base)]);
+        let you = dir.join("you");
 
         // 1. Tool call → bash → answer.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let t0 = Instant::now();
-        let t = turn(&work, None, "Run a shell command that prints a marker, then tell me what it said.", wallet.clone());
+        let mut t = turn(&work, None, "Run a shell command that prints a marker, then tell me what it said.", go.clone());
+        t.model = Some("opencode-go/glm-5.3".into());
         let proc = t.proc.clone();
         let watch = tokio::spawn(async move {
             let mut pid = None;
@@ -2979,7 +2526,7 @@ opencode-go/chatty
             }
             pid
         });
-        let out = run_on(t, tx, place()).await.expect("the turn ran");
+        let out = run_on(t, tx, bin.clone(), Some(you.clone())).await.expect("the turn ran");
         let took = t0.elapsed();
         let pid = watch.await.unwrap().expect("a server served the turn");
         let mut evs = Vec::new();
@@ -2995,52 +2542,35 @@ opencode-go/chatty
         let sid = out.session.clone().expect("a session");
         assert!(sid.starts_with("ses"), "{sid}");
         assert!(matches!(&evs[0], AgentEvent::Session(s) if *s == sid), "the session is named first: {:?}", evs[0]);
-        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Thinking(t) if t == "Let me run it.")));
         assert!(evs.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, input, .. } if name == "bash" && input["command"] == "echo oc-integration-$((6*7))")));
         assert!(evs.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, .. } if text.contains("oc-integration-42"))));
         assert!(text(&evs).contains("The tool said oc-integration-42"), "{}", text(&evs));
-        let Some(AgentEvent::Done { tokens, cost_usd, .. }) = evs.last() else { panic!("Done last: {:?}", evs.last()) };
-        assert_eq!(*tokens, Some(2040));
-        assert_eq!(*cost_usd, None);
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Stats(s) if s.model.as_deref() == Some("glm-5.3"))));
+        let Some(AgentEvent::Done { cost_usd, .. }) = evs.last() else { panic!("Done last: {:?}", evs.last()) };
+        assert_eq!(*cost_usd, None, "OpenCode's estimate is never the bill");
         {
             let seen = seen.lock().unwrap();
             assert_eq!(seen.requests.len(), 2, "a tool round trip is two calls, and no title call");
-            for (auth, body) in &seen.requests {
-                assert_eq!(auth.as_deref(), Some(format!("Bearer {key}").as_str()), "the turn's key reached the provider");
-                assert_eq!(body["model"], "deepseek-v4-flash");
-                assert_eq!(body["max_tokens"], OUTPUT_TOKENS);
+            for ((auth, body), session) in seen.requests.iter().zip(&seen.sessions) {
+                assert_eq!(auth.as_deref(), Some(format!("Bearer {key}").as_str()), "the owner's Go key reached Go");
+                assert_eq!(body["model"], "glm-5.3", "the agent's model, Go's prefix dropped");
+                assert_eq!(session.as_deref(), Some(sid.as_str()), "Go is told the session");
                 let sys = body["messages"][0]["content"].to_string();
                 assert!(sys.contains("SYSMARK"), "the turn's system text reached the model");
-                assert!(!sys.contains("SPYMARK"), "the user's ~/.opencode config never loads");
                 let tools: Vec<&str> = body["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
                 assert!(tools.contains(&"bash") && !tools.contains(&"question"), "{tools:?}");
             }
-            let second = &seen.requests[1].1["messages"];
-            assert!(second.as_array().unwrap().iter().any(|m| m["reasoning_content"] == "Let me run it."), "reasoning goes back to DeepSeek");
         }
         assert!(!crate::platform::pid_alive(pid), "the turn's server is gone with the turn");
-        let mut touched: Vec<String> = Vec::new();
-        let mut stack = vec![user_home.clone()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).unwrap().flatten() {
-                let p = e.path();
-                touched.push(p.strip_prefix(&user_home).unwrap().to_string_lossy().into_owned());
-                if p.is_dir() {
-                    stack.push(p);
-                }
-            }
-        }
-        touched.sort();
-        assert_eq!(touched, [".opencode", ".opencode/opencode.json"], "nothing of the user's OpenCode was written");
-        assert!(dir.join("root/home/ops_wallet/data/opencode/opencode.db").is_file(), "the agent's own home holds its sessions");
+        assert!(you.join("data/opencode/opencode.db").is_file(), "its sessions live with yours");
 
         // 2. Same conversation, next turn: a new server resumes the session;
         //    Stop mid-answer.
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let t = turn(&work, Some(sid.clone()), "SLOW: count for me", wallet.clone());
+        let t = turn(&work, Some(sid.clone()), "SLOW: count for me", go.clone());
         let cancel = t.cancel.clone();
         let proc = t.proc.clone();
-        let run = tokio::spawn(run_on(t, tx, place()));
+        let run = tokio::spawn(run_on(t, tx, bin.clone(), Some(you.clone())));
         let mut said = String::new();
         let t1 = loop {
             match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
@@ -3069,16 +2599,16 @@ opencode-go/chatty
         let resumed = seen.lock().unwrap().requests.last().unwrap().1["messages"].as_array().unwrap().len();
         assert!(resumed > 3, "the resumed session carried the first turn ({resumed} messages)");
 
-        // 3. Two turns of one agent starting together in a home that doesn't
-        //    exist yet — two servers creating one database at once killed one
-        //    of them, until the start lock.
-        let fresh = || Place::At { bin: PathBuf::from(&bin), root: dir.join("root2") };
+        // 3. Two turns starting together in a home that doesn't exist yet —
+        //    two servers creating one database at once killed one of them,
+        //    until the start lock.
+        let fresh = Some(dir.join("you2"));
         let (tx_a, _rx_a) = mpsc::unbounded_channel();
         let (tx_b, _rx_b) = mpsc::unbounded_channel();
         let t2 = Instant::now();
         let (a, b) = tokio::join!(
-            run_on(turn(&work, None, "Run a shell command for A", wallet.clone()), tx_a, fresh()),
-            run_on(turn(&work, None, "Run a shell command for B", wallet.clone()), tx_b, fresh()),
+            run_on(turn(&work, None, "Run a shell command for A", go.clone()), tx_a, bin.clone(), fresh.clone()),
+            run_on(turn(&work, None, "Run a shell command for B", go.clone()), tx_b, bin.clone(), fresh.clone()),
         );
         println!("turn 3: two at once on a fresh home in {:?}", t2.elapsed());
         for o in [a.expect("turn A"), b.expect("turn B")] {
@@ -3086,85 +2616,6 @@ opencode-go/chatty
             assert!(o.produced && o.session.is_some());
         }
 
-        provider.abort();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The shipped path on a computer that has never run Mafold Harness: the
-    /// turn says it is setting up, downloads and checks the pinned build
-    /// (network), installs it under `~/.mafold/runtimes`, then answers. Run
-    /// with HOME set to a fresh folder under the temp dir — it refuses any
-    /// other HOME, so it can never install into a real one.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[ignore = "downloads OpenCode 1.19.5 (~80 MB); run with HOME=<a fresh temp folder>"]
-    async fn a_turn_without_the_pinned_build_installs_it_first() {
-        let home = PathBuf::from(std::env::var("HOME").unwrap());
-        assert!(home.starts_with(std::env::temp_dir()), "HOME must be a throwaway folder, not {}", home.display());
-        assert!(!opencode_pin::installed(), "start from a computer without it");
-        let work = home.join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let (base, seen, provider) = fake::start().await;
-        let wallet = env(&[("MAFOLD_WALLET_KEY", "mrk_install"), ("MAFOLD_WALLET_BASE", &base), ("MAFOLD_WALLET_MODELS", "deepseek-v4-flash")]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let t0 = Instant::now();
-        let out = OpenCode.run(turn(&work, None, "Run a shell command that prints a marker", wallet), tx).await.unwrap();
-        println!("installed and answered in {:?}", t0.elapsed());
-        assert_eq!(out.error, None);
-        let first = rx.try_recv().unwrap();
-        assert!(matches!(&first, AgentEvent::Notice(n) if n.contains("Setting up Mafold Harness (OpenCode 1.19.5)")), "{first:?}");
-        assert!(opencode_pin::installed());
-        assert!(opencode_pin::binary().starts_with(home.join(".mafold/runtimes/opencode/1.19.5")));
-        assert!(OpenCode.available() && OpenCode.cli_version().await == "1.19.5");
-        assert_eq!(seen.lock().unwrap().requests.len(), 2);
-        provider.abort();
-    }
-
-    /// Mafold Harness on OpenCode Go: the pinned build at `MAFOLD_OPENCODE_BIN`
-    /// in its own home, the owner's Go key in `Turn::env` (as the daemon's Go
-    /// step hands it over), a stand-in for Go behind `MAFOLD_DEV_GO_BASE`.
-    /// The key reaches Go as the bearer, the model is Go's, OpenCode names
-    /// the session to Go, a tool call runs — and the user's own OpenCode,
-    /// signed in to Go with another key, is never read.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[ignore = "needs MAFOLD_OPENCODE_BIN (the pinned OpenCode binary)"]
-    async fn mafold_harness_runs_a_turn_on_opencode_go() {
-        let bin = PathBuf::from(std::env::var("MAFOLD_OPENCODE_BIN").expect("set MAFOLD_OPENCODE_BIN"));
-        let dir = std::env::temp_dir().join(format!("mafold-oc-go-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let work = dir.join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let (base, seen, provider) = fake::start().await;
-        // The user's own OpenCode, signed in to Go with a key of its own.
-        let user = dir.join("user");
-        std::fs::create_dir_all(user.join(".local/share/opencode")).unwrap();
-        std::fs::write(user.join(".local/share/opencode/auth.json"), r#"{"opencode-go":{"type":"api","key":"sk-users-own"}}"#).unwrap();
-        let key = format!("sk-go-{}", uuid::Uuid::new_v4().simple());
-        let go = env(&[
-            (crate::fuel::GO_KEY_ENV, &key),
-            ("MAFOLD_DEV_GO_BASE", &base),
-            ("HOME", &user.to_string_lossy()),
-        ]);
-        let mut t = turn(&work, None, "Run a shell command that prints a marker, then tell me what it said.", go);
-        t.model = Some("glm-5.3".into());
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let out = run_on(t, tx, Place::At { bin, root: dir.join("root") }).await.expect("the turn ran");
-        let mut evs = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            evs.push(e);
-        }
-        assert_eq!(out.error, None, "{evs:?}");
-        assert!(text(&evs).contains("The tool said oc-integration-42"), "{}", text(&evs));
-        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Stats(s) if s.model.as_deref() == Some("glm-5.3"))));
-        let sid = out.session.expect("a session");
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.requests.len(), 2, "a tool round trip is two calls");
-        for ((auth, body), session) in seen.requests.iter().zip(&seen.sessions) {
-            assert_eq!(auth.as_deref(), Some(format!("Bearer {key}").as_str()), "the owner's key from Connections, never the user's own");
-            assert_eq!(body["model"], "glm-5.3");
-            assert_eq!(session.as_deref(), Some(sid.as_str()), "Go is told the session");
-        }
         provider.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3177,7 +2628,7 @@ opencode-go/chatty
     /// sessions are yours, in your OpenCode's data.
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "needs MAFOLD_OPENCODE_BIN (the pinned OpenCode binary)"]
+    #[ignore = "needs MAFOLD_OPENCODE_BIN (an OpenCode 1 binary)"]
     async fn your_own_opencode_runs_a_turn_on_its_go_login_or_the_owners_key() {
         let bin = PathBuf::from(std::env::var("MAFOLD_OPENCODE_BIN").expect("set MAFOLD_OPENCODE_BIN"));
         let dir = std::env::temp_dir().join(format!("mafold-oc-own-{}", std::process::id()));
@@ -3191,12 +2642,11 @@ opencode-go/chatty
         std::fs::write(dir.join("mine.md"), "OWNMARK: your own instructions").unwrap();
         std::fs::write(xdg.join("config/opencode/opencode.json"), json!({ "instructions": [dir.join("mine.md")] }).to_string()).unwrap();
         std::fs::write(xdg.join("data/opencode/auth.json"), r#"{"opencode-go":{"type":"api","key":"sk-your-own-go"}}"#).unwrap();
-        let place = || Place::Own { bin: bin.clone(), xdg: Some(xdg.clone()) };
         let dev = env(&[("MAFOLD_DEV_GO_BASE", &base)]);
 
         // 1. Signed in to Go: its own login, no key from Mafold.
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let out = run_on(turn(&work, None, "Run a shell command that prints a marker, then tell me what it said.", dev.clone()), tx, place())
+        let out = run_on(turn(&work, None, "Run a shell command that prints a marker, then tell me what it said.", dev.clone()), tx, bin.clone(), Some(xdg.clone()))
             .await
             .expect("the turn ran");
         let mut evs = Vec::new();
@@ -3220,7 +2670,7 @@ opencode-go/chatty
         let keyed = env(&[("MAFOLD_DEV_GO_BASE", &base), (crate::fuel::GO_KEY_ENV, "sk-owners-go")]);
         let (tx, _rx) = mpsc::unbounded_channel();
         seen.lock().unwrap().requests.clear();
-        let out = run_on(turn(&work, None, "Run a shell command that prints a marker, then tell me what it said.", keyed), tx, place())
+        let out = run_on(turn(&work, None, "Run a shell command that prints a marker, then tell me what it said.", keyed), tx, bin.clone(), Some(xdg.clone()))
             .await
             .expect("the turn ran");
         assert_eq!(out.error, None);
@@ -3229,16 +2679,16 @@ opencode-go/chatty
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Mafold Harness on OpenCode Go when Go says no, and when you stop it.
+    /// Your own OpenCode on OpenCode Go when Go says no, and when you stop it.
     /// A key Go turns away ends the reply with Go's own 401 (a credential
     /// card). Go's 429s are retried by OpenCode itself, and the reply ends
     /// with the limit in words (a rate-limit card): Go's own 429 once
-    /// OpenCode's tries run out (the pinned build, Go asking for 50 ms
-    /// between them), Mafold's past [`RETRY_GIVE_UP`] if they never did.
-    /// Stop mid-answer ends it as stopped, nothing failed, its server gone.
+    /// OpenCode's tries run out (1.19.5, Go asking for 50 ms between them),
+    /// Mafold's past [`RETRY_GIVE_UP`] if they never did. Stop mid-answer
+    /// ends it as stopped, nothing failed, its server gone.
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "needs MAFOLD_OPENCODE_BIN (the pinned OpenCode binary)"]
+    #[ignore = "needs MAFOLD_OPENCODE_BIN (an OpenCode 1 binary)"]
     async fn opencode_go_refusals_and_stop_end_the_reply_in_words() {
         use mafold_transcript::failure::{classify, FailureKind};
         let bin = PathBuf::from(std::env::var("MAFOLD_OPENCODE_BIN").expect("set MAFOLD_OPENCODE_BIN"));
@@ -3247,15 +2697,13 @@ opencode-go/chatty
         let work = dir.join("work");
         std::fs::create_dir_all(&work).unwrap();
         let (base, seen, provider) = fake::start().await;
-        let home = dir.join("user").to_string_lossy().into_owned();
-        std::fs::create_dir_all(&home).unwrap();
-        let go = |key: &str| env(&[(crate::fuel::GO_KEY_ENV, key), ("MAFOLD_DEV_GO_BASE", &base), ("HOME", &home)]);
-        let place = || Place::At { bin: bin.clone(), root: dir.join("root") };
+        let go = |key: &str| env(&[(crate::fuel::GO_KEY_ENV, key), ("MAFOLD_DEV_GO_BASE", &base)]);
+        let you = || Some(dir.join("you"));
 
         // 1. A key Go turns away.
         let (tx, _rx) = mpsc::unbounded_channel();
         let t0 = Instant::now();
-        let out = run_on(turn(&work, None, "hello", go("sk-go-bad")), tx, place()).await.expect("the turn ran");
+        let out = run_on(turn(&work, None, "hello", go("sk-go-bad")), tx, bin.clone(), you()).await.expect("the turn ran");
         let e = out.error.expect("a key Go turns away is an error");
         println!("401: {:?} → {e}", t0.elapsed());
         assert_eq!(e, "OpenCode Go answered 401 (AuthError): Invalid API key");
@@ -3265,7 +2713,7 @@ opencode-go/chatty
         seen.lock().unwrap().requests.clear();
         let (tx, _rx) = mpsc::unbounded_channel();
         let t1 = Instant::now();
-        let out = run_on(turn(&work, None, "FAIL429 now", go("sk-go-ok")), tx, place()).await.expect("the turn ran");
+        let out = run_on(turn(&work, None, "FAIL429 now", go("sk-go-ok")), tx, bin.clone(), you()).await.expect("the turn ran");
         let e = out.error.expect("a reply Go keeps refusing ends");
         let calls = seen.lock().unwrap().requests.len() as u64;
         println!("429: {:?}, {calls} calls → {e}", t1.elapsed());
@@ -3282,7 +2730,7 @@ opencode-go/chatty
         let t = turn(&work, None, "SLOW: count for me", go("sk-go-ok"));
         let cancel = t.cancel.clone();
         let proc = t.proc.clone();
-        let run = tokio::spawn(run_on(t, tx, place()));
+        let run = tokio::spawn(run_on(t, tx, bin.clone(), you()));
         let mut said = String::new();
         let t2 = loop {
             match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
