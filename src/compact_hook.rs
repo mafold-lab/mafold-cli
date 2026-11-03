@@ -597,7 +597,7 @@ fn ask(prompt: &str, schema: &Value, effort: &str, deadline: Instant) -> Result<
     // An empty directory: no project CLAUDE.md, no repo for it to wander in.
     let cwd = std::env::temp_dir().join("mafold-compact-check");
     std::fs::create_dir_all(&cwd).map_err(|e| format!("scratch dir: {e}"))?;
-    let mut cmd = crate::platform::std_command(crate::harness::program("claude"));
+    let mut cmd = crate::harness::claude_std();
     // The prompt goes in on stdin: it carries the summary and the chat, and
     // Windows caps a command line at 32K.
     cmd.args(["-p", "--model", CHECK_MODEL, "--effort", effort, "--output-format", "json", "--tools", ""])

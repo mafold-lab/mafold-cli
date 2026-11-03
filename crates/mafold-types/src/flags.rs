@@ -767,6 +767,26 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Daemon],
         server: ClosedWithoutRecord,
     },
+    // Document covers (ops 11-03, "server renders"): a file bubble shows the
+    // document's first page instead of its type glyph. The api reads it on
+    // the READER who asks (`resolveCovers`) — it pays in Cloudflare browser
+    // time, once per document, for everyone after. Web and phone read it to
+    // ask at all.
+    FlagMeta {
+        key: "fileCovers",
+        default: false,
+        dev_default: false,
+        label: "Chat: document covers",
+        description: "A file in a chat shows its first page — an HTML or Markdown file's first \
+                      screen, a PDF's first page, a deck's first slide — full width when it is \
+                      the message's only file, as a square picture beside each name when there \
+                      are several. The server draws a document the first time anyone with this \
+                      on asks (resolveCovers) and keeps the picture on the file for every reader.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
     // Passes (ops 10-30, "build it now"): credit only its holder can spend.
     // The api reads it on the SUBSCRIBER: where it's on, a paid Premium
     // period lands as a Premium Pass instead of ordinary, sendable credit

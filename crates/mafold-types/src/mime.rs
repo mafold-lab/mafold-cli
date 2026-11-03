@@ -1,5 +1,5 @@
 //! What a document's name says it is: the one extension → content-type table
-//! for files whose bytes don't prove their own type.
+//! for files whose bytes don't prove their own type (documents, and sound).
 //!
 //! Pictures and clips prove themselves — the cli sniffs their header, the api
 //! probes them — so they aren't here. A document can't: a .docx is a ZIP like
@@ -36,6 +36,18 @@ const DOCUMENTS: &[(&str, &str)] = &[
     ("doc", "application/msword"),
     ("xls", "application/vnd.ms-excel"),
     ("ppt", "application/vnd.ms-powerpoint"),
+    // Sound has no header the cli sniffs, so its name is the evidence too —
+    // and the declared type is what lets a phone's player take the bytes
+    // (a bubble plays any `audio/*` file in place; ops 11-03).
+    ("mp3", "audio/mpeg"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("wav", "audio/wav"),
+    ("ogg", "audio/ogg"),
+    ("oga", "audio/ogg"),
+    ("opus", "audio/ogg"),
+    ("flac", "audio/flac"),
+    ("weba", "audio/webm"),
 ];
 
 /// The type a document with this extension is (`docx`, any case, no dot).
@@ -83,6 +95,15 @@ mod mime_tests {
         assert_eq!(for_name("archive.tar.gz"), None);
         // Pictures prove themselves by their bytes: not this table's call.
         assert_eq!(for_name("shot.png"), None);
+    }
+
+    #[test]
+    fn sound_is_known_by_name() {
+        assert_eq!(for_name("bonjour.mp3"), Some("audio/mpeg"));
+        assert_eq!(for_name("Lesson 3.M4A"), Some("audio/mp4"));
+        assert_eq!(for_name("voice.opus"), Some("audio/ogg"));
+        // No sniffing pretends otherwise: MIDI stays a plain file.
+        assert_eq!(for_name("tune.mid"), None);
     }
 
     #[test]

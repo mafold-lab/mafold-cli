@@ -2174,11 +2174,12 @@ mod attach_tests {
 
     /// A named-but-lying extension must not promote bytes onto the photo path:
     /// an HTML error page saved as `.png` is precisely the "broken image" report,
-    /// and audio (ISO-BMFF, but no video brand) has no player of its own.
+    /// and audio (ISO-BMFF, but no video brand) is no video: it stays a FILE,
+    /// typed by its name, which is what a bubble's sound player keys on.
     #[test]
     fn a_lying_extension_cannot_fake_media() {
         assert_eq!(classify("broken.png", b"<html>404</html>"), ("file", "application/octet-stream"));
-        assert_eq!(classify("song.m4a", &ftyp(b"M4A ")), ("file", "application/octet-stream"));
+        assert_eq!(classify("song.m4a", &ftyp(b"M4A ")), ("file", "audio/mp4"));
     }
 
     /// A sticker is a picture every client can draw. The header decides, as for

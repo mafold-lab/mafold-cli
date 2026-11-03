@@ -10,6 +10,7 @@
 //! dispatcher pushes as drafts.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,7 +18,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use mafold_transcript::render::PrivateItem;
-use mafold_transcript::{AgentEvent, RunStats, Tap, Transcript};
+use mafold_transcript::{Advance, AgentEvent, RunStats, Tap, Transcript};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -50,6 +51,12 @@ pub struct Frame {
     /// Parts of the reply's cards only some readers may read (a failure's
     /// raw error and amounts), handed over once the reply is final.
     pub private: Vec<PrivateItem>,
+    /// Paint this NOW: a tool's call opened, or its result landed. A host
+    /// that batches narration behind a timer must not batch this with it —
+    /// the daemon pushes every tool event the moment it happens
+    /// (`Advance::Immediate`), and cards that wait for the next tick, or for
+    /// the model's next step, are what makes a working bot look idle.
+    pub immediate: bool,
 }
 
 impl Frame {
@@ -556,7 +563,20 @@ fn tool_loop(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
         // `sent` is what the dispatcher holds; [`catch_up`] says the
         // difference.
         let mut tx = Transcript::new();
-        if let Some(t) = &tap { tx.set_tap(t.clone()); }
+        // What a tool writes while it runs, heard as it writes it. `tx` is
+        // the tool's until it returns, so without this its call card would
+        // reach the person together with its result — a minute late, for a
+        // tool that runs for a minute. The host's own tap hears everything,
+        // as before.
+        let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let listening = Arc::new(AtomicBool::new(false));
+        {
+            let (host, listening) = (tap.clone(), listening.clone());
+            tx.set_tap(Arc::new(move |ev: &AgentEvent| {
+                if let Some(t) = &host { t(ev); }
+                if listening.load(Ordering::Relaxed) { let _ = heard.send(ev.clone()); }
+            }));
+        }
         let mut sent = String::new();
         let mut stats = RunStats {
             run_id: Some(ctx.draft_id.unwrap_or_else(Uuid::new_v4).to_string()),
@@ -791,18 +811,39 @@ fn tool_loop(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
                 let reply = match (refusal, route.get(&call.name)) {
                     (Some(why), _) => why,
                     (None, Some(&idx)) => {
+                        // Painted as the tool writes it — the call card the
+                        // moment it opens, not when the tool returns — the
+                        // way the daemon paints every tool event. A copy
+                        // follows along, fed the same events in the same
+                        // order, so it reads exactly as `tx` will.
+                        let mut following = tx.untapped();
+                        listening.store(true, Ordering::Relaxed);
                         let execution = plugins[idx].execute(&ctx, states[idx].as_mut(), &mut tx, call);
                         tokio::pin!(execution);
                         let mut pulse = tokio::time::interval(PULSE_EVERY);
                         pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        loop {
+                        let reply = loop {
                             tokio::select! {
                                 biased;
                                 _ = live.cancelled() => { stopped = true; break 'rounds; }
                                 reply = &mut execution => break reply,
+                                Some(ev) = hearing.recv() => {
+                                    // At once when the transcript says so (a
+                                    // call or its result), like the daemon's
+                                    // push; anything else may wait for the
+                                    // host's next tick.
+                                    let now = following.push(&ev) == Advance::Immediate;
+                                    if let Some(d) = catch_up(&mut sent, following.snapshot()) {
+                                        yield Ok(Frame { immediate: now, ..d });
+                                    }
+                                }
                                 _ = pulse.tick() => yield Ok(Frame::append(String::new())),
                             }
-                        }
+                        };
+                        // `tx` has all of it now, whatever the copy missed.
+                        listening.store(false, Ordering::Relaxed);
+                        while hearing.try_recv().is_ok() {}
+                        reply
                     }
                     (None, None) => format!("unknown tool: {}", call.name),
                 };
@@ -830,13 +871,16 @@ fn tool_loop(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
                 // rounds until the model says something. Sealing it here,
                 // every round, is what put "Ran 1 tool" × 9 in a row where
                 // the daemon shows one card.
-                if let Some(d) = catch_up(&mut sent, tx.snapshot()) { yield Ok(d); }
+                if let Some(d) = catch_up(&mut sent, tx.snapshot()) { yield Ok(Frame { immediate: true, ..d }); }
             }
 
             // New tool results are new ground: a silence after them may be
             // asked about again.
             asked = false;
         }
+        // A Stop can leave a tool mid-run; the closing acts below are not
+        // the tool's to report.
+        listening.store(false, Ordering::Relaxed);
 
         // Nothing said and nothing done: a turn that didn't answer. (The
         // plain path asks twice first; here the first round IS the answer.)
@@ -969,6 +1013,36 @@ mod tap_tests {
             call: &ToolCall,
         ) -> String {
             tx.push(&AgentEvent::ToolCall { id: call.id.clone(), name: call.name.clone(), input: json!({}) });
+            tx.push(&AgentEvent::ToolResult { id: call.id.clone(), text: "alpha means something".into() });
+            "alpha means something".into()
+        }
+    }
+
+    /// `lookup` again, but it opens its card and then works until it is told
+    /// to finish.
+    struct Slow(Arc<tokio::sync::Notify>);
+
+    #[async_trait]
+    impl HarnessPlugin for Slow {
+        fn id(&self) -> &'static str {
+            "slow"
+        }
+        async fn tools(&self, ctx: &TurnCtx) -> Vec<ToolSpec> {
+            Lookup.tools(ctx).await
+        }
+        async fn execute(
+            &self,
+            _: &TurnCtx,
+            _: &mut (dyn std::any::Any + Send),
+            tx: &mut Transcript,
+            call: &ToolCall,
+        ) -> String {
+            tx.push(&AgentEvent::ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: json!({ "detail": "looking alpha up" }),
+            });
+            self.0.notified().await;
             tx.push(&AgentEvent::ToolResult { id: call.id.clone(), text: "alpha means something".into() });
             "alpha means something".into()
         }
@@ -1118,5 +1192,77 @@ mod tap_tests {
             })
             .collect();
         assert_eq!(order, ["thinking:Look it up.", "call:c1", "thinking:Found it.", "text:Alpha means something."]);
+    }
+
+    /// A host that reads the frames (mafold-api's dispatcher) gets a running
+    /// tool's card while the tool still runs, marked to be pushed at once —
+    /// and its result the same way when it lands: the daemon's tool-by-tool
+    /// painting. 11-03: the daemon's cards appeared tool by tool, @claude's
+    /// didn't.
+    #[tokio::test]
+    async fn a_running_tools_card_goes_out_before_it_returns_and_at_once() {
+        let call = ToolCall { id: "c1".into(), name: "lookup".into(), arguments: "{}".into(), ..Default::default() };
+        let script = vec![
+            vec![ChatEvent::Text("Let me check.".into()), done("Let me check.", vec![call])],
+            vec![ChatEvent::Text("Alpha means something.".into()), done("Alpha means something.", vec![])],
+        ];
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let plugins: Vec<Arc<dyn HarnessPlugin>> = vec![Arc::new(Slow(finish.clone()))];
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let ctx = TurnCtx { bot: "probe".into(), ..Default::default() };
+        let tools = Tools::of(&plugins, &ctx, "probe").await;
+        let turn = Turn {
+            ctx,
+            runtime: Arc::new(Scripted(Mutex::new(script))),
+            plugins,
+            tools,
+            messages: vec![json!({ "role": "user", "content": "hi" })],
+            model: None,
+            fallback: None,
+            live: Arc::new(Unattended),
+            stopped_line: String::new(),
+            bill: None,
+            tap: Some(Arc::new(move |ev: &AgentEvent| sink.lock().unwrap().push(ev.clone()))),
+            keep: None,
+        };
+        let apply = |reply: &mut String, f: &Frame| {
+            if f.rewrite { *reply = f.text.clone() } else { reply.push_str(&f.text) }
+        };
+        let mut frames = run(turn);
+        let mut reply = String::new();
+        // One deadline for the whole wait: the running tool's heartbeat sends
+        // an empty frame every quarter second, so a deadline per frame would
+        // never run out.
+        let card = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let f = frames.next().await.expect("the turn is still going").expect("no failure");
+                apply(&mut reply, &f);
+                if reply.contains("looking alpha up") {
+                    break f;
+                }
+            }
+        })
+        .await
+        .expect("the card goes out while the tool runs");
+        assert!(card.immediate, "the card is pushed at once, not behind the narration throttle");
+        assert!(!reply.contains("alpha means something"), "the tool hasn't returned yet: {reply}");
+        finish.notify_one();
+        let mut landed = None;
+        while let Some(f) = frames.next().await {
+            let f = f.expect("no failure");
+            apply(&mut reply, &f);
+            if landed.is_none() && reply.contains("alpha means something") {
+                landed = Some(f);
+            }
+        }
+        assert!(landed.expect("the result lands").immediate, "the result is pushed at once too");
+        assert!(reply.contains("Alpha means something."), "{reply}");
+        // Following the running tool along didn't echo its events: the host's
+        // tap heard each of them once.
+        let heard = heard.lock().unwrap();
+        let calls = heard.iter().filter(|e| matches!(e, AgentEvent::ToolCall { .. })).count();
+        let results = heard.iter().filter(|e| matches!(e, AgentEvent::ToolResult { .. })).count();
+        assert_eq!((calls, results), (1, 1), "{heard:?}");
     }
 }

@@ -88,6 +88,10 @@ struct CardManifest {
     /// the server's.
     #[serde(default)]
     composer: Option<serde_json::Value>,
+    /// `{label?, labels?, order?}` — the card offering itself as a group's live
+    /// cover (Edit group ▸ Cover ▸ Card). Verbatim, like `composer`.
+    #[serde(default)]
+    cover: Option<serde_json::Value>,
     /// `{"zh-Hans": "红包"}` — the card's name per language, read by row
     /// previews. Carried verbatim, like `composer`.
     #[serde(rename = "displayNames", default)]
@@ -253,6 +257,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         "version": manifest.version,
         "display_name": manifest.display_name,
         "composer": manifest.composer,
+        "cover": manifest.cover,
         "display_names": manifest.display_names,
         "preview": manifest.preview,
         "inline": manifest.inline,

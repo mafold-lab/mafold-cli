@@ -188,6 +188,9 @@ pub(crate) async fn drive(
         .env("PATH", path)
         .env("COLUMNS", "4096")
         .env("NO_COLOR", "1")
+        // Signing in says it is mafold too, as every claude we start does
+        // (`harness::CLAUDE_ENTRYPOINT`).
+        .env("CLAUDE_CODE_ENTRYPOINT", crate::harness::CLAUDE_ENTRYPOINT)
         // WHICH login this signs in: empty for the machine's own, a
         // credential directory for a named second account.
         .envs(seat_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))

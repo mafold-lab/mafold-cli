@@ -299,6 +299,16 @@ impl Transcript {
         self.tap = Some(tap);
     }
 
+    /// The same reply, with nobody listening: a copy to follow along with
+    /// while the original is busy being written to elsewhere, fed the same
+    /// events — and since a plain `clone` keeps the tap, without telling
+    /// the tap about each of them a second time.
+    pub fn untapped(&self) -> Transcript {
+        let mut copy = self.clone();
+        copy.tap = None;
+        copy
+    }
+
     /// Commit as much pending narration as the text policy allows. Called on
     /// every batch boundary and by the caller's idle tick, so narration keeps
     /// moving during a long silent stretch.
@@ -425,6 +435,15 @@ impl Transcript {
         if let Some(tap) = self.tap.as_ref().filter(|_| !md.is_empty()) {
             tap(&AgentEvent::Text(md.to_string()));
         }
+        self.insert_raw(md);
+    }
+
+    /// [`push_raw`] for an event's own line: the tap already heard the event,
+    /// and hearing its line again as text would draw it twice for a driver
+    /// that renders from the events.
+    ///
+    /// [`push_raw`]: Transcript::push_raw
+    fn insert_raw(&mut self, md: &str) {
         self.flush_text();
         self.close_group();
         self.full.push_str(md);
@@ -536,7 +555,7 @@ impl Transcript {
             // that had already happened, before whatever it changes — which is
             // exactly what `push_raw` guarantees.
             AgentEvent::Steered(text) if !text.trim().is_empty() => {
-                self.push_raw(&render::steer_line(text));
+                self.insert_raw(&render::steer_line(text));
                 Advance::Immediate
             }
             AgentEvent::Steered(_) => Advance::Quiet,
@@ -545,7 +564,7 @@ impl Transcript {
             // a notice that opened a group of its own is exactly how the usage
             // limit buried the answer in the trace on 2026-09-06.
             AgentEvent::Notice(text) if !text.trim().is_empty() => {
-                self.push_raw(&render::notice_line(text));
+                self.insert_raw(&render::notice_line(text));
                 Advance::Immediate
             }
             AgentEvent::Notice(_) => Advance::Quiet,
@@ -595,7 +614,7 @@ impl Transcript {
             AgentEvent::RateLimited { .. } | AgentEvent::Compacted { .. } => {
                 match render::render(ev, &mut self.names) {
                     Some(s) => {
-                        self.push_raw(&s);
+                        self.insert_raw(&s);
                         Advance::Immediate
                     }
                     None => Advance::Quiet,
@@ -1645,6 +1664,40 @@ mod fold_tests {
         let steps = md.find("Read note.txt").unwrap();
         let out = md.find("note.txt says hello").unwrap();
         assert!(steps < out, "steps first, then what it reported: {md}");
+    }
+
+    /// The tap hears each event once — an event drawn as a line of its own (a
+    /// steer, a notice, a usage limit) included — so a copy fed what it heard
+    /// reads exactly as the original. The Mafold Harness loop follows a
+    /// running tool that way, to paint its card before the tool returns.
+    #[test]
+    fn a_copy_fed_what_the_tap_heard_reads_as_the_original() {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut t = Transcript::new();
+        let sink = heard.clone();
+        t.set_tap(std::sync::Arc::new(move |ev: &AgentEvent| sink.lock().unwrap().push(ev.clone())));
+        t.push(&AgentEvent::Text("Looking.".into()));
+        let mut copy = t.untapped();
+        heard.lock().unwrap().clear();
+        let events = [
+            call("a", "Bash", json!({"command": "make"})),
+            AgentEvent::Notice("the build cache is cold".into()),
+            result("a", "ok"),
+            AgentEvent::ToolStatus { id: "a".into(), failed: false },
+            AgentEvent::Steered("also run the tests".into()),
+            AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "allowed_warning".into(), fallback: None },
+            call("b", "Bash", json!({"command": "make test"})),
+        ];
+        for ev in &events {
+            t.push(ev);
+        }
+        let heard = std::mem::take(&mut *heard.lock().unwrap());
+        assert_eq!(heard.len(), events.len(), "each event heard once: {heard:?}");
+        for ev in &heard {
+            copy.push(ev);
+        }
+        assert_eq!(copy.snapshot(), t.snapshot());
+        assert_eq!(t.snapshot().matches("the build cache is cold").count(), 1, "{}", t.snapshot());
     }
 }
 

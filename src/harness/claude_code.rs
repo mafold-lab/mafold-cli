@@ -893,7 +893,7 @@ const HIDDEN_EFFORTS: &[&str] = &["ultracode"];
 /// `None` when the CLI couldn't be run at all — distinct from an empty stderr,
 /// which is the binary saying it has no objection.
 async fn effort_probe(env: &[(String, String)], value: &str) -> Option<String> {
-    let mut cmd = crate::platform::command(super::program("claude"));
+    let mut cmd = super::claude();
     cmd.arg("--effort")
         .arg(value)
         .arg("--version")
@@ -980,7 +980,7 @@ fn account_of(resp: &Value) -> Option<String> {
 /// support" that doesn't spend the thing being asked about.
 async fn handshake(env: &[(String, String)]) -> Option<Value> {
     use tokio::io::AsyncWriteExt;
-    let mut cmd = crate::platform::command(super::program("claude"));
+    let mut cmd = super::claude();
     cmd.arg("-p")
         .arg("--input-format").arg("stream-json")
         .arg("--output-format").arg("stream-json")
@@ -1272,7 +1272,7 @@ fn build_cmd(shape: &super::TurnShape, exe: &str, must_fork: bool) -> Built {
         // Windowless from the constructor on. `run` used to add that after
         // calling here, and `prewarm` (the process that actually serves a
         // turn) never did — every message to a Windows agent opened a window.
-        let mut cmd = crate::platform::command(super::program("claude"));
+        let mut cmd = super::claude();
         // `-p` with NO prompt argument: the prompt goes in on stdin instead (see
         // the write below). It is the one input here that grows without bound —
         // it carries the conversation — and Windows hard-caps a command line at

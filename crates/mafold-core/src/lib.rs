@@ -540,6 +540,14 @@ mod native {
         pub fn load_conv_apps(&self, conversation_id: String) -> Vec<CoreConvApp> {
             pollster::block_on(self.inner.conv_apps(&conversation_id))
         }
+        /// Remember the profile page's last answer under `key` (client JSON).
+        pub fn save_profile_cache(&self, key: String, json: String) {
+            pollster::block_on(self.inner.save_profile_cache(&key, &json));
+        }
+        /// The JSON last remembered under `key` (None = never).
+        pub fn profile_cache(&self, key: String) -> Option<String> {
+            pollster::block_on(self.inner.profile_cache(&key))
+        }
     }
 
     // set_language does NETWORK I/O (reqwest), so it's an async UniFFI method
@@ -1155,6 +1163,26 @@ mod web {
             future_to_promise(async move {
                 let list = inner.conv_apps(&conv).await;
                 Ok(JsValue::from_str(&serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())))
+            })
+        }
+        /// Remember the profile page's last answer under `key` (client JSON).
+        #[wasm_bindgen(js_name = saveProfileCache)]
+        pub fn save_profile_cache(&self, key: String, json: String) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            future_to_promise(async move {
+                inner.save_profile_cache(&key, &json).await;
+                Ok(JsValue::UNDEFINED)
+            })
+        }
+        /// Promise<string | undefined> — the JSON last remembered under `key`.
+        #[wasm_bindgen(js_name = profileCache)]
+        pub fn profile_cache(&self, key: String) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            future_to_promise(async move {
+                Ok(match inner.profile_cache(&key).await {
+                    Some(s) => JsValue::from_str(&s),
+                    None => JsValue::UNDEFINED,
+                })
             })
         }
     }

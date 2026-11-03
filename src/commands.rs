@@ -1642,7 +1642,7 @@ fn parse_usage_text(text: &str) -> String {
 /// Pipe `input` into a headless `claude -p` (on the seat `env` selects) and
 /// return its (ANSI-stripped) output, or "" on any failure/timeout.
 async fn run_claude_stdin(input: &str, secs: u64, env: &[(String, String)]) -> String {
-    let mut cmd = crate::platform::command(crate::harness::program("claude"));
+    let mut cmd = crate::harness::claude();
     cmd.arg("-p")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
@@ -2071,8 +2071,9 @@ impl LiveTui {
 /// registry (`~/.claude/sessions/<pid>.json`).
 ///
 /// Every claude process writes one: terminals as `entrypoint:"cli"`, the VS
-/// Code extension as `"claude-vscode"`, and OUR OWN headless turns as `"sdk"`
-/// / `"sdk-cli"`. Only the last kind is excluded — it's us, and a daemon that
+/// Code extension as `"claude-vscode"`, and OUR OWN headless turns as
+/// [`crate::harness::CLAUDE_ENTRYPOINT`] (`"sdk"` / `"sdk-cli"` from a daemon
+/// older than that label). Only the last kind is excluded — it's us, and a daemon that
 /// counted its own in-flight turn would call every session "open elsewhere".
 /// Everything else is a real second writer, which is the whole point: a
 /// migrated VS Code tab is exactly the session someone is still typing in.
@@ -2112,14 +2113,14 @@ pub(crate) fn live_tui_sessions() -> Vec<LiveTui> {
 }
 
 /// Parse one live-registry entry; None for anything that isn't a session held
-/// by somebody else (non-interactive kinds, our own `sdk*` turns, drift).
+/// by somebody else (non-interactive kinds, our own turns, drift).
 pub(crate) fn parse_live_entry(text: &str) -> Option<(u32, LiveTui)> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     if v["kind"].as_str() != Some("interactive") {
         return None;
     }
     let entrypoint = v["entrypoint"].as_str()?.to_string();
-    if entrypoint.starts_with("sdk") {
+    if entrypoint == crate::harness::CLAUDE_ENTRYPOINT || entrypoint.starts_with("sdk") {
         return None;
     } // that's us
     let pid = v["pid"].as_u64()? as u32;
@@ -2242,7 +2243,7 @@ fn mock_reply(name: &str) -> String {
 /// Run `claude <args>` on the seat `env` selects (see `crate::accounts`) and
 /// return its output; `&[]` = the daemon's own login.
 async fn run_claude(args: &[&str], secs: u64, env: &[(String, String)]) -> String {
-    let mut cmd = crate::platform::command(crate::harness::program("claude"));
+    let mut cmd = crate::harness::claude();
     cmd.args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null());
@@ -2598,6 +2599,11 @@ Last 7d · 7983 requests · 30 sessions
             r#"{"pid":4,"sessionId":"s","kind":"interactive","entrypoint":"sdk"}"#
         )
         .is_none());
+        let ours = format!(
+            r#"{{"pid":5,"sessionId":"m","kind":"interactive","entrypoint":"{}"}}"#,
+            crate::harness::CLAUDE_ENTRYPOINT
+        );
+        assert!(parse_live_entry(&ours).is_none(), "the label every claude we start carries");
     }
 
     // ── machine-dependent smokes: read THIS machine's ~/.claude, run manually

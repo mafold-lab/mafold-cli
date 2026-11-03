@@ -732,6 +732,25 @@ impl<S: Storage> Store<S> {
             .and_then(|b| String::from_utf8(b).ok())
             .filter(|s| !s.is_empty())
     }
+
+    /// Remember the profile page's last answer under `key` (which tabs have
+    /// anything, a conversation's routines, the app catalogue, my
+    /// connections …) so the next open paints it at once and refreshes
+    /// behind. The value is the client's JSON, kept as is; the key names it
+    /// (client-shared/profileCache.ts). Per account, like every cache here.
+    pub async fn save_profile_cache(&self, key: &str, json: &str) {
+        let _g = self.write_lock.lock().await;
+        self.store.put("pcache", key, json.as_bytes().to_vec()).await;
+    }
+
+    /// The JSON last remembered under `key`; `None` = never.
+    pub async fn profile_cache(&self, key: &str) -> Option<String> {
+        self.store
+            .get("pcache", key)
+            .await
+            .and_then(|b| String::from_utf8(b).ok())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1195,6 +1214,21 @@ mod tests {
             s.set_last_channel("convA", None).await; // explicit #general = clear
             assert_eq!(s.last_channel("convA").await, None);
             assert_eq!(s.last_channel("convB").await.as_deref(), Some("chan2"), "other conv untouched");
+        });
+    }
+    /// A profile answer comes back as it went in; overwrite wins; keys don't mix.
+    #[test]
+    fn profile_cache_roundtrip_and_isolation() {
+        let s = store();
+        pollster::block_on(async {
+            assert_eq!(s.profile_cache("tabs/c1|ann").await, None, "never saved");
+            s.save_profile_cache("tabs/c1|ann", r#"{"files":true}"#).await;
+            s.save_profile_cache("routines/c1", "[]").await;
+            assert_eq!(s.profile_cache("tabs/c1|ann").await.as_deref(), Some(r#"{"files":true}"#));
+            s.save_profile_cache("tabs/c1|ann", r#"{"files":false}"#).await;
+            assert_eq!(s.profile_cache("tabs/c1|ann").await.as_deref(), Some(r#"{"files":false}"#));
+            assert_eq!(s.profile_cache("routines/c1").await.as_deref(), Some("[]"));
+            assert_eq!(s.profile_cache("tabs/c2|ann").await, None);
         });
     }
     #[test]

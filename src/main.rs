@@ -328,6 +328,18 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Draw a live card as a group's cover — one published card's tag,
+    /// `{% owner/slug k="v" /%}` — or `--clear` it so the picture shows again.
+    /// Needs the group's edit-info permission. Setting it again with new
+    /// attributes is how a stats cover stays current.
+    Cover {
+        /// The group's id.
+        chat: String,
+        /// The card tag (quote it).
+        card: Option<String>,
+        #[arg(long, conflicts_with = "card")]
+        clear: bool,
+    },
     /// Manage a forum's channels (list/create/rename/close/pin/delete).
     Channels {
         #[command(subcommand)]
@@ -1038,6 +1050,20 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 print!("{}", unfurl_lines(&v));
+            }
+        }
+        Cmd::Cover { chat, card, clear } => {
+            let card = match (card, clear) {
+                (Some(c), false) => Some(c),
+                (None, true) => None,
+                _ => anyhow::bail!("give the card tag, or --clear"),
+            };
+            let client = Client::new(cli.base, token?);
+            let chat_id = client.resolve_chat(&chat).await?;
+            let conv = client.call("setChatCoverCard", serde_json::json!({ "chat_id": chat_id, "card": card })).await?;
+            match conv["cover_card"].as_str() {
+                Some(c) => println!("✓ cover is now {}", c.split_whitespace().nth(1).unwrap_or(c)),
+                None => println!("✓ cover card cleared"),
             }
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token?)).await?,

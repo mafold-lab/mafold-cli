@@ -125,6 +125,13 @@ pub struct FileRef {
     /// One level deep; an `orig`'s own `orig` is always `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orig: Option<Box<FileRef>>,
+    /// A picture of a DOCUMENT's first page or screen (html, pdf, md, pptx),
+    /// drawn by the server the first time a reader asks (`resolveCovers`).
+    /// A bubble shows it in place of the file's type glyph. `None` = not drawn
+    /// (yet, or ever: a zip has no first page) — the bubble keeps the glyph.
+    /// One level: a cover's own `cover` is always `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<Box<FileRef>>,
 }
 
 impl FileRef {
@@ -143,6 +150,7 @@ impl FileRef {
             local: false,
             strip: None,
             orig: None,
+            cover: None,
         }
     }
 }
@@ -420,6 +428,10 @@ pub struct Conversation {
     /// peer's). Set with `setChatBanner`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub banner: Option<FileRef>,
+    /// A live card drawn as the cover instead of `banner`: one published card's
+    /// self-closing tag (`{% owner/slug k="v" /%}`). Set with `setChatCoverCard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_card: Option<String>,
     /// Group description / "about" text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

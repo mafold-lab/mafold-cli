@@ -7315,7 +7315,7 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
     // on none of the owner's own Claude Code, or the summary could carry it in.
     let owner = guest.then(crate::harness::claude_code::owner_settings);
     let guard = crate::harness::claude_code::guest_settings(guard, owner.as_ref()).to_string();
-    let mut cmd = crate::platform::command(crate::harness::program("claude"));
+    let mut cmd = crate::harness::claude();
     if guest {
         cmd.arg("--setting-sources").arg("project,local");
     }
@@ -8245,7 +8245,8 @@ genuinely is a sentence.",
 renders live in the bubble, scripts and all. Best for something small and interactive: a chart, a \
 demo, a layout, a mini-game.\n\
   • **the file itself** — `mafold attach <path>` (one or more paths) hangs a real file on THIS \
-reply. An image lands as a photo, a clip as a player, and anything else (.html, .pdf, .md, .csv, …) \
+reply. An image lands as a photo, a clip as a player, a sound file (.mp3, .m4a, .wav, .ogg) as a \
+player in the bubble with a speed control, and anything else (.html, .pdf, .md, .csv, …) \
 as a file card the user can open, download and keep. A .md, .html or plain-text file OPENS INSIDE \
 Mafold, as a full page on every client: Markdown typeset as a document, HTML running sandboxed \
 exactly as you wrote it (its own styles — no --mf-* variables there; its links ask the reader \

@@ -1371,6 +1371,34 @@ pub(crate) fn program(bin: &str) -> std::ffi::OsString {
     resolve(bin).map_or_else(|| bin.into(), Into::into)
 }
 
+/// What every Claude Code process mafold starts calls itself to Anthropic.
+/// Claude Code takes it from `CLAUDE_CODE_ENTRYPOINT`, sends it with each request
+/// (the `cc_entrypoint` in its billing header, and its User-Agent), and writes it
+/// into its transcripts and session registry. Left unset, `claude -p` calls
+/// itself `sdk-cli`, and the same tokens have been measured to use about 1.6–2.9×
+/// as much of a plan's 5-hour window under `sdk-*` as under the interactive
+/// `cli` (anthropics/claude-code#97074, which Anthropic hadn't answered as of
+/// 2026-11-03). Our own name rather than `cli`: the requests still say which
+/// client sent them. Set on every start, over an inherited value: a daemon
+/// started from a terminal's claude would otherwise hand that one down.
+pub(crate) const CLAUDE_ENTRYPOINT: &str = "claude-mafold";
+
+/// `claude`, ready to start: [`program`] with [`CLAUDE_ENTRYPOINT`] set. Every
+/// Claude Code process mafold starts comes from here or [`claude_std`]
+/// (`tests::every_claude_says_it_is_mafold` fails the build otherwise).
+pub(crate) fn claude() -> tokio::process::Command {
+    let mut cmd = crate::platform::command(program("claude"));
+    cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_ENTRYPOINT);
+    cmd
+}
+
+/// [`claude`], blocking.
+pub(crate) fn claude_std() -> std::process::Command {
+    let mut cmd = crate::platform::std_command(program("claude"));
+    cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_ENTRYPOINT);
+    cmd
+}
+
 /// First `$PATH` entry for `bin` that we could actually execute.
 pub(crate) fn resolve(bin: &str) -> Option<PathBuf> {
     // An explicit path (`/opt/bin/claude`, `C:\tools\claude.cmd`) is not a $PATH
@@ -1518,6 +1546,51 @@ pub(crate) mod env_probe {
         std::fs::write(&path, s).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         (path, record)
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_tests {
+    use super::*;
+
+    fn entrypoint_of(cmd: &std::process::Command) -> Option<&std::ffi::OsStr> {
+        cmd.get_envs().find(|(k, _)| *k == "CLAUDE_CODE_ENTRYPOINT").and_then(|(_, v)| v)
+    }
+
+    #[test]
+    fn every_claude_says_it_is_mafold() {
+        let ours = Some(std::ffi::OsStr::new(CLAUDE_ENTRYPOINT));
+        assert_eq!(entrypoint_of(claude().as_std()), ours);
+        assert_eq!(entrypoint_of(&claude_std()), ours);
+
+        // …and nothing starts one any other way: a `claude` built straight from
+        // `program("claude")` would go out as `sdk-cli` again.
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() > 20, "found the sources: {}", src.display());
+        let needle = ["program(", "\"claude\")"].concat();
+        let mut bare = Vec::new();
+        for f in files.iter().filter(|f| !f.ends_with("harness/mod.rs")) {
+            let text = std::fs::read_to_string(f).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains("command(") && line.contains(&needle) {
+                    let rel = f.strip_prefix(&src).unwrap_or(f).display().to_string();
+                    bare.push(format!("  src/{}:{}  {}", rel.replace('\\', "/"), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(bare.is_empty(), "start Claude Code with crate::harness::{{claude, claude_std}}:\n{}", bare.join("\n"));
     }
 }
 
