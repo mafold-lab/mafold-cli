@@ -6,6 +6,7 @@ Mafold from your terminal — a small CLI client **and** a Claude Code agent dae
 mafold agent --token mb_xxxx --workdir ~/your-repo   # run Claude Code as your bot
 mafold --token mb_xxxx chats                          # list your conversations
 mafold --token mb_xxxx send @alice "hi there"         # send a message
+mafold --token mb_xxxx send @alice --attach shot.png "look"  # text + picture, one message
 ```
 
 Auth is a **bot token** (`mb_…`) — create a bot in the Mafold app — via

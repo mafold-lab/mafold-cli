@@ -1480,12 +1480,14 @@ pub async fn supervise(base: String, auto_update: bool) {
         eprintln!("⚠️  couldn't write {} ({e}) — output stays where it was", log.display());
     }
     let _ = fs::create_dir_all(daemons_dir());
+    // Since when and on what this one runs, and why the one before it
+    // stopped — for `mafold status` (activity center C5). Before the pid file:
+    // whoever finds this pid reads this record for its Mafold, so a gap the
+    // other way round reads as a supervisor that won't say (`base_unknown`).
+    let (_, last_exit) = crate::lifecycle::begin(std::process::id(), auto_update, &base);
     if let Ok(mut f) = fs::File::create(sup_pid_path()) {
         let _ = writeln!(f, "{}", std::process::id());
     }
-    // Since when and on what this one runs, and why the one before it
-    // stopped — for `mafold status` (activity center C5).
-    let (_, last_exit) = crate::lifecycle::begin(std::process::id(), auto_update, &base);
     note_own_exits();
     println!("supervisor up (pid {}) · base {base}", std::process::id());
     if let Some(x) = &last_exit {

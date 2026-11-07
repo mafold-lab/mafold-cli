@@ -63,8 +63,31 @@ pub async fn edit(client: &Client, message: &str, text: Option<&str>, file: Opti
 ///
 /// The newline a pipe or a file ends on is not part of the message. Nothing
 /// but whitespace is refused here, before anything reaches the network.
-pub(crate) fn body_from(text: Option<&str>, file: Option<&str>, mut stdin: impl std::io::Read) -> Result<String> {
-    let (body, empty) = match (text, file) {
+pub(crate) fn body_from(text: Option<&str>, file: Option<&str>, stdin: impl std::io::Read) -> Result<String> {
+    let (body, empty) = read_text(text, file, stdin)?;
+    if body.trim().is_empty() {
+        bail!("refusing to send an empty message — {empty}");
+    }
+    Ok(body)
+}
+
+/// [`body_from`] for a message that carries files (`mafold send --attach`):
+/// there the text is optional, as when a picture is pasted and sent without a
+/// word. Nothing given is no text — and stdin is NOT read, so a caller that
+/// pipes nothing in never sits waiting on it — and a blank text is no text
+/// rather than a refusal. The server still refuses a message with neither.
+pub(crate) fn caption_from(text: Option<&str>, file: Option<&str>, stdin: impl std::io::Read) -> Result<String> {
+    if text.is_none() && file.is_none() {
+        return Ok(String::new());
+    }
+    let (body, _) = read_text(text, file, stdin)?;
+    Ok(if body.trim().is_empty() { String::new() } else { body })
+}
+
+/// The text as the command was given it — the text itself, `-` for stdin, or
+/// `--file <path>` — and what to say if it turns out to be blank.
+fn read_text(text: Option<&str>, file: Option<&str>, mut stdin: impl std::io::Read) -> Result<(String, &'static str)> {
+    Ok(match (text, file) {
         (Some("-"), None) => {
             let mut s = String::new();
             stdin.read_to_string(&mut s).context("reading the text from stdin")?;
@@ -77,11 +100,7 @@ pub(crate) fn body_from(text: Option<&str>, file: Option<&str>, mut stdin: impl 
         }
         (Some(_), Some(_)) => bail!("give the text OR --file, not both"),
         (None, None) => bail!("give the text, --file <path>, or - for stdin"),
-    };
-    if body.trim().is_empty() {
-        bail!("refusing to send an empty message — {empty}");
-    }
-    Ok(body)
+    })
 }
 
 /// How much of a text a receipt quotes.

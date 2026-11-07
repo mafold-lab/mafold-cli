@@ -115,6 +115,10 @@ fn server_words(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Set in an inbox turn: this process is an agent writing under a person's
+/// account, and what it sends says so (flag `a2aThreads`).
+pub const AS_AGENT_ENV: &str = "MAFOLD_SEND_AS_AGENT";
+
 /// Where a message goes. In a forum the conversation is only HALF an address:
 /// the channel, the thread it hangs under and the message it answers each narrow
 /// it further, and every one of them is part of "reply where you were asked".
@@ -669,6 +673,18 @@ impl Client {
         self.post("getCardState", json!({ "message_id": message_id })).await
     }
 
+    /// Threads this account is in with something unread (`unreadThreads`).
+    pub async fn unread_threads(&self) -> Result<Value> {
+        self.post("unreadThreads", json!({})).await
+    }
+
+    /// The message whose turn wrote `message_id`, when a turn did
+    /// (`messageOrigin`). None from an api before it said.
+    pub async fn message_trigger(&self, message_id: &str) -> Option<String> {
+        let v = self.post("messageOrigin", json!({ "message_id": message_id })).await.ok()?;
+        v["trigger"].as_str().map(str::to_string)
+    }
+
     pub async fn get_thread_messages(
         &self,
         chat_id: &str,
@@ -824,6 +840,30 @@ impl Client {
     /// chat_id/text/reply_to_message_id and silently 422'd for three releases
     /// (0.9.56→0.9.63; diagnosed in the field by @linsky:opus48).
     pub async fn send_to(&self, dest: Dest<'_>, text: &str) -> Result<Value> {
+        self.send_message(dest, text, &[], None).await
+    }
+
+    /// [`Self::send_to`] with the rest of what one message can carry.
+    ///
+    /// `attachments` — already uploaded ([`Self::upload_attachment`]) — ride in
+    /// the SAME request as the text. Text first and media hung on afterwards
+    /// (`botAttach`) is two requests, and the first one is what wakes whoever
+    /// the message is for: an agent woken by the words started its turn
+    /// before the picture they were about had landed, seconds later.
+    ///
+    /// `client_msg_id` is the send's idempotency key: the same key again in the
+    /// same conversation gets back the message the first send stored — no
+    /// second message, no second wake (`insert_message_idempotent`, api). So a
+    /// send WITH one is retried when the transport fails (a proxy that swallows
+    /// the reply). Without one nothing changes: a send is not retried, because
+    /// a repeat would post a second message.
+    pub async fn send_message(
+        &self,
+        dest: Dest<'_>,
+        text: &str,
+        attachments: &[Value],
+        client_msg_id: Option<&str>,
+    ) -> Result<Value> {
         let mut body = json!({ "chat_id": dest.chat_id, "text": text });
         // Sent from inside a turn (an agent's `mafold send`): name the turn's
         // reply, and the server stamps this with whom the turn speaks for
@@ -832,6 +872,10 @@ impl Client {
         // bubble may not exist yet, and then there is nothing to name).
         if let Some(draft) = crate::turnenv::draft().and_then(|d| crate::agent::reply_now(&d)) {
             body["carries"] = json!(draft);
+        }
+        // An inbox turn is an agent writing under a person's account (`a2a.rs`).
+        if std::env::var(AS_AGENT_ENV).is_ok_and(|v| v == "1") {
+            body["by_agent"] = json!(true);
         }
         if let Some(ch) = dest.channel_id {
             body["channel_id"] = json!(ch);
@@ -842,7 +886,17 @@ impl Client {
         if let Some(rid) = dest.reply_to_message_id {
             body["reply_to_message_id"] = json!(rid);
         }
-        self.post("sendMessage", body).await
+        // Nothing extra ⇒ the very body every send has always had.
+        if !attachments.is_empty() {
+            body["attachments"] = json!(attachments);
+        }
+        match client_msg_id {
+            Some(id) => {
+                body["client_msg_id"] = json!(id);
+                self.post_idempotent("sendMessage", body).await
+            }
+            None => self.post("sendMessage", body).await,
+        }
     }
 
     /// Move the caller's read position in a conversation's main timeline to
@@ -863,6 +917,15 @@ impl Client {
         self.post_idempotent(
             "markChannelRead",
             json!({ "chat_id": chat_id, "channel_id": channel_id, "message_id": message_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn mark_thread_read(&self, chat_id: &str, root: &str, message_id: &str) -> Result<()> {
+        self.post_idempotent(
+            "markThreadRead",
+            json!({ "chat_id": chat_id, "root_message_id": root, "message_id": message_id }),
         )
         .await
         .map(|_| ())
@@ -1405,6 +1468,31 @@ retry {attempt}/{} in {delay:?}…",
         path: &std::path::Path,
         how: AttachAs<'_>,
     ) -> Result<Value> {
+        let att = self.upload_attachment(path, how).await?;
+        self.attach(message_id, json!([att.clone()])).await?;
+        if let AttachAs::Sticker { .. } = how {
+            // Sending a sticker is how it ENTERS the sender's library — the
+            // composers do the same right after their upload — and a bot is an
+            // account like any other. After the attach, never before: the
+            // message must not wait on the library, and a failed add costs a
+            // row the next send re-creates, never the sticker in the reply.
+            let emoji: Vec<Value> = att.get("emoji").cloned().into_iter().collect();
+            let add = json!({ "file": att["file"].clone(), "emoji": emoji });
+            if let Err(e) = self.post("sticker.add", add).await {
+                eprintln!("sticker sent, but not kept in the library: {e:#}");
+            }
+        }
+        Ok(att)
+    }
+
+    /// Upload a local file and answer the attachment that names it — `{kind,
+    /// id, file}`, plus `emoji` for a sticker — WITHOUT putting it on any
+    /// message. The one place a path on this machine becomes media a message
+    /// can carry: [`Self::attach_media_as`] (`mafold attach`, the agent render
+    /// loop) hangs it on a message that already exists, `mafold send --attach`
+    /// puts it in the message it is about to send ([`Self::send_message`]).
+    /// One door, so the two can never drift on kind / name / mime / thumbnail.
+    pub async fn upload_attachment(&self, path: &std::path::Path, how: AttachAs<'_>) -> Result<Value> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let name = path
             .file_name()
@@ -1457,23 +1545,9 @@ retry {attempt}/{} in {delay:?}…",
         // `id` is the attachment's identity for the server's de-dup, so key it
         // on the file — re-attaching the same upload is a no-op, not a twin.
         let mut att = json!({ "kind": kind, "id": file_id, "file": file_id });
-        let sticker_emoji = match how {
-            AttachAs::Sticker { emoji } => Some(emoji.map(str::trim).filter(|e| !e.is_empty())),
-            AttachAs::Detected { .. } => None,
-        };
-        if let Some(Some(e)) = sticker_emoji {
-            att["emoji"] = json!(e);
-        }
-        self.attach(message_id, json!([att.clone()])).await?;
-        if let Some(emoji) = sticker_emoji {
-            // Sending a sticker is how it ENTERS the sender's library — the
-            // composers do the same right after their upload — and a bot is an
-            // account like any other. After the attach, never before: the
-            // message must not wait on the library, and a failed add costs a
-            // row the next send re-creates, never the sticker in the reply.
-            let add = json!({ "file": file_id, "emoji": emoji.into_iter().collect::<Vec<_>>() });
-            if let Err(e) = self.post("sticker.add", add).await {
-                eprintln!("sticker sent, but not kept in the library: {e:#}");
+        if let AttachAs::Sticker { emoji } = how {
+            if let Some(e) = emoji.map(str::trim).filter(|e| !e.is_empty()) {
+                att["emoji"] = json!(e);
             }
         }
         Ok(att)
@@ -1483,6 +1557,16 @@ retry {attempt}/{} in {delay:?}…",
     /// them (`ingestUrl`), so a vendor's 24 h clip link never has to cross
     /// this machine's uplink. Kind follows the registered mime.
     pub async fn attach_url(&self, message_id: &str, url: &str) -> Result<Value> {
+        let att = self.ingest_attachment(url).await?;
+        self.attach(message_id, json!([att.clone()])).await?;
+        Ok(att)
+    }
+
+    /// The attachment a PUBLIC URL's bytes become, landed server-side
+    /// (`ingestUrl`) and put on no message yet — [`Self::upload_attachment`]
+    /// for a URL. [`Self::attach_url`] hangs it on a message that exists;
+    /// `mafold send --attach <url>` sends it in its own message.
+    pub async fn ingest_attachment(&self, url: &str) -> Result<Value> {
         let up = self.call("ingestUrl", json!({ "url": url })).await?;
         let file_id = up["id"].as_str().context("ingestUrl returned no id")?;
         let mime = up["mime"].as_str().unwrap_or("");
@@ -1493,9 +1577,7 @@ retry {attempt}/{} in {delay:?}…",
         } else {
             "file"
         };
-        let att = json!({ "kind": kind, "id": file_id, "file": file_id });
-        self.attach(message_id, json!([att.clone()])).await?;
-        Ok(att)
+        Ok(json!({ "kind": kind, "id": file_id, "file": file_id }))
     }
 
     /// Close the loop on a card tap: the API is holding the tapper's request open

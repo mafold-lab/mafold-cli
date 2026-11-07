@@ -35,6 +35,18 @@ pub enum SitesCmd {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Google Search Console: have a site answer its verification file, through
+    /// every deploy. Add the site as a URL prefix property, choose "HTML file",
+    /// and pass the file's name.
+    Google {
+        site: String,
+        /// The file's name, like google1234567890abcdef.html.
+        #[arg(required_unless_present = "clear")]
+        file: Option<String>,
+        /// Stop answering it.
+        #[arg(long, conflicts_with = "file")]
+        clear: bool,
+    },
     /// A site's own Worker — the paths it claims (default /api/*) run your code.
     Worker {
         #[command(subcommand)]
@@ -361,6 +373,13 @@ pub async fn run(cmd: SitesCmd, client: &Client) -> Result<()> {
             }
             client.call("removeSite", json!({ "site": site })).await?;
             println!("✓ removed {site}");
+        }
+        SitesCmd::Google { site, file, .. } => {
+            let out = client.call("setSiteVerification", json!({ "site": site, "google": file })).await?;
+            match out["google"].as_str() {
+                Some(file) => println!("✓ {site} answers /{file} — press Verify in Search Console"),
+                None => println!("✓ {site} answers no Search Console file"),
+            }
         }
         SitesCmd::Worker { cmd } => match cmd {
             WorkerCmd::Deploy { site, main, dir, routes, d1, vars, compatibility_date, app } => {

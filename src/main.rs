@@ -192,6 +192,14 @@ enum Cmd {
         /// Read the main timeline (#all), even inside a channel turn.
         #[arg(long, conflicts_with = "channel")]
         main: bool,
+        /// Read a thread: any message in it (`mafold read` marks the ones with
+        /// a thread under them). Inside a thread turn, this turn's own
+        /// conversation already defaults to the turn's thread.
+        #[arg(long, value_name = "MESSAGE", conflicts_with_all = ["channel", "main"])]
+        thread: Option<String>,
+        /// Read the timeline this turn's thread hangs from.
+        #[arg(long, conflicts_with_all = ["channel", "main", "thread"])]
+        up: bool,
         /// Download the transcript's photos and files to ~/.mafold/attachments
         /// and print each one's path, so the agent can actually open them.
         /// Off by default: a long page of a photo-heavy room is a lot of bytes
@@ -241,6 +249,16 @@ enum Cmd {
         /// Send to the main timeline (#all), even inside a channel turn.
         #[arg(long, conflicts_with = "channel")]
         main: bool,
+        /// Send into a thread: any message in it, or one to start a thread
+        /// under. Inside a thread turn, a send to the turn's own conversation
+        /// already goes to the turn's thread.
+        #[arg(long, value_name = "MESSAGE", conflicts_with_all = ["channel", "main"])]
+        thread: Option<String>,
+        /// Take a conclusion out of a thread: post on the timeline the thread
+        /// hangs from, quoting what was asked (--reply to quote something
+        /// else). The turn's own thread, or the one named by --thread.
+        #[arg(long, conflicts_with_all = ["channel", "main"])]
+        up: bool,
         /// Quote-reply to this message id (`mafold read --ids` shows them).
         #[arg(long)]
         reply: Option<String>,
@@ -252,10 +270,25 @@ enum Cmd {
         /// Read the text from a file instead.
         #[arg(long, conflicts_with = "text")]
         file: Option<String>,
+        /// Put a file in the message — a picture, a clip, any file (or a
+        /// public http(s) URL, which the server fetches); repeat for several.
+        /// Every file is uploaded first, then the text and the files go out as
+        /// ONE message, so whoever it wakes gets the picture with the words.
+        /// The kind is read from the bytes, as `mafold attach` does. With
+        /// --attach the text may be left out. If any upload fails, nothing is
+        /// sent.
+        #[arg(long, value_name = "PATH")]
+        attach: Vec<String>,
+        /// Your own id for this send, passed on as its `client_msg_id`: the
+        /// same id again in the same chat gets back the message the first send
+        /// made instead of posting a second — so with it, a send whose answer
+        /// is lost on the way back is retried.
+        #[arg(long, value_name = "ID", value_parser = non_blank_id)]
+        client_id: Option<String>,
         /// The text (words are joined with spaces), or `-` to read it from
         /// stdin. Options go before it: from its first word on, everything is
         /// the text.
-        #[arg(trailing_var_arg = true, required_unless_present = "file")]
+        #[arg(trailing_var_arg = true, required_unless_present_any = ["file", "attach"])]
         text: Vec<String>,
     },
     /// React to a message with an emoji (`--remove` takes it back).
@@ -997,10 +1030,10 @@ async fn main() -> Result<()> {
             supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
         }
         Cmd::Chats => chats(&Client::new(cli.base, token?)).await?,
-        Cmd::Read { chat: c, limit, channel, main, media, json, unread, ids } => {
+        Cmd::Read { chat: c, limit, channel, main, thread, up, media, json, unread, ids } => {
             chat::read(
                 &Client::new(cli.base, token?),
-                chat::ReadArgs { chat: c, limit, channel, main, json, media, unread, ids },
+                chat::ReadArgs { chat: c, limit, channel, main, thread, up, json, media, unread, ids },
             )
             .await?
         }
@@ -1011,18 +1044,22 @@ async fn main() -> Result<()> {
             chat,
             channel,
             main,
+            thread,
+            up,
             reply,
             anyway,
             file,
+            attach,
+            client_id,
             text,
         } => {
-            let text = send_body(&text, file.as_deref(), std::io::stdin())?;
+            let text = send_body(&text, file.as_deref(), !attach.is_empty(), std::io::stdin())?;
             send(
                 &Client::new(cli.base, token?),
                 &chat,
-                Target::of(channel.as_deref(), main),
+                Target::of(channel.as_deref(), main, thread.as_deref(), up),
                 reply.as_deref(),
-                &text,
+                Outgoing { text: &text, files: &attach, client_id: client_id.as_deref() },
                 anyway,
             )
             .await?
@@ -1588,7 +1625,12 @@ enum Target<'a> {
     Channel(&'a str),
     /// `--main`: the main timeline, even inside a channel turn.
     Main,
-    /// Nothing said: the turn's own channel when the chat is the turn's own
+    /// `--thread <message>`: that message's thread.
+    Thread(&'a str),
+    /// `--up`: the timeline a thread hangs from — the one `--thread` names, or
+    /// this turn's.
+    Up(Option<&'a str>),
+    /// Nothing said: the turn's own thread, then the turn's own channel, when the chat is the turn's own
     /// conversation (`chat::turn_channel`), the main timeline otherwise.
     ///
     /// It used to be the main timeline always, and an agent working in a
@@ -1599,21 +1641,86 @@ enum Target<'a> {
 }
 
 impl<'a> Target<'a> {
-    fn of(channel: Option<&'a str>, main: bool) -> Self {
-        match channel {
-            Some(c) => Target::Channel(c),
-            None if main => Target::Main,
-            None => Target::Default,
+    fn of(channel: Option<&'a str>, main: bool, thread: Option<&'a str>, up: bool) -> Self {
+        match (channel, thread) {
+            (_, t) if up => Target::Up(t),
+            (Some(c), _) => Target::Channel(c),
+            (None, Some(t)) => Target::Thread(t),
+            (None, None) if main => Target::Main,
+            (None, None) => Target::Default,
         }
     }
 }
 
 /// What `mafold send` posts: its words joined with spaces, or — read exactly
 /// as `mafold edit` reads its text ([`msgops::body_from`]) — stdin for a lone
-/// `-`, or `--file`.
-fn send_body(text: &[String], file: Option<&str>, stdin: impl std::io::Read) -> Result<String> {
+/// `-`, or `--file`. With `--attach` (`attaching`) the text is optional
+/// ([`msgops::caption_from`]): files alone are a message, as a picture pasted
+/// and sent without a word is. Without, a blank text is refused as ever.
+fn send_body(text: &[String], file: Option<&str>, attaching: bool, stdin: impl std::io::Read) -> Result<String> {
     let text = (!text.is_empty()).then(|| text.join(" "));
-    msgops::body_from(text.as_deref(), file, stdin)
+    if attaching {
+        msgops::caption_from(text.as_deref(), file, stdin)
+    } else {
+        msgops::body_from(text.as_deref(), file, stdin)
+    }
+}
+
+/// `--client-id` goes out as given, but never blank: the server keys a send
+/// on it, and every send sharing one blank key would come back as the first.
+fn non_blank_id(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("the id is blank".into());
+    }
+    Ok(s.to_string())
+}
+
+/// What `mafold send` puts in its one message.
+struct Outgoing<'a> {
+    /// The text ([`send_body`]); blank only beside files.
+    text: &'a str,
+    /// `--attach`: files on this machine or public URLs, every one uploaded
+    /// before anything is sent.
+    files: &'a [String],
+    /// `--client-id`: the send's idempotency key (`client_msg_id`).
+    client_id: Option<&'a str>,
+}
+
+fn is_url(f: &str) -> bool {
+    f.starts_with("http://") || f.starts_with("https://")
+}
+
+/// Every `--attach` naming a file on this machine has to BE one — checked
+/// before anything touches the network, so a typo in the third path costs no
+/// uploads and sends nothing.
+fn check_files(files: &[String]) -> Result<()> {
+    for f in files.iter().filter(|f| !is_url(f)) {
+        let meta = std::fs::metadata(f).with_context(|| format!("--attach {f}: can't open it — nothing was sent"))?;
+        if !meta.is_file() {
+            anyhow::bail!("--attach {f}: not a file — nothing was sent");
+        }
+    }
+    Ok(())
+}
+
+/// Upload every `--attach`, in order, and answer the attachments they became.
+/// The same door `mafold attach` goes through — `Client::upload_attachment`
+/// (kind from the bytes, a photo's view and strip) or, for a URL,
+/// `Client::ingest_attachment` — only nothing is hung anywhere yet. The first
+/// failure ends it: the text is not sent without the picture it was about.
+async fn upload_files(client: &Client, files: &[String]) -> Result<Vec<serde_json::Value>> {
+    let mut out = Vec::with_capacity(files.len());
+    for f in files {
+        let att = if is_url(f) {
+            client.ingest_attachment(f).await
+        } else {
+            client
+                .upload_attachment(std::path::Path::new(f), client::AttachAs::Detected { original: false })
+                .await
+        };
+        out.push(att.with_context(|| format!("uploading {f} failed — nothing was sent"))?);
+    }
+    Ok(out)
 }
 
 async fn send(
@@ -1621,25 +1728,44 @@ async fn send(
     chat: &str,
     target: Target<'_>,
     reply: Option<&str>,
-    text: &str,
+    out: Outgoing<'_>,
     anyway: bool,
 ) -> Result<()> {
+    let text = out.text;
+    check_files(out.files)?;
     if env_flag("MAFOLD_SEND_DRY") {
         let channel = match target {
             Target::Channel(c) => Some(c.to_string()),
-            Target::Main => None,
+            Target::Main | Target::Thread(_) | Target::Up(_) => None,
             Target::Default => chat::turn_channel(chat),
         };
-        journal(&serde_json::json!({
+        let mut entry = serde_json::json!({
             "kind": "send", "dry": true, "chat_id": chat, "channel_id": channel, "reply_to": reply, "text": text,
-        }));
+        });
+        if !out.files.is_empty() {
+            entry["attachments"] = serde_json::json!(out.files);
+        }
+        journal(&entry);
         let at = channel.map(|c| format!(" #{c}")).unwrap_or_default();
         let re = reply.map(|r| format!(" (回复 #{r})")).unwrap_or_default();
-        println!("✓ (dry-run,没有真发) → {chat}{at}{re}: {text}");
+        let with = if out.files.is_empty() { String::new() } else { format!(" + {}", out.files.join(", ")) };
+        println!("✓ (dry-run,没有真发) → {chat}{at}{re}: {text}{with}");
         return Ok(());
     }
+    // Every file is up before anything is sent: the message goes out once,
+    // words and files together, or — when an upload fails — not at all.
+    let attachments = if out.files.is_empty() {
+        Vec::new()
+    } else {
+        // A one-shot process holds no flags yet (a photo's view and strip are
+        // behind thumbSend) — the same refresh `mafold attach` makes.
+        flags::refresh(client).await;
+        upload_files(client, out.files).await?
+    };
     // The receipt says where it landed, every time — a `#all` that went
     // unremarked is how the wrong timeline went unnoticed.
+    let mut thread = None;
+    let mut quote = None;
     let (chat_id, channel_id, label) = match target {
         Target::Channel(ch) => {
             let (chat_id, ch) = channels::resolve(client, chat, ch).await?;
@@ -1647,9 +1773,34 @@ async fn send(
             (chat_id, ch["id"].as_str().map(str::to_string), format!("{chat} #{name}"))
         }
         Target::Main => (client.resolve_chat(chat).await?, None, format!("{chat} #all")),
+        Target::Thread(at) => {
+            let chat_id = client.resolve_chat(chat).await?;
+            let hangs = chat::thread_of(client, &chat_id, at).await?;
+            thread = Some(hangs.root);
+            (chat_id, hangs.channel, format!("{chat} thread"))
+        }
+        Target::Up(at) => {
+            let chat_id = client.resolve_chat(chat).await?;
+            let root = match at {
+                Some(at) => at.to_string(),
+                None => chat::turn_thread(client, &chat_id)
+                    .await
+                    .context("--up: this turn isn't in a thread (name one with --thread)")?,
+            };
+            let hangs = chat::thread_of(client, &chat_id, &root).await?;
+            quote = Some(chat::what_was_asked(client, &hangs).await);
+            let at = match &hangs.channel {
+                Some(ch) => format!("#{}", chat::channel_name(client, &chat_id, ch).await),
+                None => "#all".to_string(),
+            };
+            (chat_id, hangs.channel, format!("{chat} {at} (the timeline this thread hangs from)"))
+        }
         Target::Default => {
             let chat_id = client.resolve_chat(chat).await?;
+            thread = chat::turn_thread(client, &chat_id).await;
             match chat::turn_channel(&chat_id) {
+                Some(ch) if thread.is_some() => (chat_id, Some(ch), format!("{chat} this turn's thread (--up for the timeline)")),
+                None if thread.is_some() => (chat_id, None, format!("{chat} this turn's thread (--up for the timeline)")),
                 Some(ch) => {
                     let name = chat::channel_name(client, &chat_id, &ch).await;
                     (chat_id, Some(ch), format!("{chat} #{name} (this turn's channel; --main for #all)"))
@@ -1658,7 +1809,7 @@ async fn send(
             }
         }
     };
-    if !anyway {
+    if !anyway && thread.is_none() {
         if let Some(fresh) = inbox::send_guard(client, &chat_id, channel_id.as_deref(), &label).await {
             println!("{fresh}");
             anyhow::bail!("没发出去 —— 先看上面的新消息");
@@ -1667,17 +1818,23 @@ async fn send(
     if env_flag("MAFOLD_SEND_PACE") {
         pace_typing(client, &chat_id, channel_id.as_deref(), text).await;
     }
-    let mut dest = Dest::chat(&chat_id).channel(channel_id.as_deref());
+    let reply = reply.or(quote.as_deref());
+    let mut dest = Dest::chat(&chat_id).channel(channel_id.as_deref()).thread(thread.as_deref());
     dest.reply_to_message_id = reply;
-    let sent = client.send_to(dest, text).await?;
-    journal(&serde_json::json!({
+    let sent = client.send_message(dest, text, &attachments, out.client_id).await?;
+    let mut entry = serde_json::json!({
         "kind": "send",
         "chat_id": chat_id,
         "channel_id": channel_id,
+        "thread_root_id": thread,
         "message_id": sent["id"],
         "reply_to": reply,
         "text": text,
-    }));
+    });
+    if !attachments.is_empty() {
+        entry["attachments"] = serde_json::json!(attachments);
+    }
+    journal(&entry);
     if let Some(id) = sent["id"].as_str() {
         agent::write_declared(client, id, text).await;
     }
@@ -1832,23 +1989,104 @@ mod send_target_tests {
     #[test]
     fn where_a_send_goes_is_said_once() {
         let (c, m) = send_target(&[]).unwrap();
-        assert_eq!(Target::of(c.as_deref(), m), Target::Default);
+        assert_eq!(Target::of(c.as_deref(), m, None, false), Target::Default);
         let (c, m) = send_target(&["--main"]).unwrap();
-        assert_eq!(Target::of(c.as_deref(), m), Target::Main);
+        assert_eq!(Target::of(c.as_deref(), m, None, false), Target::Main);
         let (c, m) = send_target(&["--channel", "#发版"]).unwrap();
-        assert_eq!(Target::of(c.as_deref(), m), Target::Channel("#发版"));
+        assert_eq!(Target::of(c.as_deref(), m, None, false), Target::Channel("#发版"));
         assert!(send_target(&["--main", "--channel", "#发版"]).is_err());
+        assert_eq!(Target::of(None, false, Some("m1"), false), Target::Thread("m1"));
+        assert_eq!(Target::of(None, false, None, true), Target::Up(None));
+        assert_eq!(Target::of(None, false, Some("m1"), true), Target::Up(Some("m1")));
+        for both in [&["--up", "--main"][..], &["--up", "--channel", "x"], &["--thread", "m", "--main"], &["--thread", "m", "--channel", "x"]] {
+            assert!(send_target(both).is_err(), "{both:?}");
+        }
+        assert!(send_target(&["--thread", "m", "--up"]).is_ok());
+        assert!(Cli::try_parse_from(["mafold", "read", "--up", "--thread", "m"]).is_err());
         assert!(Cli::try_parse_from(["mafold", "read", "--main", "--channel", "x"]).is_err());
         assert!(Cli::try_parse_from(["mafold", "read", "--main"]).is_ok());
     }
 
     /// What `mafold send <chat> <args…>` posts when `stdin` is piped in.
     fn sends(args: &[&str], stdin: &str) -> Result<String> {
+        sends_from(args, stdin.as_bytes())
+    }
+
+    fn sends_from(args: &[&str], stdin: impl std::io::Read) -> Result<String> {
         let argv = ["mafold", "send", "72355ef4-c43f-44ba-a0d5-b2c061026cd6"].iter().chain(args);
         match Cli::try_parse_from(argv)?.cmd {
-            Cmd::Send { text, file, .. } => send_body(&text, file.as_deref(), stdin.as_bytes()),
+            Cmd::Send { text, file, attach, .. } => send_body(&text, file.as_deref(), !attach.is_empty(), stdin),
             _ => unreachable!(),
         }
+    }
+
+    /// A stdin that must not be touched: reading it is the hang a caller
+    /// with no pipe would sit in.
+    struct NoStdin;
+    impl std::io::Read for NoStdin {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stdin was read, and nothing asked for it");
+        }
+    }
+
+    /// What `mafold send <chat> <args…>` parses into: `--attach`, `--client-id`
+    /// and the text.
+    fn send_parts(args: &[&str]) -> Result<(Vec<String>, Option<String>, Vec<String>), clap::Error> {
+        let argv = ["mafold", "send", "72355ef4-c43f-44ba-a0d5-b2c061026cd6"].iter().chain(args);
+        match Cli::try_parse_from(argv)?.cmd {
+            Cmd::Send { attach, client_id, text, .. } => Ok((attach, client_id, text)),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `--attach` takes ONE path per use (repeat it for more) and never eats
+    /// the text after it; the client id goes through verbatim, but a blank
+    /// one is refused.
+    #[test]
+    fn attach_takes_one_path_per_use_and_leaves_the_text_alone() {
+        let (attach, id, text) = send_parts(&["--attach", "a.png", "--attach", "b.pdf", "看", "这两个"]).unwrap();
+        assert_eq!(attach, ["a.png", "b.pdf"]);
+        assert_eq!(id, None);
+        assert_eq!(text, ["看", "这两个"]);
+
+        let (attach, id, text) = send_parts(&["--client-id", " desk:7f/1 ", "--attach", "a.png"]).unwrap();
+        assert_eq!(attach, ["a.png"]);
+        assert_eq!(id.as_deref(), Some(" desk:7f/1 "), "passed through verbatim");
+        assert!(text.is_empty(), "files alone parse: the text is optional with --attach");
+
+        assert!(send_parts(&["--client-id", "  ", "hi"]).is_err(), "a blank id would make every send its twin");
+        assert!(send_parts(&[]).is_err(), "no text, no --file, no --attach: refused as ever");
+        assert!(send_parts(&["--client-id", "x"]).is_err(), "an id is not something to send");
+    }
+
+    /// Blank text is a message only when there are files: a picture pasted and
+    /// sent alone. Without `--attach` it is refused exactly as before — and
+    /// with files but no text argument, stdin is never read.
+    #[test]
+    fn blank_text_is_allowed_only_beside_files() {
+        assert_eq!(sends_from(&["--attach", "a.png"], NoStdin).unwrap(), "", "no text arg: nothing read from stdin");
+        assert_eq!(sends(&["--attach", "a.png", "  "], "").unwrap(), "", "a blank caption is no caption");
+        assert_eq!(sends(&["--attach", "a.png", "-"], "").unwrap(), "", "an empty pipe beside a file");
+        assert_eq!(sends(&["--attach", "a.png", "-"], "看这张\n").unwrap(), "看这张");
+        assert_eq!(sends(&["--attach", "a.png", "看", "这张"], "").unwrap(), "看 这张");
+
+        // Without files, nothing changed.
+        assert!(sends(&[""], "").is_err());
+        assert!(sends(&["  "], "").is_err());
+        assert!(sends(&["-"], "").is_err());
+        let err = format!("{:#}", sends(&["  "], "").unwrap_err());
+        assert!(err.contains("the text is blank"), "{err}");
+    }
+
+    /// The desktop app finds out whether this `mafold` can send files by
+    /// looking for `--attach` in `mafold send --help`.
+    #[test]
+    fn send_help_names_attach_and_client_id() {
+        let err = Cli::try_parse_from(["mafold", "send", "--help"]).err().expect("--help prints the help");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        assert!(help.contains("--attach"), "{help}");
+        assert!(help.contains("--client-id"), "{help}");
     }
 
     /// 2026-10-19/20, linsky's Rei: `… | mafold send <chat> -` — the way
@@ -1929,6 +2167,251 @@ mod send_target_tests {
         let card = serde_json::json!({ "content": "{% mafold/ask answered=\"Cloudflare\" %}\nq|部署|0|去哪?\no|Cloudflare|x\n{% /mafold/ask %}" });
         assert_eq!(after_tap(&card, &card, 0), "卡片已回答:「Cloudflare」");
         assert_eq!(answered_of("{% mafold/ask %}"), None);
+    }
+}
+
+/// `mafold send --attach` / `--client-id` against a stand-in api: what goes
+/// over the wire, in what order, and what never goes at all.
+#[cfg(test)]
+mod send_attach_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CHAT: &str = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
+
+    /// What the stand-in api does with one request.
+    enum Answer {
+        /// This status and body.
+        Reply(u16, &'static str),
+        /// Read the whole request, then hang up without a word — a proxy that
+        /// swallowed the reply after the server had it.
+        HangUp,
+    }
+
+    /// Every request the stand-in saw, in order: path and body.
+    type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// A stand-in api. `answer` picks each reply from the path and how many
+    /// requests to that same path came before it.
+    async fn fake_api(answer: fn(&str, usize) -> Answer) -> (String, Seen) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let Some((path, body)) = read_request(&mut sock).await else { continue };
+                let before = {
+                    let mut log = log.lock().unwrap();
+                    let n = log.iter().filter(|(p, _)| *p == path).count();
+                    log.push((path.clone(), body));
+                    n
+                };
+                match answer(&path, before) {
+                    Answer::HangUp => drop(sock),
+                    Answer::Reply(status, body) => {
+                        let head = format!(
+                            "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                            if status == 200 { "OK" } else { "Error" },
+                            body.len()
+                        );
+                        let _ = sock.write_all(format!("{head}{body}").as_bytes()).await;
+                    }
+                }
+            }
+        });
+        (base, seen)
+    }
+
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+            let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+            let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("content-length") { v.trim().parse().ok() } else { None }
+                })
+                .unwrap_or(0);
+            if bytes.len() < end + 4 + len {
+                continue;
+            }
+            let path = head.split_whitespace().nth(1)?.to_string();
+            return Some((path, bytes[end + 4..end + 4 + len].to_vec()));
+        }
+    }
+
+    /// The api as a send with files meets it: no flags to give (the refresh
+    /// keeps what it holds), uploads answered F1, F2, …, the send answered M1.
+    fn healthy(path: &str, before: usize) -> Answer {
+        match (path, before) {
+            ("/api/getFlags", _) => Answer::Reply(200, r#"{"ok":false,"error_code":404,"description":"not here"}"#),
+            ("/api/uploadFile", 0) => Answer::Reply(200, r#"{"id":"F1","unique_id":"U1","mime":"image/png"}"#),
+            ("/api/uploadFile", _) => Answer::Reply(200, r#"{"id":"F2","unique_id":"U2","mime":"application/pdf"}"#),
+            ("/api/sendMessage", _) => Answer::Reply(200, r#"{"ok":true,"result":{"id":"M1"}}"#),
+            _ => Answer::Reply(200, r#"{"ok":true,"result":{}}"#),
+        }
+    }
+
+    fn paths(seen: &Seen) -> Vec<String> {
+        seen.lock().unwrap().iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    fn sent_bodies(seen: &Seen) -> Vec<Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == "/api/sendMessage")
+            .map(|(_, b)| serde_json::from_slice(b).unwrap())
+            .collect()
+    }
+
+    /// A png header (the bytes, not the name, make it a photo) and a pdf.
+    fn two_files() -> (std::path::PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("mf-send-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&4u32.to_be_bytes());
+        png.extend_from_slice(&4u32.to_be_bytes());
+        let shot = dir.join("shot.png");
+        std::fs::write(&shot, png).unwrap();
+        let paper = dir.join("paper.pdf");
+        std::fs::write(&paper, b"%PDF-1.7").unwrap();
+        (dir, shot.to_string_lossy().into_owned(), paper.to_string_lossy().into_owned())
+    }
+
+    async fn run_send(base: String, out: Outgoing<'_>) -> Result<()> {
+        let client = Client::new(base, "test".into());
+        tokio::time::timeout(std::time::Duration::from_secs(30), send(&client, CHAT, Target::Main, None, out, true))
+            .await
+            .expect("the send finished")
+    }
+
+    /// THE FEATURE: every file is up before the one `sendMessage`, and that
+    /// one request carries the text, the attachments (in the order given,
+    /// classified by `mafold attach`'s own door) and the client id.
+    #[tokio::test]
+    async fn files_go_up_first_then_one_send_carries_text_files_and_id() {
+        let (base, seen) = fake_api(healthy).await;
+        let (dir, shot, paper) = two_files();
+        let files = [shot, paper];
+        run_send(base, Outgoing { text: "看这两个", files: &files, client_id: Some("desk-1") }).await.unwrap();
+
+        assert_eq!(
+            paths(&seen),
+            ["/api/getFlags", "/api/uploadFile", "/api/uploadFile", "/api/sendMessage"],
+            "uploads first, then ONE send — no botAttach afterwards"
+        );
+        let sent = sent_bodies(&seen);
+        assert_eq!(sent[0]["chat_id"], CHAT);
+        assert_eq!(sent[0]["text"], "看这两个");
+        assert_eq!(
+            sent[0]["attachments"],
+            json!([
+                { "kind": "photo", "id": "F1", "file": "F1" },
+                { "kind": "file", "id": "F2", "file": "F2" }
+            ])
+        );
+        assert_eq!(sent[0]["client_msg_id"], "desk-1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Files and no words: a message all the same, its text empty.
+    #[tokio::test]
+    async fn files_alone_are_a_message() {
+        let (base, seen) = fake_api(healthy).await;
+        let (dir, shot, _) = two_files();
+        let files = [shot];
+        run_send(base, Outgoing { text: "", files: &files, client_id: None }).await.unwrap();
+        let sent = sent_bodies(&seen);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["text"], "");
+        assert_eq!(sent[0]["attachments"], json!([{ "kind": "photo", "id": "F1", "file": "F1" }]));
+        assert!(sent[0].get("client_msg_id").is_none(), "no id given, none sent: {}", sent[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upload that fails sends NOTHING — not the text without its picture.
+    #[tokio::test]
+    async fn a_failed_upload_sends_nothing() {
+        fn second_upload_fails(path: &str, before: usize) -> Answer {
+            match (path, before) {
+                ("/api/uploadFile", 1) => Answer::Reply(500, "boom"),
+                _ => healthy(path, before),
+            }
+        }
+        let (base, seen) = fake_api(second_upload_fails).await;
+        let (dir, shot, paper) = two_files();
+        let files = [shot, paper.clone()];
+        let err = run_send(base, Outgoing { text: "看这两个", files: &files, client_id: Some("desk-1") })
+            .await
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains(&paper) && err.contains("nothing was sent"), "{err}");
+        assert!(!paths(&seen).iter().any(|p| p == "/api/sendMessage"), "sent anyway: {:?}", paths(&seen));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that isn't there is refused before a single byte goes out — the
+    /// files that do exist are not uploaded for a message that won't be sent.
+    #[tokio::test]
+    async fn a_missing_file_is_refused_before_any_upload() {
+        let (base, seen) = fake_api(healthy).await;
+        let (dir, shot, _) = two_files();
+        let missing = dir.join("not-here.png").to_string_lossy().into_owned();
+        let files = [shot, missing.clone()];
+        let err = run_send(base, Outgoing { text: "hi", files: &files, client_id: None }).await.unwrap_err();
+        assert!(format!("{err:#}").contains(&missing), "{err:#}");
+        assert!(paths(&seen).is_empty(), "nothing may reach the api: {:?}", paths(&seen));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With a client id, a send whose reply was swallowed is sent again with
+    /// the SAME id — the server answers the repeat with the message it already
+    /// stored. Without one it is not retried: a repeat would post twice.
+    #[tokio::test]
+    async fn a_lost_reply_is_retried_only_under_a_client_id() {
+        fn first_reply_lost(path: &str, before: usize) -> Answer {
+            match (path, before) {
+                ("/api/sendMessage", 0) => Answer::HangUp,
+                _ => healthy(path, before),
+            }
+        }
+        let (base, seen) = fake_api(first_reply_lost).await;
+        let client = Client::new(base, "test".into());
+        let sent = client.send_message(Dest::chat(CHAT), "hi", &[], Some("desk-2")).await.unwrap();
+        assert_eq!(sent["id"], "M1");
+        let bodies = sent_bodies(&seen);
+        assert_eq!(bodies.len(), 2, "one retry after the lost reply");
+        assert_eq!(bodies[0]["client_msg_id"], "desk-2");
+        assert_eq!(bodies[0], bodies[1], "the retry is the same send, same id");
+
+        let (base, seen) = fake_api(first_reply_lost).await;
+        let client = Client::new(base, "test".into());
+        assert!(client.send_message(Dest::chat(CHAT), "hi", &[], None).await.is_err());
+        assert_eq!(sent_bodies(&seen).len(), 1, "no id, no retry");
+    }
+
+    /// No files and no id: the body every send always had.
+    #[tokio::test]
+    async fn a_plain_send_is_the_body_it_always_was() {
+        let (base, seen) = fake_api(healthy).await;
+        let client = Client::new(base, "test".into());
+        client.send_to(Dest::chat(CHAT), "hi").await.unwrap();
+        let sent = sent_bodies(&seen);
+        assert_eq!(sent[0]["text"], "hi");
+        assert!(sent[0].get("attachments").is_none(), "{}", sent[0]);
+        assert!(sent[0].get("client_msg_id").is_none(), "{}", sent[0]);
     }
 }
 

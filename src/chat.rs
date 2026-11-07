@@ -100,6 +100,10 @@ pub struct ReadArgs {
     pub channel: Option<String>,
     /// The main timeline (`#all`) even inside a channel turn.
     pub main: bool,
+    /// A thread, by any message in it.
+    pub thread: Option<String>,
+    /// The timeline this turn's thread hangs from.
+    pub up: bool,
     pub json: bool,
     pub media: bool,
     /// Only the unread (the chat's badge, capped by `limit`), then mark read.
@@ -166,6 +170,16 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
         Some(c) => Some(resolve_channel(client, &chat.id, c).await?),
         None => from_turn.clone(),
     };
+    // A thread is a timeline of its own: `--thread`, or, with nothing named,
+    // the thread this turn is in. `--main`, `--channel` and `--up` step out.
+    let thread = match &a.thread {
+        Some(at) => Some(thread_of(client, &chat.id, at).await?.root),
+        None if a.channel.is_none() && !a.main && !a.up => turn_thread(client, &chat.id).await,
+        None => None,
+    };
+    if let Some(root) = thread {
+        return read_thread(client, &chat, &root, &a).await;
+    }
 
     // `--unread`: only as many as the badge says, and none at all is an answer.
     let mut limit = a.limit;
@@ -235,6 +249,40 @@ pub async fn read(client: &Client, a: ReadArgs) -> Result<()> {
     }
     if channel.is_none() {
         forum_hint(client, &chat).await;
+    }
+    Ok(())
+}
+
+/// A thread as a reader of the timeline it hangs from needs to know it: how
+/// much is in it, when it last moved, who was talking, and how to open it. A
+/// thread's replies aren't on the timeline, so without this line the transcript
+/// reads as if the work stopped at the message that handed it out.
+fn thread_line(m: &Value) -> Option<String> {
+    let t = m.get("thread_summary").filter(|t| !t.is_null())?;
+    let n = t["reply_count"].as_u64().filter(|n| *n > 0)?;
+    let at = t["last_reply_at"].as_str().unwrap_or("");
+    let at = at.get(11..16).unwrap_or(at);
+    let who: Vec<&str> = t["participants"].as_array()?.iter().filter_map(|p| p["username"].as_str()).collect();
+    let id = m["id"].as_str()?;
+    Some(format!("💬 {n} 条 · 最后 {at} · {} · mafold read --thread {id}", who.join("、")))
+}
+
+/// `mafold read --thread`: the thread, root first, and — with `--unread` — the
+/// reader's own thread marker moved past what was shown.
+async fn read_thread(client: &Client, chat: &Room, root: &str, a: &ReadArgs) -> Result<()> {
+    let page = client.get_thread_messages(&chat.id, root, a.limit).await?;
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+        return Ok(());
+    }
+    let files = if a.media { fetch_media(client, &page).await } else { Default::default() };
+    println!("# thread {root} —— 读它挂着的时间线加 --up");
+    print_transcript_ex(chat, None, &page, &files, a.ids);
+    let dry = std::env::var("MAFOLD_SEND_DRY").is_ok_and(|v| v.trim() == "1");
+    if a.unread && !dry {
+        if let Some(newest) = newest_id(&page) {
+            client.mark_thread_read(&chat.id, root, &newest).await?;
+        }
     }
     Ok(())
 }
@@ -529,6 +577,9 @@ fn print_transcript_ex(
         let _ = ids;
         let id = if mid.is_empty() { String::new() } else { format!("#{mid} ") };
         println!("{id}[{when}] {who}: {}", if body.is_empty() { "—".into() } else { body });
+        if let Some(line) = thread_line(m) {
+            println!("              └─ {line}");
+        }
         for a in m["attachments"].as_array().into_iter().flatten() {
             let name = attachment_name(a);
             match a["file"]["id"].as_str().and_then(|id| files.get(id)) {
@@ -1440,6 +1491,72 @@ pub fn turn_channel(chat_id: &str) -> Option<String> {
     )
 }
 
+/// The thread this turn's reply is in, when `chat_id` IS the turn's own
+/// conversation — where `send` and `read` go when nothing else is said, so work
+/// handed to an agent in a thread stays there (flag `a2aThreads`,
+/// `.docs/a2a-threads.md`). Read off the reply itself: it is the one thing every
+/// harness has, where an exported variable would have to go through each.
+pub async fn turn_thread(client: &Client, chat_id: &str) -> Option<String> {
+    let conv = std::env::var("MAFOLD_CONV").ok()?;
+    if !conv.trim().eq_ignore_ascii_case(chat_id.trim()) {
+        return None;
+    }
+    let reply = crate::turnenv::draft().and_then(|d| crate::agent::reply_now(&d))?;
+    // A one-shot process holds no flags yet (the same refresh `mafold attach` makes).
+    crate::flags::refresh(client).await;
+    if !crate::flags::enabled(mafold_core::mafold_types::a2a::FLAG) {
+        return None;
+    }
+    thread_root(&client.get_message(&reply).await.ok()?, chat_id)
+}
+
+/// The thread `m` is a reply in, if it is one and it is in `chat_id`.
+fn thread_root(m: &Value, chat_id: &str) -> Option<String> {
+    if !m["conversation_id"].as_str()?.eq_ignore_ascii_case(chat_id) {
+        return None;
+    }
+    m["thread_root_id"].as_str().map(str::to_string)
+}
+
+/// A thread, as far as `send` and `read` need to know it.
+pub struct Thread {
+    pub root: String,
+    /// The channel it hangs in; None: `#all`.
+    pub channel: Option<String>,
+    /// What its root quotes, if it quotes anything.
+    quotes: Option<String>,
+}
+
+/// The thread `at` is in, or the one that would hang under it: `at` is any
+/// message in it. Refused for a message of another chat, because a send there
+/// would land somewhere the sender didn't name.
+pub async fn thread_of(client: &Client, chat_id: &str, at: &str) -> Result<Thread> {
+    let m = client.get_message(at).await.with_context(|| format!("no message {at}"))?;
+    if !m["conversation_id"].as_str().is_some_and(|c| c.eq_ignore_ascii_case(chat_id)) {
+        anyhow::bail!("message {at} isn't in this chat");
+    }
+    let root = thread_root(&m, chat_id);
+    let quotes = match &root {
+        Some(r) => client.get_message(r).await.ok().and_then(|r| r["reply_to_id"].as_str().map(str::to_string)),
+        None => m["reply_to_id"].as_str().map(str::to_string),
+    };
+    Ok(Thread {
+        root: root.unwrap_or_else(|| at.to_string()),
+        channel: m["channel_id"].as_str().map(str::to_string),
+        quotes,
+    })
+}
+
+/// What a conclusion taken out of `thread` answers: what its root quotes, else
+/// the message that started the turn behind it, else the root itself, which at
+/// least puts the conclusion beside the work.
+pub async fn what_was_asked(client: &Client, thread: &Thread) -> String {
+    if let Some(q) = &thread.quotes {
+        return q.clone();
+    }
+    client.message_trigger(&thread.root).await.unwrap_or_else(|| thread.root.clone())
+}
+
 fn turn_channel_from(chat_id: &str, conv: Option<&str>, channel: Option<&str>) -> Option<String> {
     let conv = conv.map(str::trim).filter(|c| !c.is_empty())?;
     let channel = channel.map(str::trim).filter(|c| !c.is_empty())?;
@@ -1521,6 +1638,30 @@ mod tests {
 
     /// `send`/`read` default to the turn's channel — for the turn's OWN
     /// conversation only, and only when there is one.
+    #[test]
+    fn a_thread_shows_on_the_message_it_hangs_from() {
+        let m = serde_json::json!({
+            "id": "m1",
+            "thread_summary": {
+                "reply_count": 23,
+                "last_reply_at": "2026-11-07T05:41:00Z",
+                "participants": [{ "username": "linsky:rei" }, { "username": "ops:claude" }],
+            },
+        });
+        let line = thread_line(&m).unwrap();
+        assert_eq!(line, "💬 23 条 · 最后 05:41 · linsky:rei、ops:claude · mafold read --thread m1");
+        assert_eq!(thread_line(&serde_json::json!({ "id": "m2" })), None);
+        assert_eq!(thread_line(&serde_json::json!({ "id": "m3", "thread_summary": null })), None);
+    }
+
+    #[test]
+    fn a_reply_only_counts_as_in_a_thread_of_this_chat() {
+        let m = serde_json::json!({ "conversation_id": "C1", "thread_root_id": "r" });
+        assert_eq!(thread_root(&m, "c1").as_deref(), Some("r"));
+        assert_eq!(thread_root(&m, "c2"), None);
+        assert_eq!(thread_root(&serde_json::json!({ "conversation_id": "c1" }), "c1"), None);
+    }
+
     #[test]
     fn the_turn_channel_is_the_default_only_for_this_turns_own_chat() {
         let conv = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";

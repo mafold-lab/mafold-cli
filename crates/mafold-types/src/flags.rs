@@ -194,6 +194,36 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // linsky 11-03 收藏 rework (#1487), put behind a flag after the fact (opsdu 11-05:
+    // 「新功能要 write behind flags,不然会影响发版节奏」).
+    FlagMeta {
+        key: "gardenSavedV2",
+        default: false,
+        dev_default: true,
+        label: "Garden 收藏 v2 (fixed shelves)",
+        description: "The garden's 收藏 on five fixed shelves (网站, 文章&书籍, 图片, 视频, 消息) \
+                      with real cards, a website's from getViewerLinkCards (its share image and a \
+                      real screenshot). Read by getAppViewerProfile for the viewer and gates \
+                      getViewerLinkCards. Off = the garden's old 收藏 page, and getViewerLinkCards \
+                      answers no cards. (收藏进园地 left the chat menus outright in #1497.)",
+        owner: "linsky",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    // opsdu 11-07: what he called 「建站功能 garden 里面被删了」 is 作品's sites —
+    // a site a mini app runs on folds into the app (#816), and none has a picture.
+    FlagMeta {
+        key: "gardenSites",
+        default: false,
+        dev_default: true,
+        label: "Garden 作品: 站点 row",
+        description: "A 站点 row at the top of the garden's 作品 tab: every *.mafold.app site of                       the person and their agents, the mini app that runs on it, whether the plan                       holds it back, and a real screenshot (the 收藏 site cards' page_shots track,                       one per deploy). Read by getAppViewerProfile (`sites`). Off = no `sites`,                       no screenshot asked for, and 作品 as before.",
+        owner: "linsky",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     // Owner 10-06, after seeing it live: "样式还行但不能这样直接上,要隐藏".
     // Off until the owner turns it on. A phone binary built before this entry doesn't
     // know the key and resolves it off too; turning it ON for phones therefore
@@ -429,6 +459,22 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // Stripe's checkout (ops 11-04: "pivot all payment methods to waffo").
+    // Off = nobody starts a new Stripe purchase; a Stripe subscription that
+    // already runs keeps its billing portal and its webhook. A person's
+    // switch, so going back takes no release.
+    FlagMeta {
+        key: "stripeCheckout",
+        default: false,
+        dev_default: false,
+        label: "Sell through Stripe",
+        description: "Stripe's checkout for Premium, the Pro Pass and credit. Off = Waffo sells on the \
+                      web and Android instead; anyone already subscribed through Stripe keeps Manage.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: OpenWithoutRecord,
+    },
     // Waffo Pancake, the merchant of record for Alipay and WeChat Pay (ops
     // 11-02): its buttons on the Premium and top-up cards, and the server's
     // `waffo|` checkout. The webhook credits whatever it was opened for.
@@ -631,6 +677,26 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // The desktop window's own corners (ops 11-07: "desktop's four corners
+    // line up with the chat list's"). The page hands this to the shell (cap
+    // `window-corners`), which makes the window accordingly at its next launch:
+    // see-through or not is decided when a window is made. mafold-desktop
+    // windowCorners.ts has why the line round a dark window stays.
+    FlagMeta {
+        key: "windowCorners",
+        default: false,
+        dev_default: false,
+        label: "Desktop: window corners follow the chat list",
+        description: "macOS desktop app: the main window's four corners follow the chat list's \
+                      frame, 30pt, in the wide layout (a phone-width window and full screen keep \
+                      the system's). The window keeps its shadow, and so the line macOS draws \
+                      round a dark window. Takes effect the next time the app starts. Off = the \
+                      system's window.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
     // Channels in every conversation (ops 2026-10-29: "let the discussion
     // forums be a default feature open at every conversation (even human to
     // human)"). Nothing to switch on: the first channel a flag holder makes
@@ -653,6 +719,26 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       discussion.",
         owner: "ops",
         added: "2026-10",
+        clients: &[Web, Phone, Daemon],
+        server: ClosedWithoutRecord,
+    },
+    // Work an agent hands another goes in a thread under the message that
+    // handed it out, and only the conclusion comes back to the timeline
+    // (linsky 2026-10-31, `.docs/a2a-threads.md`). Daemon: where a reply lands,
+    // sessions per thread, the prompt, the `--up` reminder. Server-read: the
+    // hosted dispatcher's landing and who a thread reply wakes.
+    FlagMeta {
+        key: "a2aThreads",
+        default: false,
+        dev_default: false,
+        label: "Agent work in threads",
+        description: "When an agent @-s another agent in a group, the reply goes in a thread under \
+                      that message, each thread keeps its own session, agents report back once and \
+                      the conclusion goes on the timeline. The thread bar says whether it's still \
+                      being worked on, and only the people in a thread get a push for it. Off = \
+                      agents answer each other on the timeline.",
+        owner: "ops",
+        added: "2026-11",
         clients: &[Web, Phone, Daemon],
         server: ClosedWithoutRecord,
     },
@@ -765,6 +851,28 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-11",
         clients: &[Daemon],
+        server: ClosedWithoutRecord,
+    },
+    // Files on Moments posts + Link only (ops 11-04, "Moments with files"):
+    // share files from a chat by link. The api reads it on the AUTHOR who
+    // writes (`moments/postUpsert` refuses files and Link only without it).
+    // Reading needs no flag: a link has to open for people with no account.
+    // Web and phone read it to offer the file row, Link only and Forward ▸
+    // Moments.
+    FlagMeta {
+        key: "momentFiles",
+        default: false,
+        dev_default: false,
+        label: "Moments: files and Link only",
+        description: "A post can carry files, and can be Link only: off your profile, timelines, \
+                      notifications, the sitemap and search, at a random URL that can expire. \
+                      Forward ▸ Moments opens the composer with a chat's files on it, set to \
+                      Link only. Readers never see a file's own address, so hiding or deleting \
+                      the post cuts its files off too. An agent can write a post as a draft card, \
+                      and the person it's for publishes it with a tap, under their own name.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
     // Document covers (ops 11-03, "server renders"): a file bubble shows the
@@ -884,6 +992,26 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // ops 11-03: on the desktop app a link opens as a tab on the app page. Needs
+    // `appBeside` (the page) and a shell with `site-tabs`; anywhere else it does
+    // nothing. Client-only (mafold-web lib/siteLinks.ts).
+    FlagMeta {
+        key: "inAppBrowser",
+        default: false,
+        dev_default: true,
+        label: "Links open inside the desktop app",
+        description: "On the desktop app, a link opens as a tab on the app page instead of in the \
+                      default browser: a site tab next to the apps, with back, forward, reload and \
+                      an address under the strip, and an address box in its +. ⌘/Ctrl-click, the ↗ \
+                      on the tab, or a Settings switch still go to the default browser. Needs a \
+                      shell that offers site tabs (older ones keep the default browser). Web in a \
+                      browser and the phones: unchanged. Off = every link goes to the default \
+                      browser.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
     // ops 11-02: opening an app shifts the columns one place left instead of
     // asking Full or Split. Client-only (client-shared/appBeside.ts).
     FlagMeta {
@@ -904,6 +1032,52 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         added: "2026-11",
         clients: &[Web, Phone],
         server: NotRead,
+    },
+    FlagMeta {
+        key: "richComposer",
+        default: false,
+        dev_default: true,
+        label: "Rich text in the message box",
+        description: "Once the words in the message box wrap, a full-screen button appears at its \
+                      top right. It opens a real editor: headings, tables, lists, quotes, code \
+                      and links, shown as they will look sent, with a pill of tools along the \
+                      bottom. Settings ▸ General can show formatting in the box itself too. The \
+                      message is still markdown, so nothing changes for the api, other clients \
+                      or agents. Off = the plain text box, no button.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    FlagMeta {
+        key: "siteSearchConsole",
+        default: false,
+        dev_default: false,
+        label: "Search Console on hosted sites",
+        description: "Each site in Apps ▸ Manage gets a Google Search Console field: paste the \
+                      name of the verification file and the site answers it, through every \
+                      deploy. Needs the sites Worker that answers it (sites@) before anyone \
+                      can save. Off = no field, and the api refuses to save one.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-06: 「给我抬一下限制」. garden-beta is opsdu's 18th site, past the five
+    // Premium publishes, so every garden@ was refused. Per person, so the plan
+    // stays what it is for everyone else.
+    FlagMeta {
+        key: "sitesUncapped",
+        default: false,
+        dev_default: false,
+        label: "No site cap",
+        description: "The people on this list can publish every site they and their agents \
+                      have, past the plan's cap (1 free, 5 with Premium). Read by the sites \
+                      api; no client reads it. Off = the plan's cap.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
     },
 ];
 
@@ -1011,6 +1185,19 @@ mod tests {
     }
 
     #[test]
+    fn search_console_on_sites_ships_dark_everywhere() {
+        // Nothing answers the file until the sites Worker that does is out, so
+        // it stays shut until ops opens it, dev builds included: a dev client
+        // drawing a field the dev api refuses to save would be a lie.
+        let m = meta("siteSearchConsole").expect("siteSearchConsole registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev builds");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "web and phone draw the field");
+        assert_eq!(m.server, ClosedWithoutRecord, "the api refuses to save without a record");
+        assert!(!server_default("siteSearchConsole"));
+        assert_eq!(server_key("siteSearchConsole"), "siteSearchConsole");
+    }
+
+    #[test]
     fn update_pill_and_boot_curtain_ship_dark_and_separately() {
         // Two keys, so the loading screen (seen on every open) can go out
         // without the pill and the pill without it; off in production until
@@ -1039,6 +1226,18 @@ mod tests {
         assert_eq!((m.owner, m.added), ("ops", "2026-10"), "{k}: owner and month");
         let at = |key: &str| KNOWN_FLAGS.iter().position(|f| f.key == key);
         assert_eq!(at(k), at("bootCurtain").map(|i| i + 1), "{k}: registered right after updatePill / bootCurtain");
+    }
+
+    #[test]
+    fn in_app_browser_ships_dark_on_web() {
+        // ops 11-03: a link is a tab on the app page of the desktop app, whose
+        // page is the web's. Production off until it is turned on for someone.
+        let k = "inAppBrowser";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert_eq!(m.clients, &[Web], "{k}: only the web reads it");
+        assert_eq!(m.server, NotRead, "{k}: read by the client only");
+        assert_eq!((m.owner, m.added), ("ops", "2026-11"), "{k}: owner and month");
     }
 
     #[test]

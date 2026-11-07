@@ -22,6 +22,8 @@ pub struct CardAt<'a> {
     pub attrs: &'a str,
     /// `<tag>/<anchor>` — the prefix of its keys.
     pub scope: String,
+    /// What's between its tags, as written. Empty for a self-closing card.
+    pub body: &'a str,
 }
 
 impl CardAt<'_> {
@@ -60,10 +62,12 @@ fn walk<'a>(md: &'a str, counts: &mut HashMap<&'a str, usize>, out: &mut Vec<Car
         *n += 1;
         let attrs = tag.attrs.trim_end().trim_end_matches('/');
         let anchor = crate::preview::attr(attrs, "sid").filter(|s| !s.is_empty()).map(str::to_string);
+        let at = out.len();
         out.push(CardAt {
             tag: tag.name,
             attrs,
             scope: format!("{}/{}", tag.name, anchor.unwrap_or_else(|| ordinal.to_string())),
+            body: "",
         });
         if tag.self_close {
             continue;
@@ -71,6 +75,7 @@ fn walk<'a>(md: &'a str, counts: &mut HashMap<&'a str, usize>, out: &mut Vec<Car
         let (body_end, end) = close_at(md, tag.end, tag.name)
             .or_else(|| orphan_close(md, tag.end, &ranges, tag.name))
             .unwrap_or((md.len(), md.len()));
+        out[at].body = &md[tag.end..body_end];
         // The cards inside count on from here, before the next sibling.
         walk(&md[tag.end..body_end], counts, out);
         if md[start..end].contains(['`', '~']) {
@@ -161,5 +166,14 @@ mod tests {
         assert_eq!(cards[0].scope, "wallet/redpacket/0");
         assert_eq!(cards[0].attr("id"), Some("y"));
         assert_eq!(cards[0].attr("amount"), Some("5"));
+    }
+
+    #[test]
+    fn a_card_gives_its_body_as_written() {
+        let md = "{% run %}\nhello {% tool /%}\n{% /run %}\n{% quote /%}";
+        let cards = card_scopes(md);
+        assert_eq!(cards[0].body, "\nhello {% tool /%}\n");
+        assert_eq!(cards[1].body, "", "self-closing");
+        assert_eq!(cards[2].body, "");
     }
 }

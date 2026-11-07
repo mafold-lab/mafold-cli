@@ -12,6 +12,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Work one agent hands another: where its replies land, how it comes back
+/// (`a2a.rs`, `.docs/a2a-threads.md`).
+pub mod a2a;
 pub mod connections;
 /// A person's computers and their agents at work on them: the machine report,
 /// the computers list, presence (`computers.rs`).
@@ -848,11 +851,14 @@ pub struct Sidecar {
     /// 32KB): `state` is left out and `getCardState` has them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub state_more: bool,
+    /// An agent's turn wrote this under a person's account (`a2a.rs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_agent: bool,
 }
 
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
-        self.state.is_empty() && !self.state_more
+        self.state.is_empty() && !self.state_more && !self.by_agent
     }
 }
 
@@ -1154,6 +1160,12 @@ pub struct ThreadSummary {
     /// after their last thread-read marker).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub unread_count: u32,
+    /// A reply in it is being written right now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub working: bool,
+    /// The work came back to the root's author (`a2a.rs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handed_back: bool,
 }
 
 // MARK: - Pagination wrappers

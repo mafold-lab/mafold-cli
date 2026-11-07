@@ -23,6 +23,7 @@
 
 use crate::client::{Client, Dest};
 use crate::harness::{self, AgentEvent, Turn};
+use mafold_core::mafold_types::a2a;
 use mafold_core::mafold_types::units::Units;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -517,6 +518,9 @@ struct Timeline {
     chat_id: String,
     channel_id: Option<String>,
     channel_name: Option<String>,
+    /// A thread rather than the timeline it hangs from: thread replies keep
+    /// their own unread and marker, and bump neither a chat's nor a channel's.
+    thread_root: Option<String>,
     label: String,
     is_dm: bool,
     unread: usize,
@@ -524,9 +528,16 @@ struct Timeline {
 
 impl Timeline {
     fn key(&self) -> String {
-        timeline_key(&self.chat_id, self.channel_id.as_deref())
+        let key = timeline_key(&self.chat_id, self.channel_id.as_deref());
+        match &self.thread_root {
+            Some(root) => format!("{key}/{root}"),
+            None => key,
+        }
     }
     fn heading(&self) -> String {
+        if let Some(root) = &self.thread_root {
+            return format!("{} · thread · chat={} 回这里:mafold send {} --thread {root}", self.label, self.chat_id, self.chat_id);
+        }
         match (&self.channel_id, &self.channel_name) {
             (Some(id), name) => format!(
                 "{} · #{} · chat={} channel={id}",
@@ -566,6 +577,7 @@ async fn unread_timelines(client: &Client, me_lc: &str) -> Result<Vec<Timeline>>
                 chat_id: id.to_string(),
                 channel_id: None,
                 channel_name: None,
+                thread_root: None,
                 label: label.clone(),
                 is_dm,
                 unread,
@@ -583,6 +595,7 @@ async fn unread_timelines(client: &Client, me_lc: &str) -> Result<Vec<Timeline>>
                         chat_id: id.to_string(),
                         channel_id: Some(ch_id.to_string()),
                         channel_name: ch["name"].as_str().map(str::to_string),
+                        thread_root: None,
                         label: label.clone(),
                         is_dm,
                         unread: n,
@@ -591,7 +604,38 @@ async fn unread_timelines(client: &Client, me_lc: &str) -> Result<Vec<Timeline>>
             }
         }
     }
+    if crate::flags::enabled(a2a::FLAG) {
+        out.extend(unread_threads(client, me_lc).await);
+    }
     Ok(out)
+}
+
+/// The threads this account is in with something unread. Work handed out lives
+/// in threads now, and a thread's replies bump no badge the walk above reads:
+/// without this a report back goes unseen and the same @ goes out again.
+/// A failed look costs this glance's threads, not the timelines beside them.
+async fn unread_threads(client: &Client, me_lc: &str) -> Vec<Timeline> {
+    let Ok(list) = client.unread_threads().await else { return Vec::new() };
+    let mut out = Vec::new();
+    for t in list["items"].as_array().cloned().unwrap_or_default() {
+        let (Some(chat_id), Some(root)) = (t["chat_id"].as_str(), t["root_message_id"].as_str()) else { continue };
+        let Ok(c) = client.get_chat(chat_id).await else { continue };
+        let kind = c["kind"].as_str().unwrap_or("");
+        out.push(Timeline {
+            chat_id: chat_id.to_string(),
+            channel_id: t["channel_id"].as_str().map(str::to_string),
+            channel_name: None,
+            thread_root: Some(root.to_string()),
+            label: format!(
+                "{} · {}",
+                crate::chat::label_of(&c, me_lc),
+                crate::chat::shape_of(kind, c["participants"].as_array().map_or(0, |p| p.len()))
+            ),
+            is_dm: kind == "direct",
+            unread: t["unread_count"].as_u64().unwrap_or(0) as usize,
+        });
+    }
+    out
 }
 
 fn created(m: &Value) -> &str {
@@ -766,7 +810,10 @@ fn later(a: &str, b: &str) -> bool {
 /// (`skip`) are dropped: they are bookkeeping, not conversation.
 async fn read_timeline(client: &Client, tl: &Timeline, skip: &HashSet<String>) -> Result<Vec<Value>> {
     let n = (tl.unread + CONTEXT_LINES).clamp(1, MAX_PER_TIMELINE + CONTEXT_LINES);
-    let page = client.get_chat_history(&tl.chat_id, n, tl.channel_id.as_deref()).await?;
+    let page = match &tl.thread_root {
+        Some(root) => client.get_thread_messages(&tl.chat_id, root, n).await?,
+        None => client.get_chat_history(&tl.chat_id, n, tl.channel_id.as_deref()).await?,
+    };
     let mut items = page["items"].as_array().cloned().unwrap_or_default();
     items.retain(|m| m["id"].as_str().is_none_or(|id| !skip.contains(id)));
     items.sort_by(|a, b| created(a).cmp(created(b)));
@@ -940,6 +987,7 @@ async fn overview(ctx: &Ctx, since: i64, skip: &HashSet<String>, known: Option<&
             chat_id: id.to_string(),
             channel_id: channel_id.map(str::to_string),
             channel_name: name.map(str::to_string),
+            thread_root: None,
             label: label.clone(),
             is_dm: false,
             unread: 0,
@@ -1383,6 +1431,22 @@ fn decision_block(pending: &PendingAsk, answer: &str, picked: &[usize]) -> Strin
 /// The mechanics of this mode — what any account running it has to know.
 /// Who the account IS lives in the notebook's CLAUDE.md, not here.
 fn preamble(me: &str, principal: Option<&str>) -> String {
+    let mut s = preamble_base(me, principal);
+    // How agents work together, in the words every agent gets. `read`, `send`
+    // and the thread sections above follow it.
+    if crate::flags::enabled(a2a::FLAG) {
+        s.push_str("\n\n");
+        s.push_str(&a2a::advice(true));
+        s.push_str(
+            "\n你在 inbox 模式下不在哪个回合的 thread 里:派出去的活回报在 thread 里,标题写着怎么回 —— \
+             `mafold send <chat_id> --thread <根消息id> …`;结论往上交用 `mafold send <chat_id> --up --thread <根消息id> …`。\
+             新话题才开频道,话题里派活就在那个话题里 @ 对方。",
+        );
+    }
+    s
+}
+
+fn preamble_base(me: &str, principal: Option<&str>) -> String {
     let who = match principal {
         Some(p) => format!(
             "- 指令只认一个来源:@{p}。那是你自己,在另一个账号上——他说的就是你要做的事,包括发版这类不可逆的事。\n\
@@ -1565,6 +1629,9 @@ fn child_env(client: &Client, me: &str, journal: &Path, seen: &Path, dry: bool) 
         ("MAFOLD_SEND_JOURNAL".to_string(), journal.to_string_lossy().into_owned()),
         ("MAFOLD_SEND_SEEN".to_string(), seen.to_string_lossy().into_owned()),
     ];
+    if crate::flags::enabled(a2a::FLAG) {
+        env.push((crate::client::AS_AGENT_ENV.to_string(), "1".to_string()));
+    }
     let person = crate::session::load_named(me).is_some_and(|s| s.token == client.token);
     if person {
         env.push(("MAFOLD_ACCOUNT".into(), me.to_string()));
@@ -1756,9 +1823,10 @@ impl Markers {
     async fn mark(&self, client: &Client) {
         for (tl, list) in self.by_key.values() {
             let Some((_, id)) = list.iter().max() else { continue };
-            let r = match &tl.channel_id {
-                Some(ch) => client.mark_channel_read(&tl.chat_id, ch, id).await,
-                None => client.mark_read(&tl.chat_id, Some(id)).await,
+            let r = match (&tl.thread_root, &tl.channel_id) {
+                (Some(root), _) => client.mark_thread_read(&tl.chat_id, root, id).await,
+                (None, Some(ch)) => client.mark_channel_read(&tl.chat_id, ch, id).await,
+                (None, None) => client.mark_read(&tl.chat_id, Some(id)).await,
             };
             if let Err(e) = r {
                 eprintln!("inbox: markRead {} failed: {e:#}", tl.key());
@@ -2551,6 +2619,9 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, op
         let due: Vec<Followup> =
             followups.into_iter().filter(|f| !state.fired.contains(&f.key()) && f.due(now)).collect();
 
+        // The flags as this account has them now: a thread is looked at, and
+        // what the turn sends is marked, only with `a2aThreads` on.
+        crate::flags::refresh(&ctx.client).await;
         let tls = match unread_timelines(&ctx.client, &ctx.me_lc).await {
             Ok(t) => t,
             Err(e) => {
@@ -3051,6 +3122,7 @@ mod tests {
             chat_id: "c1".into(),
             channel_id: Some("ch1".into()),
             channel_name: Some("dev".into()),
+            thread_root: None,
             label: "Mafold DEV · 24 人群".into(),
             is_dm: false,
             unread: 1,
@@ -3093,6 +3165,7 @@ mod tests {
             chat_id: "c1".into(),
             channel_id: None,
             channel_name: None,
+            thread_root: None,
             label: "ops · 私聊".into(),
             is_dm: true,
             unread: 1,
@@ -3359,6 +3432,7 @@ mod tests {
                 chat_id: "c".into(),
                 channel_id: Some("ch".into()),
                 channel_name: None,
+                thread_root: None,
                 label: "x".into(),
                 is_dm: false,
                 unread: 1,
@@ -3414,6 +3488,7 @@ mod tests {
             chat_id: "c1".into(),
             channel_id: None,
             channel_name: None,
+            thread_root: None,
             label: "x".into(),
             is_dm: false,
             unread: 0,
