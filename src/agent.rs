@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::client::{Client, Dest};
-use mafold_core::mafold_types::a2a;
+use mafold_core::mafold_types::{a2a, HarnessCaps};
 use crate::harness::{AgentEvent, Harness, Takes, Turn, Who};
 
 #[derive(Deserialize)]
@@ -2749,11 +2749,12 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // …and then tell the server what the harness on THIS machine actually
     // takes, so those menus stop being a list we wrote down and start being
     // what the binary answered. In the background: the probe starts a process,
-    // and nobody's first message should wait behind a menu.
+    // and nobody's first message should wait behind a menu. Asked again every
+    // hour after that, because the answer moves under the same binary.
     {
         let (client, harness) = (client.clone(), harness.clone());
         let (preferred, on_go) = (owner.account.clone(), owner.on_go());
-        tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred, on_go).await });
+        tokio::spawn(async move { keep_caps_reported(client, harness, preferred, on_go).await });
     }
 
     // Recover only this machine's journaled drafts from dead producer PIDs.
@@ -3298,18 +3299,61 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
 /// models are the router's, handed over with each reply's key, and a menu of
 /// Go's would offer models no reply of it can run.
 async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>, on_go: bool) {
+    if let Some(caps) = machine_caps(harness, preferred, on_go).await {
+        send_caps(client, harness, &caps).await;
+    }
+}
+
+/// How often a running daemon asks its harness again. The answer isn't only
+/// the build's: Claude Code takes its model list from Anthropic, and on
+/// 2026-11-09 the same 2.1.312 that had answered Fable 5.1 when cicd's daemons
+/// started (11-07) answered Fable 5.2 — the sheet went on offering 5.1,
+/// because nothing asked again short of a restart.
+const CAPS_RECHECK: Duration = Duration::from_secs(3600);
+
+/// [`report_caps`] at start, then again every [`CAPS_RECHECK`] for as long as
+/// the daemon runs. Only an answer that moved is sent: each report re-reads
+/// the owner's sheet and this daemon's config (`botConfigUpdated`), and an
+/// unchanged roster has no reason to cause either. The seat and the fuel are
+/// read afresh each time, from the config `botConfigUpdated` keeps current.
+async fn keep_caps_reported(client: Client, harness: Arc<dyn Harness>, mut preferred: Option<String>, mut on_go: bool) {
+    let mut sent: Option<HarnessCaps> = None;
+    loop {
+        if let Some(caps) = machine_caps(harness.as_ref(), preferred.clone(), on_go).await {
+            let moved = !sent.as_ref().is_some_and(|s| same_answer(s, &caps));
+            if moved && send_caps(&client, harness.as_ref(), &caps).await {
+                sent = Some(caps);
+            }
+        }
+        tokio::time::sleep(CAPS_RECHECK).await;
+        if let Some(c) = OWNER_CONFIG.get() {
+            let c = c.read().await;
+            (preferred, on_go) = (c.account.clone(), c.on_go());
+        }
+    }
+}
+
+/// Two answers that differ at most in when they were read.
+fn same_answer(a: &HarnessCaps, b: &HarnessCaps) -> bool {
+    HarnessCaps { probed_at: b.probed_at, ..a.clone() } == *b
+}
+
+/// What the harness here takes, for the seat a turn would choose
+/// ([`crate::harness::caps_report`]) — `None` when there is nothing to say.
+async fn machine_caps(harness: &dyn Harness, preferred: Option<String>, on_go: bool) -> Option<HarnessCaps> {
     if harness.id() == "opencode" && !on_go {
-        return;
+        return None;
     }
     let env = if harness.id() == "claude-code" {
-        let Some(account) = crate::accounts::choose(preferred.as_deref(), None).await.account else { return };
-        account.env()
+        crate::accounts::choose(preferred.as_deref(), None).await.account?.env()
     } else {
         Vec::new()
     };
-    let Some(caps) = crate::harness::caps_report(harness, &env).await else {
-        return;
-    };
+    crate::harness::caps_report(harness, &env).await
+}
+
+/// Send `caps` up as this machine's answer. True once the server took it.
+async fn send_caps(client: &Client, harness: &dyn Harness, caps: &HarnessCaps) -> bool {
     let what = format!(
         "{} model(s), {} tier(s){}",
         caps.models.len(),
@@ -3328,10 +3372,16 @@ async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<S
             )
         }
     );
-    let version = caps.version.clone();
+    let version = &caps.version;
     match client.call("reportHarnessCaps", serde_json::json!({ "caps": caps })).await {
-        Ok(_) => println!("✓ reported what {} {version} takes here: {what}", harness.id()),
-        Err(e) => println!("note: couldn't report harness caps: {e}"),
+        Ok(_) => {
+            println!("✓ reported what {} {version} takes here: {what}", harness.id());
+            true
+        }
+        Err(e) => {
+            println!("note: couldn't report harness caps: {e}");
+            false
+        }
     }
 }
 
@@ -3786,6 +3836,7 @@ async fn intro_turn(
         // Nobody's turn but the agent's own: not a guest's.
         sys.push_str(mail_advice(false));
         sys.push_str(&sandbox_advice(false));
+        sys.push_str(sites_advice(false));
         if let Some(extra) = cc.system_prompt.as_ref() {
             sys.push_str("\n\n");
             sys.push_str(extra);
@@ -5656,6 +5707,7 @@ async fn connect_and_run(
                 // and whether it hears of the sandbox at all.
                 sys.push_str(mail_advice(words_guest));
                 sys.push_str(&sandbox_advice(words_guest));
+                sys.push_str(sites_advice(words_guest));
                 if let Some(extra) = cc.system_prompt.as_ref() {
                     sys.push_str("\n\n");
                     sys.push_str(extra);
@@ -8596,6 +8648,25 @@ Cloudflare's price, a fraction of a cent for a typical reply, so run what the an
         mafold_core::mafold_types::sandbox::INSTALLED
     )
 }
+
+/// The PUBLISHING paragraph: every agent can put a site online (11-09) — a
+/// hosted one through the builder's tools, an agent on a computer through
+/// `mafold sites`. Nothing on a guest's turn: what it publishes counts
+/// against the owner's plan, the way the sandbox bills the owner's wallet.
+fn sites_advice(guest: bool) -> &'static str {
+    if guest {
+        ""
+    } else {
+        SITES_ADVICE
+    }
+}
+
+const SITES_ADVICE: &str = "\n\nPUBLISHING A SITE OR APP: when someone wants a page, a site or a small \
+app built, you can put it online yourself. `mafold sites deploy <folder>` publishes a folder of static \
+files (index.html at its root) to `<name>.mafold.app` and prints the address; `--site <name>` updates \
+one you published before, at the same address. What you publish counts against your owner's plan — \
+the refusal says so when it is full. `mafold apps register --help` turns a site into an app people open \
+from a chat.";
 
 /// The FORUM CHANNELS paragraph of the preamble. With channels in every chat
 /// (flag `forumEverywhere`, evaluated as this bot — its owner's record covers
@@ -14585,7 +14656,7 @@ mod inbound_file_tests {
     use super::{
         account_options, attachment_label, cards_from_list, expression_label, expression_note, expression_tag,
         file_cache_name, flatten_body_records, forum_channels_advice, human_size, mafold_preamble, topped_up,
-        mail_advice, mail_line, sandbox_advice, sandbox_line, MAIL_ADVICE, MAIL_GUEST,
+        mail_advice, mail_line, sandbox_advice, sandbox_line, sites_advice, MAIL_ADVICE, MAIL_GUEST,
     };
     use serde_json::{json, Value};
 
@@ -14882,6 +14953,18 @@ mod inbound_file_tests {
         assert_eq!((sandbox_line(true, true), sandbox_line(false, false), sandbox_line(false, true)), (String::new(), String::new(), String::new()));
         assert!(!mafold_preamble("ops:claude", "ops", &[]).contains("mafold sandbox"), "per turn, not in the preamble");
         assert_eq!(sandbox_advice(false), sandbox_line(crate::flags::enabled("pySandbox"), false));
+    }
+
+    /// Every agent can publish a site (11-09); one on a computer does it with
+    /// `mafold sites`, and is told so — except on a guest's turn, since what
+    /// it publishes counts against the owner's plan.
+    #[test]
+    fn the_sites_line_teaches_publishing_and_skips_guests() {
+        let line = sites_advice(false);
+        for want in ["mafold sites deploy <folder>", "--site <name>", ".mafold.app", "owner's plan", "mafold apps register"] {
+            assert!(line.contains(want), "missing {want:?} in {line}");
+        }
+        assert_eq!(sites_advice(true), "");
     }
 
     #[test]
@@ -15211,6 +15294,33 @@ mod customize_seed_tests {
             json!({ "key": "cwd", "kind": "string" }),
         ];
         assert!(!is_our_stock_seed(&owner));
+    }
+}
+
+#[cfg(test)]
+mod caps_recheck_tests {
+    use super::{same_answer, HarnessCaps};
+    use serde_json::json;
+
+    fn caps(probed_at: i64, models: &[(&str, &str)]) -> HarnessCaps {
+        serde_json::from_value(json!({
+            "harness": "claude-code", "version": "2.1.312", "machine": "m1",
+            "probed_at": probed_at, "source": "handshake",
+            "models": models.iter().map(|(id, display)| json!({ "id": id, "display": display })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    /// The hourly re-ask sends only an answer that moved. The same roster read
+    /// an hour later is no news; 2026-11-09's was: the same 2.1.312 put Fable
+    /// 5.2 in the slot Fable 5.1 had held.
+    #[test]
+    fn only_a_roster_that_moved_is_sent_again() {
+        let before = caps(1_000, &[("opus", "Opus 5.5"), ("fable", "Fable 5.1")]);
+        let an_hour_on = caps(4_600, &[("opus", "Opus 5.5"), ("fable", "Fable 5.1")]);
+        let moved = caps(4_600, &[("opus", "Opus 5.5"), ("claude-fable-5-2", "Fable 5.2"), ("fable", "Fable 5.1")]);
+        assert!(same_answer(&before, &an_hour_on));
+        assert!(!same_answer(&before, &moved));
     }
 }
 

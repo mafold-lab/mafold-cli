@@ -677,6 +677,25 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // Garden and the Activity Center as one drawer (ops 11-08, demo rounds
+    // 1–5 in their DM's #设计系统统一): the header's garden button goes, and
+    // the M slides the panel out of the window's left edge. Web only for now:
+    // the phone's panel hasn't been drawn.
+    FlagMeta {
+        key: "activityDrawer",
+        default: false,
+        dev_default: false,
+        label: "Activity: one drawer for Garden and the Activity Center",
+        description: "Tapping the M slides one panel out of the window's left edge, as tall as the \
+                      chat list and as wide as the list up to its new-chat button, with Now, \
+                      Agents, Works and Tasks. The M rolls into its bottom-right corner and the \
+                      tab bar steps aside while it's open; the header's garden button goes. Off = \
+                      the garden button and the Activity Center that grows out of the M.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
     // The desktop window's own corners (ops 11-07: "desktop's four corners
     // line up with the chat list's"). The page hands this to the shell (cap
     // `window-corners`), which makes the window accordingly at its next launch:
@@ -1038,12 +1057,12 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         default: false,
         dev_default: true,
         label: "Rich text in the message box",
-        description: "Once the words in the message box wrap, a full-screen button appears at its \
-                      top right. It opens a real editor: headings, tables, lists, quotes, code \
-                      and links, shown as they will look sent, with a pill of tools along the \
-                      bottom. Settings ▸ General can show formatting in the box itself too. The \
-                      message is still markdown, so nothing changes for the api, other clients \
-                      or agents. Off = the plain text box, no button.",
+        description: "Once the words in the message box reach a third line, a full-screen button \
+                      appears at its top right. It opens a real editor: headings, tables, lists, \
+                      quotes, code and links, shown as they will look sent, with a pill of tools \
+                      along the bottom. Settings ▸ General can show formatting in the box itself \
+                      too. The message is still markdown, so nothing changes for the api, other \
+                      clients or agents. Off = the plain text box, no button.",
         owner: "ops",
         added: "2026-11",
         clients: &[Web, Phone],
@@ -1061,6 +1080,57 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-11",
         clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-09 「The page, Visitors, Domains, Show on Google」: a site's page in
+    // the drawer gets three sections, each opened on its own once what it
+    // stands on is out — the sites Worker that counts views and answers the
+    // files (sites@), the zone's custom-hostname setup, Mafold's Search
+    // Console. No client reads these: listSites says which sections a person
+    // has (`features`), so a page never draws one the api would refuse.
+    FlagMeta {
+        key: "siteStats",
+        default: false,
+        dev_default: false,
+        label: "Visitors on hosted sites",
+        description: "A site's page shows its views and visitors for the last 7 or 30 days and \
+                      where they came from, counted by the sites Worker without cookies. Needs \
+                      that Worker (sites@) before there is anything to count. Off = no Visitors \
+                      section, and getSiteStats refuses.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    FlagMeta {
+        key: "siteDomains",
+        default: false,
+        dev_default: false,
+        label: "Own domains on hosted sites",
+        description: "A site's owner can connect a domain of their own with one CNAME record; \
+                      once Cloudflare has it live with HTTPS it becomes the site's main address. \
+                      Needs the sites zone's custom hostnames (fallback origin, the Worker's \
+                      catch-all route) and CF_SITES_ZONE_ID on the api. Off = no Domains \
+                      section, and the api refuses to add one.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    FlagMeta {
+        key: "siteSearch",
+        default: false,
+        dev_default: false,
+        label: "Show on Google for hosted sites",
+        description: "One switch per site, off by default. On, the site answers a robots.txt \
+                      and a sitemap.xml unless it ships its own, and every deploy sends its \
+                      pages to IndexNow (Bing, Yandex, Naver…) and its sitemap to Google through \
+                      Mafold's Search Console (GOOGLE_SEARCH_KEY). Needs the sites Worker that \
+                      answers the files (sites@). Off = no switch, and the api refuses to turn \
+                      one on.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
         server: ClosedWithoutRecord,
     },
     // ops 11-06: 「给我抬一下限制」. garden-beta is opsdu's 18th site, past the five
@@ -1149,6 +1219,17 @@ mod tests {
     }
 
     #[test]
+    fn activity_drawer_ships_dark_on_web() {
+        // Off everywhere until ops turns it on for someone, dev included: it
+        // takes the header's garden button away. Only the web reads it.
+        let m = meta("activityDrawer").expect("activityDrawer registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Web], "the web reads it");
+        assert_eq!(m.server, NotRead, "gates the page only");
+        assert!(!server_default("activityDrawer"), "nothing server-side opens without a record");
+    }
+
+    #[test]
     fn new_agent_in_three_steps_ships_dark() {
         // It replaces New Agent for everyone: off in production until ops says
         // ship to all, on in dev; read by both clients, nothing server-side.
@@ -1195,6 +1276,21 @@ mod tests {
         assert_eq!(m.server, ClosedWithoutRecord, "the api refuses to save without a record");
         assert!(!server_default("siteSearchConsole"));
         assert_eq!(server_key("siteSearchConsole"), "siteSearchConsole");
+    }
+
+    #[test]
+    fn a_sites_page_sections_ship_dark_and_separately() {
+        // Each stands on something released apart from the api (the sites
+        // Worker, the zone's setup, Mafold's Search Console), so each opens on
+        // its own, dev builds included. The api reads them; no client does.
+        for key in ["siteStats", "siteDomains", "siteSearch"] {
+            let m = meta(key).unwrap_or_else(|| panic!("{key} registered"));
+            assert!(!m.default && !m.dev_default, "{key}: off in production and in dev builds");
+            assert!(m.clients.is_empty(), "{key}: listSites says what a page shows");
+            assert_eq!(m.server, ClosedWithoutRecord, "{key}: the api refuses without a record");
+            assert!(!server_default(key));
+            assert_eq!(server_key(key), key);
+        }
     }
 
     #[test]

@@ -52,6 +52,20 @@ real money is spent, real files must survive, and the chat is the record.
     clip runs from their device and ModelArk bills **their own ModelArk
     account**. The Mafold wallet is not touched — nothing held, nothing charged;
     there is no `wallet` in the answer. `estimate` is at list price.
+    **A prepaid pack covers one model.** ModelArk takes their own-key calls
+    from prepaid resource packs first, and a pack pays only for the model it
+    was bought for: a Seedance 2.5 pack pays nothing toward 2.0, 2.0 fast or
+    2.0 mini. Any Seedance pack lets the other Seedance models be switched on
+    too, so a call to a model their pack doesn't cover still runs — billed in
+    cash to their BytePlus account, pay-as-you-go, with no warning. Unpaid,
+    that bill can stop the account (10-31: an owner's account was shut, 2.5
+    pack and all, after 2.0 clips were billed outside it). The tool can't see
+    packs: ask which model theirs covers, plan on that model, and never move
+    to another one without saying it is cash, not pack
+    (「2.0 不在你的资源包里，这条直接扣现金」). Without a `reference_video` a
+    pack also burns faster than the token count (on 2.5 about 1.67× at
+    480p/720p, 1.83× at 1080p), so don't work out what's left from tokens; only
+    the BytePlus console shows it (Billing center ▸ Resource package).
   - **Mafold's key** (`wallet` in the answer), for owners without their own:
     a submit holds the estimate on the Mafold token wallet of the bot's owner
     (`wallet.payer`); when the clip finishes, the real count is taken from it
@@ -109,8 +123,9 @@ real money is spent, real files must survive, and the chat is the record.
    asked approves: model, number of generations × seconds, ratio, **resolution
    (their choice, not yours)**, and the estimate the tool printed. One yes
    covers that plan. More generations, a higher resolution, another model, a
-   bridge, or a retry that costs again is a new plan. In a group, only the
-   requester (or the bot's owner) approves spending.
+   bridge, or a retry that costs again is a new plan — and a model their
+   prepaid pack doesn't cover is cash, so that plan says so. In a group, only
+   the requester (or the bot's owner) approves spending.
 2. **Land what you make.** Always `status --attach`, so the clip is saved in the
    chat. Vendor links expire after 24 h and are never the deliverable.
 3. **Only real numbers.** Estimates are labelled 估算 and come from the tool.
@@ -235,7 +250,8 @@ before writing a blocking file; start from a copy of `director/example.json`.
   resolution question as an ask card whose options carry the whole film's
   estimate at each resolution (dry-run every scene and add them up), and who
   pays (their own ModelArk account, or their Mafold wallet — the dry run's
-  `billing` / `own_key_linked` says which, above). Then submit only what was
+  `billing` / `own_key_linked` says which, above; on their own account, whether
+  this model is the one their prepaid pack covers). Then submit only what was
   approved.
 - **Deliver**: one message per scene version — the clip plus one line:
   `场 n · v k · model · resolution · tokens · $cost` (on their own key:
@@ -279,7 +295,7 @@ scenes exist, list them under the second rule with their seams
 | `ark 400 …InvalidParameter…` | The vendor refused a parameter (a scene longer than the model's cap, frame roles mixed with reference roles); fix it, same rule. |
 | job `failed` / `InternalServiceError` | The vendor bills only succeeded jobs. Offer one retry, ideally at another resolution or ratio. |
 | a content-policy refusal (codes with `Sensitive`) | Don't resubmit the same words. Explain plainly; offer a rephrase that keeps their intent. |
-| `OutputVideoSensitiveContentDetected.PolicyViolation` ("may be related to copyright") | Nothing is billed, but each one is minutes of waiting (2–7 on 10-28…10-30), and they come in runs. Seen when a style is named after a studio, film or a genre's famous look ("写实风格的日本动画电影") in the same prompt as a real landmark and an anime-looking character. Describe the look in your own words (line, light, palette, lens) instead of naming where it comes from, keep real places generic unless the place is the point, and say what you changed. Two blocks in a row on one scene: tell the person before trying a third. |
+| `OutputVideoSensitiveContentDetected.PolicyViolation` ("may be related to copyright") | Nothing is billed, but each one is minutes of waiting (2–7 on 10-28…10-30), and they come in runs. Seen when a style is named after a studio, film or a genre's famous look ("写实风格的日本动画电影") in the same prompt as a real landmark and an anime-looking character. Describe the look in your own words (line, light, palette, lens) instead of naming where it comes from, keep real places generic unless the place is the point, and say what you changed — the prompt, not the model: another model may sit outside their prepaid pack and bill cash (above). Two blocks in a row on one scene: tell the person before trying a third. |
 | `succeeded` but `landing_error` | The clip didn't make it into the chat. Read the job once more later; if the vendor's 24 h copy is gone, offer to re-run that scene (it costs again). |
 | `hasn't allowed @… to use it` from `submit` (a consent card was posted) | The owner has their own ModelArk key and hasn't let this bot use it yet. Nothing was submitted or spent. Say a card is waiting for them; their Allow brings you back — then run the same command. Don't switch to `--via house` on your own. |
 | `hasn't allowed @… ` from `status` / `cancel` | No card was posted. The job is untouched at ModelArk; tell the owner they can allow you under Settings ▸ Connections, then read it again. |

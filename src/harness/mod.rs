@@ -1099,8 +1099,8 @@ pub fn invalidate_versions() {
 /// is a property of the MACHINE: a box running six bots would otherwise pay six
 /// identical probes every time the supervisor restarts them. It is keyed by
 /// harness + seat and holds only while the version it was read from is still
-/// installed, which is the whole of what can change the answer short of the
-/// account itself.
+/// installed, and for [`CAPS_MAX_AGE_SECS`] at most: a roster comes from the
+/// harness's server as well as its build.
 ///
 /// `None` = nothing to report: no binary, no probe, or a probe that came back
 /// empty-handed. Never a report that says the machine has nothing — that claim
@@ -1115,7 +1115,8 @@ pub async fn caps_report(h: &dyn Harness, env: &[(String, String)]) -> Option<Ha
         // An unknown version can't confirm freshness, and re-probing is cheap
         // next to reporting a roster that moved. Nor can a same-version answer
         // stand forever: codex's roster comes from its server as well as its
-        // build, so a model or a tier can arrive without an upgrade.
+        // build, and so does Claude Code's (Fable 5.2 reached 2.1.312 with no
+        // upgrade), so a model or a tier can arrive without an upgrade.
         if !version.is_empty() && c.version == version && SeatHealth::now() - c.probed_at < CAPS_MAX_AGE_SECS {
             return Some(c);
         }
@@ -1123,8 +1124,10 @@ pub async fn caps_report(h: &dyn Harness, env: &[(String, String)]) -> Option<Ha
     probe_and_cache(h, env, &version, &seat).await
 }
 
-/// How long a same-version answer on file is reported as-is, at daemon start.
-const CAPS_MAX_AGE_SECS: i64 = 6 * 3600;
+/// How long a same-version answer on file is reported as-is — at daemon start,
+/// and on the daemon's hourly re-ask (`agent::keep_caps_reported`), so the
+/// bots on one machine share a probe instead of each paying for their own.
+const CAPS_MAX_AGE_SECS: i64 = 3600;
 
 /// Ask the binary ([`Harness::caps`]) and keep the answer for the seat.
 async fn probe_and_cache(h: &dyn Harness, env: &[(String, String)], version: &str, seat: &str) -> Option<HarnessCaps> {
@@ -1178,7 +1181,7 @@ fn reask_gate() -> &'static tokio::sync::Mutex<std::collections::HashMap<String,
 
 /// Judge `effort` for a turn of `model` on `h`, for the seat `env` selects.
 ///
-/// The answer on file (the daemon's startup probe, [`caps_report`]) decides —
+/// The answer on file (the daemon's probe at start and every hour, [`caps_report`]) decides —
 /// a file read, nothing spawned. Before overruling the owner's pick, though
 /// (refusing it, or dropping it as a dial the model hasn't got), the binary is
 /// asked again when it moved since (an upgrade brings tiers its old answer
