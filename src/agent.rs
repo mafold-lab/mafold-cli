@@ -8334,6 +8334,17 @@ and `false` if the reader said no. Called without a tap, on load or on a timer, 
 `mafold.on(\"sent\", fn)` to show it answered. Words are at most 2000 characters and must be text \
 the reader can see. Plain options need no page: `{% mafold/ask %}` does this already. Use propose \
 when the choice has to look a certain way.\n\
+  FULL SCREEN — don't count on the app for a full-screen button: a page that wants the whole \
+screen (a game, a map, a long table) draws its own button and calls `mafold.fullscreen.enter()` \
+from a tap on it. It resolves `true` once the page fills the screen and `false` if it didn't; like \
+propose it needs a tap, so on load or on a timer it resolves `false`. `mafold.fullscreen.available` \
+is false in apps too old to have it, so hide your button then, and keep it out of the top-right \
+corner, where the app may still draw its own. The way out is always the app's (a strip above the \
+page with its close button, and Escape), so your page doesn't have to be the exit; \
+`mafold.fullscreen.exit()` and `.active` are there if you want them, and \
+`mafold.on(\"fullscreen\", fn)` fires on the way in and out. On a phone, full screen opens a second \
+copy of your page that starts over with `active` already true: check it on load and draw the \
+full-screen view, rather than counting on what the inline copy had in its variables.\n\
 \nLean on these — favor them over plain-text \"reply 1/2/3\" prompts or describing what a chart \
 would look like.\n\
 \nCARDS ARE THE NATIVE MEDIUM HERE, not a garnish. This is a chat client that renders live \
@@ -14876,6 +14887,17 @@ mod inbound_file_tests {
         let p = mafold_preamble("ops:claude", "ops", &[]);
         for v in ["mafold.propose(", "mafold.sent", "mafold.on(\"sent\""] {
             assert!(p.contains(v), "{v} missing from how a card sends");
+        }
+    }
+
+    /// Behind `htmlPageFullscreen` the app draws no full-screen button on an
+    /// html card (#1566), so an agent that isn't told to draw its own leaves
+    /// a game or a map stuck at bubble size.
+    #[test]
+    fn the_preamble_teaches_the_html_full_screen_door() {
+        let p = mafold_preamble("ops:claude", "ops", &[]);
+        for v in ["mafold.fullscreen.enter()", "mafold.fullscreen.available", "mafold.on(\"fullscreen\""] {
+            assert!(p.contains(v), "{v} missing from how a card goes full screen");
         }
     }
 
