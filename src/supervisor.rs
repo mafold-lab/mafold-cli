@@ -1816,6 +1816,13 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
         .await?
         .json()
         .await?;
+    // The account changed its username (`renameMe`): the login keeps its
+    // token and takes the new name, so the next tick acts as who it is now.
+    if let Some(now) = resp.pointer("/result/username").and_then(|v| v.as_str()).filter(|u| !u.eq_ignore_ascii_case(&sess.username)) {
+        if crate::session::rename(&sess.token, now).unwrap_or(false) {
+            println!("✓ @{} is @{now} now — this machine's login follows", sess.username);
+        }
+    }
     let items = resp.pointer("/result/items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     for it in items {
         let name = it["bot_username"].as_str().unwrap_or_default().to_string();

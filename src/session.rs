@@ -105,6 +105,21 @@ impl Disk {
         self.username = username.to_string();
         self.token = token.to_string();
     }
+    /// The login holding `token` is called `username` now ([`rename`]). By
+    /// token, never by name: only that login changes, whatever it was called.
+    fn rename(&mut self, token: &str, username: &str) -> bool {
+        let username = username.to_lowercase();
+        let mut changed = false;
+        for a in self.accounts.iter_mut().filter(|a| a.token == token && a.username != username) {
+            a.username = username.clone();
+            changed = true;
+        }
+        if self.token == token && self.username != username {
+            self.username = username;
+            changed = true;
+        }
+        changed
+    }
 
     /// Drop an account; `false` = there was no such account. Leaving the list
     /// empty is the caller's cue to delete the file rather than keep a login
@@ -202,6 +217,19 @@ pub fn save(s: &Session) -> Result<()> {
     });
     d.upsert(s);
     write(&d)
+}
+
+/// The account behind the login with `token` is called `username` now — it
+/// changed its username (`renameMe`): the same login, under its new name, so
+/// `mafold add <label>` and the connections it checks name the right account.
+/// `false` = nothing to change (no such login, or already that name).
+pub fn rename(token: &str, username: &str) -> Result<bool> {
+    let Some(mut d) = read() else { return Ok(false) };
+    let changed = d.rename(token, username);
+    if changed {
+        write(&d)?;
+    }
+    Ok(changed)
 }
 
 /// Switch which account is current. Errors rather than logging in for you:
@@ -369,6 +397,25 @@ mod tests {
         assert_eq!(d.accounts.len(), 2);
         assert_eq!(d.username, "b", "the fresh login is current");
         assert_eq!(d.find("a").unwrap().token, "s_a", "the first login survives");
+    }
+
+    /// An account that changed its username (`renameMe`) keeps its login under
+    /// the new name — only the login with that token, current or not.
+    #[test]
+    fn a_renamed_account_keeps_its_login_under_the_new_name() {
+        let mut d = disk(
+            r#"{"token":"s_a","username":"ann","device_id":"d1","device_name":"mac",
+                "accounts":[{"username":"ann","token":"s_a"},{"username":"bob","token":"s_b"}]}"#,
+        );
+        assert!(d.rename("s_a", "Annabel"));
+        assert_eq!(d.username, "annabel", "the current login follows");
+        assert_eq!(d.find("annabel").unwrap().token, "s_a");
+        assert!(d.find("ann").is_none());
+        assert_eq!(d.find("bob").unwrap().token, "s_b", "bob is bob");
+        assert!(!d.rename("s_a", "annabel"), "already that name");
+        assert!(d.rename("s_b", "bobby"));
+        assert_eq!(d.username, "annabel", "renaming another login leaves current alone");
+        assert!(!d.rename("s_zzz", "eve"), "no such login");
     }
 
     /// Re-logging in the SAME account is a token refresh, not a duplicate row —

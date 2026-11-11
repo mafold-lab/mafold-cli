@@ -968,6 +968,24 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // One balance in dollars (ops 11-10: "废除token经济学 以后用wallet单一个美金即可",
+    // then "transfer 换成一个 redeem 否则有审查风险" and Subscriptions between
+    // Redeem and Details). The wallet page reads in dollars and loses what
+    // only a balance in many models needed, on the web and the phone alike.
+    FlagMeta {
+        key: "usdWallet",
+        default: false,
+        dev_default: false,
+        label: "Wallet: one balance in dollars",
+        description: "The wallet is one balance in US dollars: no provider pills, Holdings, Convert \
+                      or Auto convert, and every Activity row in dollars with its model under it. \
+                      The buttons are Deposit, Redeem, Subscriptions and Details; Transfer goes. \
+                      Redeem takes a code from Mafold. The api redeems codes only where this is on.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
     // Mafold Mail phase 1 (ops 10-30): `username@mafold.com`, receive only.
     // The api gates every part of it on the MAILBOX's handle — the rcpt hook,
     // the inbound hook, the mail* methods, @mail's commands — so a record of
@@ -1149,6 +1167,86 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // ops 11-09 (DM #Username rename + NoBrain harness): an agent's username
+    // changes once a day, a person's once a month, the old one held 30 days;
+    // a person's change moves everything ("Everything moves"). Behind this
+    // until ops has used it; the api refuses `renameAgent` / `renameMe`
+    // without a record.
+    FlagMeta {
+        key: "usernameChange",
+        default: false,
+        dev_default: true,
+        label: "Change a username",
+        description: "Customize ▸ Username has Change: an agent's username changes at most \
+                      once a day. Settings ▸ Username does the same for a person, once a \
+                      month, and everything moves with it: their agents, apps and cards \
+                      (republished under the new name), sites, wallet, chats. For 30 days the \
+                      old names and ids still lead there — old @mentions, links, mail, cards \
+                      in old messages — then they are free (an old app or card id never is). \
+                      Off = usernames are read-only and the api refuses renameAgent and renameMe.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // NoBrain (ops 11-09, same DM): New Agent makes the agent at once and it
+    // sets itself up in its own chat. Behind this until ops has used it; the
+    // api refuses newAgent and the two cards' taps without a record.
+    FlagMeta {
+        key: "noBrain",
+        default: false,
+        dev_default: true,
+        label: "New Agent: NoBrain",
+        description: "New Message's ✦ makes the agent at once — @you:new-ai-with-nobrain, no \
+                      brain — or opens the one you have that still has that username, and it sets \
+                      itself up in its own chat: avatar, name and username (New Agent's ①), then \
+                      where its brain runs (② and ③), as two cards. Typing to it before it has a \
+                      brain stays a message and gets a fixed answer. Off = New Agent's panel.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // An html card's full screen belongs to its page (ops 11-10, demo rounds
+    // 2–3 in their DM, "default is off"): the app's button leaves the card, and
+    // a page that wants full screen calls `mafold.fullscreen.enter()` from a
+    // tap. The calls work with this off too; it only takes the app's button
+    // away, so every card already sent loses its way into full screen.
+    FlagMeta {
+        key: "htmlPageFullscreen",
+        default: false,
+        dev_default: false,
+        label: "HTML cards: the page owns full screen",
+        description: "An html card in chat has no full-screen button of the app's own: a page \
+                      that wants full screen draws its own button and calls \
+                      mafold.fullscreen.enter() from a tap. In full screen the app's close button \
+                      sits in a strip above the page instead of on it. Off = the app's button on \
+                      the card's top-right corner, and on the page in full screen.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // The agent-turn cards in MDS (ops 11-10, "then start build it behind
+    // flags" on the Today/New demo in their DM). Cards publish on merge and read
+    // no flags, so the host says it instead: on, a card's theme carries
+    // `design: "mds"` (cards/sdk `CardTheme`) and the cards that have an MDS
+    // look draw it. Off = every card exactly as today.
+    FlagMeta {
+        key: "cardsMds",
+        default: false,
+        dev_default: false,
+        label: "Cards: the agent cards in MDS",
+        description: "The cards an agent's reply is made of draw in MDS: turn summaries, step \
+                      groups and background tasks become rows with their steps on a thin line \
+                      instead of boxes, a step's short result sits at the end of its row, output \
+                      and edits sit in a grey block, questions get raised answers with radio \
+                      buttons, and the cost row is plain text. Off = the cards as they were.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -1227,6 +1325,41 @@ mod tests {
         assert_eq!(m.clients, &[Web], "the web reads it");
         assert_eq!(m.server, NotRead, "gates the page only");
         assert!(!server_default("activityDrawer"), "nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn usd_wallet_ships_dark_everywhere() {
+        // It takes Transfer and Convert off the wallet page: off until ops
+        // turns it on for someone, dev included. Redeeming a code asks it.
+        let m = meta("usdWallet").expect("usdWallet registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Web, Phone], "web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord, "the api redeems codes only where it's on");
+        assert!(!server_default("usdWallet"), "nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn html_page_fullscreen_ships_dark_everywhere() {
+        // It takes the app's full-screen button off every html card already
+        // sent: off until ops turns it on for someone, dev included. Both
+        // clients draw the card; nothing server-side reads it.
+        let m = meta("htmlPageFullscreen").expect("htmlPageFullscreen registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Web, Phone], "web and phone read it");
+        assert_eq!(m.server, NotRead, "gates the card's frame only");
+        assert!(!server_default("htmlPageFullscreen"), "nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn cards_mds_ships_dark_everywhere() {
+        // It redraws the most-seen cards in every chat: off until ops turns it
+        // on for someone, dev included. Both hosts hand it to cards through the
+        // theme; nothing server-side reads it.
+        let m = meta("cardsMds").expect("cardsMds registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Web, Phone], "web and phone read it");
+        assert_eq!(m.server, NotRead, "only the cards' look");
+        assert!(!server_default("cardsMds"), "nothing server-side opens without a record");
     }
 
     #[test]
