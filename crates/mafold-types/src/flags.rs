@@ -1247,6 +1247,46 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // How a Modal comes and goes, after a Telegram for Mac clip (ops 11-11,
+    // "Web and Mac" on the demo in their DM): the pressed thing becomes the
+    // sheet and back. Off = the line off the pressed edge (#1519). The phone's
+    // sheets keep the system's fade either way.
+    FlagMeta {
+        key: "modalMorph",
+        default: false,
+        dev_default: false,
+        label: "Modals: the pressed thing becomes the sheet",
+        description: "A sheet opens out of what you pressed: one box grows from it to the sheet \
+                      on a spring with no bounce, wearing its look for the first moments and the \
+                      sheet's after that, and the sheet's contents are drawn at their own layout \
+                      scaled to the box. Its place stays empty while the sheet is up, and closing \
+                      shrinks the sheet back into it. Off = a line off the pressed edge that flies \
+                      to the sheet.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
+    // The chat header's top-right corner as one ☰ (ops 11-11, the html demo in
+    // their DM's #右上角汉堡菜单, answered "as shown" on all three questions):
+    // the button grows into a solid panel that holds the chat's apps and what
+    // its profile opens. Web first; the phone's twin comes with its own PR.
+    FlagMeta {
+        key: "headerMenu",
+        default: false,
+        dev_default: false,
+        label: "Chat header: one ☰ for the apps and the chat's pages",
+        description: "The chat's top-right corner is one ☰ at every width. Tapped, it grows into a \
+                      solid panel: search in this chat, every app here plus Add, Media · Files · \
+                      Pinned · Channels, the rows for that kind of chat (an agent's Customize and \
+                      working directory, a group's members, invite links and permissions, a \
+                      person's moments), mute, a new window, and clear history, leave or block. \
+                      Off = the app icons and the ⊞ that grows into the app list.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -1317,6 +1357,17 @@ mod tests {
     }
 
     #[test]
+    fn modal_morph_ships_dark_on_web() {
+        // Off everywhere until ops turns it on for someone, dev included: every
+        // Modal on the web moves differently. The phone keeps its own sheets.
+        let m = meta("modalMorph").expect("modalMorph registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Web], "the web reads it");
+        assert_eq!(m.server, NotRead, "only how the page moves");
+        assert!(!server_default("modalMorph"), "nothing server-side opens without a record");
+    }
+
+    #[test]
     fn activity_drawer_ships_dark_on_web() {
         // Off everywhere until ops turns it on for someone, dev included: it
         // takes the header's garden button away. Only the web reads it.
@@ -1360,6 +1411,18 @@ mod tests {
         assert_eq!(m.clients, &[Web, Phone], "web and phone read it");
         assert_eq!(m.server, NotRead, "only the cards' look");
         assert!(!server_default("cardsMds"), "nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn header_menu_ships_dark_everywhere() {
+        // It takes the app icons out of every chat's header: off until ops
+        // turns it on for someone, dev included. Only the web draws it so far;
+        // nothing server-side reads it.
+        let m = meta("headerMenu").expect("headerMenu registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Web], "the web reads it");
+        assert_eq!(m.server, NotRead, "only the header's corner");
+        assert!(!server_default("headerMenu"), "nothing server-side opens without a record");
     }
 
     #[test]

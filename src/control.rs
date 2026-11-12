@@ -41,8 +41,8 @@ pub enum Action {
     /// Stop the bot's daemon and start it again. The replies it was writing
     /// are cut off and picked back up by the new one (`agent::resume_turns`).
     RestartBot { name: String },
-    /// Re-exec onto the binary on disk — `why` it changed — letting the
-    /// replies in progress finish first (at most 5 minutes).
+    /// Re-exec onto the binary on disk — `why` it changed. A bot writing a
+    /// reply keeps writing it, and moves once it's written (`supervisor::Moving`).
     RestartSupervisor {
         why: Moved,
         /// The version on disk, when the command knows it.

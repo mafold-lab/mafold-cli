@@ -1,11 +1,12 @@
-//! `mafold wallet` — the token wallet from the CLI. Currency = model id
-//! ("claude-fable-5"); 1 unit = 1 output-equivalent unit of that model, which
-//! is a token for everything billed per token and whatever the vendor actually
-//! meters otherwise — `rates` prints each currency's own unit rather than
-//! captioning the whole column "tokens".
-//! Amounts accept 1M/2.5B/1000 shorthand. Account-symmetric: `mint` works for
-//! anyone to TYPE but only the @mafold first-party account passes the server
-//! check — there is no privileged client path.
+//! `mafold wallet` — the Mafold wallet from the CLI, in dollars (ops 11-11):
+//! `balance` is one dollar figure, `transfer` sends dollars, and `history` and
+//! `grants` read in dollars at each model's official output price — the way
+//! every client's wallet shows them.
+//! Underneath, the ledger still keeps each model's own units (currency = model
+//! id, 1 unit = 1 output-equivalent unit of that model); `rates`, `convert` and
+//! `mint` still speak those, with 1M/2.5B/1000 shorthand. Account-symmetric:
+//! `mint` works for anyone to TYPE but only the @mafold first-party account
+//! passes the server check — there is no privileged client path.
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
@@ -16,13 +17,17 @@ use mafold_core::mafold_types::units::{self, EN};
 
 #[derive(Subcommand)]
 pub enum WalletCmd {
-    /// Show your balances.
+    /// Show your balance, in dollars.
     Balance,
-    /// Transfer tokens: `mafold wallet transfer @friend 1M claude-fable-5`.
+    /// Send dollars from your wallet: `mafold wallet transfer @friend 5` (or `5.25`, `$5`).
     Transfer {
         to: String,
+        /// Dollars: `5`, `5.25` or `$5`.
         amount: String,
-        currency: String,
+        /// A model id here is how transfers were sent before they were in
+        /// dollars; it is refused with the way to say it now.
+        #[arg(hide = true)]
+        currency: Option<String>,
         /// Optional note recorded on both ledgers.
         #[arg(long)]
         memo: Option<String>,
@@ -125,6 +130,47 @@ fn pass_line(p: &Value) -> String {
     }
 }
 
+/// "5" / "5.25" / "$5" → cents: the amount a transfer sends. A cent is the
+/// finest one is stated in — anything finer is refused, not rounded into an
+/// amount nobody typed.
+fn parse_dollars(s: &str) -> Result<i64> {
+    let t = s.trim().trim_start_matches('$').trim();
+    let bad = || anyhow::anyhow!("bad amount `{s}` — dollars, like 5 or 5.25");
+    let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
+    let digits = |d: &str| d.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && frac.is_empty()) || !digits(whole) || !digits(frac) || frac.len() > 2 {
+        return Err(bad());
+    }
+    let whole: i64 = if whole.is_empty() { 0 } else { whole.parse().map_err(|_| bad())? };
+    let frac: i64 = format!("{frac:0<2}").parse().map_err(|_| bad())?;
+    let cents = whole.checked_mul(100).and_then(|w| w.checked_add(frac)).ok_or_else(bad)?;
+    if cents <= 0 {
+        bail!("amount must be positive");
+    }
+    Ok(cents)
+}
+
+/// Each currency's official output price per 1M of its units, from
+/// `walletRates`: what turns a holding into dollars, the way the wallet does.
+async fn prices_of(client: &Client) -> std::collections::HashMap<String, f64> {
+    let Ok(r) = client.call("walletRates", json!({})).await else { return Default::default() };
+    items(&r)
+        .iter()
+        .filter_map(|row| Some((row["currency"].as_str()?.to_string(), row["usd_out"].as_f64().filter(|p| *p > 0.0)?)))
+        .collect()
+}
+
+/// `n` of `cur` in dollars, when there is a price for it.
+fn usd_of(n: i64, cur: &str, prices: &std::collections::HashMap<String, f64>) -> Option<f64> {
+    prices.get(cur).map(|p| n as f64 * p / 1_000_000.0)
+}
+
+/// Every balance at its official output price, added up: the one number the
+/// wallet shows. A holding with no price adds nothing.
+fn total_usd(rows: &[Value], prices: &std::collections::HashMap<String, f64>) -> f64 {
+    rows.iter().filter_map(|b| usd_of(b["amount"].as_i64()?, b["currency"].as_str()?, prices)).sum()
+}
+
 /// Each currency's own unit ("token", "second"), from `walletRates`. A failed
 /// call is no units, and every amount then reads as tokens.
 async fn units_of(client: &Client) -> std::collections::HashMap<String, String> {
@@ -164,17 +210,11 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
             let rows = items(&r);
             let passes = live_passes(&r);
             if rows.is_empty() && passes.is_empty() {
-                println!("(empty — ask a friend for a transfer, e.g. `mafold wallet transfer @you 1M claude-fable-5`)");
+                println!("  $0 — add money with Deposit in your Mafold wallet");
                 return Ok(());
             }
-            for b in rows {
-                println!(
-                    "  {:>10}  {}",
-                    fmt(b["amount"].as_i64().unwrap_or(0)),
-                    b["currency"].as_str().unwrap_or("?")
-                );
-            }
-            // Passes after the balances, apart: only you can spend them, and
+            println!("  {}", units::usd(total_usd(&rows, &prices_of(client).await)));
+            // Passes after the balance, apart: only you can spend them, and
             // `transfer` / `convert` never see them.
             if !passes.is_empty() {
                 println!("\n  Passes (only you can spend them; they pay first and can't be sent)");
@@ -189,14 +229,16 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
             currency,
             memo,
         } => {
-            let amt = parse_amount(&amount)?;
-            client
-                .call(
-                    "walletTransfer",
-                    json!({ "to": to, "currency": currency, "amount": amt, "memo": memo }),
-                )
-                .await?;
-            println!("✓ sent {} → {to}", amount_of(amt, &currency, &units_of(client).await));
+            if let Some(cur) = currency {
+                bail!(
+                    "transfers are in dollars now: `mafold wallet transfer {to} 5` sends $5.00 out of whatever you hold \
+                     (`{amount} {cur}` was an amount of one model)"
+                );
+            }
+            let cents = parse_dollars(&amount)?;
+            let usd = format!("{}.{:02}", cents / 100, cents % 100);
+            client.call("walletTransfer", json!({ "to": to, "usd": usd, "memo": memo })).await?;
+            println!("✓ sent {} → {to}", units::usd(cents as f64 / 100.0));
         }
         WalletCmd::Convert { amount, from, to } => {
             let amt = parse_amount(&amount)?;
@@ -243,8 +285,14 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                 return Ok(());
             }
             let units = units_of(client).await;
+            let prices = prices_of(client).await;
             for tx in rows {
                 let kind = tx["kind"].as_str().unwrap_or("?");
+                // A convert turns one model's units into another's at the same
+                // worth: in dollars it moves nothing, and the wallet lists none.
+                if kind == "convert" {
+                    continue;
+                }
                 // The SERVER stamps direction (`credit`). Keeping our own list
                 // of kinds here is what drew claimed red packets as withdrawals;
                 // the fallback is the naming rule walletHistory documents.
@@ -256,25 +304,12 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                     .as_str()
                     .map(|p| format!(" @{p}"))
                     .unwrap_or_default();
-                // `auto`: the wallet ran this convert to fund a payment — the
-                // server's field (it used to ride in the memo as "auto"), and
-                // the memo is then the bill it paid for.
-                let auto = tx["auto"].as_bool() == Some(true);
-                let memo = match (auto, tx["memo"].as_str()) {
-                    (true, Some(m)) => format!("  (auto · {m})"),
-                    (true, None) => "  (auto)".to_string(),
-                    (false, Some(m)) => format!("  ({m})"),
-                    (false, None) => String::new(),
-                };
-                let conv = match (tx["to_amount"].as_i64(), tx["to_currency"].as_str()) {
-                    (Some(a), Some(c)) => format!(" → +{}", amount_of(a, c, &units)),
-                    _ => String::new(),
-                };
-                println!(
-                    "  {:<10} {sign}{}{conv}{peer}{memo}",
-                    kind,
-                    amount_of(tx["amount"].as_i64().unwrap_or(0), tx["currency"].as_str().unwrap_or("?"), &units),
-                );
+                let memo = tx["memo"].as_str().map(|m| format!("  ({m})")).unwrap_or_default();
+                // In dollars at the official output price; a model with no
+                // price keeps its own units, which is all there is to say.
+                let (n, cur) = (tx["amount"].as_i64().unwrap_or(0), tx["currency"].as_str().unwrap_or("?"));
+                let amount = usd_of(n, cur, &prices).map(units::usd).unwrap_or_else(|| amount_of(n, cur, &units));
+                println!("  {kind:<10} {sign}{amount}{peer}{memo}");
             }
         }
         WalletCmd::Grants { revoke } => {
@@ -295,17 +330,28 @@ pub async fn run(cmd: WalletCmd, client: &Client) -> Result<()> {
                 println!("(no one is authorized to debit your wallet)");
                 return Ok(());
             }
+            // A grant's cap counts units of whatever each bill was in. The
+            // wallet states it in dollars at the price of the model the
+            // spender last billed in; one that never billed has no price yet,
+            // and its cap stays a count: "1M tokens".
+            let prices = prices_of(client).await;
+            let history = match client.call("walletHistory", json!({ "limit": 200 })).await {
+                Ok(h) => items(&h),
+                Err(_) => Vec::new(),
+            };
             for g in rows {
-                // A grant's cap belongs to no one currency: "1M tokens".
-                let cap = g["monthly_cap"]
-                    .as_i64()
-                    .map(|n| EN.tokens(n as f64))
-                    .unwrap_or_else(|| "uncapped".into());
-                println!(
-                    "  @{:<20} cap {cap:<12} used this month {}",
-                    g["spender"].as_str().unwrap_or("?"),
-                    EN.tokens(g["used_month"].as_i64().unwrap_or(0) as f64)
-                );
+                let spender = g["spender"].as_str().unwrap_or("?");
+                let price = history
+                    .iter()
+                    .find(|t| t["kind"].as_str() == Some("debit") && t["peer"].as_str() == Some(spender))
+                    .and_then(|t| prices.get(t["currency"].as_str()?))
+                    .copied();
+                let money = |n: i64| match price {
+                    Some(p) => units::usd(n as f64 * p / 1_000_000.0),
+                    None => EN.tokens(n as f64),
+                };
+                let cap = g["monthly_cap"].as_i64().map(money).unwrap_or_else(|| "uncapped".into());
+                println!("  @{spender:<20} cap {cap:<12} used this month {}", money(g["used_month"].as_i64().unwrap_or(0)));
             }
         }
         WalletCmd::Mint {
@@ -361,6 +407,33 @@ mod tests {
             assert!(parse_amount(bad).is_err(), "{bad}");
         }
         assert_eq!(fmt(4_100_000), "4.1M", "and the wallet prints it back the same");
+    }
+
+    /// A transfer is stated in dollars, to the cent — and nothing else passes
+    /// for one (a model amount like `1M` least of all).
+    #[test]
+    fn transfers_read_dollars_to_the_cent() {
+        for (s, c) in [("5", 500), ("5.25", 525), ("$5", 500), (" $0.50 ", 50), (".5", 50), ("5.", 500)] {
+            assert_eq!(parse_dollars(s).unwrap(), c, "{s:?}");
+        }
+        for bad in ["0", "0.00", "-5", "5.255", "1M", "five", "", "$", "1e3", "5,00"] {
+            assert!(parse_dollars(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The balance is one number: every holding at its official output price,
+    /// added up, the way every client's wallet shows it.
+    #[test]
+    fn the_balance_is_one_dollar_figure() {
+        let prices: std::collections::HashMap<String, f64> =
+            [("gpt-5.6-terra".to_string(), 12.0), ("claude-fable-5".to_string(), 25.0)].into();
+        let rows = vec![
+            json!({ "currency": "gpt-5.6-terra", "amount": 1_000_000 }),
+            json!({ "currency": "claude-fable-5", "amount": 200_000 }),
+            json!({ "currency": "unpriced-model", "amount": 5_000 }),
+        ];
+        assert_eq!(units::usd(total_usd(&rows, &prices)), "$17.00");
+        assert_eq!(usd_of(1, "unpriced-model", &prices), None);
     }
 
     #[test]

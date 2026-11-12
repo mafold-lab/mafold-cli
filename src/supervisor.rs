@@ -79,8 +79,9 @@ fn pid_path(name: &str) -> PathBuf {
 }
 
 /// Per-daemon in-flight-turn marker: the daemon writes its active-turn count here
-/// (via `TurnGuard`), and the supervisor reads it to DRAIN — wait a live turn out
-/// before a cliUpdate restart instead of killing the reply mid-flight.
+/// (via `TurnGuard`), and the supervisor reads it to move a daemon onto a new
+/// binary only once its replies are written ([`Moving`]) instead of killing
+/// one mid-flight.
 pub(crate) fn busy_path(name: &str) -> PathBuf {
     daemons_dir().join(safe(name)).join("busy")
 }
@@ -89,30 +90,191 @@ fn busy_count(name: &str) -> usize {
     fs::read_to_string(busy_path(name)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
-/// Wait (up to `max`) for every ALIVE daemon to finish its in-flight turns before
-/// a restart, so the daemon watching its own release doesn't kill a turn. A dead
-/// daemon's stale marker is ignored; the cap stops a forever-busy daemon from
-/// blocking updates indefinitely.
-async fn drain_daemons(daemons: &[DaemonCfg], max: std::time::Duration) {
-    let start = std::time::Instant::now();
+/// How long a bot an update left writing a reply ([`Moving`]) may stay on the
+/// old binary. Long enough for any reply a person waits on; a bot that is
+/// never between two replies (one serving many people at once) is moved
+/// anyway after it, and the replies it was writing are picked back up by the
+/// process that replaces it (`drafts::Journal`). Awake time: a laptop asleep
+/// in the middle of a move doesn't wake up past it, cutting off the reply it
+/// carries on with.
+const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+/// The bots an update left writing a reply on the old binary ([`move_on`]),
+/// for the supervisor that starts next to move onto the new one each as soon
+/// as its replies are written ([`keep_moving`]) —
+/// `~/.mafold/supervisor.moving.json`, while there are any.
+///
+/// It used to be all bots at once, after waiting for every reply on the
+/// machine — at most 5 minutes, then the restart came anyway: on 2026-11-11 it
+/// cut off a reply 27 minutes into its work, mid-command.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct Moving {
+    /// The version they are moving onto, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    onto: Option<String>,
+    /// When the first of them was left running, epoch seconds.
+    since: i64,
+    /// Each bot left running, by name, with the pid it was left running as —
+    /// one running as any other has been restarted since.
+    left: std::collections::BTreeMap<String, u32>,
+}
+
+fn moving_path() -> PathBuf {
+    home().join(".mafold/supervisor.moving.json")
+}
+
+impl Moving {
+    fn read(path: &std::path::Path) -> Moving {
+        fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+
+    /// Written while any bot is left; gone when none is.
+    fn write(&self, path: &std::path::Path) {
+        if self.left.is_empty() {
+            let _ = fs::remove_file(path);
+        } else if let Ok(json) = serde_json::to_string(self) {
+            let tmp = path.with_extension("tmp");
+            if fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, path)).is_err() {
+                eprintln!("✗ couldn't write {} — a bot left writing a reply stays on the old binary until it restarts", path.display());
+            }
+        }
+    }
+
+    /// One look at the bots left running. One gone, restarted since or no
+    /// longer configured is off the list; one with no reply in progress — or,
+    /// once the move is `overdue`, any — is handed to `restart`, and is off the
+    /// list once that worked. What is left still has to be moved.
+    fn step(
+        &mut self,
+        configured: &[DaemonCfg],
+        overdue: bool,
+        running_as: impl Fn(&str) -> Option<u32>,
+        busy: impl Fn(&str) -> usize,
+        mut restart: impl FnMut(&DaemonCfg, usize) -> bool,
+    ) {
+        self.left.retain(|name, pid| {
+            let Some(d) = configured.iter().find(|d| &d.name == name) else { return false };
+            if running_as(name) != Some(*pid) {
+                return false;
+            }
+            let n = busy(name);
+            if n > 0 && !overdue {
+                return true;
+            }
+            !restart(d, n)
+        });
+    }
+}
+
+/// Move the bots an update left writing a reply ([`Moving`]) onto the binary
+/// on disk, each the moment it has none in progress. Looked at every second,
+/// so a gap between two replies is enough; one still busy after [`MOVE_WAIT`]
+/// is moved anyway. Runs until none is left, on a thread of its own: the loop
+/// keeps the other bots up meanwhile.
+fn keep_moving(base: String) {
+    let path = moving_path();
+    let began = std::time::Instant::now();
+    let first = Moving::read(&path);
+    if first.left.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    let _busy = Busy::start(&doing_path(), "waiting_for_turns", first.onto.as_deref());
+    println!(
+        "↻ {} still writing a reply on the old binary — each moves onto {} as soon as its replies are written",
+        first.left.keys().cloned().collect::<Vec<_>>().join(", "),
+        first.onto.as_deref().map_or_else(|| "the new one".to_string(), |v| format!("v{v}")),
+    );
+    // A bot that didn't stop when asked is asked again a minute later, not
+    // every second — each try holds every other start up for `STOP_WAIT`.
+    let mut not_before: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
     loop {
-        let busy: Vec<String> = daemons
-            .iter()
-            .filter_map(|d| {
-                let live = read_pid(&d.name).map(alive).unwrap_or(false);
-                let n = busy_count(&d.name);
-                (live && n > 0).then(|| format!("{}={n}", d.name))
-            })
-            .collect();
-        if busy.is_empty() {
-            return;
+        {
+            // Read and written under the lock `move_on` takes: an update
+            // landing meanwhile adds to the list, and a write from here can't
+            // come after it and take that back.
+            let _one = spawning();
+            let mut m = Moving::read(&path);
+            if m.left.is_empty() {
+                let _ = fs::remove_file(&path);
+                return;
+            }
+            let before = m.clone();
+            let overdue = began.elapsed() >= MOVE_WAIT;
+            let now = std::time::Instant::now();
+            let resting: std::collections::HashSet<String> =
+                not_before.iter().filter(|(_, t)| now < **t).map(|(name, _)| name.clone()).collect();
+            m.step(
+                &load().daemons,
+                overdue,
+                |name| read_pid(name).filter(|p| platform::pid_running(*p)),
+                // Not due again yet: as good as busy.
+                |name| if resting.contains(name) { usize::MAX } else { busy_count(name) },
+                |d, writing| {
+                    if resting.contains(&d.name) {
+                        return false;
+                    }
+                    let (code, r) = restart_with(&d.name, &pid_path(&d.name), STOP_WAIT, || {
+                        // Gone for good before the next one looks for the
+                        // drafts it left (`drafts::Outbox`).
+                        reap();
+                        start_one(&base, d)
+                    });
+                    let moved = code == crate::control::Code::Restarted;
+                    match (moved, writing) {
+                        (true, 0) => println!(
+                            "↻ {} has written its replies — restarted onto the new binary (pid {} → {})",
+                            d.name,
+                            r.old_pid.map_or("?".into(), |p| p.to_string()),
+                            r.new_pid.map_or("?".into(), |p| p.to_string()),
+                        ),
+                        (true, n) => println!(
+                            "↻ {} still writing {n} repl{} after {} — restarted onto the new binary anyway; the next process picks {} back up",
+                            d.name,
+                            if n == 1 { "y" } else { "ies" },
+                            crate::update::human(MOVE_WAIT),
+                            if n == 1 { "it" } else { "them" },
+                        ),
+                        (false, _) => {
+                            eprintln!(
+                                "✗ moving {} onto the new binary: {code:?}{} — trying again in a minute",
+                                d.name,
+                                r.detail.as_deref().map(|e| format!(" ({e})")).unwrap_or_default(),
+                            );
+                            not_before.insert(d.name.clone(), now + std::time::Duration::from_secs(60));
+                        }
+                    }
+                    moved
+                },
+            );
+            if m != before {
+                m.write(&path);
+            }
+            if m.left.is_empty() {
+                println!("✓ every bot here runs the new binary");
+                return;
+            }
         }
-        if start.elapsed() >= max {
-            println!("↻ drain capped at {max:?} — restarting anyway (still busy: {})", busy.join(", "));
-            return;
-        }
-        println!("↻ waiting for in-flight turns before restart: {}", busy.join(", "));
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Start [`keep_moving`] when an update left bots to move — once per process.
+fn spawn_mover(base: &str) {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !moving_path().exists() || RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let base = base.to_string();
+    let spawned = std::thread::Builder::new().name("moving".into()).spawn(move || {
+        // A pass that panics ends the thread; the next start of the
+        // supervisor looks at the list again.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| keep_moving(base)));
+        RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    if let Err(e) = spawned {
+        RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("⚠️  couldn't start moving the bots still writing a reply ({e}) — they stay on the old binary until they restart");
     }
 }
 /// Where a bot's daemon writes its output ([`crate::logfile::keep`]).
@@ -1506,6 +1668,9 @@ pub async fn supervise(base: String, auto_update: bool) {
     // A busy mark left by the process this one replaced (an update re-execs
     // in place, mid-«waiting for turns») is not true of this one.
     let _ = fs::remove_file(doing_path());
+    // The bots the supervisor before this one left writing a reply when it
+    // moved onto this binary (`move_on`): each moves too, once it's written.
+    spawn_mover(&base);
     // What commands ask of it (`control`: `mafold restart`, and `update` /
     // `rollback` having put another binary on disk), on a thread of its own —
     // a bot restarts now, not once the loop below is done waiting on an
@@ -1568,7 +1733,7 @@ pub async fn supervise(base: String, auto_update: bool) {
                 crate::control::Moved::Rollback => "rolled back",
             };
             println!("↻ the binary on disk was {what}{} — restarting onto it…", version.as_deref().map(|v| format!(" to v{v}")).unwrap_or_default());
-            move_on(&cfg.daemons, version.as_deref(), last_exit.as_ref()).await;
+            move_on(&base, &cfg.daemons, version.as_deref(), last_exit.as_ref());
         }
         // Keep every configured daemon running (start any that died / aren't up).
         for d in &cfg.daemons {
@@ -1632,7 +1797,7 @@ pub async fn supervise(base: String, auto_update: bool) {
                     match crate::update::apply(&http, &r.url, &r.version, r.sha256.as_deref()).await {
                         Ok(()) => {
                             crate::update::note_installed();
-                            move_on(&cfg.daemons, Some(&r.version), last_exit.as_ref()).await;
+                            move_on(&base, &cfg.daemons, Some(&r.version), last_exit.as_ref());
                         }
                         Err(e) => {
                             let wait = crate::update::mark_failed(&r.version, &e);
@@ -1679,23 +1844,41 @@ pub async fn supervise(base: String, auto_update: bool) {
     }
 }
 
-/// Move onto the binary on disk — `onto`, its version when known: let the
-/// replies in progress finish (at most 5 minutes, so a stuck one can't hold
-/// it forever), stop every daemon, re-exec; the new supervisor starts them
-/// again on the new binary. How an update the supervisor installed itself
-/// lands, and how `mafold update` / `rollback` ask for theirs (`control`).
+/// Move onto the binary on disk — `onto`, its version when known. How an
+/// update the supervisor installed itself lands, and how `mafold update` /
+/// `rollback` ask for theirs (`control`).
+///
+/// A bot with no reply in progress is stopped now — gone, not just signalled,
+/// so the one started in its place never finds it still there — and comes
+/// back on the new binary with the supervisor that starts next. A bot in the
+/// middle of a reply keeps writing it on the old binary: it goes on the list
+/// ([`Moving`]) that the next supervisor works through, moving each one as
+/// soon as its replies are written ([`keep_moving`]). Then the re-exec.
 ///
 /// Returns only when the re-exec failed — said loudly — and this, the old
-/// supervisor, carries on: its loop starts the daemons again, on the binary
-/// on disk.
-async fn move_on(daemons: &[DaemonCfg], onto: Option<&str>, last_exit: Option<&crate::lifecycle::Exit>) {
-    let _busy = Busy::start(&doing_path(), "waiting_for_turns", onto);
-    drain_daemons(daemons, std::time::Duration::from_secs(300)).await;
-    // No restart a command asked for starts one in between.
+/// supervisor, carries on: its loop starts the stopped daemons again, on the
+/// binary on disk, and it moves the rest itself.
+fn move_on(base: &str, daemons: &[DaemonCfg], onto: Option<&str>, last_exit: Option<&crate::lifecycle::Exit>) {
+    // No restart a command asked for starts one in between, and the list isn't
+    // written behind this one's back (`keep_moving`).
     let _one = spawning();
-    for d in daemons {
-        let _ = stop_one(&d.name);
+    let path = moving_path();
+    let mut moving = Moving::read(&path);
+    let files: Vec<(&str, PathBuf)> = daemons.iter().map(|d| (d.name.as_str(), pid_path(&d.name))).collect();
+    moving.left.extend(stop_idle(&files, busy_count, STOP_WAIT));
+    // Reaped, so nothing that asks after them takes them for running.
+    reap();
+    if !moving.left.is_empty() {
+        if moving.since == 0 {
+            moving.since = crate::accounts::now();
+        }
+        moving.onto = onto.map(str::to_string).or(moving.onto);
+        println!(
+            "↻ {} writing a reply — left running on the old binary until it's written",
+            moving.left.keys().cloned().collect::<Vec<_>>().join(", "),
+        );
     }
+    moving.write(&path);
     crate::lifecycle::note_exit(std::process::id(), crate::lifecycle::Why::Update, onto);
     SERVING.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::update::reexec_or_warn(onto);
@@ -1703,6 +1886,30 @@ async fn move_on(daemons: &[DaemonCfg], onto: Option<&str>, last_exit: Option<&c
     // still the last, and the requests are still its to take.
     SERVING.store(true, std::sync::atomic::Ordering::SeqCst);
     crate::lifecycle::restore_exit(last_exit);
+    drop(_one);
+    spawn_mover(base);
+}
+
+/// Stop every daemon — `(name, pid file)` — that has no reply in progress
+/// (`busy`), and wait until each is gone; the ones still running, by name and
+/// pid: those writing a reply, and any that didn't stop within `wait`.
+fn stop_idle(daemons: &[(&str, PathBuf)], busy: impl Fn(&str) -> usize, wait: std::time::Duration) -> std::collections::BTreeMap<String, u32> {
+    let idle: Vec<(&str, PathBuf)> = daemons.iter().filter(|(name, _)| busy(name) == 0).cloned().collect();
+    for ((name, f), stopped) in idle.iter().zip(stop_all_confirmed_at(&idle, wait)) {
+        match stopped {
+            // Stopped on purpose: not a death of the daemon's own.
+            Ok(Some(pid)) => {
+                crate::lifecycle::take_stop(&f.with_file_name("stopping"), pid);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("✗ {name}: {e:#}"),
+        }
+    }
+    let read = |f: &std::path::Path| -> Option<u32> { fs::read_to_string(f).ok()?.trim().parse().ok() };
+    daemons
+        .iter()
+        .filter_map(|(name, f)| read(f).filter(|p| platform::pid_running(*p)).map(|pid| (name.to_string(), pid)))
+        .collect()
 }
 
 /// A restart of the supervisor itself that a command asked for (`control`),
@@ -2546,9 +2753,16 @@ pub fn move_onto_disk(why: crate::control::Moved, version: Option<&str>) -> (Str
                 back = read::<Run>(&run_path()).filter(|r| r.started_at >= asked && sup_running() == Some(r.pid));
                 back.is_some()
             });
+            // The bots writing a reply move once it's written (`move_on`).
+            let left = Moving::read(&moving_path()).left.into_keys().collect::<Vec<_>>();
+            let after = if left.is_empty() {
+                String::new()
+            } else {
+                format!("; {} move{} onto it once the replies in progress are written — `mafold status` shows when", left.join(", "), if left.len() == 1 { "s" } else { "" })
+            };
             let line = match back {
-                Some(r) => format!("the supervisor restarted onto it (v{}, pid {})", r.version, r.pid),
-                None => "the supervisor restarts onto it as soon as the replies in progress are written (at most 5 minutes) — `mafold status` shows when".into(),
+                Some(r) => format!("the supervisor restarted onto it (v{}, pid {}){after}", r.version, r.pid),
+                None => "the supervisor restarts onto it in a moment, and each bot writing a reply moves once it's written — `mafold status` shows when".into(),
             };
             (line, true)
         }
@@ -3503,6 +3717,87 @@ mod stop_tests {
         let (code, r) = restart_with("a:bot", &f, Duration::from_secs(5), || Ok(Some(4242)));
         assert_eq!((code, r.old_pid, r.new_pid, r.interrupted), (Code::Restarted, None, Some(4242), 0));
         let _ = fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    /// An update stops the bots with no reply in progress — gone before it
+    /// re-execs — and leaves the one writing a reply running, by pid. On
+    /// 2026-11-11 the bot writing one was stopped anyway after 5 minutes,
+    /// 27 minutes into its work.
+    #[test]
+    fn an_update_stops_only_the_bots_with_no_reply_in_progress() {
+        let mut idle = platform::idle_child();
+        let mut writing = platform::idle_child();
+        let (fi, fw) = (pid_file("move-idle", idle.id()), pid_file("move-writing", writing.id()));
+        let files = [("a:idle", fi.clone()), ("a:writing", fw.clone())];
+        let left = stop_idle(&files, |name| usize::from(name == "a:writing"), Duration::from_secs(5));
+        assert_eq!(left.into_iter().collect::<Vec<_>>(), [("a:writing".to_string(), writing.id())]);
+        assert!(!platform::pid_running(idle.id()), "the idle one is gone, not just asked");
+        assert!(!fi.exists(), "its pid file goes with it, so the next supervisor starts it");
+        assert!(!fi.with_file_name("stopping").exists(), "stopped on purpose, and no note left to mistake later");
+        assert!(platform::pid_running(writing.id()) && fw.exists(), "the one writing a reply keeps writing it");
+        idle.wait().unwrap();
+        let _ = writing.kill();
+        let _ = writing.wait();
+        for f in [fi, fw] {
+            let _ = fs::remove_dir_all(f.parent().unwrap());
+        }
+    }
+
+    /// The next supervisor moves each bot left writing a reply the moment it
+    /// has none in progress, and only then; one gone, restarted since or
+    /// removed is off the list without a restart; once the move is overdue,
+    /// one still writing is moved anyway; one that wouldn't restart stays on.
+    #[test]
+    fn a_bot_left_writing_a_reply_moves_once_it_is_written() {
+        let cfg = |name: &str| DaemonCfg { name: name.into(), token: "mb_x".into(), workdir: "/tmp".into(), harness: None, env: Default::default() };
+        let configured = [cfg("a:writing"), cfg("a:done"), cfg("a:gone"), cfg("a:again"), cfg("a:stuck")];
+        let left = |names: &[(&str, u32)]| Moving {
+            onto: Some("0.9.200".into()),
+            since: 1,
+            left: names.iter().map(|(n, p)| (n.to_string(), *p)).collect(),
+        };
+        let mut m = left(&[("a:writing", 1), ("a:done", 2), ("a:gone", 3), ("a:again", 4), ("a:stuck", 5), ("a:removed", 6)]);
+        let running_as = |name: &str| match name {
+            "a:gone" => None,
+            "a:again" => Some(40), // restarted since: on the new binary already
+            "a:writing" => Some(1),
+            "a:done" => Some(2),
+            "a:stuck" => Some(5),
+            _ => Some(6),
+        };
+        let busy = |name: &str| usize::from(name == "a:writing");
+        let mut restarted = vec![];
+        m.step(&configured, false, running_as, busy, |d, n| {
+            restarted.push((d.name.clone(), n));
+            d.name != "a:stuck"
+        });
+        assert_eq!(restarted, [("a:done".to_string(), 0), ("a:stuck".to_string(), 0)]);
+        assert_eq!(m, left(&[("a:writing", 1), ("a:stuck", 5)]), "still writing, and the one that wouldn't restart");
+
+        // Overdue: the one still writing goes too; its replies are picked back
+        // up by the process that replaces it.
+        let mut moved = vec![];
+        m.step(&configured, true, running_as, busy, |d, n| {
+            moved.push((d.name.clone(), n));
+            true
+        });
+        assert_eq!(moved, [("a:stuck".to_string(), 0), ("a:writing".to_string(), 1)]);
+        assert!(m.left.is_empty());
+    }
+
+    /// The list lives in a file while any bot is on it, and is gone when none is.
+    #[test]
+    fn the_move_list_is_kept_while_any_bot_is_on_it() {
+        let dir = std::env::temp_dir().join(format!("mafold-moving-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("supervisor.moving.json");
+        assert_eq!(Moving::read(&path), Moving::default(), "none yet");
+        let m = Moving { onto: Some("0.9.200".into()), since: 7, left: [("a:bot".to_string(), 42)].into_iter().collect() };
+        m.write(&path);
+        assert_eq!(Moving::read(&path), m);
+        Moving { left: Default::default(), ..m }.write(&path);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// A daemon that won't stop is left alone, and no second one of the same

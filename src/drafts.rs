@@ -9,8 +9,22 @@
 //! each ending on «edited 9 files, ran 7 shell commands» and nothing after it.
 //! So a turn that has a [`Journal`] is instead handed back to the daemon that
 //! starts next, which picks it up in the same bubble ([`Outbox::take_resumable`]).
+//! One that can't be picked up ends on the failure card saying it was cut off
+//! ([`cut_off`]) — never left on its generating card.
+//!
+//! «Died» is asked of the producer itself, not of its pid: on 2026-11-11 an
+//! update's restart started the next daemon while the one it had just stopped
+//! was still going (a zombie answers `kill(pid, 0)` until it is reaped), the
+//! next daemon took the reply for a live one's and never looked again, and the
+//! reply showed «generating» for 12 hours. A producer still on its way out is
+//! now taken over once it has gone ([`Outbox::take_over_dead`]).
 
-use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Mutex,
+    time::SystemTime,
+};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -111,9 +125,9 @@ pub struct Journal {
 enum Verdict {
     /// Run it again in the same bubble.
     Resume,
-    /// Finalize the partial transcript as it stands — the recovery every draft
-    /// got before there was a journal.
-    Finalize,
+    /// Close it as cut off, and why it couldn't be picked back up: what it
+    /// says so far, then the failure card ([`cut_off`]).
+    Finalize(&'static str),
     /// Throw the draft away: the turn died before it asked the model anything,
     /// so the bubble holds nothing but a generating card, and the message it
     /// answers is still journaled in `crate::pending`, which replays it.
@@ -121,20 +135,71 @@ enum Verdict {
 }
 
 fn verdict(turn: Option<&Journal>, at: u64, now: SystemTime) -> Verdict {
-    let Some(t) = turn else { return Verdict::Finalize };
+    let Some(t) = turn else { return Verdict::Finalize("it was written by a mafold that couldn't pick replies back up") };
     if t.prompt.is_none() && !t.produced {
         return Verdict::Discard;
     }
     let beat = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(at);
-    let stale = now.duration_since(beat).unwrap_or_default() > RESUME_WITHIN;
+    if now.duration_since(beat).unwrap_or_default() > RESUME_WITHIN {
+        return Verdict::Finalize("it stopped more than 30 minutes before the agent came back");
+    }
+    if t.resumes >= MAX_RESUMES {
+        return Verdict::Finalize("it had been picked back up twice already, and stopped again");
+    }
+    if t.prompt.is_none() {
+        return Verdict::Finalize("it stopped before what it was asked was saved");
+    }
+    if t.trigger.is_none() {
+        return Verdict::Finalize("no message started it (a background-task update or an introduction)");
+    }
     // A turn with work on screen can only go on in the session that holds what
     // it did; without that id, starting it over would redo the work under a
     // bubble that already shows half of it.
     let continuable = if t.produced { t.session.is_some() } else { t.session_first || !t.shown };
-    if stale || t.resumes >= MAX_RESUMES || t.prompt.is_none() || t.trigger.is_none() || !continuable {
-        return Verdict::Finalize;
+    if !continuable {
+        return Verdict::Finalize("the session holding its work wasn't known yet");
     }
     Verdict::Resume
+}
+
+/// Is the process that wrote an entry still running: alive, not a zombie, and
+/// not a later process handed the same pid ([`Entry::pid_start`])? A daemon an
+/// update has just stopped is a zombie until the supervisor reaps it, and
+/// answers `kill(pid, 0)` all the same.
+fn owner_running(pid: u32, start: Option<u64>) -> bool {
+    crate::platform::pid_running(pid)
+        && match (start, crate::platform::start_token(pid)) {
+            (Some(was), Some(is)) => was == is,
+            _ => true,
+        }
+}
+
+/// This process's start ([`crate::platform::start_token`]), read once.
+fn my_start() -> Option<u64> {
+    static START: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *START.get_or_init(|| crate::platform::start_token(std::process::id()))
+}
+
+/// A reply cut off for good — its producer died and it couldn't be picked back
+/// up (`why`) — as it is left: what it says, its live generating card gone, a
+/// code block it left open closed, then the failure card that says it was cut
+/// off. The card a server restart leaves on a hosted reply
+/// (`close_interrupted_server_turns`), so one reads like the other. `reader`:
+/// whom the card's details are for when the bot has no owner (a house bot).
+pub(crate) fn cut_off(content: &str, why: &str, reader: Option<String>) -> (String, Option<mafold_transcript::render::PrivateItem>) {
+    use mafold_transcript::{failure, render};
+    // Built, not classified: `why` may be an error some other kind's words
+    // match (a 502 on reading the reply back), and it was still cut off.
+    let mut f = failure::Failure::of(failure::FailureKind::Interrupted, failure::agent_restarted(why));
+    f.reader = reader;
+    let (card, private) = render::failure_card_private(&f);
+    let said = render::strip_trailing_generating(content);
+    let closed = if said.trim().is_empty() {
+        card.trim().to_string()
+    } else {
+        format!("{}\n\n{}", render::heal_open_code(said.trim_end()), card.trim())
+    };
+    (closed, private)
 }
 
 fn now_secs() -> u64 {
@@ -147,6 +212,10 @@ fn now_secs() -> u64 {
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     pid: u32,
+    /// [`Self::pid`]'s start ([`crate::platform::start_token`]): a pid handed
+    /// to another process since — a reboot — doesn't pass for its producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_start: Option<u64>,
     ready: bool,
     /// None means finalize the server's existing partial transcript. Once the
     /// final snapshot is acknowledged, clear it so retries cannot overwrite a
@@ -172,6 +241,10 @@ struct Entry {
     /// [`Journal::settles`], kept once the turn is finished and its journal gone.
     #[serde(default)]
     settles: Option<String>,
+    /// Cut off for good, and why: before it is finalized the reply gets the
+    /// card that says so ([`cut_off`]), written into `content` on delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut: Option<String>,
     #[serde(skip)]
     delivering: bool,
 }
@@ -188,17 +261,38 @@ fn lenient_outcome<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<crat
     Ok(Option::<serde_json::Value>::deserialize(d)?.and_then(|v| serde_json::from_value(v).ok()))
 }
 
+/// How a reply cut off for good is closed ([`Outbox::close_cut`]).
+enum Closing {
+    /// With what it says, and the card saying it was cut off.
+    With(String),
+    /// As it stands: it couldn't be read back.
+    AsItStands,
+    /// Not at all: it was finished meanwhile (a Stop from a client).
+    Finished,
+}
+
+/// Is the process that wrote an entry — `(pid, its start)` — still running?
+/// [`owner_running`]; a stand-in in tests.
+type OwnerRunning = Box<dyn Fn(u32, Option<u64>) -> bool + Send + Sync>;
+
 pub struct Outbox {
     dir: PathBuf,
+    /// The bot these drafts are written as (`owner:label`, or a house bot's
+    /// bare handle) — whom a cut-off reply's details are for ([`cut_off`]).
+    bot: String,
     entries: Mutex<HashMap<String, Entry>>,
-    /// Dead turns this process is to pick back up — taken once, at startup.
+    /// Dead turns this process is to pick back up — taken at startup, and
+    /// again whenever [`Self::take_over_dead`] took over another.
     resumable: Mutex<Vec<(String, Journal)>>,
-    /// What the dead turns this process is now delivering settle — taken once,
-    /// at startup, before anything decides whether it still needs saying.
+    /// What the dead turns this process is now delivering settle — taken
+    /// before anything decides whether it still needs saying.
     settled: Mutex<Vec<String>>,
     /// The processes the dead turns this process took over were running in
-    /// (`Journal::child`, with its start) — taken once, at startup.
+    /// (`Journal::child`, with its start).
     orphans: Mutex<Vec<(u32, Option<u64>)>>,
+    owner_running: OwnerRunning,
+    /// Entries already said to be unreadable — said once, not on every look.
+    unreadable: Mutex<HashSet<String>>,
 }
 
 impl Outbox {
@@ -208,20 +302,51 @@ impl Outbox {
         let dir = PathBuf::from(std::env::var("HOME").context("HOME is unset")?)
             .join(".mafold/drafts")
             .join(key);
-        Self::load(dir, crate::platform::pid_alive)
+        let mut outbox = Self::load(dir, owner_running)?;
+        outbox.bot = username.to_string();
+        Ok(outbox)
     }
 
-    fn load(dir: PathBuf, alive: impl Fn(u32) -> bool) -> Result<Self> {
-        Self::load_at(dir, alive, SystemTime::now())
+    fn load(dir: PathBuf, owner_running: impl Fn(u32, Option<u64>) -> bool + Send + Sync + 'static) -> Result<Self> {
+        Self::load_at(dir, owner_running, SystemTime::now())
     }
 
-    fn load_at(dir: PathBuf, alive: impl Fn(u32) -> bool, now: SystemTime) -> Result<Self> {
+    fn load_at(
+        dir: PathBuf,
+        owner_running: impl Fn(u32, Option<u64>) -> bool + Send + Sync + 'static,
+        now: SystemTime,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let mut entries = HashMap::new();
-        let mut resumable = Vec::new();
-        let mut settled = Vec::new();
-        let mut orphans = Vec::new();
-        for file in std::fs::read_dir(&dir)? {
+        let outbox = Self {
+            dir,
+            bot: String::new(),
+            entries: Mutex::default(),
+            resumable: Mutex::default(),
+            settled: Mutex::default(),
+            orphans: Mutex::default(),
+            owner_running: Box::new(owner_running),
+            unreadable: Mutex::default(),
+        };
+        outbox.take_over(now)?;
+        Ok(outbox)
+    }
+
+    /// Take over the drafts of producers that have since gone — after
+    /// startup's: one still on its way out when this process started (an
+    /// update's restart doesn't wait for it), another daemon of this account
+    /// that has died since. Each is judged as startup judges them; how many
+    /// were taken over. Those to pick back up are in [`Self::take_resumable`].
+    pub fn take_over_dead(&self) -> Result<usize> {
+        self.take_over(SystemTime::now())
+    }
+
+    fn take_over(&self, now: SystemTime) -> Result<usize> {
+        // Held throughout: a draft this process starts meanwhile is written
+        // to disk under this lock (`track`), so it is either in the map
+        // already or not on disk yet — never taken for a stranger's.
+        let mut entries = self.entries.lock().unwrap();
+        let mut taken = 0;
+        for file in std::fs::read_dir(&self.dir)? {
             let path = file?.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
@@ -229,7 +354,7 @@ impl Outbox {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if uuid::Uuid::parse_str(id).is_err() {
+            if uuid::Uuid::parse_str(id).is_err() || entries.contains_key(id) {
                 continue;
             }
             let mut entry: Entry = match std::fs::read(&path)
@@ -238,23 +363,28 @@ impl Outbox {
             {
                 Ok(entry) => entry,
                 Err(e) => {
-                    eprintln!("draft journal {} unreadable: {e:#}", path.display());
+                    if self.unreadable.lock().unwrap().insert(id.to_string()) {
+                        eprintln!("draft journal {} unreadable: {e:#}", path.display());
+                    }
                     continue;
                 }
             };
             // Another daemon on this machine may own the same account. Its
-            // drafts stay with it; never sweep a username's remote history.
-            // An exec-based self-update keeps our PID. At startup no current
-            // turns exist yet, so entries carrying our own PID are recoverable.
-            if entry.pid != std::process::id() && alive(entry.pid) {
+            // drafts stay with it while it runs; never sweep a username's
+            // remote history. An exec-based self-update keeps our PID: no turn
+            // of this process is missing from the map, so an entry carrying
+            // our own PID is one the image before this one wrote.
+            if entry.pid != std::process::id() && (self.owner_running)(entry.pid, entry.pid_start) {
                 continue;
             }
             entry.pid = std::process::id();
+            entry.pid_start = my_start();
             // The process it was running in may have outlived its daemon:
             // handed to the daemon to look at, however the turn is judged.
             if let Some(child) = entry.turn.as_ref().and_then(|t| t.child.map(|c| (c, t.child_start))) {
-                orphans.push(child);
+                self.orphans.lock().unwrap().push(child);
             }
+            taken += 1;
             // A finished turn whose delivery didn't get through is just
             // delivered. A turn that was still running is the one to judge.
             if !entry.ready {
@@ -270,14 +400,19 @@ impl Outbox {
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        resumable.push((id.to_string(), turn));
+                        self.resumable.lock().unwrap().push((id.to_string(), turn));
+                        self.persist(id, &entry)?;
                         entries.insert(id.to_string(), entry);
                         continue;
                     }
                     Verdict::Discard => entry.discard = true,
                     // Cut off, not finished — what the server's own boot sweep
-                    // says of a hosted reply a restart interrupted.
-                    Verdict::Finalize => entry.outcome = Some(crate::client::TurnEnd::Failed),
+                    // says of a hosted reply a restart interrupted — and the
+                    // reply says so.
+                    Verdict::Finalize(why) => {
+                        entry.outcome = Some(crate::client::TurnEnd::Failed);
+                        entry.cut = Some(why.to_string());
+                    }
                 }
             }
             // Delivered from here, or finalized as it stands: either way it has
@@ -285,22 +420,13 @@ impl Outbox {
             // owed. (A turn that settles something is never picked back up —
             // nobody's message started it — so Resume above never carries one.)
             if !entry.discard {
-                settled.extend(entry.settles());
+                self.settled.lock().unwrap().extend(entry.settles());
             }
             entry.ready = true;
+            self.persist(id, &entry)?;
             entries.insert(id.to_string(), entry);
         }
-        let outbox = Self {
-            dir,
-            entries: Mutex::new(entries),
-            resumable: Mutex::new(resumable),
-            settled: Mutex::new(settled),
-            orphans: Mutex::new(orphans),
-        };
-        for (id, entry) in outbox.entries.lock().unwrap().iter() {
-            outbox.persist(id, entry)?;
-        }
-        Ok(outbox)
+        Ok(taken)
     }
 
     fn persist(&self, id: &str, entry: &Entry) -> Result<()> {
@@ -324,6 +450,7 @@ impl Outbox {
     pub fn track(&self, id: &str) -> Result<()> {
         let entry = Entry {
             pid: std::process::id(),
+            pid_start: my_start(),
             ready: false,
             content: None,
             success_for: None,
@@ -332,6 +459,7 @@ impl Outbox {
             at: now_secs(),
             discard: false,
             settles: None,
+            cut: None,
             delivering: false,
         };
         let mut entries = self.entries.lock().unwrap();
@@ -408,13 +536,15 @@ impl Outbox {
         std::mem::take(&mut *self.resumable.lock().unwrap())
     }
 
-    /// A turn handed out by [`Self::take_resumable`] could not be started: its
-    /// draft goes back to plain recovery — the partial transcript, finalized.
-    pub fn give_up(&self, id: &str) {
+    /// A turn handed out by [`Self::take_resumable`] could not be started
+    /// (`why`): its draft is closed as cut off — the partial transcript, and
+    /// the card that says so ([`cut_off`]).
+    pub fn give_up(&self, id: &str, why: &str) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(entry) = entries.get_mut(id) {
             entry.ready = true;
             entry.outcome = Some(crate::client::TurnEnd::Failed); // cut off, not finished
+            entry.cut = Some(why.to_string());
             let _ = self.persist(id, entry);
         }
     }
@@ -431,6 +561,7 @@ impl Outbox {
         let settles = entries.get(id).and_then(Entry::settles);
         let entry = Entry {
             pid: std::process::id(),
+            pid_start: my_start(),
             ready: true,
             // Masked now, while the turn still holds its live secrets (a
             // wallet reply's key): a delivery that fails is retried after the
@@ -443,6 +574,7 @@ impl Outbox {
             at: now_secs(),
             discard: false,
             settles,
+            cut: None,
             delivering: false,
         };
         // Keep an in-memory retry even if the disk fills up; report the loss of
@@ -464,7 +596,7 @@ impl Outbox {
     }
 
     pub async fn deliver(&self, client: &Client, id: &str) -> Result<bool> {
-        let (content, success_for, outcome, discard) = {
+        let (content, success_for, outcome, discard, cut) = {
             let mut entries = self.entries.lock().unwrap();
             let Some(entry) = entries.get_mut(id) else {
                 return Ok(true);
@@ -473,7 +605,12 @@ impl Outbox {
                 return Ok(false);
             }
             entry.delivering = true;
-            (entry.content.clone(), entry.success_for.clone(), entry.outcome, entry.discard)
+            // A house bot has no owner to read a failure's details: whoever
+            // the turn was for does (as on the server's own cut-off replies).
+            let reader = entry.cut.as_ref().filter(|_| !self.bot.contains(':')).and_then(|_| {
+                entry.turn.as_ref().map(|t| t.sender.clone()).filter(|s| !s.is_empty())
+            });
+            (entry.content.clone(), entry.success_for.clone(), entry.outcome, entry.discard, entry.cut.clone().map(|why| (why, reader)))
         };
         let result = async {
             if discard {
@@ -488,6 +625,14 @@ impl Outbox {
                 }
                 return Ok(true);
             }
+            let content = match (content, cut) {
+                (None, Some((why, reader))) => match self.close_cut(client, id, &why, reader).await? {
+                    Closing::With(closed) => Some(closed),
+                    Closing::AsItStands => None,
+                    Closing::Finished => return Ok(true),
+                },
+                (content, _) => content,
+            };
             if let Some(content) = content {
                 client.edit_draft(id, &content).await?;
                 let mut entries = self.entries.lock().unwrap();
@@ -505,6 +650,48 @@ impl Outbox {
             entry.delivering = false;
         }
         result
+    }
+
+    /// What a reply cut off for good is closed with ([`cut_off`]), from what
+    /// its bubble says now — kept as the entry's content before anything is
+    /// sent, so a retry sends the same and never appends a second card.
+    async fn close_cut(&self, client: &Client, id: &str, why: &str, reader: Option<String>) -> Result<Closing> {
+        let msg = match client.get_message(id).await {
+            Ok(msg) => msg,
+            // An api that won't hand it back (one from before `getMessage`):
+            // finalized as it stands, as every cut-off reply used to be.
+            Err(e) if matches!(e.downcast_ref::<mafold_core::RpcError>(), Some(mafold_core::RpcError::Api(_))) => {
+                eprintln!("draft {id}: couldn't read it back to say it was cut off ({e:#}) — finalizing it as it stands");
+                self.set_closing(id, None)?;
+                return Ok(Closing::AsItStands);
+            }
+            Err(e) => return Err(e),
+        };
+        if !msg["finalized_at"].is_null() {
+            self.forget(id)?;
+            return Ok(Closing::Finished);
+        }
+        let (closed, private) = cut_off(msg["content"].as_str().unwrap_or(""), why, reader);
+        self.set_closing(id, Some(closed.clone()))?;
+        // The details only the card's reader may open, as the reply's state
+        // (`agent::write_private`): best-effort, like there.
+        if let Some(item) = private {
+            if let Err(e) = client.set_card_state(id, &item.key, &item.v, &item.read, &["sender".to_string()]).await {
+                eprintln!("card state {} on {id} not written: {e:#}", item.key);
+            }
+        }
+        Ok(Closing::With(closed))
+    }
+
+    /// What a cut-off entry was decided to be closed with — its card no longer
+    /// to be written, whatever comes of sending it.
+    fn set_closing(&self, id: &str, content: Option<String>) -> Result<()> {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(id) {
+            entry.content = content;
+            entry.cut = None;
+            self.persist(id, entry)?;
+        }
+        Ok(())
     }
 
     pub async fn retry(&self, client: &Client) {
@@ -549,7 +736,7 @@ mod tests {
     #[test]
     fn a_recovered_reply_hands_over_what_it_settles() {
         let dir = dir("settles");
-        let old = Outbox::load(dir.clone(), |_| false).unwrap();
+        let old = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let done = "00000000-0000-0000-0000-000000000001";
         let cut = "00000000-0000-0000-0000-000000000002";
         let silent = "00000000-0000-0000-0000-000000000003";
@@ -571,7 +758,7 @@ mod tests {
             entry.pid = std::process::id() + 1;
             old.persist(id, entry).unwrap();
         }
-        let next = Outbox::load(dir.clone(), |_| false).unwrap();
+        let next = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let mut settled = next.take_settled();
         settled.sort();
         assert_eq!(settled, vec!["boot".to_string(), "cut".to_string()]);
@@ -586,7 +773,7 @@ mod tests {
     #[test]
     fn a_dead_processs_journaled_children_are_handed_over_once() {
         let dir = dir("orphans");
-        let old = Outbox::load(dir.clone(), |_| false).unwrap();
+        let old = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let resumed = "00000000-0000-0000-0000-000000000011";
         let cut = "00000000-0000-0000-0000-000000000012";
         let none = "00000000-0000-0000-0000-000000000013";
@@ -604,7 +791,7 @@ mod tests {
             entry.pid = if id == live { live_owner } else { dead_owner };
             old.persist(id, entry).unwrap();
         }
-        let next = Outbox::load(dir.clone(), |pid| pid == live_owner).unwrap();
+        let next = Outbox::load(dir.clone(), move |pid, _| pid == live_owner).unwrap();
         assert_eq!(next.take_resumable().len(), 1, "one of them is picked back up");
         let mut orphans = next.take_orphans();
         orphans.sort();
@@ -621,7 +808,7 @@ mod tests {
     #[test]
     fn a_completion_queued_for_retry_keeps_a_live_key_masked_after_its_turn() {
         let dir = dir("live-key");
-        let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
+        let outbox = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let id = "00000000-0000-0000-0000-00000000000a";
         outbox.track(id).unwrap();
         let key = format!("mrk_live_{}", uuid::Uuid::new_v4().simple());
@@ -640,7 +827,7 @@ mod tests {
     #[test]
     fn restart_recovers_only_owned_drafts_from_dead_processes() {
         let dir = dir("restart-owned");
-        let old = Outbox::load(dir.clone(), |_| false).unwrap();
+        let old = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let a = "00000000-0000-0000-0000-000000000001";
         let b = "00000000-0000-0000-0000-000000000002";
         let c = "00000000-0000-0000-0000-000000000003";
@@ -655,13 +842,13 @@ mod tests {
             entry.pid = std::process::id() + 1;
             old.persist(id, entry).unwrap();
         }
-        assert!(Outbox::load(dir.clone(), |_| true)
+        assert!(Outbox::load(dir.clone(), |_, _| true)
             .unwrap()
             .entries
             .lock()
             .unwrap()
             .is_empty());
-        let recovered = Outbox::load(dir.clone(), |_| false).unwrap();
+        let recovered = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let entries = recovered.entries.lock().unwrap();
         assert!(entries[a].ready);
         assert!(entries[a].content.is_none());
@@ -677,10 +864,10 @@ mod tests {
     #[test]
     fn exec_restart_recovers_entries_with_the_same_pid() {
         let dir = dir("exec-restart");
-        let old = Outbox::load(dir.clone(), |_| false).unwrap();
+        let old = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let id = "00000000-0000-0000-0000-000000000005";
         old.track(id).unwrap();
-        let recovered = Outbox::load(dir.clone(), |_| true).unwrap();
+        let recovered = Outbox::load(dir.clone(), |_, _| true).unwrap();
         assert!(recovered.entries.lock().unwrap()[id].ready);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -688,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn failed_delivery_retains_final_snapshot_and_ignores_active_drafts() {
         let dir = dir("failed-delivery");
-        let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
+        let outbox = Outbox::load(dir.clone(), |_, _| false).unwrap();
         let id = "00000000-0000-0000-0000-000000000003";
         let client = Client::new("http://127.0.0.1:1".into(), "dev:test".into());
         outbox.track(id).unwrap();
@@ -698,13 +885,13 @@ mod tests {
             .unwrap();
         assert!(outbox.deliver(&client, id).await.is_err());
         assert!(!outbox.entries.lock().unwrap()[id].delivering);
-        let recovered = Outbox::load(dir.clone(), |_| false).unwrap();
+        let recovered = Outbox::load(dir.clone(), |_, _| false).unwrap();
         assert_eq!(
             recovered.entries.lock().unwrap()[id].content.as_deref(),
             Some("complete text, no footer needed")
         );
         outbox.forget(id).unwrap();
-        assert!(Outbox::load(dir.clone(), |_| false)
+        assert!(Outbox::load(dir.clone(), |_, _| false)
             .unwrap()
             .entries
             .lock()
@@ -740,12 +927,12 @@ mod tests {
         let dir = dir("resume");
         let id = "00000000-0000-0000-0000-000000000010";
         let now = SystemTime::now();
-        let old = Outbox::load_at(dir.clone(), |_| false, now).unwrap();
+        let old = Outbox::load_at(dir.clone(), |_, _| false, now).unwrap();
         old.track(id).unwrap();
         old.journal(id, journal(Some("fix the bug"), Some("s-live"), true));
         die(&old);
 
-        let next = Outbox::load_at(dir.clone(), |_| false, now).unwrap();
+        let next = Outbox::load_at(dir.clone(), |_, _| false, now).unwrap();
         assert!(!next.entries.lock().unwrap()[id].ready, "still a live turn: nothing may finalize it");
         let taken = next.take_resumable();
         assert_eq!(taken.len(), 1);
@@ -757,12 +944,12 @@ mod tests {
 
         // It dies again while picked up: one more try…
         die(&next);
-        let third = Outbox::load_at(dir.clone(), |_| false, now).unwrap();
+        let third = Outbox::load_at(dir.clone(), |_, _| false, now).unwrap();
         assert_eq!(third.take_resumable()[0].1.resumes, 2);
         // …and the next death finalizes it, so a turn that kills its daemon
         // can't loop.
         die(&third);
-        let fourth = Outbox::load_at(dir.clone(), |_| false, now).unwrap();
+        let fourth = Outbox::load_at(dir.clone(), |_, _| false, now).unwrap();
         assert!(fourth.take_resumable().is_empty());
         assert!(fourth.entries.lock().unwrap()[id].ready);
         std::fs::remove_dir_all(dir).unwrap();
@@ -773,6 +960,7 @@ mod tests {
         let now = SystemTime::now();
         let at = now_secs();
         let long_ago = at - RESUME_WITHIN.as_secs() - 60;
+        let closed = |v: Verdict| matches!(v, Verdict::Finalize(_));
         // Nothing on screen yet: run the prompt again on the session it started from.
         assert_eq!(verdict(Some(&journal(Some("p"), None, false)), at, now), Verdict::Resume);
         // On screen, with the session that holds the work: continue it.
@@ -780,7 +968,7 @@ mod tests {
         // On screen with no session named (a harness that names its session
         // only at the end): starting over could redo visible work.
         let shown = Journal { shown: true, ..journal(Some("p"), None, false) };
-        assert_eq!(verdict(Some(&shown), at, now), Verdict::Finalize);
+        assert!(closed(verdict(Some(&shown), at, now)));
         // …but from a harness that names its session first, whatever is on
         // screen before that name is the daemon's own narration: run it again.
         let narrated = Journal { session_first: true, ..shown.clone() };
@@ -788,18 +976,216 @@ mod tests {
         // Picked up twice already and killed again: something in the turn is
         // what takes the daemon down.
         let looping = Journal { resumes: MAX_RESUMES, ..journal(Some("p"), Some("s"), true) };
-        assert_eq!(verdict(Some(&looping), at, now), Verdict::Finalize);
+        assert!(closed(verdict(Some(&looping), at, now)));
         // Nobody's message started it — an introduction, a background-task
         // wrap-up: those are armed again at startup on their own.
         let unasked = Journal { trigger: None, ..journal(Some("p"), Some("s"), true) };
-        assert_eq!(verdict(Some(&unasked), at, now), Verdict::Finalize);
+        assert!(closed(verdict(Some(&unasked), at, now)));
         // Died before it asked the model anything: the bubble is empty and the
         // trigger replays from `pending`.
         assert_eq!(verdict(Some(&journal(None, None, false)), at, now), Verdict::Discard);
         // Too long ago.
-        assert_eq!(verdict(Some(&journal(Some("p"), Some("s"), true)), long_ago, now), Verdict::Finalize);
+        assert_eq!(
+            verdict(Some(&journal(Some("p"), Some("s"), true)), long_ago, now),
+            Verdict::Finalize("it stopped more than 30 minutes before the agent came back"),
+            "and the card's details say why"
+        );
         // No journal: what every draft got before.
-        assert_eq!(verdict(None, at, now), Verdict::Finalize);
+        assert!(closed(verdict(None, at, now)));
+    }
+
+    /// 2026-11-11: an update's restart started the next daemon while the one
+    /// it had stopped was still there (a zombie answers `kill(pid, 0)`). The
+    /// next one passed its reply over as another live daemon's, never looked
+    /// again, and the reply said «generating» for 12 hours. A producer still
+    /// running at startup keeps its drafts — and once it has gone, they are
+    /// taken over: picked back up, or closed as cut off.
+    #[test]
+    fn a_reply_left_by_a_process_still_going_is_taken_over_once_it_has_gone() {
+        let dir = dir("taken-over");
+        let (resumed, cut, done) = (
+            "00000000-0000-0000-0000-000000000021",
+            "00000000-0000-0000-0000-000000000022",
+            "00000000-0000-0000-0000-000000000023",
+        );
+        let old = Outbox::load(dir.clone(), |_, _| false).unwrap();
+        for id in [resumed, cut, done] {
+            old.track(id).unwrap();
+        }
+        old.journal(resumed, journal(Some("fix the bug"), Some("s-live"), true));
+        old.journal(cut, Journal { trigger: None, ..journal(Some("wrap up"), Some("s"), true) });
+        old.complete(done, "the answer", None, None).unwrap();
+        die(&old);
+        let dying = std::process::id() + 1;
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next = {
+            let gone = gone.clone();
+            Outbox::load(dir.clone(), move |pid, _| pid == dying && !gone.load(std::sync::atomic::Ordering::SeqCst)).unwrap()
+        };
+        assert!(next.entries.lock().unwrap().is_empty(), "still going: its drafts are its own");
+        assert!(next.take_resumable().is_empty());
+        assert_eq!(next.take_over_dead().unwrap(), 0, "and stay so while it runs");
+
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(next.take_over_dead().unwrap(), 3);
+        let taken = next.take_resumable();
+        assert_eq!(taken.iter().map(|(id, j)| (id.as_str(), j.resumes)).collect::<Vec<_>>(), [(resumed, 1)]);
+        {
+            let entries = next.entries.lock().unwrap();
+            let e = &entries[cut];
+            assert!(e.ready && e.content.is_none());
+            assert_eq!(e.outcome, Some(crate::client::TurnEnd::Failed));
+            assert_eq!(e.cut.as_deref(), Some("no message started it (a background-task update or an introduction)"));
+            assert_eq!(entries[done].content.as_deref(), Some("the answer"), "a finished one is just delivered");
+            assert!(entries[done].cut.is_none());
+            assert!(entries.values().all(|e| e.pid == std::process::id()), "ours now");
+        }
+        assert_eq!(next.take_over_dead().unwrap(), 0, "taken over once");
+        assert!(next.take_resumable().is_empty());
+        // What it now holds is its own on disk too: the start after it judges
+        // them as this process's.
+        let on_disk: Entry = serde_json::from_slice(&std::fs::read(dir.join(format!("{cut}.json"))).unwrap()).unwrap();
+        assert_eq!((on_disk.pid, on_disk.pid_start), (std::process::id(), my_start()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The process an entry names is asked for by its start too: a pid handed
+    /// to another process since (a reboot) is not the producer, and a zombie —
+    /// a daemon stopped and not yet reaped — is not running.
+    #[cfg(unix)]
+    #[test]
+    fn the_producer_is_asked_for_by_pid_and_start() {
+        let mut child = crate::platform::idle_child();
+        let pid = child.id();
+        let start = crate::platform::start_token(pid);
+        assert!(owner_running(pid, start), "itself");
+        assert!(owner_running(pid, None), "an entry from before the start was kept");
+        if let Some(s) = start {
+            assert!(!owner_running(pid, Some(s + 1)), "another process given its pid");
+        }
+        child.kill().unwrap();
+        assert!(crate::platform::wait_until(std::time::Duration::from_secs(5), || !owner_running(pid, start)), "a zombie isn't running");
+        assert!(crate::platform::pid_alive(pid), "though it still answers kill(pid, 0)");
+        child.wait().unwrap();
+        assert!(!owner_running(pid, start));
+        assert!(owner_running(std::process::id(), my_start()), "this process");
+    }
+
+    /// A reply closed as cut off keeps what it said, loses the generating card
+    /// it was left on, and ends on the shared failure card: «This turn was cut
+    /// off» — the reason in its details, for whoever reads those.
+    #[test]
+    fn a_reply_cut_off_for_good_says_so() {
+        let live = "{% mafold/trace summary=\"Ran 3 shell commands\" steps=\"3\" %}\n{% /mafold/trace %}\n\nChecking dark mode next:\n```sh\nnpm test\n\n{% mafold/generating started=1 beat=2 beatAt=3 tokens=4 shells=0 /%}";
+        let (closed, private) = cut_off(live, "it stopped more than 30 minutes before the agent came back", None);
+        assert!(closed.starts_with("{% mafold/trace summary=\"Ran 3 shell commands\""), "what it did stays: {closed}");
+        assert!(!closed.contains("mafold/generating"), "{closed}");
+        assert!(closed.contains("npm test\n```"), "the code block it left open is closed before the card: {closed}");
+        assert!(closed.trim_end().ends_with("/%}") && closed.contains("{% mafold/error kind=\"interrupted\""), "{closed}");
+        let item = private.expect("the reason, for the owner");
+        assert!(item.key.starts_with("mafold/error/") && item.key.ends_with(".detail"), "{}", item.key);
+        let raw = item.v["raw"].as_str().unwrap();
+        assert!(raw.contains("turn_interrupted") && raw.contains("more than 30 minutes"), "{raw}");
+        assert!(closed.contains("for=\"owner\""), "{closed}");
+
+        // Nothing on screen but the card it was left on: only the failure card.
+        let (empty, _) = cut_off("{% mafold/generating started=1 beat=2 beatAt=3 tokens=0 shells=0 /%}", "x", None);
+        assert!(empty.starts_with("{% mafold/error kind=\"interrupted\""), "{empty}");
+        // A house bot's: the details are for whoever asked.
+        let (house, _) = cut_off("half an answer", "x", Some("ann".into()));
+        assert!(house.starts_with("half an answer\n\n{% mafold/error") && house.contains("for=\"@ann\""), "{house}");
+        // An error some other kind's words match is still a cut-off reply.
+        let (odd, _) = cut_off("x", "it couldn't be read back (HTTP 429 rate limit)", None);
+        assert!(odd.contains("kind=\"interrupted\"") && !odd.contains("status="), "{odd}");
+    }
+
+    /// Delivering a cut-off reply reads it back, closes it with the card, and
+    /// finalizes it as failed — and a retry after the edit went through sends
+    /// the same text again, never a second card. A reply finished meanwhile
+    /// (a Stop from a client) is left as it is.
+    #[tokio::test]
+    async fn delivering_a_cut_off_reply_closes_it_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(format!("http://{}", listener.local_addr().unwrap()), "dev:test".into());
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let mut request = Vec::new();
+                let (head, body) = loop {
+                    let mut buf = [0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break (String::new(), String::new());
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len: usize = text[..end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break (text[..end].to_string(), text[end + 4..].to_string());
+                        }
+                    }
+                };
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let reply = match path.as_str() {
+                    "/api/getMessage" if body["message_id"] == "00000000-0000-0000-0000-000000000032" => {
+                        serde_json::json!({ "ok": true, "result": { "content": "done", "finalized_at": "2026-11-11T12:00:00Z" } })
+                    }
+                    "/api/getMessage" => serde_json::json!({ "ok": true, "result": {
+                        "content": "half of it\n\n{% mafold/generating started=1 beat=2 beatAt=3 tokens=4 shells=0 /%}",
+                        "finalized_at": null,
+                    } }),
+                    // The first finalize is lost on the way back.
+                    "/api/botFinalize" if !seen.iter().any(|(p, _): &(String, serde_json::Value)| p == "/api/botFinalize") => {
+                        serde_json::json!({ "ok": false, "error_code": 503, "description": "unavailable" })
+                    }
+                    _ => serde_json::json!({ "ok": true, "result": { "ok": true } }),
+                };
+                seen.push((path.clone(), body));
+                let reply = reply.to_string();
+                let _ = socket
+                    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
+                    .await;
+                if path == "/api/botFinalize" && seen.iter().filter(|(p, _)| p == "/api/botFinalize").count() == 2 {
+                    break;
+                }
+            }
+            seen
+        });
+        let dir = dir("cut-delivery");
+        let (cut, stopped) = ("00000000-0000-0000-0000-000000000031", "00000000-0000-0000-0000-000000000032");
+        let outbox = Outbox::load(dir.clone(), |_, _| false).unwrap();
+        outbox.track(cut).unwrap();
+        outbox.journal(cut, journal(Some("p"), Some("s"), true));
+        outbox.track(stopped).unwrap();
+        outbox.give_up(cut, "picking it back up failed (boom)");
+        outbox.give_up(stopped, "picking it back up failed (boom)");
+        assert!(outbox.deliver(&client, stopped).await.unwrap(), "finished meanwhile: nothing to close");
+        assert!(!outbox.entries.lock().unwrap().contains_key(stopped));
+        assert!(outbox.deliver(&client, cut).await.is_err(), "the finalize didn't get through");
+        let recovered = Outbox::load(dir.clone(), |_, _| false).unwrap();
+        assert!(recovered.deliver(&client, cut).await.unwrap());
+        assert!(recovered.entries.lock().unwrap().is_empty());
+        let seen = server.await.unwrap();
+        let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["/api/getMessage", "/api/getMessage", "/api/setCardState", "/api/botEditDraft", "/api/botFinalize", "/api/botFinalize"],
+            "read back once, edited once"
+        );
+        let edit = &seen[3].1;
+        let text = edit["content"].as_str().unwrap();
+        assert!(text.starts_with("half of it\n\n{% mafold/error kind=\"interrupted\""), "{text}");
+        assert!(!text.contains("mafold/generating"), "{text}");
+        let fin = &seen[5].1;
+        assert_eq!(fin["outcome"], "failed", "{fin}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An entry written by a daemon from before the journal has none of its
@@ -814,7 +1200,7 @@ mod tests {
             br#"{"pid":1,"ready":false,"content":null,"success_for":null}"#,
         )
         .unwrap();
-        let o = Outbox::load_at(dir.clone(), |_| false, SystemTime::now()).unwrap();
+        let o = Outbox::load_at(dir.clone(), |_, _| false, SystemTime::now()).unwrap();
         assert!(o.take_resumable().is_empty());
         let e = &o.entries.lock().unwrap()[id];
         assert!(e.ready && !e.discard && e.content.is_none());
@@ -834,7 +1220,7 @@ mod tests {
             br#"{"pid":1,"ready":true,"content":"done","success_for":null,"outcome":"superseded"}"#,
         )
         .unwrap();
-        let o = Outbox::load_at(dir.clone(), |_| false, SystemTime::now()).unwrap();
+        let o = Outbox::load_at(dir.clone(), |_, _| false, SystemTime::now()).unwrap();
         let e = &o.entries.lock().unwrap()[id];
         assert!(e.ready && e.content.as_deref() == Some("done") && e.outcome.is_none());
         std::fs::remove_dir_all(dir).unwrap();
@@ -846,14 +1232,14 @@ mod tests {
     fn a_steer_carries_the_journal_to_the_new_draft() {
         let dir = dir("carry");
         let (a, b) = ("00000000-0000-0000-0000-000000000012", "00000000-0000-0000-0000-000000000013");
-        let o = Outbox::load(dir.clone(), |_| false).unwrap();
+        let o = Outbox::load(dir.clone(), |_, _| false).unwrap();
         o.track(a).unwrap();
         o.journal(a, journal(Some("p"), Some("s"), true));
         o.track(b).unwrap();
         o.carry(a, b);
         o.forget(a).unwrap();
         die(&o);
-        let taken = Outbox::load(dir.clone(), |_| false).unwrap().take_resumable();
+        let taken = Outbox::load(dir.clone(), |_, _| false).unwrap().take_resumable();
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].0, b);
         std::fs::remove_dir_all(dir).unwrap();
@@ -865,12 +1251,12 @@ mod tests {
     fn a_completed_turn_is_delivered_not_resumed() {
         let dir = dir("completed");
         let id = "00000000-0000-0000-0000-000000000014";
-        let o = Outbox::load(dir.clone(), |_| false).unwrap();
+        let o = Outbox::load(dir.clone(), |_, _| false).unwrap();
         o.track(id).unwrap();
         o.journal(id, journal(Some("p"), Some("s"), true));
         o.complete(id, "the answer", None, None).unwrap();
         die(&o);
-        let next = Outbox::load(dir.clone(), |_| false).unwrap();
+        let next = Outbox::load(dir.clone(), |_, _| false).unwrap();
         assert!(next.take_resumable().is_empty());
         assert_eq!(next.entries.lock().unwrap()[id].content.as_deref(), Some("the answer"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -936,11 +1322,11 @@ mod tests {
         });
         let dir = dir("retry-after-ack");
         let id = "00000000-0000-0000-0000-000000000004";
-        let outbox = Outbox::load(dir.clone(), |_| false).unwrap();
+        let outbox = Outbox::load(dir.clone(), |_, _| false).unwrap();
         outbox.track(id).unwrap();
         outbox.complete(id, "full final answer", None, None).unwrap();
         assert!(outbox.deliver(&client, id).await.is_err());
-        let recovered = Outbox::load(dir.clone(), |_| false).unwrap();
+        let recovered = Outbox::load(dir.clone(), |_, _| false).unwrap();
         assert!(recovered.entries.lock().unwrap()[id].content.is_none());
         assert!(recovered.deliver(&client, id).await.unwrap());
         assert!(recovered.entries.lock().unwrap().is_empty());

@@ -174,6 +174,12 @@ pub fn turn_interrupted() -> String {
     "turn_interrupted: a server restart cut this reply off before it finished".into()
 }
 
+/// The agent restarted on its computer — an update, a crash, a reboot — in the
+/// middle of a reply, and the next start couldn't pick the reply back up: `why`.
+pub fn agent_restarted(why: &str) -> String {
+    format!("turn_interrupted: the agent restarted on its computer while writing this reply, and couldn't pick it back up: {why}")
+}
+
 /// The model's maker refused the content itself — its safety policy blocked
 /// the request or what came out of it (`why`: the vendor's own words, e.g.
 /// Gemini's `IMAGE_SAFETY`). The marker is the OpenAI error code mafold-router

@@ -312,7 +312,6 @@ pub static KNOWN_METHODS: &[&str] = &[
     "queryDatabase",
     "queryInline",
     "recordTutorialEvent",
-    "referralGiftSend",
     "referralPeek",
     "referralState",
     "registerPushToken",

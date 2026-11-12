@@ -2965,6 +2965,45 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // struck off that list first.
     resume_turns(&client, &my_username, &sessions, &coord, &chat_states, &harness);
 
+    // …and the turns of a process that was still on its way out when this one
+    // started — an update's restart doesn't wait for the old daemon to go, and
+    // its drafts, still its own, were passed over above. Each is taken over
+    // once that process has gone (`Outbox::take_over_dead`): picked back up
+    // the same way, or closed with the card saying it was cut off. On
+    // 2026-11-11 nothing ever looked again, and a reply said «generating» for
+    // 12 hours.
+    {
+        let (client, bot) = (client.clone(), my_username.clone());
+        let (sessions, coord, chat_states, harness) = (sessions.clone(), coord.clone(), chat_states.clone(), harness.clone());
+        tokio::spawn(async move {
+            let Some(outbox) = client.drafts.clone() else { return };
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.tick().await; // the startup sweep was just now
+            loop {
+                tick.tick().await;
+                match outbox.take_over_dead() {
+                    Ok(0) => continue,
+                    Ok(n) => println!("↻ {n} reply(ies) left by a process that has stopped since — taking them over"),
+                    Err(e) => {
+                        eprintln!("couldn't look for replies left by a stopped process: {e:#}");
+                        continue;
+                    }
+                }
+                for key in outbox.take_settled() {
+                    mark_intro(&bot, &key);
+                }
+                for (pid, start) in outbox.take_orphans() {
+                    if tokio::task::spawn_blocking(move || crate::harness::opencode::end_orphan(pid, start)).await.unwrap_or(false) {
+                        println!("ended OpenCode server pid {pid}, left running by a stopped process");
+                    }
+                }
+                resume_turns(&client, &bot, &sessions, &coord, &chat_states, &harness);
+                // The ones closed as cut off say so now, not a tick later.
+                outbox.retry(&client).await;
+            }
+        });
+    }
+
     // Reconnect loop: a dropped WS (network blip, server restart) must NOT kill
     // the daemon. Reconnect with backoff; sessions/coord persist across it.
     // A DELETED bot must not reconnect forever, though: botDeleted (live) or a
@@ -9500,12 +9539,9 @@ fn resume_turns(
             crate::pending::clear(bot, t);
         }
         if journal.harness != harness.id() {
-            println!(
-                "↻ not picking up reply {draft}: it ran on {}, this bot now runs {}",
-                journal.harness,
-                harness.id()
-            );
-            outbox.give_up(&draft);
+            let why = format!("it ran on {}, and this agent now runs {}", journal.harness, harness.id());
+            println!("↻ not picking up reply {draft}: {why}");
+            outbox.give_up(&draft, &why);
             continue;
         }
         let (client, bot, outbox) = (client.clone(), bot.to_string(), outbox.clone());
@@ -9544,10 +9580,11 @@ fn resume_turns(
                     Ok(_) => break,
                     Err(e) => {
                         // One line, like `handle error:` (`logfile::EXITED`).
-                        eprintln!("picked-up turn in chat {} failed: {}", j.chat, crate::logfile::one_line(&format!("{e:#}")));
-                        // Whatever it managed stays, finalized as it stands.
+                        let e = crate::logfile::one_line(&format!("{e:#}"));
+                        eprintln!("picked-up turn in chat {} failed: {e}", j.chat);
+                        // Whatever it managed stays, and says it was cut off.
                         if round == 1 {
-                            outbox.give_up(&draft);
+                            outbox.give_up(&draft, &format!("picking it back up failed ({e})"));
                         }
                         break;
                     }
@@ -9577,10 +9614,11 @@ async fn pick_up(
             println!("↻ reply {draft}: ended OpenCode server pid {pid}, left running by the previous process");
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while crate::platform::pid_alive(pid) {
+        // Gone, or a zombie nobody has reaped yet: either way at work no more.
+        while crate::platform::pid_running(pid) {
             if std::time::Instant::now() >= deadline {
                 println!("↻ not picking up reply {draft}: pid {pid}, which was working on it, is still running");
-                outbox.give_up(&draft);
+                outbox.give_up(&draft, "the process that was working on it was still running");
                 return None;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -9605,7 +9643,7 @@ async fn pick_up(
             }
             Err(e) => {
                 eprintln!("↻ not picking up reply {draft}: couldn't read it back ({e:#})");
-                outbox.give_up(&draft);
+                outbox.give_up(&draft, &format!("it couldn't be read back ({})", crate::logfile::one_line(&format!("{e:#}"))));
                 return None;
             }
         }

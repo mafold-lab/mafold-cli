@@ -9,8 +9,8 @@
 //!   left exactly as it was (a registration with `--no-auto-update` is what made
 //!   the desktop app show the computer read-only);
 //! - the supervisor reads that setting on every pass;
-//! - an install asks the supervisor to move onto it, and it does once the
-//!   replies in progress are written.
+//! - an install asks the supervisor to move onto it: it does at once, and a
+//!   bot writing a reply moves once the reply is written.
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -181,7 +181,8 @@ fn configure_bot(home: &Path) {
     std::fs::write(home.join(".mafold/daemons.json"), cfg.to_string()).unwrap();
 }
 
-/// The bot's in-flight-reply count, as its daemon writes it for the drain.
+/// The bot's in-flight-reply count, as its daemon writes it for the supervisor
+/// (a bot moves onto a new binary only at 0).
 fn busy(home: &Path, n: usize) {
     let dir = home.join(".mafold/daemons/t_bot");
     std::fs::create_dir_all(&dir).unwrap();
@@ -493,10 +494,12 @@ fn the_supervisor_reads_the_setting_on_every_pass() {
 }
 
 /// `mafold update` installs, then asks the supervisor to move onto it — which
-/// it does only once the reply in progress is written: the bot's daemon runs
-/// on, untouched, while it is.
+/// it does at once, while the bot writing a reply keeps writing it on the old
+/// binary, untouched; the bot moves once its reply is written. On 2026-11-11
+/// the supervisor waited its 5 minutes and then stopped the bot anyway, 27
+/// minutes into a reply.
 #[test]
-fn a_manual_update_waits_for_the_reply_in_progress() {
+fn a_manual_update_lets_the_reply_in_progress_finish() {
     let home = temp_home("manual");
     let bin = install_copy(&home);
     let api = Api::start(true);
@@ -507,39 +510,39 @@ fn a_manual_update_waits_for_the_reply_in_progress() {
     busy(&home, 1);
 
     let t = Instant::now();
-    let cmd = mafold(&bin, &home, &api.base).args(["update", "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    sup.wait("the supervisor waiting on the reply", Duration::from_secs(20), || {
-        sup.log().contains(&format!("waiting for in-flight turns before restart: {BOT}=1")).then_some(())
-    });
-    assert_eq!(api.downloads(), 1);
-    // While the reply is being written: the same daemon, the same supervisor.
-    for _ in 0..10 {
-        assert!(alive(first), "the daemon writing the reply was stopped\n{}", sup.log());
-        assert_eq!(sup.starts(), 1, "{}", sup.log());
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    busy(&home, 0);
-    let out = cmd.wait_with_output().unwrap();
+    let out = mafold(&bin, &home, &api.base).args(["update", "--json"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let r: Value = serde_json::from_str(text.trim()).unwrap_or_else(|e| panic!("{text:?} ({e}) {}", String::from_utf8_lossy(&out.stderr)));
     assert_eq!((out.status.code(), r["code"].as_str(), r["latest"].as_str()), (Some(0), Some("updated"), Some(NEWER)), "{r}");
     assert_eq!(r["moving"], true, "{r}");
-    // Read back within the command's own wait, or said to be on its way —
-    // either way the move itself is checked below.
+    assert_eq!(api.downloads(), 1);
+    // The supervisor itself moved at once — the command read it back — and
+    // the bot writing a reply is said to follow once it's written.
     let restart = r["restart"].as_str().unwrap_or("");
     assert!(
-        restart.contains("restarted onto it") || restart.contains("as soon as the replies in progress are written"),
+        restart.contains("restarted onto it") && restart.contains(&format!("{BOT} moves onto it once the replies in progress are written")),
         "after {:?}: {r}\n{}",
         t.elapsed(),
         sup.log()
     );
+    assert_eq!(sup.starts(), 2, "{}", sup.log());
+    // While the reply is being written: the same daemon.
+    for _ in 0..10 {
+        assert!(alive(first), "the daemon writing the reply was stopped\n{}", sup.log());
+        assert_eq!(bot_pid(&bin, &home, &api.base), Some(first), "{}", sup.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    busy(&home, 0);
 
     let second = sup.wait("the daemon on the new binary", Duration::from_secs(30), || {
         bot_pid(&bin, &home, &api.base).filter(|p| *p != first)
     });
     assert!(!alive(first), "the old daemon is gone");
     assert!(alive(second));
-    assert_eq!(sup.starts(), 2, "{}", sup.log());
+    let log = sup.log();
+    assert!(log.contains(&format!("{BOT} has written its replies — restarted onto the new binary")), "{log}");
+    assert_eq!(sup.starts(), 2, "the supervisor moved once\n{log}");
+    sup.wait("nothing left to move", Duration::from_secs(5), || (!home.join(".mafold/supervisor.moving.json").exists()).then_some(()));
     // On the binary on disk now — not still the replaced one, which Linux
     // names `… (deleted)`.
     #[cfg(target_os = "linux")]
@@ -547,6 +550,8 @@ fn a_manual_update_waits_for_the_reply_in_progress() {
         let pid = std::fs::read_to_string(home.join(".mafold/supervisor.pid")).unwrap();
         let exe = std::fs::read_link(format!("/proc/{}/exe", pid.trim())).unwrap();
         assert_eq!(exe, bin, "{}", sup.log());
+        let exe = std::fs::read_link(format!("/proc/{second}/exe")).unwrap();
+        assert_eq!(exe, bin, "the bot too\n{}", sup.log());
     }
     drop(sup);
 }
