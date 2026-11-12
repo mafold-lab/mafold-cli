@@ -1,0 +1,967 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D 导演台 · 灰盒预演</title>
+<style>
+:root{--bg:#0b0d12;--panel:#12151d;--line:#232836;--text:#d9dde7;--dim:#8a92a5;--pink:#ff5fa2;--amber:#ffc94a}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:13px/1.45 "Microsoft YaHei","PingFang SC","Noto Sans CJK SC","Source Han Sans SC",system-ui,sans-serif;overflow:hidden}
+#app{display:flex;flex-direction:column;height:100%}
+header{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:14px;font-weight:600;margin:0}
+header .sub{color:var(--dim);font-size:12px}
+.sp{flex:1}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{background:none;border:0;color:var(--dim);padding:5px 12px;font:inherit;cursor:pointer}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:#232a3a;color:#fff}
+.btn{background:#1b2030;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:5px 12px;font:inherit;cursor:pointer}
+.btn:hover{border-color:#3a4256}
+label.chk{display:inline-flex;gap:5px;align-items:center;color:var(--dim);cursor:pointer;user-select:none}
+#stage{position:relative;flex:1;min-height:0;overflow:hidden;background:#07080c}
+#stage canvas{position:absolute;display:block}
+#plan{left:0;top:0;width:100%;height:100%;display:none}
+.lbl{position:absolute;transform:translate(-50%,-100%);font-size:12px;padding:1px 7px;border-radius:999px;background:rgba(9,11,16,.78);border:1px solid currentColor;pointer-events:none;white-space:nowrap;display:none}
+#pipf{position:absolute;border:1px solid rgba(255,201,74,.75);pointer-events:none;display:none}
+#pipf span{position:absolute;left:6px;top:3px;font-size:11px;color:var(--amber);text-shadow:0 1px 2px #000}
+#hint{position:absolute;left:10px;bottom:8px;color:var(--dim);font-size:11px;pointer-events:none;text-shadow:0 1px 2px #000}
+#boot{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:13px;padding:20px;text-align:center;white-space:pre-line}
+footer{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border-top:1px solid var(--line)}
+#play{min-width:76px}
+#scrub{flex:1;accent-color:var(--pink)}
+#tlabel{font-variant-numeric:tabular-nums;color:var(--dim);min-width:190px;text-align:right}
+#side{position:absolute;top:0;right:0;bottom:0;width:min(440px,92%);background:var(--panel);border-left:1px solid var(--line);display:none;flex-direction:column;gap:8px;padding:10px;z-index:5}
+#side.open{display:flex}
+#side textarea{flex:1;resize:none;background:#090b10;color:#cfd6e6;border:1px solid var(--line);border-radius:8px;padding:8px;font:12px/1.4 Consolas,"Cascadia Mono",ui-monospace,monospace}
+#msg{min-height:18px;font-size:12px;color:var(--dim)}
+#msg.err{color:#ff7b7b}
+body.render header,body.render footer,body.render #hint,body.render #boot{display:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>3D 导演台</h1><span class="sub" id="title"></span>
+    <div class="seg" id="modes"><button data-m="shot" class="on">导演视角</button><button data-m="free">自由视角</button><button data-m="plan">平面图</button></div>
+    <label class="chk"><input type="checkbox" id="optPaths" checked>路径/机位</label>
+    <label class="chk"><input type="checkbox" id="optPip" checked>画中画</label>
+    <span class="sp"></span>
+    <button class="btn" id="btnJson">JSON</button>
+  </header>
+  <div id="stage">
+    <div id="boot">正在加载 three.js …</div>
+    <canvas id="plan"></canvas>
+    <div id="pipf"><span>导演视角</span></div>
+    <div class="lbl" id="lbl-cam" style="color:#ffc94a">镜头</div>
+    <div id="hint">左键旋转 · 右键平移 · 滚轮缩放 · 空格 播放/暂停 · ←/→ 逐帧 · 1/2/3 切换视图</div>
+    <div id="side">
+      <div style="display:flex;gap:8px;align-items:center"><b>分镜 JSON</b><span class="sp"></span><button class="btn" id="btnApply">应用</button><button class="btn" id="btnReset">恢复内置</button><button class="btn" id="btnClose">关闭</button></div>
+      <textarea id="ta" spellcheck="false"></textarea>
+      <div id="msg">可粘贴另一份 blocking JSON，点「应用」即重建场景。</div>
+    </div>
+  </div>
+  <footer>
+    <button class="btn" id="play">▶ 播放</button>
+    <input type="range" id="scrub" min="0" max="5" step="0.001" value="0">
+    <span id="tlabel">0.00 s</span>
+  </footer>
+</div>
+
+<!-- The scene. render.mjs copies blocking.json in here, so the page and the render always agree. -->
+<script type="application/json" id="blocking">
+{
+  "title": "屋顶追逐 · 跳过楼缝",
+  "duration": 5.0,
+  "fps": 24,
+  "aspect": "16:9",
+  "conventions": "metres, y up. box/cylinder pos = centre of bottom face; plane/zone pos = centre. size: box [w,h,d], cylinder [diameter,h], plane [w,h], zone [w,d]. yaw/face in degrees about +y: actor face 0 = facing +x, 90 = -z, -90 = +z; plane yaw 0 faces +z. camera fov = vertical degrees. actor keys: pose starts at its key and blends in over 'blend' s (default 0.2); 'ease' (linear|in|out|inOut) shapes the segment that starts at the key; a 'jump' key flies a parabola to the next key, peaking 'apex' m above take-off. orb paths are smoothed (Catmull-Rom).",
+  "env": {
+    "sky": { "top": "#03050b", "horizon": "#2c2548" },
+    "fog": { "color": "#272140", "near": 10, "far": 125 },
+    "lights": [
+      { "type": "hemi", "sky": "#7d88c0", "ground": "#1a1622", "intensity": 0.6 },
+      { "type": "dir", "dir": [0.45, 1.0, 0.7], "color": "#dfe5ff", "intensity": 1.15, "shadow": true },
+      { "type": "dir", "dir": [-0.8, 0.35, -0.6], "color": "#7c6cff", "intensity": 0.3 },
+      { "type": "dir", "dir": [0.9, 0.25, -0.5], "color": "#5fd8ff", "intensity": 0.15 }
+    ]
+  },
+  "set": [
+    { "type": "box", "label": "屋顶 A", "pos": [-4.5, -30, 0], "size": [9, 30, 6], "color": "#c4c8d0" },
+    { "type": "box", "label": "屋顶 B", "pos": [6.6, -30, 0], "size": [8.8, 29, 6], "color": "#c4c8d0" },
+    { "type": "zone", "label": "楼缝 2.2 m · 落差 1.0 m", "pos": [1.1, 0, 0], "size": [2.2, 6] },
+
+    { "type": "box", "label": "女儿墙", "pos": [-4.5, 0, -2.925], "size": [9, 0.45, 0.15], "color": "#b9bdc6" },
+    { "type": "box", "label": "女儿墙", "pos": [-4.5, 0, 2.925], "size": [9, 0.45, 0.15], "color": "#b9bdc6" },
+    { "type": "box", "label": "女儿墙", "pos": [6.6, -1, -2.925], "size": [8.8, 0.45, 0.15], "color": "#b9bdc6" },
+    { "type": "box", "label": "女儿墙", "pos": [6.6, -1, 2.925], "size": [8.8, 0.45, 0.15], "color": "#b9bdc6" },
+
+    { "type": "box", "label": "空调外机", "pos": [-6, 0, -2], "size": [1.3, 0.9, 0.9], "color": "#a9aeb8" },
+    { "type": "box", "label": "空调外机", "pos": [-3, 0, 2.2], "size": [1.1, 0.8, 0.8], "color": "#a9aeb8" },
+    { "type": "cylinder", "label": "通风管", "pos": [-1.6, 0, -2.3], "size": [0.3, 0.7], "color": "#9aa0ab" },
+    { "type": "cylinder", "label": "水箱", "pos": [6, -1, -2], "size": [1.7, 2.0], "color": "#b3b8c2" },
+    { "type": "box", "label": "天窗", "pos": [9.2, -1, 1.2], "size": [1.4, 0.35, 1.0], "color": "#9aa0ab" },
+
+    { "type": "box", "label": "中景楼", "pos": [-5, -30, -9.5], "size": [10, 26, 5], "color": "#b2b7c1" },
+    { "type": "box", "label": "中景楼", "pos": [7, -30, -10], "size": [9, 28.5, 6], "color": "#b2b7c1" },
+    { "type": "box", "label": "中景楼", "pos": [-14, -30, -10], "size": [6, 31, 6], "color": "#b2b7c1" },
+
+    { "type": "box", "label": "远景楼", "pos": [-16, -30, -18], "size": [7, 38, 7], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [-7, -30, -20], "size": [6, 52, 8], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [8, -30, -22], "size": [8, 60, 8], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [16, -30, -18], "size": [6, 42, 6], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [24, -30, -24], "size": [9, 48, 9], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [-24, -30, -30], "size": [10, 66, 10], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [-4, -30, -36], "size": [9, 74, 9], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [12, -30, -40], "size": [11, 56, 10], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [30, -30, -38], "size": [10, 70, 10], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [-12, -30, -44], "size": [8, 50, 8], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [4, -30, -28], "size": [5, 44, 5], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [-10, -30, 22], "size": [8, 40, 8], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [6, -30, 26], "size": [9, 50, 7], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [20, -30, 20], "size": [7, 36, 7], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [18, -30, -6], "size": [6, 28, 7], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [24, -30, 4], "size": [8, 40, 8], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [32, -30, -10], "size": [9, 58, 9], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [40, -30, 6], "size": [10, 48, 10], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [48, -30, -18], "size": [12, 72, 12], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [-18, -30, -4], "size": [7, 34, 7], "color": "#aab0bb" },
+    { "type": "box", "label": "远景楼", "pos": [-26, -30, 8], "size": [8, 44, 8], "color": "#aab0bb" },
+
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [-9.3, 10, -15.94], "size": [1.0, 6], "color": "#ff4fa3" },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [8, 20, -17.94], "size": [5, 1.4], "color": "#39ffb0" },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [4, 6, -25.44], "size": [3.6, 1.1], "color": "#45d4ff" },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [14, 5, -14.94], "size": [1.1, 5], "color": "#ff4fa3" },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [-24, 24, -24.94], "size": [6, 1.5], "color": "#39ffb0" },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [19.94, 4, 4], "size": [4, 1.2], "color": "#45d4ff", "yaw": -90 },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [27.44, 16, -8], "size": [1.1, 7], "color": "#ff4fa3", "yaw": -90 },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [14.94, -5, -6], "size": [3, 0.9], "color": "#39ffb0", "yaw": -90 },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [-14.44, -1, -4], "size": [1.0, 4], "color": "#45d4ff", "yaw": 90 },
+    { "type": "plane", "label": "霓虹", "glow": true, "pos": [-10, 2, 17.94], "size": [5, 1.3], "color": "#ff4fa3", "yaw": 180 }
+  ],
+  "actors": [
+    {
+      "id": "girl", "label": "少女", "kind": "mannequin", "height": 1.6,
+      "color": "#ff5fa2", "color2": "#f3f3f6",
+      "keys": [
+        { "t": 0.0, "pos": [-7, 0, 0], "face": 0, "pose": "run" },
+        { "t": 2.0, "pos": [-0.4, 0, 0], "face": 0, "pose": "jump", "apex": 1.3, "blend": 0.12 },
+        { "t": 3.1, "pos": [3.4, -1, 0], "face": 0, "pose": "crouch", "blend": 0.1, "ease": "out" },
+        { "t": 3.5, "pos": [3.6, -1, 0], "face": 0, "pose": "crouch" },
+        { "t": 3.6, "pos": [3.6, -1, 0], "face": 0, "pose": "stand", "blend": 0.6 },
+        { "t": 4.2, "pos": [3.6, -1, 0], "face": 0, "pose": "stand", "ease": "inOut" },
+        { "t": 5.0, "pos": [3.6, -1, 0], "face": -36, "pose": "stand" }
+      ]
+    },
+    {
+      "id": "robot", "label": "小机器人", "kind": "orb", "size": 0.35,
+      "color": "#f4f5f8", "color2": "#111216",
+      "keys": [
+        { "t": 0.0, "pos": [-8.2, 1.7, -0.8], "face": 0 },
+        { "t": 1.0, "pos": [-4.9, 1.72, -0.8], "face": 0 },
+        { "t": 2.0, "pos": [-1.6, 1.85, -0.8], "face": 0 },
+        { "t": 2.6, "pos": [0.9, 3.0, -0.8], "face": -5, "note": "越缝抬高" },
+        { "t": 3.25, "pos": [2.6, 1.4, -0.75], "face": 0 },
+        { "t": 4.0, "pos": [3.1, 0.75, -0.85], "face": -15 },
+        { "t": 5.0, "pos": [3.85, 0.45, -0.45], "face": -44, "note": "到她左肩旁" }
+      ]
+    }
+  ],
+  "camera": {
+    "keys": [
+      { "t": 0.0, "pos": [-9.5, 1.1, 2.2], "look": [-6.5, 1.0, 0], "fov": 50 },
+      { "t": 1.8, "pos": [-2.5, 1.6, 4.0], "look": [-0.6, 1.0, 0], "fov": 48 },
+      { "t": 2.5, "pos": [1.1, 2.8, 6.5], "look": [1.4, 1.2, 0], "fov": 52 },
+      { "t": 3.4, "pos": [5.2, 1.2, 4.5], "look": [3.4, 0.0, 0], "fov": 45 },
+      { "t": 5.0, "pos": [6.6, -0.35, 2.2], "look": [3.6, 0.0, 0], "fov": 40 }
+    ]
+  }
+}
+</script>
+
+<script type="text/plain" id="app-src">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const RENDER = !!(window.__RENDER__ || new URLSearchParams(location.search).has('render'));
+const D2R = Math.PI / 180;
+const $ = (id) => document.getElementById(id);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, u) => a + (b - a) * u;
+const smooth = (u) => u * u * (3 - 2 * u);
+const EASE = { linear: (u) => u, in: (u) => u * u, out: (u) => 1 - (1 - u) * (1 - u), inOut: smooth };
+const POSE_ZH = { run: '奔跑', jump: '起跳', crouch: '落地', stand: '起身', idle: '站定' };
+const CAM_COLOR = '#ffc94a';
+const FONT = '"Microsoft YaHei","PingFang SC","Noto Sans CJK SC","Source Han Sans SC",sans-serif';
+const fmt = (v) => (Math.abs(v) < 0.05 ? 0 : v).toFixed(1);
+
+const EMBED_TEXT = $('blocking').textContent.trim();
+let DATA = null, ASPECT = 16 / 9, ACTORS = [], T = 0;
+
+/* ------------------------------------------------------------------ data */
+function parseAspect(a) {
+  if (typeof a === 'number' && a > 0) return a;
+  const m = String(a || '16:9').match(/([\d.]+)\s*[:x/]\s*([\d.]+)/);
+  return m ? +m[1] / +m[2] : 16 / 9;
+}
+function normalize(d) {
+  if (!d || typeof d !== 'object') throw new Error('不是 JSON 对象');
+  if (!Array.isArray(d.actors)) throw new Error('缺少 actors[]');
+  if (!d.camera || !Array.isArray(d.camera.keys) || !d.camera.keys.length) throw new Error('缺少 camera.keys[]');
+  for (const k of d.camera.keys) if (!Array.isArray(k.pos) || !Array.isArray(k.look)) throw new Error('camera key 需要 pos 和 look');
+  for (const a of d.actors) {
+    if (!Array.isArray(a.keys) || !a.keys.length) throw new Error('actor ' + (a.id || '?') + ' 缺少 keys[]');
+    for (const k of a.keys) if (!Array.isArray(k.pos)) throw new Error('actor ' + (a.id || '?') + ' 的 key 缺少 pos');
+    a.keys.sort((p, q) => p.t - q.t);
+  }
+  d.camera.keys.sort((p, q) => p.t - q.t);
+  d.fps = +d.fps || 24;
+  d.duration = +d.duration || d.camera.keys[d.camera.keys.length - 1].t || 5;
+  d.set = Array.isArray(d.set) ? d.set : [];
+  d.env = d.env || {};
+  return d;
+}
+
+/* --------------------------------------------------------- interpolation */
+function segIndex(K, t) { let i = 0; while (i < K.length - 2 && t >= K[i + 1].t) i++; return i; }
+function slopeAt(K, i, get) {
+  const n = K.length, a = K[Math.max(0, i - 1)], b = K[Math.min(n - 1, i + 1)];
+  const dt = (b.t - a.t) || 1, pa = get(a), pb = get(b);
+  return pa.map((v, j) => (pb[j] - v) / dt);
+}
+// time-parameterised Catmull-Rom (cubic Hermite, finite-difference tangents): C1 in time
+function hermite(K, t, get) {
+  const n = K.length;
+  if (n === 1 || t <= K[0].t) return get(K[0]).slice();
+  if (t >= K[n - 1].t) return get(K[n - 1]).slice();
+  const i = segIndex(K, t), k0 = K[i], k1 = K[i + 1], h = k1.t - k0.t, u = (t - k0.t) / h;
+  const p0 = get(k0), p1 = get(k1), m0 = slopeAt(K, i, get), m1 = slopeAt(K, i + 1, get);
+  const u2 = u * u, u3 = u2 * u, a = 2 * u3 - 3 * u2 + 1, b = u3 - 2 * u2 + u, c = -2 * u3 + 3 * u2, e = u3 - u2;
+  return p0.map((v, j) => a * v + b * h * m0[j] + c * p1[j] + e * h * m1[j]);
+}
+function camState(t) {
+  const K = DATA.camera.keys;
+  return { pos: hermite(K, t, (k) => k.pos), look: hermite(K, t, (k) => k.look), fov: hermite(K, t, (k) => [k.fov ?? 50])[0] };
+}
+// parabola from y0 to y1 whose top is `apex` above y0
+function arcY(y0, y1, apex, u) {
+  const d = y1 - y0, h = Math.max(apex, d + 0.05, 0.05);
+  const c = (2 * h - d) + 2 * Math.sqrt(Math.max(0, h * (h - d))), b = c + d;
+  return y0 + b * u - c * u * u;
+}
+function actorPos(a, t) {
+  const K = a.keys, n = K.length;
+  if (n === 1 || t <= K[0].t) return K[0].pos.slice();
+  if (t >= K[n - 1].t) return K[n - 1].pos.slice();
+  if (a.kind === 'orb' || a.smooth) return hermite(K, t, (k) => k.pos);
+  const i = segIndex(K, t), k0 = K[i], k1 = K[i + 1], u = (t - k0.t) / (k1.t - k0.t);
+  if (k0.pose === 'jump') return [lerp(k0.pos[0], k1.pos[0], u), arcY(k0.pos[1], k1.pos[1], k0.apex ?? 0.8, u), lerp(k0.pos[2], k1.pos[2], u)];
+  const ue = (EASE[k0.ease] || EASE.linear)(u);
+  return k0.pos.map((v, j) => lerp(v, k1.pos[j], ue));
+}
+function actorFace(a, t) {
+  const K = a.keys, n = K.length;
+  if (n === 1 || t <= K[0].t) return K[0].face || 0;
+  if (t >= K[n - 1].t) return K[n - 1].face || 0;
+  const i = segIndex(K, t), k0 = K[i], k1 = K[i + 1], u = (t - k0.t) / (k1.t - k0.t);
+  return lerp(k0.face || 0, k1.face || 0, (EASE[k0.ease] || smooth)(u));
+}
+
+/* ----------------------------------------------------------------- poses */
+const L1 = 0.40, L2 = 0.40, FOOT = 0.05;           // thigh, shin, ankle height (for a 1.6 m figure)
+const legReach = (hip, knee) => L1 * Math.cos(hip) + L2 * Math.cos(hip - knee);
+const P = (o) => Object.assign({ py: null, lean: 0, twist: 0, hipL: 0, hipR: 0, kneeL: 0, kneeR: 0, shL: 0, shR: 0, elL: 0.15, elR: 0.15, armOut: 0.1, head: 0 }, o);
+function mixPose(A, B, w) { const o = {}; for (const k in B) o[k] = lerp(A[k], B[k], w); return o; }
+function grounded(p) { if (p.py == null) p.py = Math.max(legReach(p.hipL, p.kneeL), legReach(p.hipR, p.kneeR)) + FOOT; return p; }
+const POSES = {
+  stand: () => P({ lean: 0.03, hipL: 0.03, hipR: -0.02, kneeL: 0.06, kneeR: 0.05, shL: 0.06, shR: -0.04, elL: 0.2, elR: 0.18, armOut: 0.1, head: 0.02 }),
+  idle: (c) => { const b = Math.sin(c.t * 2 * Math.PI / 3.2); return P({ lean: 0.03 + 0.012 * b, hipL: 0.03, hipR: -0.02, kneeL: 0.06, kneeR: 0.05, shL: 0.06 + 0.02 * b, shR: -0.04 - 0.02 * b, elL: 0.2, elR: 0.18, armOut: 0.1, head: 0.02 }); },
+  run: (c) => {
+    const f = c.phase, s = Math.sin(f), knee = (x) => 0.3 + 0.62 * (1 + Math.cos(x + 0.6));
+    return P({ py: 0.80 - 0.035 * Math.cos(2 * f), lean: 0.3, twist: 0.14 * s, hipR: 0.12 + 0.68 * s, hipL: 0.12 - 0.68 * s,
+      kneeR: knee(f), kneeL: knee(f + Math.PI), shR: -0.8 * s, shL: 0.8 * s, elR: 1.5 + 0.25 * s, elL: 1.5 - 0.25 * s, armOut: 0.14, head: 0.24 });
+  },
+  jump: (c) => {
+    const s = c.s;
+    const take = P({ py: 0.85, lean: 0.25, hipR: -0.35, hipL: 0.95, kneeR: 0.35, kneeL: 1.5, shR: 1.3, shL: 0.5, elR: 0.7, elL: 1.1, armOut: 0.2, head: 0.2 });
+    const tuck = P({ py: 0.82, lean: 0.45, hipR: 1.55, hipL: 1.4, kneeR: 2.15, kneeL: 2.25, shR: 0.95, shL: 0.85, elR: 1.25, elL: 1.3, armOut: 0.3, head: 0.35 });
+    const land = P({ py: 0.85, lean: 0.25, hipR: 0.65, hipL: 0.45, kneeR: 0.7, kneeL: 0.55, shR: 1.35, shL: 1.15, elR: 0.45, elL: 0.5, armOut: 0.45, head: 0.25 });
+    if (s < 0.32) return mixPose(take, tuck, smooth(s / 0.32));
+    if (s < 0.6) return tuck;
+    if (s < 0.9) return mixPose(tuck, land, smooth((s - 0.6) / 0.3));
+    return land;
+  },
+  crouch: () => P({ lean: 0.62, hipR: 1.6, hipL: 1.15, kneeR: 2.2, kneeL: 2.45, shR: 0.55, shL: 0.25, elR: 0.5, elL: 0.35, armOut: 0.32, head: 0.55 }),
+};
+function evalPose(name, ctx) { return grounded((POSES[name] || POSES.stand)(ctx)); }
+// pose starts at its key and blends in over key.blend seconds (default 0.2)
+function poseAt(A, t) {
+  const K = A.def.keys, n = K.length;
+  let i = 0; while (i < n - 1 && t >= K[i + 1].t) i++;
+  const k = K[i], segEnd = i < n - 1 ? K[i + 1].t : k.t + 1;
+  const ctx = { t, phase: 2 * Math.PI * distAt(A, t) / ((A.def.height || 1.6) * 1.45), s: clamp((t - k.t) / Math.max(1e-6, segEnd - k.t), 0, 1) };
+  const cur = k.pose || 'stand';
+  let p = evalPose(cur, ctx);
+  if (i > 0 && t >= k.t) {
+    const prev = K[i - 1].pose || 'stand', bl = k.blend ?? 0.2;
+    if (prev !== cur && bl > 0 && t - k.t < bl) p = mixPose(evalPose(prev, { ...ctx, s: 1 }), p, smooth(clamp((t - k.t) / bl, 0, 1)));
+  }
+  return p;
+}
+// distance travelled on the ground plane -> run-cycle phase (no foot skating at any speed)
+function buildDistTable(A) {
+  const dt = 1 / 240, n = Math.ceil(DATA.duration / dt) + 2, tab = new Float32Array(n);
+  let prev = actorPos(A.def, 0), acc = 0;
+  for (let i = 1; i < n; i++) { const p = actorPos(A.def, i * dt); acc += Math.hypot(p[0] - prev[0], p[2] - prev[2]); tab[i] = acc; prev = p; }
+  A.dist = { dt, tab };
+}
+function distAt(A, t) { const { dt, tab } = A.dist; const x = clamp(t / dt, 0, tab.length - 1.001), i = Math.floor(x); return lerp(tab[i], tab[i + 1], x - i); }
+
+/* ----------------------------------------------------------------- scene */
+const scene = new THREE.Scene();
+let world = null, helpers = null, frustum = null, camBody = null, camLookDist = 3, GLOW = null;
+const mesh = (geo, mat, fn) => { const m = new THREE.Mesh(geo, mat); m.castShadow = true; m.receiveShadow = true; if (fn) fn(m); return m; };
+// a limb segment hanging down from its joint: a lathe whose radius runs r0 (joint) → rm (belly, at `at`) → r1 (next joint)
+function spindle(len, r0, rm, r1, at, mat) {
+  const pts = [];
+  for (let i = 16; i >= 0; i--) {                                    // bottom → top, so the normals face out
+    const v = i / 16, w = v < at ? smooth(v / at) : 1 - smooth((v - at) / (1 - at));   // v = 0 at the joint
+    const r = v < at ? lerp(r0, rm, w) : lerp(r1, rm, w), cap = Math.min(1, Math.sqrt(Math.min(v, 1 - v) / 0.07));
+    pts.push(new THREE.Vector2(Math.max(1e-3, r * cap), -len * v));
+  }
+  return mesh(new THREE.LatheGeometry(pts, 18), mat);
+}
+// a torso block: same lathe idea, standing up from y0 to y1, flattened front-to-back (x)
+function trunk(prof, depth, mat) {
+  const pts = prof.map(([r, y]) => new THREE.Vector2(Math.max(1e-3, r), y));
+  return mesh(new THREE.LatheGeometry(pts, 22), mat, (m) => { m.scale.x = depth; });
+}
+const ball = (r, mat, fn) => mesh(new THREE.SphereGeometry(r, 14, 10), mat, fn);
+
+// An artist's wooden mannequin: head, neck, chest, pelvis, upper/lower arms, hands, thighs, shins, feet,
+// with a ball at every joint. One body colour = who it is; the joints are neutral; the left side is a shade
+// darker so crossing limbs stay readable. No face, hair or clothes — the figure is only there to carry motion.
+function buildMannequin(A) {
+  const a = A.def, sc = (a.height || 1.6) / 1.6;
+  const cA = new THREE.Color(a.color || '#ff5fa2');
+  const mR = new THREE.MeshLambertMaterial({ color: cA, emissive: cA.clone().multiplyScalar(0.18) });
+  const mL = new THREE.MeshLambertMaterial({ color: cA.clone().multiplyScalar(0.72), emissive: cA.clone().multiplyScalar(0.1) });
+  const cJ = new THREE.Color(a.jointColor || '#5d6170');
+  const mJ = new THREE.MeshLambertMaterial({ color: cJ, emissive: cJ.clone().multiplyScalar(0.1) });
+  const root = new THREE.Group(), body = new THREE.Group(); body.scale.setScalar(sc); root.add(body);
+
+  const pelvis = new THREE.Group(); body.add(pelvis);                                  // origin = hip-joint height
+  pelvis.add(trunk([[0.001, -0.1], [0.085, -0.085], [0.15, -0.035], [0.155, 0.03], [0.125, 0.09], [0.095, 0.125], [0.001, 0.13]], 0.68, mR));
+  const waist = new THREE.Group(); waist.position.y = 0.13; pelvis.add(waist);        // the spine bends here
+  waist.add(ball(0.085, mJ, (m) => { m.scale.set(0.72, 0.8, 1); }));
+  waist.add(trunk([[0.001, 0.02], [0.1, 0.03], [0.125, 0.12], [0.158, 0.25], [0.152, 0.31], [0.11, 0.35], [0.001, 0.365]], 0.62, mR));
+  const neck = new THREE.Group(); neck.position.y = 0.355; waist.add(neck);
+  neck.add(ball(0.042, mJ));
+  neck.add(mesh(new THREE.CylinderGeometry(0.036, 0.042, 0.09, 12), mR, (m) => { m.position.y = 0.04; }));
+  const head = new THREE.Group(); head.position.y = 0.09; neck.add(head);
+  head.add(ball(1, mR, (m) => { m.scale.set(0.088, 0.104, 0.074); m.position.set(0, 0.1, 0); }));    // cranium
+  head.add(ball(1, mR, (m) => { m.scale.set(0.058, 0.05, 0.052); m.position.set(0.032, 0.045, 0); })); // jaw
+  head.add(mesh(new THREE.ConeGeometry(0.017, 0.045, 10), mR, (m) => { m.rotation.z = -Math.PI / 2; m.position.set(0.096, 0.09, 0); })); // nose: which way she faces, nothing more
+
+  const arm = (side) => {
+    const mat = side > 0 ? mR : mL;
+    const sh = new THREE.Group(); sh.position.set(0, 0.3, 0.178 * side); waist.add(sh);
+    sh.add(ball(0.054, mJ));
+    const swing = new THREE.Group(); sh.add(swing);
+    swing.add(spindle(0.27, 0.05, 0.05, 0.036, 0.25, mat));
+    const el = new THREE.Group(); el.position.y = -0.27; swing.add(el);
+    el.add(ball(0.04, mJ));
+    el.add(spindle(0.23, 0.037, 0.04, 0.026, 0.3, mat));
+    const wr = new THREE.Group(); wr.position.y = -0.23; el.add(wr);
+    wr.add(ball(0.029, mJ));
+    wr.add(ball(1, mat, (m) => { m.scale.set(0.046, 0.075, 0.024); m.position.y = -0.07; }));          // mitten hand, palm to the body
+    return { sh, swing, el, wr };
+  };
+  const leg = (side) => {
+    const mat = side > 0 ? mR : mL;
+    const hip = new THREE.Group(); hip.position.set(0, 0, 0.09 * side); pelvis.add(hip);
+    hip.add(ball(0.066, mJ));
+    hip.add(spindle(L1, 0.076, 0.08, 0.05, 0.2, mat));
+    const knee = new THREE.Group(); knee.position.y = -L1; hip.add(knee);
+    knee.add(ball(0.05, mJ));
+    knee.add(spindle(L2, 0.05, 0.056, 0.033, 0.28, mat));
+    const foot = new THREE.Group(); foot.position.y = -L2; knee.add(foot);
+    foot.add(ball(0.036, mJ));
+    foot.add(mesh(new THREE.BoxGeometry(0.2, 0.05, 0.075), mat, (m) => { m.position.set(0.055, -FOOT + 0.025, 0); }));
+    foot.add(ball(1, mat, (m) => { m.scale.set(0.045, 0.026, 0.038); m.position.set(0.155, -FOOT + 0.024, 0); })); // toe
+    return { hip, knee, foot };
+  };
+  A.rig = { pelvis, waist, neck, armR: arm(1), armL: arm(-1), legR: leg(1), legL: leg(-1) };
+  A.root = root;
+  return root;
+}
+function applyRig(r, p) {
+  r.pelvis.position.y = p.py;
+  r.pelvis.rotation.set(0, -p.twist * 0.5, 0);
+  r.waist.rotation.set(0, p.twist, -p.lean);
+  r.neck.rotation.set(0, -p.twist * 0.5 + (p.look || 0), p.head);
+  for (const [g, h, k] of [[r.legR, p.hipR, p.kneeR], [r.legL, p.hipL, p.kneeL]]) { g.hip.rotation.z = h; g.knee.rotation.z = -k; g.foot.rotation.z = (k - h) * 0.85; }
+  r.armR.sh.rotation.x = -p.armOut; r.armR.swing.rotation.z = p.shR; r.armR.el.rotation.z = p.elR;
+  r.armL.sh.rotation.x = p.armOut; r.armL.swing.rotation.z = p.shL; r.armL.el.rotation.z = p.elL;
+}
+function buildOrb(A) {
+  const a = A.def, r = (a.size || 0.35) / 2;
+  const root = new THREE.Group(), orb = new THREE.Group(); root.add(orb);
+  orb.add(mesh(new THREE.SphereGeometry(r, 32, 24), new THREE.MeshLambertMaterial({ color: a.color || '#f4f5f8' })));
+  orb.add(mesh(new THREE.CylinderGeometry(r * 1.035, r * 1.035, r * 0.48, 40, 1, true, Math.PI / 2 - 1.3, 2.6),
+    new THREE.MeshLambertMaterial({ color: a.color2 || '#111216', side: THREE.DoubleSide }), (m) => { m.position.y = r * 0.1; }));
+  A.root = root; A.orb = orb; A.r = r;
+  return root;
+}
+function buildActor(def) {
+  const A = { def, pathColor: def.pathColor || (def.kind === 'orb' ? '#ffffff' : def.color || '#ff5fa2') };
+  world.add(def.kind === 'orb' ? buildOrb(A) : buildMannequin(A));
+  if (!RENDER) {
+    const el = document.createElement('div'); el.className = 'lbl'; el.textContent = def.label || def.id; el.style.color = A.pathColor;
+    $('stage').appendChild(el); A.label = el;
+  }
+  return A;
+}
+function glowTex() {
+  if (GLOW) return GLOW;
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d'), gr = g.createRadialGradient(64, 64, 6, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(255,255,255,0.9)'); gr.addColorStop(0.45, 'rgba(255,255,255,0.3)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+  GLOW = new THREE.CanvasTexture(c); GLOW.colorSpace = THREE.SRGBColorSpace;
+  return GLOW;
+}
+function shadeByHeight(g, h) {   // building faces darken with depth so a drop reads as deep
+  const p = g.attributes.position, c = new Float32Array(p.count * 3);
+  for (let i = 0; i < p.count; i++) { const k = clamp(1 - (h - p.getY(i)) / 16, 0.16, 1); c[i * 3] = k; c[i * 3 + 1] = k; c[i * 3 + 2] = Math.min(1, k * 1.12); }
+  g.setAttribute('color', new THREE.BufferAttribute(c, 3));
+}
+function buildSet(items) {
+  for (const it of items) {
+    const [x, y, z] = it.pos || [0, 0, 0], yaw = (it.yaw || 0) * D2R, col = new THREE.Color(it.color || '#c4c8d0');
+    const near = Math.abs(x) < 16 && Math.abs(z) < 9;
+    let m;
+    if (it.type === 'box') {
+      const [w, h, d] = it.size, g = new THREE.BoxGeometry(w, h, d); g.translate(0, h / 2, 0);
+      if (h > 3) shadeByHeight(g, h);
+      m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: col, vertexColors: h > 3 }));
+    } else if (it.type === 'cylinder') {
+      const [dia, h] = it.size, g = new THREE.CylinderGeometry(dia / 2, dia / 2, h, 36); g.translate(0, h / 2, 0);
+      m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: col }));
+    } else if (it.type === 'plane') {
+      const [w, h] = it.size;
+      if (it.glow) {
+        m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: col, toneMapped: false }));
+        const halo = new THREE.Mesh(new THREE.PlaneGeometry(w * 1.6 + 1.6, h * 1.6 + 1.6),
+          new THREE.MeshBasicMaterial({ map: glowTex(), color: col, transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+        halo.position.z = -0.02; m.add(halo);
+      } else m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshLambertMaterial({ color: col, side: THREE.DoubleSide }));
+    } else continue;   // 'zone' = plan/free-view annotation only
+    m.position.set(x, y, z); m.rotation.y = yaw;
+    if (it.type !== 'plane') { m.castShadow = near; m.receiveShadow = near; }
+    world.add(m);
+  }
+}
+function buildLights(env) {
+  const Ls = env.lights || [{ type: 'hemi', sky: '#a3aedb', ground: '#2b2338', intensity: 1 }, { type: 'dir', dir: [0.45, 1, 0.7], color: '#e8ecff', intensity: 1.8, shadow: true }];
+  for (const L of Ls) {
+    if (L.type === 'hemi') world.add(new THREE.HemisphereLight(L.sky || '#ffffff', L.ground || '#222222', L.intensity ?? 1));
+    else if (L.type === 'ambient') world.add(new THREE.AmbientLight(L.color || '#ffffff', L.intensity ?? 0.5));
+    else if (L.type === 'dir') {
+      const d = new THREE.Vector3(...(L.dir || [0, 1, 0])).normalize(), tgt = new THREE.Vector3(1, -0.5, 0);
+      const l = new THREE.DirectionalLight(L.color || '#ffffff', L.intensity ?? 1);
+      l.position.copy(tgt).addScaledVector(d, 40); l.target.position.copy(tgt);
+      world.add(l, l.target);
+      if (L.shadow) {
+        l.castShadow = true; l.shadow.mapSize.set(2048, 2048);
+        Object.assign(l.shadow.camera, { left: -17, right: 17, top: 17, bottom: -17, near: 1, far: 100 });
+        l.shadow.camera.updateProjectionMatrix(); l.shadow.bias = -0.0005; l.shadow.normalBias = 0.02;
+      }
+    }
+  }
+}
+function buildSky(env) {
+  const s = env.sky || {};
+  const mat = new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, fog: false,
+    uniforms: { top: { value: new THREE.Color(s.top || '#03050b') }, hor: { value: new THREE.Color(s.horizon || '#2c2548') }, bot: { value: new THREE.Color(s.bottom || '#07060c') } },
+    vertexShader: 'varying vec3 vP;\nvoid main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: [
+      'uniform vec3 top; uniform vec3 hor; uniform vec3 bot; varying vec3 vP;',
+      'void main(){',
+      '  float h = normalize(vP).y;',
+      '  vec3 c = h > 0.0 ? mix(hor, top, pow(smoothstep(0.0, 0.6, h), 0.8)) : mix(hor, bot, smoothstep(0.0, -0.25, h));',
+      '  gl_FragColor = vec4(c, 1.0);',
+      '  #include <colorspace_fragment>',
+      '}'].join('\n'),
+  });
+  const m = new THREE.Mesh(new THREE.SphereGeometry(900, 32, 16), mat); m.frustumCulled = false; m.renderOrder = -1;
+  return m;
+}
+function lineFrom(points, color, o = {}) {
+  const g = new THREE.BufferGeometry().setFromPoints(points.map((p) => new THREE.Vector3(p[0], p[1], p[2])));
+  const m = o.dashed ? new THREE.LineDashedMaterial({ color, dashSize: 0.25, gapSize: 0.18, transparent: true, opacity: o.opacity ?? 1 })
+    : new THREE.LineBasicMaterial({ color, transparent: true, opacity: o.opacity ?? 1 });
+  const l = new THREE.Line(g, m); if (o.dashed) l.computeLineDistances(); return l;
+}
+const dot = (p, color, r) => { const m = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 8), new THREE.MeshBasicMaterial({ color })); m.position.set(p[0], p[1], p[2]); return m; };
+function buildHelpers() {
+  const dur = DATA.duration, N = Math.max(2, Math.round(dur * 60));
+  for (const A of ACTORS) {
+    const pts = []; for (let i = 0; i <= N; i++) { const p = actorPos(A.def, i / N * dur); pts.push([p[0], p[1] + 0.03, p[2]]); }
+    helpers.add(lineFrom(pts, A.pathColor));
+    for (const k of A.def.keys) helpers.add(dot(k.pos, A.pathColor, 0.06));
+  }
+  const cp = []; for (let i = 0; i <= N; i++) cp.push(camState(i / N * dur).pos);
+  helpers.add(lineFrom(cp, CAM_COLOR));
+  for (const k of DATA.camera.keys) helpers.add(dot(k.pos, CAM_COLOR, 0.08));
+  for (const it of DATA.set) if (it.type === 'zone') {
+    const [x, y, z] = it.pos, [w, d] = it.size, yy = y + 0.03;
+    helpers.add(lineFrom([[x - w / 2, yy, z - d / 2], [x + w / 2, yy, z - d / 2], [x + w / 2, yy, z + d / 2], [x - w / 2, yy, z + d / 2], [x - w / 2, yy, z - d / 2]], '#ff8c8c', { dashed: true, opacity: 0.85 }));
+  }
+  const fg = new THREE.BufferGeometry(); fg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(32 * 3), 3));
+  frustum = new THREE.LineSegments(fg, new THREE.LineBasicMaterial({ color: CAM_COLOR })); frustum.frustumCulled = false; helpers.add(frustum);
+  camBody = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.16, 0.3), new THREE.MeshBasicMaterial({ color: CAM_COLOR })); helpers.add(camBody);
+}
+function updateFrustum() {
+  const c = shotCam, D = 1.4, hh = D * Math.tan(c.fov * D2R / 2), hw = hh * ASPECT, V = (x, y, z) => new THREE.Vector3(x, y, z);
+  const o = V(0, 0, 0), q = [V(-hw, -hh, -D), V(hw, -hh, -D), V(hw, hh, -D), V(-hw, hh, -D)], segs = [];
+  for (const v of q) segs.push(o, v);
+  for (let i = 0; i < 4; i++) segs.push(q[i], q[(i + 1) % 4]);
+  const a = V(-hw * 0.35, hh * 1.08, -D), b = V(hw * 0.35, hh * 1.08, -D), tp = V(0, hh * 1.45, -D);   // "up" marker
+  segs.push(a, b, b, tp, tp, a, o, V(0, 0, -camLookDist));
+  const arr = frustum.geometry.attributes.position.array;
+  segs.forEach((v, i) => { const w = v.clone().applyMatrix4(c.matrixWorld); arr[i * 3] = w.x; arr[i * 3 + 1] = w.y; arr[i * 3 + 2] = w.z; });
+  frustum.geometry.attributes.position.needsUpdate = true; frustum.geometry.setDrawRange(0, segs.length);
+  camBody.position.copy(c.position); camBody.quaternion.copy(c.quaternion);
+}
+function buildAll(d) {
+  const nd = normalize(d);
+  DATA = nd; ASPECT = parseAspect(DATA.aspect);
+  if (world) scene.remove(world);
+  if (helpers) scene.remove(helpers);
+  for (const A of ACTORS) if (A.label) A.label.remove();
+  world = new THREE.Group(); helpers = new THREE.Group(); scene.add(world, helpers);
+  const fog = DATA.env.fog || {};
+  scene.fog = new THREE.Fog(fog.color || '#221d3a', fog.near ?? 24, fog.far ?? 160);
+  world.add(buildSky(DATA.env));
+  buildLights(DATA.env);
+  buildSet(DATA.set);
+  ACTORS = DATA.actors.map(buildActor);
+  ACTORS.forEach(buildDistTable);
+  buildHelpers();
+  setTime(clamp(T, 0, DATA.duration));
+}
+
+/* ------------------------------------------------------------------ time */
+const shotCam = new THREE.PerspectiveCamera(50, 16 / 9, 0.05, 3000);
+function setTime(t) {
+  T = clamp(t, 0, DATA.duration);
+  for (const A of ACTORS) {
+    const p = actorPos(A.def, T), yaw = actorFace(A.def, T) * D2R;
+    if (A.orb) {
+      A.root.position.set(p[0], p[1] + 0.03 * Math.sin(2 * Math.PI * 1.3 * T), p[2]);     // hover bob
+      const q1 = actorPos(A.def, Math.min(DATA.duration, T + 0.05)), q0 = actorPos(A.def, Math.max(0, T - 0.05));
+      const fwd = ((q1[0] - q0[0]) * Math.cos(yaw) - (q1[2] - q0[2]) * Math.sin(yaw)) / 0.1;
+      A.orb.rotation.set(0, yaw, -clamp(fwd * 0.07, -0.35, 0.35));                        // dips into its travel
+    } else {
+      A.root.position.set(p[0], p[1], p[2]); A.root.rotation.y = yaw;
+      const pose = poseAt(A, T), dt = 0.12;
+      const turn = (actorFace(A.def, Math.min(DATA.duration, T + dt)) - actorFace(A.def, Math.max(0, T - dt))) * D2R;
+      pose.look = clamp(turn * 1.6, -0.6, 0.6);                                           // the head leads a turn
+      applyRig(A.rig, pose);
+    }
+  }
+  const c = camState(T);
+  shotCam.position.set(c.pos[0], c.pos[1], c.pos[2]); shotCam.up.set(0, 1, 0);
+  shotCam.lookAt(c.look[0], c.look[1], c.look[2]);
+  shotCam.fov = c.fov; shotCam.updateProjectionMatrix(); shotCam.updateMatrixWorld();
+  camLookDist = Math.hypot(c.look[0] - c.pos[0], c.look[1] - c.pos[1], c.look[2] - c.pos[2]);
+}
+
+/* ------------------------------------------------------------------ plan */
+function footprint(it) {
+  const [x, , z] = it.pos || [0, 0, 0];
+  let w = 0, d = 0;
+  if (it.type === 'box') { w = it.size[0]; d = it.size[2]; } else if (it.type === 'cylinder') { w = d = it.size[0]; } else if (it.type === 'zone') { w = it.size[0]; d = it.size[1]; }
+  const yaw = (it.yaw || 0) * D2R, c = Math.abs(Math.cos(yaw)), s = Math.abs(Math.sin(yaw));
+  const hw = (w * c + d * s) / 2, hd = (w * s + d * c) / 2;
+  return { x0: x - hw, x1: x + hw, z0: z - hd, z1: z + hd };
+}
+function tagBox(g, txt, x, y, o = {}) {
+  const size = o.size || 16, lines = String(txt).split('\n'), lh = size * 1.28;
+  g.font = (o.bold ? '600 ' : '') + size + 'px ' + FONT;
+  const w = Math.max(...lines.map((l) => g.measureText(l).width)), h = lh * lines.length, pad = size * 0.38;
+  const bx = o.align === 'left' ? x : o.align === 'right' ? x - w : x - w / 2;
+  const by = o.valign === 'top' ? y : o.valign === 'bottom' ? y - h : y - h / 2;
+  return { size, lines, lh, bx, by, x0: bx - pad, y0: by - pad * 0.55, x1: bx + w + pad, y1: by + h + pad * 0.55 };
+}
+function tag(g, txt, x, y, o = {}) {
+  const b = tagBox(g, txt, x, y, o);
+  if (o.bg !== false) {
+    g.beginPath(); g.roundRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, b.size * 0.4);
+    g.fillStyle = o.bg || 'rgba(11,14,20,0.86)'; g.fill();
+    if (o.border) { g.strokeStyle = o.border; g.lineWidth = 1; g.stroke(); }
+  }
+  g.fillStyle = o.color || '#e6e9f0'; g.textBaseline = 'middle'; g.textAlign = 'left';
+  b.lines.forEach((l, i) => g.fillText(l, b.bx, b.by + b.lh * (i + 0.5)));
+  return b;
+}
+let PLACED = [];
+function place(g, txt, x, y, o, dx = 0, dy = 0) {   // nudge by (dx,dy) until clear of earlier labels
+  let i = 0;
+  for (; i < 7; i++) {
+    const b = tagBox(g, txt, x + dx * i, y + dy * i, o);
+    if (!PLACED.some((q) => b.x0 < q.x1 + 3 && b.x1 > q.x0 - 3 && b.y0 < q.y1 + 3 && b.y1 > q.y0 - 3)) break;
+  }
+  PLACED.push(tag(g, txt, x + dx * i, y + dy * i, o));
+}
+function seg(g, x0, y0, x1, y1) { g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); }
+function wedge(g, c, X, Z, S, fillA, strokeA, L) {
+  const dx = c.look[0] - c.pos[0], dz = c.look[2] - c.pos[2], dl = Math.hypot(dx, dz) || 1, ux = dx / dl, uz = dz / dl;
+  const hf = Math.atan(Math.tan(c.fov * D2R / 2) * ASPECT);
+  const rot = (a) => [ux * Math.cos(a) - uz * Math.sin(a), ux * Math.sin(a) + uz * Math.cos(a)];
+  const [ax, az] = rot(hf), [bx, bz] = rot(-hf), px = c.pos[0], pz = c.pos[2];
+  g.beginPath(); g.moveTo(X(px), Z(pz)); g.lineTo(X(px + ax * L), Z(pz + az * L)); g.lineTo(X(px + bx * L), Z(pz + bz * L)); g.closePath();
+  g.fillStyle = 'rgba(255,201,74,' + fillA + ')'; g.fill();
+  g.strokeStyle = 'rgba(255,201,74,' + strokeA + ')'; g.lineWidth = 1.6 * S; g.stroke();
+  g.setLineDash([5 * S, 5 * S]); g.strokeStyle = 'rgba(255,201,74,' + strokeA * 0.5 + ')'; g.lineWidth = 1.2 * S;
+  seg(g, X(px), Z(pz), X(c.look[0]), Z(c.look[2])); g.setLineDash([]);
+  g.beginPath(); g.arc(X(px), Z(pz), 5.5 * S, 0, Math.PI * 2); g.fillStyle = CAM_COLOR; g.fill();
+  return [ux, uz];
+}
+function actorNotes(A) {
+  const K = A.def.keys, notes = [], orb = A.def.kind === 'orb';
+  K.forEach((k, i) => {
+    let txt = null; const prev = K[i - 1], ts = k.t.toFixed(1) + 's';
+    if (k.note) txt = ts + ' ' + k.note;
+    else if (i === 0) txt = ts + (orb ? '' : ' ' + (POSE_ZH[k.pose] || k.pose || ''));
+    else if (orb) txt = i === K.length - 1 ? ts : null;
+    else {
+      if ((k.pose || 'stand') !== (prev.pose || 'stand')) txt = ts + ' ' + (POSE_ZH[k.pose] || k.pose);
+      if (Math.abs((k.face || 0) - (prev.face || 0)) >= 10) { const s = prev.t.toFixed(1) + '–' + ts + ' 转身'; txt = txt ? txt + ' · ' + s : s; }
+    }
+    if (i === 0) txt = (A.def.label || A.def.id) + ' · ' + txt;
+    if (txt) notes.push({ pos: k.pos, txt });
+  });
+  const groups = [];
+  for (const n of notes) { const g0 = groups.find((g) => Math.hypot(g.pos[0] - n.pos[0], g.pos[2] - n.pos[2]) < 0.7); if (g0) g0.lines.push(n.txt); else groups.push({ pos: n.pos, lines: [n.txt] }); }
+  return groups;
+}
+function subjectGround(t) {   // ground under the first mannequin (take-off level while airborne)
+  const A = ACTORS.find((a) => a.def.kind !== 'orb'); if (!A) return 0;
+  const K = A.def.keys, i = segIndex(K, t);
+  if (K.length > 1 && K[i].pose === 'jump' && t > K[i].t && t < K[i + 1].t) return K[i].pos[1];
+  return actorPos(A.def, t)[1];
+}
+function drawPlan(g, W, H, tNow) {
+  const S = Math.min(W / 1600, H / 960), dur = DATA.duration, N = Math.max(60, Math.round(dur * 48));
+  const samp = (fn) => { const a = []; for (let i = 0; i <= N; i++) a.push(fn(i / N * dur)); return a; };
+  const aP = ACTORS.map((A) => samp((t) => actorPos(A.def, t))), cP = samp((t) => camState(t).pos);
+  const bb = { x0: 1e9, x1: -1e9, z0: 1e9, z1: -1e9 };
+  const add = (x, z) => { bb.x0 = Math.min(bb.x0, x); bb.x1 = Math.max(bb.x1, x); bb.z0 = Math.min(bb.z0, z); bb.z1 = Math.max(bb.z1, z); };
+  aP.flat().concat(cP).forEach((p) => add(p[0], p[2]));
+  const core = { x0: bb.x0 - 2, x1: bb.x1 + 2, z0: bb.z0 - 2, z1: bb.z1 + 2.2 };
+  const items = DATA.set.filter((it) => it.type !== 'plane' && it.size).map((it) => ({ it, r: footprint(it) }))
+    .filter((o) => o.r.x1 > core.x0 && o.r.x0 < core.x1 && o.r.z1 > core.z0 && o.r.z0 < core.z1);
+  add(core.x0, core.z0); add(core.x1, core.z1);
+  for (const o of items) { add(Math.max(o.r.x0, core.x0 - 6), Math.max(o.r.z0, core.z0 - 6)); add(Math.min(o.r.x1, core.x1 + 6), Math.min(o.r.z1, core.z1 + 6)); }
+  bb.x0 -= 0.6; bb.x1 += 0.6; bb.z0 -= 0.6; bb.z1 += 0.6;
+  const mL = 30 * S, mR = 30 * S, mT = 100 * S, mB = 64 * S;
+  const k = Math.min((W - mL - mR) / (bb.x1 - bb.x0), (H - mT - mB) / (bb.z1 - bb.z0));
+  const ox = mL + (W - mL - mR - k * (bb.x1 - bb.x0)) / 2, oz = mT + (H - mT - mB - k * (bb.z1 - bb.z0)) / 2;
+  const X = (x) => ox + (x - bb.x0) * k, Z = (z) => oz + (z - bb.z0) * k;
+  const mx = X(bb.x0), my = Z(bb.z0), mw = (bb.x1 - bb.x0) * k, mh = (bb.z1 - bb.z0) * k;
+  g.save();
+  g.fillStyle = '#0a0d13'; g.fillRect(0, 0, W, H);
+  g.fillStyle = '#0f131b'; g.fillRect(mx, my, mw, mh);
+  g.save(); g.beginPath(); g.rect(mx, my, mw, mh); g.clip();
+  g.lineWidth = Math.max(1, S);
+  for (let x = Math.ceil(bb.x0); x <= bb.x1; x++) { g.strokeStyle = x % 5 === 0 ? '#1f2533' : '#151a24'; seg(g, X(x), my, X(x), my + mh); }
+  for (let z = Math.ceil(bb.z0); z <= bb.z1; z++) { g.strokeStyle = z % 5 === 0 ? '#1f2533' : '#151a24'; seg(g, mx, Z(z), mx + mw, Z(z)); }
+  // set pieces: roofs, then zones, then props
+  const isRoof = (it) => it.type === 'box' && it.size[1] > 3, rank = (it) => (isRoof(it) ? 0 : it.type === 'zone' ? 1 : 2);
+  const topY = (it) => (it.pos[1] || 0) + (it.type === 'zone' ? 0 : it.size[1]);
+  items.sort((a, b) => rank(a.it) - rank(b.it));
+  const later = [], labels = [], camLabels = [];   // labels are placed last, most important first
+  for (const { it, r } of items) {
+    const [x, , z] = it.pos, yaw = (it.yaw || 0) * D2R;
+    g.save(); g.translate(X(x), Z(z)); g.rotate(-yaw);
+    if (it.type === 'cylinder') {
+      g.beginPath(); g.arc(0, 0, it.size[0] / 2 * k, 0, Math.PI * 2); g.fillStyle = '#343c4c'; g.fill(); g.strokeStyle = '#8590a6'; g.lineWidth = 1.5 * S; g.stroke();
+    } else if (it.type === 'zone') {
+      const w = it.size[0] * k, d = it.size[1] * k;
+      g.save(); g.beginPath(); g.rect(-w / 2, -d / 2, w, d); g.clip(); g.strokeStyle = 'rgba(255,110,110,0.25)'; g.lineWidth = 2 * S;
+      for (let s = -d; s < w + d; s += 14 * S) seg(g, -w / 2 + s, -d / 2, -w / 2 + s - d, d / 2);
+      g.restore();
+      g.setLineDash([8 * S, 6 * S]); g.strokeStyle = 'rgba(255,130,130,0.85)'; g.lineWidth = 1.6 * S; g.strokeRect(-w / 2, -d / 2, w, d); g.setLineDash([]);
+    } else {
+      const w = it.size[0] * k, d = it.size[2] * k, roof = isRoof(it);
+      g.fillStyle = roof ? (topY(it) >= -0.01 ? '#272e3d' : '#1f2533') : '#3b4354'; g.fillRect(-w / 2, -d / 2, w, d);
+      g.strokeStyle = roof ? '#9aa4ba' : '#7b859b'; g.lineWidth = (roof ? 2.4 : 1.2) * S; g.strokeRect(-w / 2, -d / 2, w, d);
+    }
+    g.restore();
+    if (isRoof(it)) later.push([(it.label || '') + '   顶面 y = ' + fmt(topY(it)) + ' m', X(r.x0) + 2 * S, Z(r.z0) - 5 * S, { size: 17 * S, align: 'left', valign: 'bottom', color: '#b4bdd0', bg: false }, 0, -12 * S]);
+    else if (it.type === 'zone') later.push([String(it.label || '').replace(' · ', '\n'), X(x), Z(z + it.size[1] * 0.33), { size: 16 * S, color: '#ffb3b3' }, 0, 14 * S]);
+    else if (it.label && Math.min(it.size[0], it.type === 'box' ? it.size[2] : it.size[0]) > 0.25) later.push([it.label, X(x), Z(r.z1) + 12 * S, { size: 13 * S, color: '#8892a8', bg: false }, 0, 10 * S]);
+  }
+  // camera path + direction chevrons
+  const poly = (pts, i0, i1) => { g.beginPath(); g.moveTo(X(pts[i0][0]), Z(pts[i0][2])); for (let j = i0 + 1; j <= i1; j++) g.lineTo(X(pts[j][0]), Z(pts[j][2])); g.stroke(); };
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  g.strokeStyle = CAM_COLOR; g.lineWidth = 3 * S; poly(cP, 0, N);
+  const CK = DATA.camera.keys;
+  for (let i = 0; i < CK.length - 1; i++) {
+    const tm = (CK[i].t + CK[i + 1].t) / 2, p = camState(tm).pos, q = camState(tm + 0.02).pos;
+    const a = Math.atan2(Z(q[2]) - Z(p[2]), X(q[0]) - X(p[0])), s = 9 * S;
+    g.save(); g.translate(X(p[0]), Z(p[2])); g.rotate(a); g.beginPath(); g.moveTo(-s, -s * 0.8); g.lineTo(s * 0.4, 0); g.lineTo(-s, s * 0.8); g.lineWidth = 2.6 * S; g.stroke(); g.restore();
+  }
+  // actor paths (airborne part dashed), whole-second ticks
+  const others = (ai) => aP.filter((_, j) => j !== ai).flat();
+  ACTORS.forEach((A, ai) => {
+    const pts = aP[ai], K = A.def.keys, orb = A.def.kind === 'orb';
+    const air = (t) => !orb && K.some((kk, i) => kk.pose === 'jump' && i < K.length - 1 && t > kk.t && t < K[i + 1].t);
+    g.strokeStyle = A.pathColor; g.lineWidth = (orb ? 2.6 : 4.2) * S; g.globalAlpha = orb ? 0.92 : 1;
+    let start = 0, st = air(0.5 / N * dur);
+    for (let i = 1; i <= N; i++) {
+      const s2 = i < N ? air((i + 0.5) / N * dur) : !st;
+      if (s2 !== st) { g.setLineDash(st ? [11 * S, 8 * S] : []); poly(pts, start, i); start = i; st = s2; }
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+    for (let s = 1; s < dur - 1e-6; s++) { const p = actorPos(A.def, s); g.beginPath(); g.arc(X(p[0]), Z(p[2]), 3.6 * S, 0, Math.PI * 2); g.fillStyle = A.pathColor; g.fill(); }
+    // labels on the side away from the other actors
+    const mz = pts.reduce((s, p) => s + p[2], 0) / pts.length, oth = others(ai);
+    const oz = oth.length ? oth.reduce((s, p) => s + p[2], 0) / oth.length : mz - 1, side = mz >= oz ? 1 : -1;
+    for (const grp of actorNotes(A)) {
+      const p = grp.pos; g.beginPath(); g.arc(X(p[0]), Z(p[2]), 5.5 * S, 0, Math.PI * 2); g.fillStyle = A.pathColor; g.fill();
+      g.strokeStyle = '#0a0d13'; g.lineWidth = 1.5 * S; g.stroke();
+      labels.push([grp.lines.join('\n'), X(p[0]), Z(p[2] + side * 0.62), { size: 16 * S, color: orb ? '#ffffff' : A.pathColor, valign: side > 0 ? 'top' : 'bottom' }, 0, side * 20 * S]);
+    }
+    if (!orb) {   // apex of each jump + final facing arrow
+      K.forEach((kk, i) => {
+        if (kk.pose !== 'jump' || i >= K.length - 1) return;
+        let best = null; for (let j = 0; j <= 60; j++) { const t = lerp(kk.t, K[i + 1].t, j / 60), p = actorPos(A.def, t); if (!best || p[1] > best.p[1]) best = { p, t }; }
+        const p = best.p; g.save(); g.translate(X(p[0]), Z(p[2])); g.rotate(Math.PI / 4); g.fillStyle = A.pathColor; g.fillRect(-6 * S, -6 * S, 12 * S, 12 * S); g.restore();
+        labels.push([best.t.toFixed(1) + 's 最高 +' + (p[1] - kk.pos[1]).toFixed(1) + ' m', X(p[0]), Z(p[2] + side * 0.62), { size: 16 * S, color: A.pathColor, valign: side > 0 ? 'top' : 'bottom' }, 0, side * 20 * S]);
+      });
+      const kl = K[K.length - 1], f = (kl.face || 0) * D2R, p = kl.pos, L = 0.95, ex = p[0] + Math.cos(f) * L, ez = p[2] - Math.sin(f) * L;
+      g.strokeStyle = A.pathColor; g.lineWidth = 3 * S; seg(g, X(p[0]), Z(p[2]), X(ex), Z(ez));
+      const a = Math.atan2(Z(ez) - Z(p[2]), X(ex) - X(p[0])), s = 10 * S;
+      g.save(); g.translate(X(ex), Z(ez)); g.rotate(a); g.beginPath(); g.moveTo(0, 0); g.lineTo(-s * 1.4, -s * 0.8); g.lineTo(-s * 1.4, s * 0.8); g.closePath(); g.fillStyle = A.pathColor; g.fill(); g.restore();
+    }
+  });
+  // frustum wedges at the camera keys
+  for (const ck of CK) {
+    const c = camState(ck.t), [ux, uz] = wedge(g, c, X, Z, S, 0.14, 0.95, 2.0);
+    camLabels.push([ck.t.toFixed(1) + 's\n机高 ' + fmt(c.pos[1] - subjectGround(ck.t)) + ' m · ' + Math.round(c.fov) + '°', X(c.pos[0] - ux * 0.95), Z(c.pos[2] - uz * 0.95), { size: 15 * S, color: CAM_COLOR, border: 'rgba(255,201,74,0.5)' }, -ux * 14 * S, -uz * 14 * S]);
+  }
+  if (tNow != null) {   // live markers (page only)
+    const c = camState(tNow); wedge(g, c, X, Z, S, 0.32, 1, 2.6);
+    ACTORS.forEach((A) => { const p = actorPos(A.def, tNow); g.beginPath(); g.arc(X(p[0]), Z(p[2]), 8 * S, 0, Math.PI * 2); g.fillStyle = A.pathColor; g.fill(); g.strokeStyle = '#000'; g.lineWidth = 2 * S; g.stroke(); });
+  }
+  PLACED = [];
+  if (tNow != null) PLACED.push(tag(g, 't = ' + tNow.toFixed(2) + ' s', mx + mw - 12 * S, my + 14 * S, { size: 18 * S, align: 'right', valign: 'top', color: '#fff' }));
+  for (const l of camLabels.concat(labels, later)) place(g, ...l);
+  g.restore();   // end clip
+  g.strokeStyle = '#262d3c'; g.lineWidth = 1; g.strokeRect(mx + 0.5, my + 0.5, mw - 1, mh - 1);
+  // title, legend, scale
+  tag(g, '平面图 · 俯视', 30 * S, 22 * S, { size: 26 * S, bold: true, align: 'left', valign: 'top', bg: false, color: '#eef1f7' });
+  tag(g, (DATA.title ? DATA.title + '  ·  ' : '') + fmt(dur) + ' s · ' + DATA.fps + ' fps · ' + (DATA.aspect || '16:9') + '  ·  x → 右，z ↓ 朝镜头一侧  ·  网格 1 m',
+    30 * S, 60 * S, { size: 15 * S, align: 'left', valign: 'top', bg: false, color: '#8f98ab' });
+  const leg = [['少女', '#ff5fa2', 'line'], ['腾空', '#ff5fa2', 'dash'], ['小机器人', '#ffffff', 'line'], ['镜头（楔形 = 水平视角）', CAM_COLOR, 'wedge'], ['楼缝', '#ff8c8c', 'zone']];
+  ACTORS.forEach((A) => { const e = leg.find((l) => l[0] === (A.def.label || A.def.id)); if (e) e[1] = A.pathColor; });
+  g.font = 15 * S + 'px ' + FONT;
+  let lx = W - 30 * S; const ly = 42 * S;
+  for (let i = leg.length - 1; i >= 0; i--) {
+    const [name, col, kind] = leg[i], tw = g.measureText(name).width;
+    lx -= tw; tag(g, name, lx, ly, { size: 15 * S, align: 'left', bg: false, color: '#c9cfdb' });
+    lx -= 40 * S; g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 3.5 * S;
+    if (kind === 'line') seg(g, lx, ly, lx + 30 * S, ly);
+    else if (kind === 'dash') { g.setLineDash([7 * S, 5 * S]); seg(g, lx, ly, lx + 30 * S, ly); g.setLineDash([]); }
+    else if (kind === 'wedge') { g.beginPath(); g.moveTo(lx, ly); g.lineTo(lx + 30 * S, ly - 9 * S); g.lineTo(lx + 30 * S, ly + 9 * S); g.closePath(); g.globalAlpha = 0.35; g.fill(); g.globalAlpha = 1; g.lineWidth = 1.5 * S; g.stroke(); }
+    else { g.setLineDash([5 * S, 4 * S]); g.lineWidth = 1.5 * S; g.strokeRect(lx + 4 * S, ly - 8 * S, 22 * S, 16 * S); g.setLineDash([]); }
+    lx -= 26 * S;
+  }
+  const sy = my + mh + 30 * S, sx = mx + 4 * S, sl = 2 * k;
+  g.strokeStyle = '#c9cfdb'; g.lineWidth = 2 * S; seg(g, sx, sy, sx + sl, sy); seg(g, sx, sy - 6 * S, sx, sy + 6 * S); seg(g, sx + sl, sy - 6 * S, sx + sl, sy + 6 * S); seg(g, sx + sl / 2, sy - 4 * S, sx + sl / 2, sy + 4 * S);
+  tag(g, '2 m', sx + sl + 10 * S, sy, { size: 15 * S, align: 'left', bg: false, color: '#c9cfdb' });
+  tag(g, '圆点 = 每整秒位置 · 色点 = 关键帧 · 机位标注 = 时间 / 机高（离少女脚下地面）/ 垂直视角', mx + mw, sy, { size: 14 * S, align: 'right', bg: false, color: '#7f889c' });
+  g.restore();
+}
+
+/* -------------------------------------------------------------- renderer */
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: RENDER });
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+const canvas = renderer.domElement; $('stage').insertBefore(canvas, $('plan'));
+const _box = new THREE.Box3(), _v = new THREE.Vector3();
+function ndcOf(obj) {
+  _box.setFromObject(obj);
+  let x0 = 9, x1 = -9, y0 = 9, y1 = -9, behind = false;
+  for (let i = 0; i < 8; i++) {
+    _v.set(i & 1 ? _box.max.x : _box.min.x, i & 2 ? _box.max.y : _box.min.y, i & 4 ? _box.max.z : _box.min.z);
+    if (_v.clone().applyMatrix4(shotCam.matrixWorldInverse).z > -0.01) behind = true;
+    _v.project(shotCam);
+    x0 = Math.min(x0, _v.x); x1 = Math.max(x1, _v.x); y0 = Math.min(y0, _v.y); y1 = Math.max(y1, _v.y);
+  }
+  const r = (v) => +v.toFixed(3);
+  return { x0: r(x0), x1: r(x1), y0: r(y0), y1: r(y1), h: r((y1 - y0) / 2), behind };
+}
+function glInfo() { const gl = renderer.getContext(), e = gl.getExtension('WEBGL_debug_renderer_info'); return e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER); }
+
+function start() {
+  buildAll(window.__BLOCKING__ ? structuredClone(window.__BLOCKING__) : JSON.parse(EMBED_TEXT));
+  if (RENDER) return startRender();
+  startPage();
+}
+
+/* ------------------------------------------- headless render API (render.mjs) */
+function startRender() {
+  document.body.classList.add('render');
+  const RW = 854, RH = 480, SS = 2;                     // drawn at 2x, averaged down to 854x480
+  renderer.setPixelRatio(SS); renderer.setSize(RW, RH); canvas.style.left = '0px'; canvas.style.top = '0px';
+  const out = document.createElement('canvas'); out.width = RW; out.height = RH;
+  const octx = out.getContext('2d');
+  window.stage = {
+    info: () => ({ duration: DATA.duration, fps: DATA.fps, aspect: ASPECT, frames: Math.round(DATA.duration * DATA.fps), gl: glInfo() }),
+    frame(t) {
+      setTime(t); helpers.visible = false;
+      shotCam.aspect = RW / RH; shotCam.updateProjectionMatrix();
+      renderer.setScissorTest(false); renderer.setViewport(0, 0, RW, RH); renderer.render(scene, shotCam);
+      octx.imageSmoothingEnabled = true; octx.imageSmoothingQuality = 'high'; octx.drawImage(canvas, 0, 0, RW, RH);
+      const framing = {}; scene.updateMatrixWorld();
+      for (const A of ACTORS) framing[A.def.id] = ndcOf(A.orb || A.root);
+      return { png: out.toDataURL('image/png'), framing };
+    },
+    plan(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; drawPlan(c.getContext('2d'), w, h, null); return c.toDataURL('image/png'); },
+    async contact(urls, labels, tw, th) {
+      const gap = 8, n = urls.length, c = document.createElement('canvas'); c.width = n * tw + (n + 1) * gap; c.height = th + gap * 2;
+      const g = c.getContext('2d'); g.fillStyle = '#0c0f16'; g.fillRect(0, 0, c.width, c.height);
+      for (let i = 0; i < n; i++) {
+        const img = new Image(); img.src = urls[i]; await img.decode();
+        const x = gap + i * (tw + gap); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high'; g.drawImage(img, x, gap, tw, th);
+        tag(g, labels[i], x + 8, gap + 7, { size: 15, align: 'left', valign: 'top', color: '#ffffff', bg: 'rgba(0,0,0,0.62)' });
+      }
+      return c.toDataURL('image/png');
+    },
+    ready: true,
+  };
+}
+
+/* ------------------------------------------------------- interactive page */
+function startPage() {
+  $('boot').style.display = 'none';
+  const freeCam = new THREE.PerspectiveCamera(42, 1, 0.1, 4000); freeCam.position.set(-4, 10, 17);
+  const controls = new OrbitControls(freeCam, canvas); controls.target.set(0.8, -0.3, 0); controls.enableDamping = true; controls.update();
+  let mode = 'shot', playing = false, view = { w: 1, h: 1 }, last = performance.now();
+  const ta = $('ta'), msg = $('msg');
+  ta.value = EMBED_TEXT;
+  const fr = () => Math.round(DATA.duration * DATA.fps);
+  function refreshMeta() { $('title').textContent = (DATA.title || '') + ' · ' + DATA.duration.toFixed(1) + ' s · ' + DATA.fps + ' fps · ' + (DATA.aspect || '16:9'); $('scrub').max = DATA.duration; $('scrub').step = 1 / DATA.fps; }
+  function layout() {
+    const st = $('stage'), W = st.clientWidth, H = st.clientHeight;
+    let w = W, h = H, x = 0, y = 0;
+    if (mode === 'shot') { if (W / H > ASPECT) { w = Math.round(H * ASPECT); x = Math.round((W - w) / 2); } else { h = Math.round(W / ASPECT); y = Math.round((H - h) / 2); } }
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1)); renderer.setSize(Math.max(1, w), Math.max(1, h));
+    canvas.style.left = x + 'px'; canvas.style.top = y + 'px'; view = { w, h };
+    const pc = $('plan'), dpr = Math.min(2, window.devicePixelRatio || 1); pc.width = Math.max(1, Math.round(W * dpr)); pc.height = Math.max(1, Math.round(H * dpr));
+  }
+  function setMode(m) { mode = m; for (const b of document.querySelectorAll('#modes button')) b.classList.toggle('on', b.dataset.m === m); $('hint').style.display = m === 'free' ? 'block' : 'none'; layout(); }
+  function hideLabels() { for (const A of ACTORS) A.label.style.display = 'none'; $('lbl-cam').style.display = 'none'; }
+  function placeLabels(w, h) {
+    const items = ACTORS.map((A) => { const p = A.root.position; return [A.label, new THREE.Vector3(p.x, p.y + (A.orb ? A.r + 0.3 : (A.def.height || 1.6) + 0.4), p.z)]; });
+    items.push([$('lbl-cam'), shotCam.position.clone().add(new THREE.Vector3(0, 0.34, 0))]);
+    for (const [el, v] of items) {
+      v.project(freeCam); const vis = v.z > -1 && v.z < 1 && Math.abs(v.x) < 1.05 && Math.abs(v.y) < 1.05;
+      el.style.display = vis ? 'block' : 'none';
+      if (vis) { el.style.left = (v.x + 1) / 2 * w + 'px'; el.style.top = (1 - v.y) / 2 * h + 'px'; }
+    }
+  }
+  function draw() {
+    const plan = mode === 'plan';
+    canvas.style.display = plan ? 'none' : 'block'; $('plan').style.display = plan ? 'block' : 'none';
+    if (plan) { const pc = $('plan'); drawPlan(pc.getContext('2d'), pc.width, pc.height, T); hideLabels(); $('pipf').style.display = 'none'; return; }
+    const { w, h } = view;
+    renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h);
+    if (mode === 'shot') {
+      helpers.visible = false; shotCam.aspect = ASPECT; shotCam.updateProjectionMatrix(); renderer.render(scene, shotCam);
+      hideLabels(); $('pipf').style.display = 'none'; return;
+    }
+    controls.update();
+    helpers.visible = $('optPaths').checked; if (helpers.visible) updateFrustum();
+    freeCam.aspect = w / h; freeCam.updateProjectionMatrix(); renderer.render(scene, freeCam); placeLabels(w, h);
+    const f = $('pipf');
+    if ($('optPip').checked) {
+      const pw = Math.round(Math.min(w * 0.3, 420)), ph = Math.round(pw / ASPECT), m = 12;
+      helpers.visible = false; shotCam.aspect = ASPECT; shotCam.updateProjectionMatrix();
+      renderer.setScissorTest(true); renderer.setScissor(w - pw - m, m, pw, ph); renderer.setViewport(w - pw - m, m, pw, ph);
+      renderer.render(scene, shotCam); renderer.setScissorTest(false);
+      Object.assign(f.style, { display: 'block', width: pw + 'px', height: ph + 'px', right: m + 'px', bottom: m + 'px' });
+    } else f.style.display = 'none';
+  }
+  function syncUI() {
+    $('scrub').value = T;
+    const n = fr(), fi = Math.min(n - 1, Math.floor(T * DATA.fps + 1e-6));
+    $('tlabel').textContent = T.toFixed(2) + ' s / ' + DATA.duration.toFixed(1) + ' s · 帧 ' + (fi + 1) + '/' + n;
+    $('play').textContent = playing ? '❚❚ 暂停' : '▶ 播放';
+  }
+  function tick(now) {
+    const dt = Math.min(0.1, (now - last) / 1000); last = now;
+    if (playing) { let t = T + dt; if (t >= DATA.duration) t = 0; T = t; }
+    setTime(T); draw(); syncUI();
+    requestAnimationFrame(tick);
+  }
+  const step = (d) => { playing = false; T = clamp(Math.round(T * DATA.fps + d) / DATA.fps, 0, DATA.duration); };
+  $('modes').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setMode(b.dataset.m); });
+  $('play').onclick = () => { playing = !playing; if (playing && T >= DATA.duration - 1e-3) T = 0; };
+  $('scrub').addEventListener('input', (e) => { playing = false; T = +e.target.value; });
+  $('btnJson').onclick = () => $('side').classList.toggle('open');
+  $('btnClose').onclick = () => $('side').classList.remove('open');
+  $('btnApply').onclick = () => {
+    try { buildAll(JSON.parse(ta.value)); refreshMeta(); msg.className = ''; msg.textContent = '已应用：' + ACTORS.length + ' 个角色，' + DATA.camera.keys.length + ' 个机位关键帧。'; }
+    catch (err) { msg.className = 'err'; msg.textContent = '无法应用：' + err.message; }
+  };
+  $('btnReset').onclick = () => { ta.value = EMBED_TEXT; buildAll(JSON.parse(EMBED_TEXT)); refreshMeta(); msg.className = ''; msg.textContent = '已恢复内置分镜。'; };
+  window.addEventListener('keydown', (e) => {
+    if (e.target === ta) return;
+    if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
+    else if (e.key === 'ArrowRight') step(1); else if (e.key === 'ArrowLeft') step(-1);
+    else if (e.key === '1') setMode('shot'); else if (e.key === '2') setMode('free'); else if (e.key === '3') setMode('plan');
+  });
+  window.addEventListener('resize', layout);
+  if (window.ResizeObserver) new ResizeObserver(layout).observe($('stage'));
+  refreshMeta(); setMode('shot'); requestAnimationFrame(tick);
+}
+
+try { start(); }
+catch (err) { const b = $('boot'); b.style.display = 'flex'; b.textContent = '出错了：' + err.message; console.error(err); }
+</script>
+
+<script>
+// Boot: pick the first CDN that answers, map 'three' to it, then start the app module.
+// (Works from file://, http(s):// and inside a sandboxed iframe; render.mjs serves the vendored copy offline.)
+(function () {
+  var BASES = ['https://cdn.jsdelivr.net/npm/three@0.160.0/', 'https://fastly.jsdelivr.net/npm/three@0.160.0/', 'https://unpkg.com/three@0.160.0/', 'https://registry.npmmirror.com/three/0.160.0/files/'];
+  var boot = document.getElementById('boot');
+  function fail(m) { boot.style.display = 'flex'; boot.textContent = m; }
+  window.addEventListener('error', function (e) { if (!window.stage && !document.querySelector('#stage > canvas:not(#plan)')) fail('页面脚本出错：' + (e.message || e)); });
+  function probe(i) {
+    if (i >= BASES.length) { fail('three.js 加载失败：需要联网访问 cdn.jsdelivr.net / unpkg.com。'); return; }
+    var ctl = window.AbortController ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctl) ctl.abort(); }, 6000);
+    fetch(BASES[i] + 'build/three.module.js', { method: 'HEAD', mode: 'cors', signal: ctl ? ctl.signal : undefined })
+      .then(function (r) { clearTimeout(timer); if (r.ok) start(BASES[i]); else probe(i + 1); }, function () { clearTimeout(timer); probe(i + 1); });
+  }
+  function start(base) {
+    var im = document.createElement('script'); im.type = 'importmap';
+    im.textContent = JSON.stringify({ imports: { 'three': base + 'build/three.module.js', 'three/addons/': base + 'examples/jsm/' } });
+    document.head.appendChild(im);
+    var s = document.createElement('script'); s.type = 'module';
+    s.textContent = document.getElementById('app-src').textContent;
+    document.body.appendChild(s);
+  }
+  probe(0);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1989 @@
+//! Shared wire/protocol model for Mafold — the ONE definition of the data the
+//! API serves and clients consume (Account / Conversation / Message / Attachment
+//! / Reaction / pagination / auth). Extracted from `mafold-api/src/models.rs` so
+//! the backend and the client core can share a single source of truth instead of
+//! re-declaring the shapes per side. `mafold-api` re-exports this as its
+//! `models` module (so its call sites are unchanged); the client core can adopt
+//! it for server-payload (de)serialization.
+
+use std::collections::HashSet;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Work one agent hands another: where its replies land, how it comes back
+/// (`a2a.rs`, `.docs/a2a-threads.md`).
+pub mod a2a;
+pub mod connections;
+/// A person's computers and their agents at work on them: the machine report,
+/// the computers list, presence (`computers.rs`).
+pub mod computers;
+/// D1 databases: names, wire shapes (`d1.rs`, `.docs/d1-v1.md`).
+pub mod d1;
+/// Who can send me messages: the setting, what it decides, why a sender is
+/// turned away (`dm_privacy.rs`).
+pub mod dm_privacy;
+pub mod drive;
+/// The feature-flag registry — keys, defaults, who reads each, and what the
+/// server decides without a record (`flags.rs`, `.docs/feature-flags.md`).
+pub mod flags;
+/// A handle's address at mafold.com and back — the one mapping the rcpt hook,
+/// the mail methods, @mail and the cli share (`mail.rs`).
+pub mod mail;
+/// What a document's name says it is — the one extension → type table the cli
+/// declares from and the api guesses from (`mime.rs`).
+pub mod mime;
+/// What agents did for a person, one row per reply — the activity center's
+/// receipts card (`receipts.rs`).
+pub mod receipts;
+/// A mafold.app site's own Worker (`sites.rs`, `.docs/site-workers-v1.md`).
+pub mod sites;
+/// Which addresses a request to somebody else's URL may reach — the api's
+/// fetches and a daemon's `mafold app call` (`net.rs`).
+pub mod net;
+/// Mid-turn words: which running turn takes them, and how they are framed —
+/// one rule for the daemon and the hosted brains (`steer.rs`).
+pub mod steer;
+/// How a number reads — durations, counts, dollars, sizes, "how long ago" —
+/// the Rust half of `client-shared/units.ts`, tested against the same table
+/// (`units.rs`).
+pub mod units;
+/// Seedance on ModelArk: which aspect ratio a job may ask for, by model and
+/// ref roles — one rule for the api's `videoSubmit` and the core's
+/// `ark-video` driver (`video.rs`).
+pub mod video;
+/// How a Python sandbox run reads to the agent that ran it — one copy for the
+/// hosted `python` tool and `mafold sandbox run` (`sandbox.rs`).
+pub mod sandbox;
+/// What may sign a new agent in, by where it runs and its runtime — the Rust
+/// half of `client-shared/newAgent.ts`, tested against the same table.
+pub mod agent_setup;
+pub use connections::{
+    provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
+    PROVIDERS,
+};
+
+// MARK: - Files
+
+/// **The** way an asset appears on this wire — avatars, banners, group photos,
+/// message media, thumbnails. There is no url field anywhere, by design
+/// (owner's call, 2026-08-12): a url is a location, and locations belong in
+/// configuration, not in data. Storing one is how `api.mafold.com` stayed
+/// frozen in account rows for months after the bytes moved to a CDN.
+///
+/// Two ids, splitting Telegram's responsibilities:
+///
+/// * `id` — the **handle**. Fetch bytes from `<file_base>/<id>`, where
+///   `file_base` arrives once per connection in `events.hello`. It is also the
+///   object key, which is what makes that template work with no per-file round
+///   trip and no re-keying of pre-existing objects.
+/// * `unique_id` — the **content identity** (sha256). Answers "same file?"
+///   without fetching; never resolves to anything. Empty on rows inherited from
+///   before the registry, where the bytes were never in our hands: empty means
+///   *unknown*, and must never compare equal to another unknown.
+///
+/// `w`/`h` ride along so a bubble can reserve the box before the image lands.
+/// See `.docs/file-id-v1.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileRef {
+    pub id: String,
+    #[serde(default)]
+    pub unique_id: String,
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// The bytes never reached the bucket and only the api host has them —
+    /// append `id` to the api origin instead of `file_base`. A property of the
+    /// file, not a second addressing scheme.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
+    /// The picture itself, small enough to ride along: a JPEG whose long edge
+    /// is ~40px with its metadata segments stripped, base64, ~1.2 KB. It costs
+    /// **zero requests** — by the time a bubble exists, its first frame is
+    /// already in hand. `w`/`h` reserve the box; this fills it.
+    ///
+    /// A plain JPEG on purpose, not Telegram's header-stripped form: readers
+    /// hand it straight to `data:image/jpeg;base64,…` with no expansion code
+    /// and no hardcoded quantisation table to keep in sync. See
+    /// `.docs/thumbnail-v1.md` §3.1/§4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip: Option<String>,
+    /// The same picture at higher fidelity, when one exists.
+    ///
+    /// `None` is the COMMON case, not a degraded one: the sender has to tick
+    /// "original" for the full-size bytes to be uploaded at all. Readers show
+    /// a "view original" affordance exactly when this is `Some` — there is no
+    /// second question to ask and no request that can 404.
+    ///
+    /// One level deep; an `orig`'s own `orig` is always `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orig: Option<Box<FileRef>>,
+    /// A picture of a DOCUMENT's first page or screen (html, pdf, md, pptx),
+    /// drawn by the server the first time a reader asks (`resolveCovers`).
+    /// A bubble shows it in place of the file's type glyph. `None` = not drawn
+    /// (yet, or ever: a zip has no first page) — the bubble keeps the glyph.
+    /// One level: a cover's own `cover` is always `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<Box<FileRef>>,
+}
+
+impl FileRef {
+    /// A bare handle, everything else unknown — what an author has when all it
+    /// did was upload something and keep the id.
+    pub fn from_id(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            unique_id: String::new(),
+            mime: String::new(),
+            size_bytes: 0,
+            w: None,
+            h: None,
+            duration_ms: None,
+            filename: None,
+            local: false,
+            strip: None,
+            orig: None,
+            cover: None,
+        }
+    }
+}
+
+/// Accept either a full [`FileRef`] or a bare id string.
+///
+/// Author-facing fields (a bot's inline-result thumbnail) are hand-written
+/// JSON, and `"thumb": "<file id>"` is the honest shape for someone who only
+/// holds the handle. The API fills in the rest from the registry on the way
+/// out, so a reader always sees the complete object either way.
+pub fn opt_file_ref<'de, D>(d: D) -> Result<Option<FileRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Bare(String),
+        Full(FileRef),
+    }
+    Ok(match Option::<Either>::deserialize(d)? {
+        None => None,
+        Some(Either::Bare(s)) if s.trim().is_empty() => None,
+        Some(Either::Bare(s)) => Some(FileRef::from_id(s)),
+        Some(Either::Full(f)) => Some(f),
+    })
+}
+
+// MARK: - Account
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountKind {
+    Human,
+    Bot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Account {
+    pub username: String,
+    pub display_name: String,
+    pub kind: AccountKind,
+    /// The account's picture — a [`FileRef`], like every other asset on this
+    /// wire. Was `avatar_url`; see [`FileRef`] for why there is no url.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<FileRef>,
+    /// Publication banner (the /@handle cover), ~3:1. Same contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<FileRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    /// For bot accounts (e.g. `ops:claude`), the username of the human
+    /// owner whose API key + cost the bot runs on. None for humans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_username: Option<String>,
+    /// For bot accounts, which provider this bot runs against:
+    /// `"claude"` / `"deepseek"` / etc. Picks the brain implementation
+    /// and the credential row to use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// For external (locally-driven) bots, which agent harness the user's
+    /// mafold-cli daemon should drive: `"claude-code"` / `"codex"` /
+    /// `"kimi-code"` / `"opencode"` / `"openclaw"`. The daemon reads this from
+    /// `getMe` (cloud-first); None ⇒ the daemon's default (claude-code).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Preferred UI language (BCP-47, e.g. "zh-Hans" / "en"). A cloud setting that
+    /// syncs across the user's devices; None ⇒ the client uses the device locale.
+    /// See .docs/i18n-v0.md.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Platform verification (blue check), granted by ops — first cohort: the
+    /// official-AI matrix accounts whose words come from the vendor's official
+    /// API. Clients render a badge next to the display name; never self-serve.
+    #[serde(default)]
+    pub verified: bool,
+    /// The Mafold Premium crown. Orthogonal to `verified` — that one says
+    /// "this identity was checked", this one says "this person is a member".
+    /// Both can be true and clients render both.
+    ///
+    /// **DERIVED, never stored.** The server computes it from the Stripe
+    /// subscription row and the clock at every egress, so a missed webhook
+    /// cannot leave a badge outliving the money. Nothing sets it by hand.
+    ///
+    /// A member may turn the crown off (the Premium card's switch), and then
+    /// this is false on every copy of the account — so it is NOT whether the
+    /// account holds Premium. That is [`Self::premium_member`].
+    #[serde(default)]
+    pub premium: bool,
+    /// Whether the account holds Premium — on the account's OWN copy only (the
+    /// socket's hello, `getMe`); every other copy omits it, or hiding the crown
+    /// would hide nothing. A server from before the switch never sends it, and
+    /// there `premium` is still the membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premium_member: Option<bool>,
+}
+
+/// A slash command a bot advertises — shown in the chat's command panel when
+/// the user types `/`. Telegram-style; each bot defines its own set (via
+/// `setBotCommands` with its own token).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BotCommand {
+    pub command: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_hint: Option<String>,
+}
+
+// MARK: - Inline query
+
+/// What picking an inline result does to the composer. Declared BY THE RESULT,
+/// so no client ever branches on which bot produced it: a gif bot's row sends,
+/// a document bot's row drops a link into the sentence you were writing.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InlinePick {
+    /// Send `content` immediately as the user's own message (Telegram's default).
+    #[default]
+    Send,
+    /// Put `content` in the draft and let the user keep typing around it.
+    Insert,
+}
+
+/// One candidate row in an inline-query picker.
+///
+/// `content` is the message body that gets sent or inserted — everything else is
+/// presentation for the row. Whatever is picked is sent AS THE USER; the queried
+/// bot never appears in the conversation, which is what lets a bot answer an
+/// inline query from a group it isn't a member of.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InlineResult {
+    /// Stable, content-derived id. Clients de-duplicate on it and use it to keep
+    /// the highlighted row from jumping while later keystrokes re-answer.
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Result thumbnail — a [`FileRef`], like every asset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumb: Option<FileRef>,
+    pub content: String,
+    /// Seconds a client MAY reuse this answer for an unchanged query. `None` =
+    /// don't cache. Set by whoever answers, because only it knows whether the
+    /// underlying data is a fixed command list or a live search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<u32>,
+    pub on_pick: InlinePick,
+}
+
+/// Longest title a picker row can show before it has to be clipped.
+const INLINE_TITLE_CHARS: usize = 80;
+
+impl InlineResult {
+    /// A plain message body as a single picker row — its own title, sent on pick.
+    pub fn from_body(content: String) -> Self {
+        Self {
+            id: fnv1a_hex(content.as_bytes()),
+            title: inline_first_line(&content),
+            description: None,
+            thumb: None,
+            content,
+            cache_ttl: None,
+            on_pick: InlinePick::Send,
+        }
+    }
+}
+
+/// The first non-empty line, clipped to a picker row's worth. Clipped by CHARS,
+/// never bytes — a CJK title cut mid-codepoint would panic on the slice.
+fn inline_first_line(content: &str) -> String {
+    let line = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut out: String = line.chars().take(INLINE_TITLE_CHARS).collect();
+    if line.chars().count() > INLINE_TITLE_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+impl<'de> Deserialize<'de> for InlineResult {
+    /// Accepts the structured object OR a bare string.
+    ///
+    /// The bare string is what `answerInlineQuery` took before there was a
+    /// picker to fill, and daemons are user-installed software that updates on
+    /// its own schedule — so an old daemon's answer must degrade to one plain
+    /// row, not fail the whole query. Partial objects fill in the same way: a
+    /// result carrying only a title still sends something rather than an empty
+    /// message.
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Obj {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default, deserialize_with = "opt_file_ref")]
+            thumb: Option<FileRef>,
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            cache_ttl: Option<u32>,
+            #[serde(default)]
+            on_pick: InlinePick,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Bare(String),
+            Obj(Obj),
+        }
+        Ok(match Wire::deserialize(d)? {
+            Wire::Bare(s) => Self::from_body(s),
+            Wire::Obj(o) => {
+                let content = o.content.or_else(|| o.title.clone()).unwrap_or_default();
+                Self {
+                    id: o.id.unwrap_or_else(|| fnv1a_hex(content.as_bytes())),
+                    title: o.title.unwrap_or_else(|| inline_first_line(&content)),
+                    description: o.description,
+                    thumb: o.thumb,
+                    content,
+                    cache_ttl: o.cache_ttl,
+                    on_pick: o.on_pick,
+                }
+            }
+        })
+    }
+}
+
+// MARK: - Conversation
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationKind {
+    Direct,
+    Group,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: Uuid,
+    pub kind: ConversationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub participants: Vec<Account>,
+    pub updated_at: DateTime<Utc>,
+    /// Telegram-style unread badge count. Server-set; clients render it
+    /// as a pill at the end of the dialog row. Zero is omitted by the
+    /// `skip_serializing_if`, so the client treats absence as zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unread_count: u32,
+    /// Someone @-mentioned the requester inside that unread. The badge then
+    /// reads `@` instead of a number — which of them is talking to you outranks
+    /// how many. Same walk as `unread_count`, so it obeys the same read marker.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread_mention: bool,
+    /// How many messages the requester can see in the main timeline (#all —
+    /// a channel's and a thread's messages aren't in it). Per requester like
+    /// `unread_count`. Clients show it where there's nobody to be online:
+    /// Saved Messages' header. Server-set at list time.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub message_count: u32,
+    /// Group avatar (None for direct chats — clients use the peer's avatar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<FileRef>,
+    /// Group cover — the ~3:1 picture across the top of its profile, the
+    /// account's `banner` for a group (None for direct chats — clients use the
+    /// peer's). Set with `setChatBanner`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<FileRef>,
+    /// A live card drawn as the cover instead of `banner`: one published card's
+    /// self-closing tag (`{% owner/slug k="v" /%}`). Set with `setChatCoverCard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_card: Option<String>,
+    /// Group description / "about" text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Pinned message ids, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_message_ids: Vec<Uuid>,
+    /// Pinned installed-app ids (`owner/slug`), newest first. Same manage
+    /// gate as message pins; clients surface these ahead of the other
+    /// installs (e.g. the launcher's collapsed slots).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_app_ids: Vec<String>,
+    /// True when the requesting user has muted this chat. Per-user; filled
+    /// in at list time from the caller's mute set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
+    /// True when the requesting user has pinned this chat to the top. Per-user;
+    /// filled in at list time from the caller's pin set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    /// The most recent visible message — populated at list time so clients
+    /// render the dialog preview without a per-conversation history fetch.
+    /// Not stored; computed per requester (respects their deletes/hidden).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<Message>,
+    /// Incremental-sync watermark for this conversation's `#all` timeline — the
+    /// value `messages.diff` takes as `since`. Monotonic, server-issued, and
+    /// bumped by anything that changes a row (new message, finalize, edit,
+    /// delete, reaction).
+    ///
+    /// Shipped WITH the list on purpose: a client that already cached this
+    /// conversation can compare it against its own watermark and know, without
+    /// a single request, whether opening the chat needs the network at all.
+    /// Same "populated at list time" rule as `last_message`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub pts: u64,
+    /// Group creator (lowercased username) — full control. None for direct
+    /// chats and for legacy groups created before roles existed (those fall
+    /// back to "any participant can manage", preserving prior behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Lowercased usernames the owner has promoted to admin. An admin runs the
+    /// group day to day; `transferGroupOwner`, `disbandGroup` and
+    /// `setGroupAdmin` stay owner-only, so admins can't appoint, demote or kick
+    /// each other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admins: Vec<String>,
+    /// Disbanded: retired group — no sends, no management, but the conversation
+    /// and all its messages stay readable in everyone's chat list.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disbanded: bool,
+    /// True when this group is a forum ("discussion" enabled): its messages are
+    /// organized into channels. The main timeline (`#all`, `channel_id = None`)
+    /// always exists and needs no migration; extra named channels are `Channel`
+    /// records, fetched on demand via `listChannels`. Admin-gated toggle.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_forum: bool,
+    /// Forum: may ordinary members create channels? (Telegram's "Create
+    /// Topics" member permission.) Default false = managers only.
+    ///
+    /// LEGACY WIRE NAME for `member_perms.create_channels` — shipped clients
+    /// (core's `CoreConversation`, iOS) read this spelling. It is a mirror, not
+    /// a second source of truth: `Store::set_member_perms` writes both and
+    /// nothing else writes either.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forum_member_channels: bool,
+    /// What ORDINARY members may do here. Absent = every bit false = managers
+    /// only, which is exactly how groups behaved before this field existed.
+    #[serde(default, skip_serializing_if = "MemberPerms::is_default")]
+    pub member_perms: MemberPerms,
+    /// FORUM ONLY — the unread sitting in this group's CHANNELS, summed at list
+    /// time for the requester.
+    ///
+    /// `unread_count` above is the MAIN timeline's and nothing else: channel
+    /// messages deliberately never enter `ConversationRecord.message_ids`, so a
+    /// forum that is on fire reports `unread_count: 0`. Every client papered
+    /// over that by summing `listChannels` for the forums it had already opened
+    /// — which is why the row you have never visited stays blank while the tab
+    /// badge, computed from the same partial data, shows a number. The sum
+    /// belongs here, once, computed by the side that can see every channel.
+    ///
+    /// Muted channels are NOT in it (they go to `channel_muted_unread`), and
+    /// neither are archived ones: archived means out of sight, and a number
+    /// that only an archive drawer can explain is worse than no number.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub channel_unread: u32,
+    /// Someone @-mentioned the requester inside `channel_unread`. Same rule the
+    /// per-channel badge follows: who is talking to you outranks how many.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channel_unread_mention: bool,
+    /// The unread the requester asked not to be shouted at about — muted
+    /// channels only. Clients draw a quiet dot for it, never a number.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub channel_muted_unread: u32,
+    /// The newest thing actually said in this conversation, wherever it was
+    /// said — `#all` or any un-archived channel — plus which channel that was.
+    ///
+    /// SEPARATE FROM `last_message` on purpose. `last_message` is the main
+    /// timeline's and doubles as the read-marker source clients hand back to
+    /// `markRead`; the server REJECTS a channel id there (it used to poison
+    /// `unread_for` into "everything unread"), so widening that field's meaning
+    /// would silently turn "mark all read" into a no-op. This one is additive:
+    /// a client that doesn't know it still renders exactly what it renders now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<LatestActivity>,
+}
+
+/// The newest visible message in a conversation together with the channel it
+/// came from — what a dialog row's second line should actually read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestActivity {
+    pub message: Message,
+    /// None = the `#all` main timeline. Clients draw no prefix for it: the
+    /// absence IS the statement "this is the main timeline", and a `#general`
+    /// stamped on most rows is noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<ChannelRef>,
+}
+
+/// Just enough of a `Channel` to name it in a dialog row. The whole record
+/// would drag a second `Message` (the channel's own `last_message`) into every
+/// row of the chat list — and the name is all the row draws.
+///
+/// Carried by value rather than as an id because the client has NO channel
+/// table for a forum it has never opened, which is exactly the row this exists
+/// to fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelRef {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// The member-side half of group permissions: powers an ordinary member does
+/// NOT have unless the group grants them. The owner and admins always have all
+/// of these — these bits only ever widen the circle, never narrow it, so a
+/// manager can't be locked out of their own group by a permission toggle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberPerms {
+    /// Add other people (`addChatMembers`) and mint invite links.
+    #[serde(default)]
+    pub add_members: bool,
+    /// Edit the group's title / photo / description.
+    #[serde(default)]
+    pub edit_info: bool,
+    /// Add a bot they own to the group (`addGroupBot`).
+    #[serde(default)]
+    pub add_bots: bool,
+    /// Forum only: create channels (Telegram's "Create Topics").
+    #[serde(default)]
+    pub create_channels: bool,
+}
+
+impl MemberPerms {
+    /// All-false = the locked-down default; lets the field vanish from the wire
+    /// for the overwhelming majority of conversations that never change it.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A shareable invite to a group — the ONLY way to join one without a manager
+/// adding you by name.
+///
+/// A group may hold several at once (one per place you posted it), each
+/// independently expirable, capped and revocable, so retiring the link you put
+/// in one channel never breaks the others. The code is the whole credential:
+/// opaque, never reused, and worthless once `revoked` or spent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteLink {
+    /// URL-safe opaque code — the tail of `https://mafold.com/join/<code>`.
+    pub code: String,
+    pub conversation_id: Uuid,
+    /// Who minted it (lowercased username).
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    /// Manager-visible label, so two links are tellable apart ("Twitter", "Q3").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Hard expiry. None = never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Max successful joins. None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limit: Option<u32>,
+    /// Successful joins so far. Never decremented — someone leaving does not
+    /// refund a seat, or a capped link would be an unbounded one.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub used_count: u32,
+    /// Manually killed. Revoked links stay listed (they are the audit trail of
+    /// who let whom in) and never work again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub revoked: bool,
+}
+
+impl InviteLink {
+    /// Usable right now? Mirrors the server's join gate exactly.
+    pub fn is_live(&self, now: DateTime<Utc>) -> bool {
+        !self.revoked
+            && self.expires_at.is_none_or(|t| t > now)
+            && self.usage_limit.is_none_or(|n| self.used_count < n)
+    }
+}
+
+/// What someone holding an invite code sees BEFORE they join — enough to decide,
+/// and nothing more. Deliberately not a `Conversation`: a stranger with a link
+/// has no business reading the member list or the history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvitePreview {
+    pub conversation_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<FileRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub member_count: u32,
+    /// A handful of members for the avatar stack — capped server-side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_members: Vec<Account>,
+    /// The caller is already in: the client offers "Open", not "Join".
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub already_member: bool,
+    /// Who minted the link, when that account still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter: Option<Account>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+/// An extra forum channel (beyond the implicit `#all` main timeline). A group
+/// becomes a forum via `is_forum`; each `Channel` is a named sub-timeline whose
+/// messages carry `Message.channel_id = Some(this.id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+    pub id: Uuid,
+    pub conversation_id: Uuid,
+    pub name: String,
+    /// Ascending display order. `#all` is implicit and always sorts first.
+    pub order: i32,
+    pub created_at: DateTime<Utc>,
+    /// Per-requester unread badge, computed at list time (like a dialog row).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unread_count: u32,
+    /// Someone @-mentioned the requester inside that unread — the badge reads
+    /// `@` instead of a number. Computed in the same walk as `unread_count`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread_mention: bool,
+    /// Most recent message in this channel, computed at list time for the
+    /// channel-list preview. Not stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<Message>,
+    /// Plain summary of the full last message, at most 240 characters. Kept
+    /// separate from the bounded raw prefix so clients never parse it as markup
+    /// or mistake a generating-only placeholder for meaningful spoken content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_preview: Option<String>,
+    /// Closed = read-only lock: history stays, new messages are rejected
+    /// server-side (`channel_guard`); reopen anytime. `#all` can't close (v1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub closed: bool,
+    /// Pinned to the top section of the channel list (cap 5, Telegram parity).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    /// Archived = out of sight, not read-only: the channel moves out of the main
+    /// list into the "Archive" drawer, keeps working (post/read as usual), and
+    /// stops contributing to the forum's unread dot. Orthogonal to `closed`
+    /// (the read-only lock). Mutually exclusive with `pinned`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
+    /// Channel icon: a single emoji. None = the default "#" tile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Created without a name: `name` is a placeholder in the creator's
+    /// language until the first real name lands. Clients show it as an
+    /// untitled channel; anyone who may post in it may name it once.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub untitled: bool,
+    /// Pinned message ids in THIS channel, newest first.
+    ///
+    /// A pin belongs to the timeline it was made in. `Conversation::
+    /// pinned_message_ids` is therefore the MAIN (`#all`) timeline's list, not
+    /// the forum's — before this split, pinning in `#garden` put a bar in every
+    /// channel, and since the message isn't in their buckets the bar rendered
+    /// with no text. The server routes each pin by the pinned message's own
+    /// `channel_id`, so no caller has to say which list it meant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_message_ids: Vec<Uuid>,
+}
+
+// MARK: - Message
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    /// Server-assigned content/attachment revision, persisted with the message.
+    /// Independent of a recipient's event seq: late broadcasts and history
+    /// responses keep the revision of the snapshot they actually carry.
+    #[serde(default)]
+    pub content_revision: u64,
+    pub id: Uuid,
+    pub conversation_id: Uuid,
+    pub sender: Account,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<Uuid>,
+    /// Author (username) of the message `reply_to_id` points at. Decorated
+    /// server-side at send time — clients never send it. Lets "reply to a
+    /// bot's message" engage that bot like an @-mention without any
+    /// client-side message-id memory (which a daemon restart would wipe).
+    /// `None` on non-replies and on messages stored before this field shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_sender: Option<String>,
+    /// Set by the SERVER, never by a client: this message is the server's
+    /// receipt of the sender's action on card `receipt_of` — the server wrote
+    /// its words, not the sender. Cleared when the sender edits it (then the
+    /// words are theirs). See [`answers_own_request`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_of: Option<Uuid>,
+    /// Slack-style thread root. `None` = top-level message (lives in the main
+    /// channel timeline). `Some(root)` = a thread reply: HIDDEN from the main
+    /// timeline, shown only in the thread pane for `root`, and it does NOT bump
+    /// the channel's order / last_message / unread. One level deep — replying
+    /// in-thread to a reply normalizes to that reply's own root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_id: Option<Uuid>,
+    /// Computed at read time and decorated onto a thread *root* message in the
+    /// main timeline. Absent when the message is not a root / has no live
+    /// replies. Never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_summary: Option<ThreadSummary>,
+    /// Forum channel this message belongs to. `None` = the `#all` main timeline
+    /// (the pre-forum default; needs no migration). `Some(ch)` = an extra
+    /// `Channel`. Promoted out of the payload — like `thread_root_id` — so the
+    /// store partitions channel timelines without parsing content. A message can
+    /// carry both `channel_id` (which channel) and `thread_root_id` (a thread
+    /// within that channel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalized_at: Option<DateTime<Utc>>,
+    pub reactions: Vec<Reaction>,
+    /// Echoed back on `events.messageNew` so clients can match the server
+    /// message to their optimistic local copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_attachments"
+    )]
+    pub attachments: Vec<Attachment>,
+    /// Set of usernames who have deleted this message **for themselves**
+    /// (Telegram "Delete for me"). Filtered out at history-read time so
+    /// other participants are unaffected. Never serialised to clients —
+    /// they only see whether the message is visible to them.
+    #[serde(default, skip)]
+    pub hidden_for: HashSet<String>,
+    /// True after a "Delete for everyone" — the message survives as a
+    /// tombstone (content + attachments cleared) so it can be filtered
+    /// out everywhere.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
+    /// Set when the message has been edited; clients show an "edited" mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<DateTime<Utc>>,
+    /// Original author when this message was forwarded from elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from: Option<Account>,
+    /// Telegram-style SERVICE message: an in-timeline event (e.g. a minigame
+    /// result — "ops 赢得了本局象棋游戏") rendered by clients as a centered
+    /// capsule pill with NO sender bubble/avatar. When set, `content` is
+    /// typically empty; the pill text lives in `ServiceNotice.text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceNotice>,
+    /// What is kept beside this message's text (`Sidecar`).
+    /// Absent on the wire while empty. A plain field, not `flatten`: flatten
+    /// sends every message through serde's buffered map path, and this struct
+    /// is loaded wholesale at boot and serialized on every event.
+    #[serde(default, skip_serializing_if = "Sidecar::is_empty", deserialize_with = "lenient_sidecar")]
+    pub sidecar: Sidecar,
+}
+
+/// A sidecar that fails to parse costs the sidecar, never the message — the
+/// same bargain `lenient_attachments` strikes. A client older than a state
+/// shape shows the card without it instead of losing a whole history page.
+fn lenient_sidecar<'de, D>(d: D) -> Result<Sidecar, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
+}
+
+/// What is kept BESIDE a message's (or post's) text — the text itself is never
+/// rewritten (`.docs/card-state-v1.md`). Pictures and pages for links are not
+/// here: a card asks for them (`resolveMedia` / `resolvePage`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Sidecar {
+    /// Controlled state (`.docs/card-state-v1.md`): key → item. The server has
+    /// already left out every item this reader may not read.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub state: std::collections::BTreeMap<String, StateItem>,
+    /// How many writes this message's state has taken (§3.6).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub rev: u64,
+    /// This reader's items were too many to carry with the message (over
+    /// 32KB): `state` is left out and `getCardState` has them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub state_more: bool,
+    /// An agent's turn wrote this under a person's account (`a2a.rs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_agent: bool,
+}
+
+impl Sidecar {
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty() && !self.state_more && !self.by_agent
+    }
+}
+
+/// `resolveMedia { urls }`: one slot per URL the server would answer, keyed as
+/// asked. Empty when the asker's `inlineMedia` flag is off.
+///
+/// THIS IS THE WIRE FORM: the server stores each file as `"mf-file:<id>"` and
+/// every response expands it into a full [`FileRef`] — or `null` when the file
+/// is gone — so file fields are `Option<FileRef>` read through
+/// [`opt_file_ref`], which also takes a bare id.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResolveMediaResponse {
+    #[serde(default)]
+    pub media: std::collections::BTreeMap<String, MediaSlot>,
+}
+
+/// `resolvePage { urls }`, as [`ResolveMediaResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResolvePageResponse {
+    #[serde(default)]
+    pub pages: std::collections::BTreeMap<String, PageSlot>,
+}
+
+/// One controlled-state item beside a message (`.docs/card-state-v1.md` §3.1).
+/// A reader never gets `read` / `write` of an item they may not read — the item
+/// is not sent at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateItem {
+    #[serde(default)]
+    pub v: serde_json::Value,
+    #[serde(default)]
+    pub read: Vec<String>,
+    #[serde(default)]
+    pub write: Vec<String>,
+    /// Who wrote it last; `@server` for the server's own writes.
+    #[serde(default)]
+    pub by: String,
+    /// Unix seconds of the last write.
+    #[serde(default)]
+    pub at: i64,
+    /// The message's state revision at this item's last write — what
+    /// `setCardState`'s `if_rev` compares; `0` on items from before (§3.6).
+    #[serde(default)]
+    pub rev: u64,
+}
+
+/// One picture: re-hosted on our CDN, still being fetched, or not to be had.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MediaSlot {
+    /// `file` is `None` only when the registry no longer has it.
+    Ready {
+        #[serde(default, deserialize_with = "opt_file_ref")]
+        file: Option<FileRef>,
+    },
+    Pending,
+    /// Refused for good (not public, not a picture, too large, gone) or given
+    /// up on — `reason` is for logs, never shown verbatim.
+    Failed {
+        #[serde(default)]
+        reason: String,
+    },
+    /// A state newer than this build: shown as nothing, never an error.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotState {
+    Ready,
+    #[default]
+    Pending,
+    Failed,
+    /// A state newer than this build.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One page: the name a source pill shows and the pictures it offers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageSlot {
+    #[serde(default)]
+    pub state: SlotState,
+    /// What a pill / source list shows — computed by the server (the
+    /// registrable domain unless the page's own site name matches it), never
+    /// taken from the author.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The re-hosted icon.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "opt_file_ref")]
+    pub icon: Option<FileRef>,
+    /// The re-hosted og:image.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "opt_file_ref")]
+    pub image: Option<FileRef>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// Is this message `bot`'s OWN request coming back — the server's receipt of
+/// someone's action on a card `bot` posted? ONE rule for both access gates:
+/// the daemon's allow-list (`mafold-cli` `agent.rs`, who may drive a turn on
+/// the owner's machine) and the server's draft-time billing
+/// (`mafold-api` `metering::authorize_draft`, who pays for it).
+///
+/// Both gates exist to stop a stranger's WORDS from driving the bot. A receipt
+/// carries none: the server wrote it (`receipt_of` is server-only, and an edit
+/// clears it). What it reports is that something `bot` asked for has arrived —
+/// a secret its `{% mafold/connection-create %}` card requested from a named
+/// person, who may well be someone the bot otherwise doesn't take orders from.
+/// The turn it starts is the bot following up on its own request, so it passes
+/// the allow-list and nobody is billed for it. A blacklist still wins: each
+/// gate checks that first.
+///
+/// `I` is the id type: uuids in the api, strings in the daemon.
+pub fn answers_own_request<I: PartialEq + ?Sized>(
+    receipt_of: Option<&I>,
+    reply_to_id: Option<&I>,
+    reply_to_sender: Option<&str>,
+    bot: &str,
+) -> bool {
+    receipt_of.is_some()
+        && receipt_of == reply_to_id
+        && reply_to_sender.is_some_and(|s| s.eq_ignore_ascii_case(bot))
+}
+
+#[cfg(test)]
+mod answers_own_request_tests {
+    use super::answers_own_request;
+
+    #[test]
+    fn only_a_receipt_replying_to_the_bots_own_card() {
+        let card = "card-1";
+        assert!(answers_own_request(Some(card), Some(card), Some("Ops:Claude"), "ops:claude"));
+        // A typed reply to the same card: no receipt, no pass.
+        assert!(!answers_own_request(None, Some(card), Some("ops:claude"), "ops:claude"));
+        // Someone else's card.
+        assert!(!answers_own_request(Some(card), Some(card), Some("eve:bot"), "ops:claude"));
+        // A receipt that doesn't answer the message it replies to.
+        assert!(!answers_own_request(Some(card), Some("other"), Some("ops:claude"), "ops:claude"));
+        assert!(!answers_own_request(Some(card), None, None, "ops:claude"));
+    }
+}
+
+/// A service-message payload — a ready-to-render centered pill (see
+/// `Message::service`). Generic so it's reusable beyond games (member joined,
+/// pinned, …): `text` is the display string, `icon` an optional lucide/SF name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceNotice {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+// MARK: - Attachment
+
+/// Decode an `attachments` array, DROPPING any element this build no longer
+/// understands instead of failing the whole message.
+///
+/// A message is stored as one blob, and the loader skips anything it cannot
+/// parse — so without this, retiring a single attachment variant silently
+/// deletes every message that ever carried one. Retiring a shape must cost that
+/// attachment, never the message it rode in on.
+///
+/// It also makes the wire honestly one-directional: an older client can be sent
+/// a kind it has never heard of and will show the rest of the message rather
+/// than nothing at all.
+fn lenient_attachments<'de, D>(d: D) -> Result<Vec<Attachment>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Attachment {
+    /// A link-preview card. Kept — unlike the two demo shapes retired beside it,
+    /// this one has a real consumer: the Garden brain files it as a URL
+    /// candidate (`brains/garden.rs`), including inside merge-forward records.
+    News {
+        id: String,
+        title: String,
+        source_id: String,
+        url: String,
+        snippet: String,
+    },
+    /// `id` identifies the ATTACHMENT (its slot in this message); `file`
+    /// identifies the BYTES. They were conflated before as `id` + `media_id` +
+    /// `url` + `w` + `h` — four fields describing one file, kept in sync by
+    /// hand. Everything about the file now lives in the one [`FileRef`].
+    Photo {
+        id: String,
+        file: FileRef,
+    },
+    /// An uploaded video clip (mp4/mov). Mirrors `Photo`; `file.w`/`file.h`
+    /// reserve the player box so the bubble doesn't jump on load.
+    Video {
+        id: String,
+        file: FileRef,
+    },
+    File {
+        id: String,
+        file: FileRef,
+    },
+    /// WeChat-style "merge forward" — a frozen transcript of several messages
+    /// bundled into one card. The snapshot is complete (sender + time + content
+    /// + each message's own attachments, which may themselves be chat records),
+    /// so it survives the originals being edited or deleted.
+    ChatRecord {
+        id: String,
+        /// Human label for the card (source chat name).
+        title: String,
+        entries: Vec<RecordEntry>,
+    },
+}
+
+impl Attachment {
+    /// The attachment's stable id. Every variant carries one, so callers that
+    /// need identity (de-dup on append, diffing a message's media) never have
+    /// to match per-kind — the whole point of keeping the field uniform.
+    pub fn id(&self) -> &str {
+        match self {
+            Attachment::News { id, .. }
+            | Attachment::Photo { id, .. }
+            | Attachment::Video { id, .. }
+            | Attachment::File { id, .. }
+            | Attachment::ChatRecord { id, .. } => id,
+        }
+    }
+}
+
+/// One frozen message inside a `ChatRecord` snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordEntry {
+    pub sender_name: String,
+    pub sender_username: String,
+    pub ts: DateTime<Utc>,
+    pub content: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_attachments"
+    )]
+    pub attachments: Vec<Attachment>,
+}
+
+// MARK: - Report (UGC moderation)
+
+/// A user's report of objectionable content or behavior. Stored for review;
+/// required for App Store UGC compliance (Guideline 1.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Report {
+    pub id: Uuid,
+    pub reporter: String,
+    /// "user" or "message".
+    pub target_kind: String,
+    /// The reported username or message id.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+// MARK: - Reaction
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reaction {
+    pub message_id: Uuid,
+    pub reactor: Account,
+    pub emoji: String,
+    pub created_at: DateTime<Utc>,
+}
+
+// MARK: - Thread summary
+
+/// Per-root thread summary, computed at read time and decorated onto the root
+/// `Message` in the main timeline (and informing thread badges on clients).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub root_message_id: Uuid,
+    /// Number of live (non-deleted) replies in the thread.
+    pub reply_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reply_at: Option<DateTime<Utc>>,
+    /// Distinct repliers, newest-first, capped (see `Store::thread_summary`).
+    pub participants: Vec<Account>,
+    /// Unread replies for the requesting user (replies they didn't send,
+    /// after their last thread-read marker).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unread_count: u32,
+    /// A reply in it is being written right now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub working: bool,
+    /// The work came back to the root's author (`a2a.rs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handed_back: bool,
+}
+
+// MARK: - Pagination wrappers
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagesPage {
+    pub items: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The answer to `messages.diff`: everything one timeline did since the
+/// caller's watermark, and the watermark to carry next time.
+///
+/// Not a page. A page is positional ("the newest fifty") and this is temporal
+/// ("what moved"), which is why it has no cursor and why `items` can be empty
+/// while `pts` still advances — activity in a sibling forum channel moves the
+/// conversation's counter without touching this timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagesDiff {
+    /// The new watermark. Store it with the timeline; send it back as `since`.
+    pub pts: u64,
+    /// Rows to insert or replace, chronological. A tombstoned message arrives
+    /// here like any other row, with `deleted` set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<Message>,
+    /// Rows that left this timeline for THIS caller — delete-for-me, and drafts
+    /// that were thrown away rather than tombstoned. Without it a cache keeps
+    /// showing messages their owner deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
+    /// The caller is further behind than the log reaches: this diff is empty
+    /// and meaningless, reload the newest page instead. Telegram's
+    /// `updates.differenceTooLong`, and the reason a bounded log is safe.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub too_long: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationsPage {
+    pub items: Vec<Conversation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountsPage {
+    pub items: Vec<Account>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Usernames among `items` that couldn't answer the caller right now —
+    /// set by `getOfficialBots` only (a resale pool with no seller free).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<String>,
+}
+
+// MARK: - Auth
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Auth {
+    pub access_token: String,
+    pub expires_in: i64,
+    pub account: Account,
+}
+
+// MARK: - Ok placeholder for methods that return nothing meaningful
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ok_ {
+    pub ok: bool,
+}
+
+impl Ok_ {
+    pub fn yes() -> Self {
+        Self { ok: true }
+    }
+}
+
+// MARK: - Feature flags (.docs/feature-flags.md)
+//
+// The wire carries only SERVER-EVALUATED booleans (`FlagState`) — the stable
+// seam: richer server targeting never changes the client or this wire shape.
+// The compile-time default lives ONLY in the client core's registry; the server
+// record (`FlagRecord`) stores a rollout override and deliberately has NO
+// default field (invariant ① — one home for the default).
+
+pub type FlagKey = String;
+
+/// server → client: the evaluated flag values for THIS user. Delivered at
+/// bootstrap (`getFlags`) and re-pushed over WS (`flagsChanged`) when the
+/// control plane changes. Keys absent here fall back to the client default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FlagState {
+    pub values: std::collections::BTreeMap<FlagKey, bool>,
+    /// Monotonic; a client ignores a delta older than what it already holds.
+    pub version: u64,
+}
+
+/// How a flag rolls out (the control plane's whole vocabulary — evaluated
+/// server-side only; clients never see this, only the resulting bool).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FlagRollout {
+    /// Force false for everyone.
+    Off,
+    /// Force true for everyone.
+    On,
+    /// Deterministic per-user bucket: `hash(account_id + ":" + key) % 100 < p`.
+    Percent { p: u8 },
+    /// Explicit allowlist (a beta cohort).
+    Accounts { list: Vec<String> },
+}
+
+/// Control-plane record (admin/storage). A key with NO record ⇒ the client uses
+/// its compile-time default (and the server treats server-side gates as open —
+/// gating only activates once a record exists).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlagRecord {
+    pub key: FlagKey,
+    pub rollout: FlagRollout,
+    /// Admin-facing note; the client-facing description lives in the core registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub updated_at: String,
+}
+
+// ── language-pack content fingerprint ────────────────────────────────────────
+
+/// Fingerprint of a language pack's FULL string map — FNV-1a 64 over a
+/// canonical (recursively key-sorted) JSON rendering, hex-encoded.
+///
+/// Both ends of `getLangPackDiff` compute this over the complete latest pack:
+/// the server sends it with every delta, and a client whose post-merge map
+/// hashes differently has diverged from the server's snapshot of that version
+/// (same version number, different content — e.g. a seed replaced a version
+/// in place) and must refetch the full pack. Version numbers alone cannot
+/// detect that divergence, which otherwise sticks forever.
+///
+/// Canonicalization is done by hand (objects rendered with sorted keys) so the
+/// value is independent of serde_json's `preserve_order` feature, which any
+/// crate in a build graph could flip on.
+pub fn langpack_checksum(strings: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut canonical = String::new();
+    canon_json(&serde_json::Value::Object(strings.clone()), &mut canonical);
+    fnv1a_hex(canonical.as_bytes())
+}
+
+/// JSON rendered with object keys sorted, so two equal documents always produce
+/// one string.
+///
+/// Shared by every checksum in this crate rather than copied per pack: a second
+/// canonicaliser that drifted by one comma would make one cache think it was
+/// stale forever and another think it was fresh forever, and both failures look
+/// like anything but a whitespace difference.
+pub(crate) fn canon_json(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String((*k).clone()).to_string());
+                out.push(':');
+                canon_json(&o[k.as_str()], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(a) => {
+            out.push('[');
+            for (i, item) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canon_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// FNV-1a as lowercase hex.
+///
+/// Spelled out rather than reaching for `DefaultHasher` because these digests
+/// cross process AND version boundaries — a seeded langpack's checksum, a
+/// client-cached inline result's id — and `DefaultHasher`'s output is explicitly
+/// not stable across Rust releases. One that shifted under a toolchain bump
+/// would silently invalidate every cache keyed on it.
+pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+// MARK: - App update(RN 壳本身:安卓 APK + iOS 商店版本)
+
+/// server → client answer to `appUpdateCheck`. The metadata fields are filled
+/// whenever ANY release is live (so the UI can say "you're on the latest,
+/// which is X"); `available` alone decides whether an update is offered.
+///
+/// 没有 `version` = 服务端还不知道,绝不是「已是最新」。
+///
+/// 安卓(我们自己发的 APK):`version_code`、`abi`、`size`、`sha256` —— `abi` 是服务端
+/// 从客户端的 ABI 里挑中的那个,下载时原样传回 `appUpdateDownload`。
+/// iPhone(App Store 上的版本):`version`、`size`、`notes`、`store_url`、`min_os`;
+/// 客户端报的 iOS 版本服务端已经算进 `available` 了,`min_os` 只给界面解释用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppUpdateInfo {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_code: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// iPhone:去哪儿装(`itms-apps://apps.apple.com/app/id…`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_url: Option<String>,
+    /// iPhone:这一版最低要哪个 iOS。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_os: Option<String>,
+}
+
+// MARK: - CLI update (release metadata for mafold-cli's self-updater)
+
+/// server → client answer to `cliUpdateCheck`: what the newest release on a
+/// channel IS, for one target triple. Metadata only — the bytes still come from
+/// the release host named in `url`.
+///
+/// DELIBERATELY NOT SHAPED LIKE [`AppUpdateInfo`]. There is no `available`
+/// flag, because the server does not get to decide: `mafold-cli`'s
+/// `wants_update` knows things this endpoint cannot (the checksum of the binary
+/// actually on that disk, which is what tells a real build apart from one that
+/// merely claims the same version). The server reports, the client decides.
+///
+/// `known: false` means THE SERVER HAS NO RECORD — not "you are up to date".
+/// Collapsing those two would be the worst bug in this feature: a client would
+/// read silence as reassurance and stop looking, right when the fallback path
+/// is the thing that should fire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliReleaseInfo {
+    /// false → no manifest for this channel yet; the caller must fall back to
+    /// the release host rather than treat itself as current.
+    pub known: bool,
+    /// Echoes the channel resolved (`stable` / `dev`).
+    pub channel: String,
+    /// Release version without the leading `v` (e.g. `0.9.116`, `0.9.116-dev.7`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Where the binary for the requested target lives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// The published checksum. `None` means the manifest is INCOMPLETE — the
+    /// updater refuses to install an unverifiable binary, so a caller that sees
+    /// this must fall back rather than proceed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+// MARK: - App bundle update (OTA for the RN client's JS bundle)
+
+/// server → client answer to `appBundleCheck`: what the client should do.
+/// `stale_binary` is always on the wire, `false` included — the client tells
+/// "nothing new" from "this binary is too old" by it alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppBundleInfo {
+    /// A bundle for THIS abi, newer than what the caller runs.
+    pub available: bool,
+    /// THE ANSWER THAT PREVENTS A SILENT DEAD END: nothing is published for the
+    /// caller's abi, but something is published for a newer one. The binary is
+    /// behind, not the JS — say so, because "no update" and "you can no longer
+    /// receive updates" look identical from the client and mean opposite things.
+    pub stale_binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub js_rev: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[cfg(test)]
+mod update_check_wire_tests {
+    use super::*;
+
+    /// The answer as this type alone writes it (declared field order — the
+    /// api's envelope re-sorts the keys, and its handler tests pin THOSE bytes),
+    /// and the same answer read back: a client decoding the wire gets what was sent.
+    fn pin<T: Serialize + serde::de::DeserializeOwned>(answer: &T, want: &str) {
+        assert_eq!(serde_json::to_string(answer).unwrap(), want);
+        let back: T = serde_json::from_str(want).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), want, "decodes back to the same answer");
+    }
+
+    #[test]
+    fn app_update_info_keeps_its_wire_shape() {
+        let none = AppUpdateInfo {
+            available: false,
+            version: None,
+            version_code: None,
+            abi: None,
+            size: None,
+            sha256: None,
+            notes: None,
+            store_url: None,
+            min_os: None,
+        };
+        pin(&none, r#"{"available":false}"#);
+        let offered = AppUpdateInfo {
+            available: true,
+            version: Some("1.1.13".into()),
+            version_code: Some(113),
+            abi: Some("arm64-v8a".into()),
+            size: Some(39_845_888),
+            sha256: Some("5e884898da28047151d0e56f8dc62927".into()),
+            notes: Some("Fixes the blank first frame.".into()),
+            store_url: None,
+            min_os: None,
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"version":"1.1.13","version_code":113,"abi":"arm64-v8a","size":39845888,"sha256":"5e884898da28047151d0e56f8dc62927","notes":"Fixes the blank first frame."}"#,
+        );
+    }
+
+    /// iPhone 收到的:App Store 上的版本、去哪儿装、要哪个 iOS —— APK 那几个字段一个都没有。
+    #[test]
+    fn app_update_info_from_the_app_store() {
+        let offered = AppUpdateInfo {
+            available: true,
+            version: Some("1.1.9".into()),
+            size: Some(42_971_136),
+            store_url: Some("itms-apps://apps.apple.com/app/id6778362401".into()),
+            min_os: Some("15.1".into()),
+            ..AppUpdateInfo::default()
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"version":"1.1.9","size":42971136,"store_url":"itms-apps://apps.apple.com/app/id6778362401","min_os":"15.1"}"#,
+        );
+        pin(&AppUpdateInfo::default(), r#"{"available":false}"#);
+    }
+
+    #[test]
+    fn cli_release_info_keeps_its_wire_shape() {
+        let unknown = CliReleaseInfo {
+            known: false,
+            channel: "stable".into(),
+            version: None,
+            url: None,
+            size: None,
+            sha256: None,
+        };
+        pin(&unknown, r#"{"known":false,"channel":"stable"}"#);
+        let known = CliReleaseInfo {
+            known: true,
+            channel: "stable".into(),
+            version: Some("0.9.148".into()),
+            url: Some("https://github.com/mafold-lab/mafold-cli/releases/download/v0.9.148/mafold-aarch64-apple-darwin".into()),
+            size: Some(12_345),
+            sha256: Some("2c26b46b68ffc68ff99b453c1d304134".into()),
+        };
+        pin(
+            &known,
+            r#"{"known":true,"channel":"stable","version":"0.9.148","url":"https://github.com/mafold-lab/mafold-cli/releases/download/v0.9.148/mafold-aarch64-apple-darwin","size":12345,"sha256":"2c26b46b68ffc68ff99b453c1d304134"}"#,
+        );
+    }
+
+    #[test]
+    fn app_bundle_info_keeps_its_wire_shape() {
+        let none = |stale_binary: bool| AppBundleInfo {
+            available: false,
+            stale_binary,
+            js_rev: None,
+            size: None,
+            sha256: None,
+            notes: None,
+        };
+        pin(&none(false), r#"{"available":false,"stale_binary":false}"#);
+        pin(&none(true), r#"{"available":false,"stale_binary":true}"#);
+        let offered = AppBundleInfo {
+            available: true,
+            stale_binary: false,
+            js_rev: Some(23),
+            size: Some(1_234_567),
+            sha256: Some("cafebabe".into()),
+            notes: Some("Input bar moves with the keyboard.".into()),
+        };
+        pin(
+            &offered,
+            r#"{"available":true,"stale_binary":false,"js_rev":23,"size":1234567,"sha256":"cafebabe","notes":"Input bar moves with the keyboard."}"#,
+        );
+    }
+}
+
+#[cfg(test)]
+mod inline_result_tests {
+    use super::{InlinePick, InlineResult};
+
+    fn parse(json: &str) -> InlineResult {
+        serde_json::from_str(json).expect("InlineResult")
+    }
+
+    /// THE COMPATIBILITY CASE. Daemons are user-installed and update on their
+    /// own schedule, so the pre-picker `Vec<String>` answer must still parse —
+    /// as one plain row that is its own title.
+    #[test]
+    fn a_bare_string_becomes_one_plain_row() {
+        let r = parse(r#""看这个 https://example.com""#);
+        assert_eq!(r.content, "看这个 https://example.com");
+        assert_eq!(r.title, "看这个 https://example.com");
+        assert_eq!(r.on_pick, InlinePick::Send);
+        assert!(r.description.is_none());
+        assert!(!r.id.is_empty());
+    }
+
+    /// A whole answer must not fail because one result skipped fields. Title
+    /// falls back to the body, and `on_pick` to the Telegram default.
+    #[test]
+    fn a_partial_object_fills_in_rather_than_erroring() {
+        let r = parse(r#"{"content":"周报 2026-W31"}"#);
+        assert_eq!(r.title, "周报 2026-W31");
+        assert_eq!(r.on_pick, InlinePick::Send);
+    }
+
+    /// The inverse: a row that carried only a title still SENDS something. An
+    /// empty `content` would post a blank message on pick.
+    #[test]
+    fn title_only_still_has_a_body_to_send() {
+        let r = parse(r#"{"title":"/usage"}"#);
+        assert_eq!(r.content, "/usage");
+    }
+
+    /// Presentation and payload are separate: the row reads as a page title, the
+    /// message that gets inserted is a link.
+    #[test]
+    fn a_full_object_keeps_content_and_presentation_apart() {
+        let r = parse(
+            r#"{"id":"pg1","title":"周报模板","description":"Notion · 团队",
+                "thumb":"b9OgRzKFL3uZ0MsfuCBkUw","content":"[周报模板](https://notion.so/pg1)",
+                "cache_ttl":30,"on_pick":"insert"}"#,
+        );
+        assert_eq!(r.id, "pg1");
+        assert_eq!(r.title, "周报模板");
+        assert_eq!(r.description.as_deref(), Some("Notion · 团队"));
+        // A bare handle is a valid thumbnail — the author only has the id.
+        assert_eq!(r.thumb.as_ref().map(|f| f.id.as_str()), Some("b9OgRzKFL3uZ0MsfuCBkUw"));
+        assert_eq!(r.content, "[周报模板](https://notion.so/pg1)");
+        assert_eq!(r.cache_ttl, Some(30));
+        assert_eq!(r.on_pick, InlinePick::Insert);
+    }
+
+    /// A long CJK body must be clipped by CHARS. Slicing bytes at 80 would land
+    /// mid-codepoint and panic — the crash this test exists to pin down.
+    #[test]
+    fn a_long_cjk_title_is_clipped_without_panicking() {
+        let body = "中".repeat(200);
+        let r = InlineResult::from_body(body);
+        assert_eq!(r.title.chars().count(), 81); // 80 + the ellipsis
+        assert!(r.title.ends_with('…'));
+    }
+
+    /// The title is the first line WITH CONTENT — a body that opens with blank
+    /// lines (or a card tag on line 2) must not produce an empty row.
+    #[test]
+    fn leading_blank_lines_are_skipped_for_the_title() {
+        let r = InlineResult::from_body("\n\n  实际标题\n更多正文".into());
+        assert_eq!(r.title, "实际标题");
+    }
+
+    /// Ids are content-derived and must not drift: clients cache by them.
+    #[test]
+    fn ids_are_stable_and_content_sensitive() {
+        assert_eq!(
+            InlineResult::from_body("同样的内容".into()).id,
+            InlineResult::from_body("同样的内容".into()).id
+        );
+        assert_ne!(
+            InlineResult::from_body("内容 A".into()).id,
+            InlineResult::from_body("内容 B".into()).id
+        );
+    }
+}
+
+// ───────────────── Harness capabilities ─────────────────
+// What a coding-agent CLI on ONE machine actually accepts — probed by the
+// daemon that drives it, reported over the bot token (`reportHarnessCaps`),
+// and read back into the Customize sheet's model / effort menus
+// (`effective_fields`). The roster lives nowhere else: not in a client, not
+// in the daemon's seed, not in a langpack.
+
+/// One machine's report for one bot. A bot driven from two machines has two;
+/// the sheet shows their union, every option saying where it holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessCaps {
+    /// Harness id — `claude-code` | `codex` | `kimi-code` …
+    pub harness: String,
+    /// The harness CLI's version on that machine (`2.1.272`). The list is
+    /// version-bound: a build that lacks a model or a tier says so here.
+    pub version: String,
+    /// Stable id of the machine — the same `device_id` its `mafold login`
+    /// session reports in `reportHarnesses`, so New-Bot's device list and
+    /// these reports name the same box.
+    pub machine: String,
+    /// Human name of the machine, for provenance (`2.1.272 · ops's MacBook`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_name: Option<String>,
+    /// The login the list was read for. A harness answers PER ACCOUNT (the
+    /// subscription decides the roster), so another login is another entry,
+    /// never a correction of this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Epoch seconds the probe ran.
+    pub probed_at: i64,
+    /// Where the list came from — how much to trust it.
+    pub source: CapsSource,
+    /// Models the harness accepts, in the harness's own order.
+    #[serde(default)]
+    pub models: Vec<ModelCap>,
+    /// Effort tiers the binary accepts but that this probe could NOT attribute
+    /// to a model — what the fallback path learns (`--effort <bogus>` answers
+    /// with the valid values, no model roster attached). Unioned into the
+    /// effort menu beside the per-model tiers; empty whenever the handshake
+    /// answered, because then every tier has a model behind it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
+    /// Session modes beside the effort tiers (`ultracode`), when the harness
+    /// has any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<ModeCap>,
+}
+
+/// How a `HarnessCaps` was obtained.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapsSource {
+    /// The harness's own control-protocol handshake — authoritative.
+    Handshake,
+    /// Parsed out of `--help` text: tiers only, no per-model detail.
+    HelpText,
+    /// A previous probe, re-sent because the live one failed.
+    Cached,
+    /// Nothing could be probed. `models` is empty, and a client renders the
+    /// menus as unknown rather than as a picker of guesses. The default, so
+    /// that a half-built report claims nothing.
+    #[default]
+    None,
+}
+
+/// One model the harness accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCap {
+    /// The value the harness's model flag takes (`opus[1m]`).
+    pub id: String,
+    /// What it resolves to (`claude-opus-5[1m]`), when the harness says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// Other spellings the flag also accepts for this model (`fable` for
+    /// `claude-fable-5-1[1m]`). A stored value names a model by `id`,
+    /// `resolved` or any alias — see [`ModelCap::matches`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Display name from the harness (`Opus (1M context)`).
+    pub display: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Effort tiers THIS model takes, ascending. Empty = no effort dial at
+    /// all (Haiku): offer none, pass none.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+}
+
+/// A session mode that sits beside the effort tiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModeCap {
+    /// `ultracode`
+    pub id: String,
+    /// The tier the mode pins while on (`xhigh`), when it pins one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pins_effort: Option<String>,
+}
+
+impl ModelCap {
+    /// Does a stored value name this model — by id, resolved id or alias?
+    pub fn matches(&self, value: &str) -> bool {
+        self.id == value
+            || self.resolved.as_deref() == Some(value)
+            || self.aliases.iter().any(|a| a == value)
+    }
+}
+
+impl HarnessCaps {
+    /// The model a stored value names on this machine, if its harness accepts it.
+    pub fn model(&self, value: &str) -> Option<&ModelCap> {
+        self.models.iter().find(|m| m.matches(value))
+    }
+    /// `2.1.272 · ops's MacBook` — where a learned option holds.
+    pub fn provenance(&self) -> String {
+        format!("{} · {}", self.version, self.machine_name.as_deref().unwrap_or(&self.machine))
+    }
+    /// Does this report have anything to say about which MODELS exist?
+    ///
+    /// A probe that only reached the fallback path learns the effort tiers and
+    /// nothing else; its report must leave the model menu alone rather than
+    /// empty it. `source: none` — "the probe ran and found nothing" — is the
+    /// one case where saying nothing IS the statement, so it counts as telling.
+    pub fn tells_models(&self) -> bool {
+        !self.models.is_empty() || self.source == CapsSource::None
+    }
+    /// Same question for the effort tiers, whether they came attached to a
+    /// model, unattributed, or as a mode.
+    pub fn tells_efforts(&self) -> bool {
+        !self.efforts.is_empty()
+            || !self.modes.is_empty()
+            || self.models.iter().any(|m| !m.efforts.is_empty())
+            || self.source == CapsSource::None
+    }
+}
+
+#[cfg(test)]
+mod sidecar_wire_tests {
+    use super::*;
+
+    fn message_with(sidecar: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "conversation_id": "00000000-0000-0000-0000-000000000002",
+            "sender": { "username": "mafold", "display_name": "Mafold", "kind": "bot" },
+            "content": "TITAN {% mafold/cite src=\"https://fuse.energy\" /%}",
+            "created_at": "2026-10-12T00:00:00Z",
+            "reactions": [],
+            "sidecar": sidecar,
+        })
+    }
+
+    /// What `resolveMedia` / `resolvePage` SEND: egress has expanded
+    /// `"mf-file:<id>"` into a FileRef, or into null when the file is gone.
+    #[test]
+    fn resolved_slots_decode() {
+        let media: ResolveMediaResponse = serde_json::from_value(serde_json::json!({ "media": {
+            "https://fuse.energy/titan.jpg": { "state": "ready", "file": { "id": "f1", "mime": "image/jpeg", "w": 1600, "h": 1200 } },
+            "https://fuse.energy/gone.jpg": { "state": "ready", "file": null },
+            "https://fuse.energy/wait.jpg": { "state": "pending" },
+            "https://fuse.energy/svg.svg": { "state": "failed", "reason": "not a picture" },
+            "https://a.b/x.jpg": { "state": "quarantined", "until": 3 }
+        } }))
+        .expect("decodes");
+        let titan = &media.media["https://fuse.energy/titan.jpg"];
+        assert!(matches!(titan, MediaSlot::Ready { file: Some(f) } if f.id == "f1" && f.w == Some(1600)));
+        assert!(matches!(media.media["https://fuse.energy/gone.jpg"], MediaSlot::Ready { file: None }));
+        assert_eq!(media.media["https://a.b/x.jpg"], MediaSlot::Unknown, "a newer state is nothing, not an error");
+
+        let pages: ResolvePageResponse = serde_json::from_value(serde_json::json!({ "pages": {
+            "https://fuse.energy": { "state": "ready", "label": "Fuse", "domain": "fuse.energy", "icon": { "id": "i1" }, "image": "bare-id" },
+            "https://a.b": { "state": "archived" }
+        } }))
+        .expect("decodes");
+        let page = &pages.pages["https://fuse.energy"];
+        assert_eq!(page.label, "Fuse");
+        assert_eq!(page.icon.as_ref().map(|f| f.id.as_str()), Some("i1"));
+        assert_eq!(page.image.as_ref().map(|f| f.id.as_str()), Some("bare-id"), "a bare id reads too");
+        assert_eq!(pages.pages["https://a.b"].state, SlotState::Unknown);
+    }
+
+    /// A sidecar from before (pictures and pages kept per message) or one that
+    /// does not parse at all costs the sidecar, never the message.
+    #[test]
+    fn old_or_broken_sidecars_never_cost_the_message() {
+        let v = message_with(serde_json::json!({
+            "media": { "https://a.b/x.jpg": { "state": "ready", "file": { "id": "f1" } } },
+            "pages": { "https://a.b": { "state": "ready" } }
+        }));
+        let m: Message = serde_json::from_value(v).expect("decodes");
+        assert!(m.sidecar.is_empty());
+
+        let broken: Message = serde_json::from_value(message_with(serde_json::json!({ "state": [1, 2, 3] }))).expect("decodes");
+        assert!(broken.sidecar.is_empty());
+        let absent: Message = serde_json::from_value({
+            let mut v = message_with(serde_json::Value::Null);
+            v.as_object_mut().unwrap().remove("sidecar");
+            v
+        })
+        .expect("decodes");
+        assert!(absent.sidecar.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod harness_caps_tests {
+    use super::*;
+
+    fn fable() -> ModelCap {
+        ModelCap {
+            id: "claude-fable-5-1[1m]".into(),
+            resolved: Some("claude-fable-5-1".into()),
+            aliases: vec!["fable".into()],
+            display: "Fable".into(),
+            description: None,
+            efforts: vec!["low".into(), "max".into()],
+        }
+    }
+
+    /// A stored value reaches a model by any of its spellings — the stock
+    /// seed wrote `fable`, the handshake says `claude-fable-5-1[1m]`.
+    #[test]
+    fn a_value_names_a_model_by_id_resolved_or_alias() {
+        let m = fable();
+        assert!(m.matches("claude-fable-5-1[1m]"));
+        assert!(m.matches("claude-fable-5-1"));
+        assert!(m.matches("fable"));
+        assert!(!m.matches("opus"));
+    }
+
+    /// The wire shape tolerates a report that omits the optional fields — an
+    /// older daemon, or a probe that learned less — and `source` is lowercase
+    /// on the wire.
+    #[test]
+    fn a_sparse_report_parses_and_source_is_snake_case() {
+        let c: HarnessCaps = serde_json::from_value(serde_json::json!({
+            "harness": "claude-code", "version": "2.1.272", "machine": "m1",
+            "probed_at": 1, "source": "help_text",
+            "models": [{ "id": "haiku", "display": "Haiku" }],
+        }))
+        .unwrap();
+        assert_eq!(c.source, CapsSource::HelpText);
+        assert!(c.models[0].efforts.is_empty());
+        assert_eq!(c.provenance(), "2.1.272 · m1");
+        assert_eq!(serde_json::to_value(CapsSource::None).unwrap(), "none");
+    }
+
+    /// A report speaks for each menu SEPARATELY. The fallback probe learns the
+    /// tiers and no roster: it must not be read as "this machine has no
+    /// models". `source: none` is the one report that means exactly that.
+    #[test]
+    fn a_report_speaks_only_for_what_it_learned() {
+        let base = HarnessCaps {
+            harness: "claude-code".into(),
+            version: "2.1.272".into(),
+            machine: "m1".into(),
+            machine_name: None,
+            account: None,
+            probed_at: 1,
+            source: CapsSource::HelpText,
+            models: vec![],
+            efforts: vec!["low".into()],
+            modes: vec![],
+        };
+        assert!(!base.tells_models(), "tiers alone say nothing about the roster");
+        assert!(base.tells_efforts());
+
+        // A handshake with a model that takes no tiers (Haiku) tells both:
+        // the roster is real, and "no tier here" is an answer.
+        let handshake = HarnessCaps {
+            source: CapsSource::Handshake,
+            models: vec![ModelCap {
+                id: "haiku".into(),
+                resolved: None,
+                aliases: vec![],
+                display: "Haiku".into(),
+                description: None,
+                efforts: vec![],
+            }],
+            efforts: vec![],
+            ..base.clone()
+        };
+        assert!(handshake.tells_models());
+        assert!(!handshake.tells_efforts());
+
+        // Nothing probed: that IS the statement, for both menus.
+        let nothing = HarnessCaps { source: CapsSource::None, models: vec![], efforts: vec![], ..base };
+        assert!(nothing.tells_models() && nothing.tells_efforts());
+    }
+}
+
+#[cfg(test)]
+mod langpack_checksum_tests {
+    use super::langpack_checksum;
+
+    fn map(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Pinned vector: the wire value must never drift between releases — an old
+    /// client's checksum must keep matching a new server's for identical content.
+    #[test]
+    fn pinned_vector() {
+        let m = map(r#"{"a":"x","n":{"one":"{n} item","other":"{n} items"}}"#);
+        assert_eq!(langpack_checksum(&m), "06072a92983c8961");
+        assert_eq!(langpack_checksum(&map("{}")), "08f44b07b5901a25");
+    }
+
+    /// Key order (top-level AND nested) must not affect the value; content must.
+    #[test]
+    fn order_independent_content_sensitive() {
+        let a = map(r#"{"a":"x","b":{"k1":"1","k2":"2"}}"#);
+        let b = map(r#"{"b":{"k2":"2","k1":"1"},"a":"x"}"#);
+        assert_eq!(langpack_checksum(&a), langpack_checksum(&b));
+        let c = map(r#"{"a":"CHANGED","b":{"k1":"1","k2":"2"}}"#);
+        assert_ne!(langpack_checksum(&a), langpack_checksum(&c));
+        // A missing key (the poisoned-cache signature) changes the value.
+        let d = map(r#"{"a":"x"}"#);
+        assert_ne!(langpack_checksum(&a), langpack_checksum(&d));
+    }
+}
+pub mod tutorial;

@@ -1,0 +1,30 @@
+[package]
+name = "mafold-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Mafold Harness: the one tool loop every Mafold model bot runs on — the official bots and Cloud agents in mafold-api, and Mafold Harness agents on people's own computers in mafold-cli."
+license = "MIT"
+
+[dependencies]
+# The event vocabulary and the transcript the loop writes its reply into —
+# the same one the daemon renders every other runtime with.
+mafold-transcript = { path = "../mafold-transcript" }
+# `HarnessCaps`: what a plugin's runner says it can run.
+mafold-types = { path = "../mafold-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+async-stream = "0.3"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+# No TLS backend named here: the binary that links this crate picks one
+# (mafold-api the default, mafold-cli rustls) and cargo unifies the features.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# A 400 is read once and handed back to the fallbacks as a response again.
+http = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

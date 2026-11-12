@@ -1,0 +1,2030 @@
+//! Harness abstraction — the pluggable coding-agent backend a daemon drives.
+//!
+//! Implemented harnesses: **Claude Code**, **Codex**, **Kimi Code**, and
+//! **OpenCode** (Mafold Harness, on the wallet); planned: `openclaw`. Each
+//! harness knows how to invoke its CLI headlessly and
+//! normalize that CLI's output into [`AgentEvent`]s. The renderer (`crate::render`) turns
+//! those events into chat text + cards, so card rendering is identical across
+//! harnesses — a new harness only has to emit the common event stream.
+//!
+//! A `Daemon` (one bot presence) is `(token + workdir + harness + model)`; the
+//! supervisor runs many daemons, one process per bot.
+
+pub mod cc_conn;
+pub mod claude_code;
+pub mod codex;
+mod codex_stats;
+// Codex uses this transport for native control data, the live thread/turn path,
+// and reply-scoped server-request approvals.
+#[allow(dead_code)]
+pub mod codex_app_server;
+pub mod computer;
+pub mod kimi_code;
+pub mod mafold_harness;
+pub mod opencode;
+pub mod unsupported;
+
+use async_trait::async_trait;
+use mafold_core::mafold_types::{CapsSource, HarnessCaps, ModeCap, ModelCap};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::{mpsc::UnboundedSender, Notify};
+
+use crate::client::Client;
+
+/// PIDs of harness child processes (claude runs) currently IN FLIGHT. The
+/// daemon's shutdown handler kills exactly these — never the process group:
+/// legitimate background tasks the agent left running (run_in_background
+/// shells) share the daemon's pgroup and MUST survive a daemon restart
+/// (0.9.46's group kill wrongly took them down — the 2026-07-19 regression).
+pub fn live_children() -> &'static Mutex<HashSet<u32>> {
+    static LIVE: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// RAII registration of a harness child pid in [`live_children`] — deregisters
+/// on drop, so every exit path (clean, error, panic) cleans up.
+pub struct ChildGuard(Option<u32>);
+impl ChildGuard {
+    pub fn new(pid: Option<u32>) -> Self {
+        if let Some(p) = pid {
+            live_children().lock().unwrap().insert(p);
+        }
+        Self(pid)
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            live_children().lock().unwrap().remove(&p);
+        }
+    }
+}
+
+/// The process running a turn RIGHT NOW, so the daemon can tell a turn that is
+/// busy from one whose producer is gone.
+///
+/// The generating card judges the producer by one thing: whether `beat` keeps
+/// moving. `beat` moves on harness EVENTS, and a tool call that is still running
+/// emits none — so a ten-minute `copy-verify` read «No signal» two minutes in, on
+/// a bot that was working the whole time (2026-10-01). What separates "busy"
+/// from "gone" is whether the process doing the work is still there, and only
+/// the harness knows which process that is: a pooled `claude` outlives the turns
+/// it serves, and a seat failover swaps it out mid-turn. So each harness
+/// [`serve`](Self::serve)s from here while it runs the turn, and the render loop
+/// asks [`running`](Self::running) (see `Heartbeat` in `crate::agent`).
+///
+/// One per turn, shared by every attempt at it — the render loop outlives a
+/// failover, and so must this.
+#[derive(Clone, Default)]
+pub struct TurnProc(Arc<Mutex<Option<u32>>>);
+
+impl TurnProc {
+    /// This turn is running in `pid` until the returned guard drops. Every
+    /// harness holds one for exactly as long as its process is working on the
+    /// turn, so no exit path can leave a finished turn looking alive.
+    pub fn serve(&self, pid: Option<u32>) -> Serving {
+        *self.0.lock().unwrap() = pid;
+        Serving(self.clone(), pid)
+    }
+
+    /// Is the process serving this turn still running? False before any process
+    /// serves it (still spawning), between failover attempts, and once it has
+    /// exited — even exited-but-not-yet-reaped (`platform::child_running`).
+    pub fn running(&self) -> bool {
+        let pid = *self.0.lock().unwrap();
+        pid.is_some_and(crate::platform::child_running)
+    }
+
+    /// The pid serving the turn — what the turn's journal records, so a
+    /// restart can tell whether that process outlived its daemon
+    /// (`drafts::Journal::child`); tests reach the harness process through it.
+    pub fn pid(&self) -> Option<u32> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// How long a turn keeps reading after the process running it has exited.
+/// What it wrote before it died is still in the pipe and is read as usual; past
+/// this, a pipe that is still open is held by something the process STARTED
+/// (a tool's child that inherited its stdout), not by the agent, and waiting on
+/// it is waiting for nothing.
+pub const EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Notices that the process running a turn is gone, for a read loop that would
+/// otherwise wait on its pipe forever.
+///
+/// The pipe is not the process. A harness killed mid-turn while a process it
+/// started still holds its stdout never delivers EOF, and the turn used to stay
+/// open until a stall watchdog fired (15 minutes; codex has none at all — the
+/// turn waited for someone to type /stop). [`gone`](Self::gone) asks the process
+/// itself (`platform::child_running`) and gives the pipe [`EXIT_DRAIN`] to
+/// finish before the loop gives up on it.
+///
+/// Each read loop selects on `gone()` beside its read. The state lives here,
+/// not in the future, so recreating the future every iteration loses nothing —
+/// and it only ever completes once the turn is over, so it never interrupts a
+/// read that is still worth waiting for.
+pub struct ExitWatch {
+    pid: Option<u32>,
+    drain_until: Option<tokio::time::Instant>,
+}
+
+impl ExitWatch {
+    /// How often a silent pipe has its process checked.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    pub fn new(pid: Option<u32>) -> Self {
+        Self { pid, drain_until: None }
+    }
+
+    /// Resolves when the process has exited AND [`EXIT_DRAIN`] has passed with
+    /// it still gone. Never resolves without a pid to watch.
+    pub async fn gone(&mut self) {
+        let Some(pid) = self.pid else {
+            return std::future::pending().await;
+        };
+        loop {
+            match self.drain_until {
+                None => {
+                    tokio::time::sleep(Self::POLL).await;
+                    if !crate::platform::child_running(pid) {
+                        self.drain_until = Some(tokio::time::Instant::now() + EXIT_DRAIN);
+                    }
+                }
+                Some(until) => {
+                    tokio::time::sleep_until(until).await;
+                    // Re-checked, not assumed: one misread probe must never
+                    // end a turn that is still running.
+                    if crate::platform::child_running(pid) {
+                        self.drain_until = None;
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What a turn ended by [`ExitWatch`] tells the person waiting on it.
+pub const EXITED_MID_TURN: &str = "the agent's process exited mid-turn, and something it started is still \
+holding its output open — so the turn was ended here instead of waiting on it. Your context is kept; just resend to retry.";
+
+/// See [`TurnProc::serve`].
+pub struct Serving(TurnProc, Option<u32>);
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        let mut cur = (self.0).0.lock().unwrap();
+        // Only our own entry: a later attempt may already serve the turn.
+        if *cur == self.1 {
+            *cur = None;
+        }
+    }
+}
+
+/// The normalized event a harness turn speaks. Defined in `mafold-transcript`
+/// and re-exported here, because the vocabulary is not the daemon's: the api's
+/// own brains emit the same events and get the same cards. Harness-specific
+/// output formats (Claude Code stream-json, etc.) are parsed down to it.
+pub use mafold_transcript::AgentEvent;
+
+/// One turn to run against a harness.
+/// The spawn-time half of a turn: everything that decides WHICH process serves
+/// it, and nothing about the message.
+///
+/// Split out so a caller can start that process BEFORE it has a prompt. The
+/// daemon spends real time between "a message arrived" and "the turn runs" —
+/// it pulls the group's recent messages, asks the server which apps are
+/// installed, opens the draft — and a cold `claude` takes ~1.3s to come up.
+/// Those are the same wall-clock seconds; this lets them be spent once.
+#[derive(Clone, Debug)]
+pub struct TurnShape {
+    pub conv: String,
+    pub surface: String,
+    pub workdir: String,
+    pub session: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub thinking: Option<u32>,
+    pub system: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub mount: Mount,
+}
+
+/// What the agent PROCESS is pointed at besides its workdir: the plugin
+/// folders its skills come from (Mafold's own, then the bot's drive,
+/// `crate::drive`). Its memory is never redirected — the agent keeps its own
+/// folder. Process-level: a warm process started with one mount never serves
+/// a turn that needs another (it's part of the pool key).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Mount {
+    pub plugin_dirs: Vec<String>,
+    /// A guest's turn — someone outside the owner's circle started it
+    /// (`crate::agent`, trust): the process loads none of the owner's own
+    /// Claude Code (their `~/.claude/skills`, plugins, `CLAUDE.md`, settings),
+    /// only the project's and the plugin folders above.
+    pub guest: bool,
+    /// Whose eyes the process reads with — which of the agent's other rooms
+    /// and read tickets its `mafold read` may open ([`crate::chat::ReadsFor`]).
+    /// Exported by [`turn_env`]; a process started for one guest never serves
+    /// another's turn (it's part of the pool key).
+    pub reads: crate::chat::ReadsFor,
+    /// The built-in tools the process may use, comma-separated (Claude Code
+    /// `--tools`); None = the harness's own set. A tool left out never reaches
+    /// the model, description included — and every description is re-read on
+    /// every model call of the session.
+    pub tools: Option<String>,
+}
+
+impl Mount {
+    /// Stable text for the pool key: a guest's process is never an owner's,
+    /// nor one guest's another's — nor one with fewer tools one with more.
+    pub fn signature(&self) -> String {
+        format!(
+            "{}{}|reads={}{}",
+            self.plugin_dirs.join(","),
+            if self.guest { "|guest" } else { "" },
+            self.reads.env_value(),
+            self.tools.as_deref().map(|t| format!("|tools={t}")).unwrap_or_default()
+        )
+    }
+}
+
+/// Where a turn's agent process is told it is: the conversation, and the forum
+/// channel the turn was asked in. Every harness exports exactly these — one
+/// door, so a fourth harness can't forget one.
+///
+/// `MAFOLD_FORUM_CHANNEL` is what lets `mafold send` / `mafold read` default to
+/// THIS channel (`chat::turn_channel`). Before it existed only Claude Code knew
+/// its channel at all (inside `MAFOLD_SURFACE`), and every agent's `mafold send
+/// <this chat>` landed in `#all`: 2026-10-05 a reply working in
+/// #mafold内容生产线 posted the GitHub device code it was waiting on to `#all`,
+/// and the chat list showed that line as if the channel's reply had finished.
+/// Exported EMPTY on `#all`, so a value inherited from the daemon's own
+/// environment can never stand in for a channel the turn isn't in.
+///
+/// `MAFOLD_READS_FOR` is whose eyes the turn reads with (`Mount::reads`):
+/// what `mafold read`, `msg`, `chats` and `access` may open beyond this room.
+/// Always exported, for the same reason — an inherited value must never stand
+/// in for the turn's own.
+pub fn turn_env(conv: &str, surface: &str, reads: &crate::chat::ReadsFor) -> [(&'static str, String); 3] {
+    [
+        ("MAFOLD_CONV", conv.to_string()),
+        ("MAFOLD_FORUM_CHANNEL", forum_channel_of(surface).unwrap_or_default()),
+        (crate::chat::READS_FOR_ENV, reads.env_value()),
+    ]
+}
+
+/// A tool call's input as the MODEL wrote it, minus what only the daemon may
+/// say about an ask: `action` (where its tap goes — `perm:answer` is what makes
+/// it a permission prompt, `claude_code::permission_watcher`'s alone), `user`
+/// (who alone may answer it) and `prompt` (which permission prompt a verdict
+/// is for). A model that put them on its own question drew a card passing for
+/// one of the owner's rules — on a guest's turn, copied into the owner's DM as
+/// one — or hid its buttons from the person it was asking. Every harness that
+/// hands a model's tool call to the transcript passes it through here.
+pub(crate) fn model_tool_input(name: &str, input: &Value) -> Value {
+    let mut input = input.clone();
+    if name.eq_ignore_ascii_case("AskUserQuestion") {
+        if let Some(o) = input.as_object_mut() {
+            for key in ["action", "user", "prompt"] {
+                o.remove(key);
+            }
+        }
+    }
+    input
+}
+
+/// The forum channel inside a surface tag (`{conv}__{channel}__{bot}`, built by
+/// `agent::surface_tag`; the channel part is empty on `#all`). Ids are uuids,
+/// which the tag keeps verbatim. Anything that isn't a three-part tag has no
+/// channel to offer.
+pub fn forum_channel_of(surface: &str) -> Option<String> {
+    let parts: Vec<&str> = surface.split("__").collect();
+    match parts[..] {
+        [conv, channel, bot] if !conv.is_empty() && !bot.is_empty() && !channel.is_empty() => {
+            Some(channel.to_string())
+        }
+        _ => None,
+    }
+}
+
+pub struct Turn {
+    pub prompt: String,
+    /// The conversation id this turn runs in — exported to the agent's process
+    /// env as `MAFOLD_CONV` so `mafold send` / `read` / `app call` target it.
+    pub conv: String,
+    /// The fully scoped SURFACE this turn runs on: bot, harness, conversation,
+    /// forum channel and cwd. Exported as `MAFOLD_SURFACE` and used by the
+    /// bash-hook as the `~/.mafold/bgtasks` registry key, so a detached task is
+    /// only picked up by the daemon/session/tree that created it.
+    pub surface: String,
+    /// The in-flight reply's message id — the draft this turn is streaming
+    /// into. Exported as `MAFOLD_DRAFT` so `mafold attach <file>` can hang
+    /// media on THIS reply, which is what lets an agent send a picture in the
+    /// same bubble as the words about it. The uniform door: every harness gets
+    /// it, whether or not it can also produce images natively.
+    pub draft: String,
+    pub workdir: String,
+    /// The harness's prior session id for this conversation, to resume context.
+    pub session: Option<String>,
+    /// Per-chat model override (`/model`), or None for the harness default.
+    pub model: Option<String>,
+    /// Reasoning-effort level (`low`/`medium`/`high`/`xhigh`/`max`), or None for
+    /// the harness default. Maps to Claude Code's `--effort`.
+    pub effort: Option<String>,
+    /// Extended-thinking budget in tokens (`/think`), or None for the harness
+    /// default (off). Maps to Claude Code's `MAX_THINKING_TOKENS`.
+    pub thinking: Option<u32>,
+    /// Fires when `/stop` is invoked — the harness must kill its child and stop.
+    pub cancel: Arc<Notify>,
+    /// Extra system-prompt context (the daemon's mafold preamble: identity, the
+    /// current conversation, embeddable cards). Appended to the agent's own
+    /// system prompt; None = a pure, mafold-unaware agent.
+    pub system: Option<String>,
+    /// Per-turn file the AskUserQuestion PreToolUse hook waits on: the daemon
+    /// writes the user's chat-card answer here, the hook reads it and feeds it
+    /// back to the model. None = interactive ask unsupported for this harness.
+    pub ask_file: Option<String>,
+    /// Per-turn file carrying what the user said WHILE this turn was running.
+    /// The daemon appends; a PostToolUse hook drains it and hands the text to
+    /// the model as the next tool result's context, so a long run is corrected
+    /// at the next tool boundary instead of killed and restarted. None = this
+    /// harness can't be steered mid-turn (the message queues for the next one).
+    pub steer_file: Option<String>,
+    /// Extra process environment for the harness child — the SEAT this turn
+    /// runs on: `CLAUDE_SECURESTORAGE_CONFIG_DIR` picks the Claude login
+    /// (`crate::accounts`), and whatever a future harness keys its login by
+    /// (`CODEX_HOME`) goes through the same door. Applied verbatim on top of
+    /// the daemon's own env; empty = the harness's default login.
+    pub env: Vec<(String, String)>,
+    /// See [`Mount`].
+    pub mount: Mount,
+    /// On a guest's turn (`Mount::guest`): the only plugins it may invoke
+    /// skills from — the ones in `mount` — so the owner's own skills stay
+    /// theirs even if the process has them (`crate::drive::skill_gate`).
+    /// `None` on a turn the owner's circle started.
+    pub skill_plugins: Option<Vec<String>>,
+    /// Where the harness says which process is running this turn — see
+    /// [`TurnProc`]. Every harness must serve from it, or its long tool calls
+    /// read as «No signal».
+    pub proc: TurnProc,
+}
+
+/// The seat behind a turn said no: its usage window is full.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitHit {
+    /// The window, in the harness's own words (`five_hour`, `seven_day`, …).
+    pub kind: String,
+    /// Epoch seconds it rolls over, when the harness said.
+    pub resets_at: Option<i64>,
+}
+
+/// Outcome of a turn.
+#[derive(Default)]
+pub struct TurnOutcome {
+    /// Any content (text or a tool event) was produced.
+    pub produced: bool,
+    /// The turn was interrupted by `/stop`.
+    pub stopped: bool,
+    /// The (possibly new) session id to persist for this conversation.
+    pub session: Option<String>,
+    /// Set when the agent ended on an API / execution error (an `is_error`
+    /// result, or a fatal error event mid-stream) rather than completing — the
+    /// specific reason to surface to the user. The turn stops cleanly and the
+    /// session is still persisted, so a retry resumes with context.
+    pub error: Option<String>,
+    /// Set (alongside `error`) when the run ended because the SEAT was
+    /// exhausted — a `rejected` rate-limit event, or a result / exit whose
+    /// reason says the usage limit was reached. Kept apart from `error` so the
+    /// caller can move the same turn to another seat instead of treating the
+    /// session as broken: nothing about the conversation is wrong, only the
+    /// account is out of quota.
+    pub limit: Option<LimitHit>,
+}
+
+/// Where a slash command lands when not a daemon control command.
+/// (`Handled` is for harnesses whose command posts its own messages; Claude
+/// Code only returns `Reply`/`Forward` today.)
+#[allow(dead_code)]
+pub enum CommandOutcome {
+    /// Handled locally — send this markdown reply.
+    Reply(String),
+    /// Handled locally; the harness already posted its own messages.
+    Handled,
+    /// Not a harness command — forward the raw text to the harness as a prompt.
+    Forward,
+}
+
+/// Who may run a command. Every road a command arrives by asks it — a typed
+/// `/name`, the run card's Stop button, a card's Refresh — so none of them
+/// can hand a stranger what another one refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    /// Anyone the access gate let in. A guest's acts only on what is theirs:
+    /// their own `#guest` session, their own runs.
+    Anyone,
+    /// The owner's circle (`agent::trusted`): it reads the owner's machine, or
+    /// changes how the agent runs for everyone in the chat.
+    Circle,
+    /// The owner alone: the Claude sign-ins the machine holds, and the model
+    /// and thinking a whole chat runs on — as on the usage card's switch,
+    /// where anyone else picks only for their own replies and only where the
+    /// owner opens the lock (owner call 2026-10-29).
+    Owner,
+}
+
+/// What a slash command takes after its name — declared by whoever runs it
+/// (the daemon's table, a harness's own), and asked by the one parser every
+/// typed command goes through (`agent::slash`). A message that only BEGINS
+/// with a command is words: 10-29, `@bot /model → owner only, same rule as
+/// the card…` was read as `/model` with the whole sentence for a model name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Takes {
+    /// Nothing: `/stop`, `/usage`.
+    Nothing,
+    /// At most this many words: one model name, `forget <name>`.
+    Words(usize),
+    /// A directory, which may have spaces in it: one word, or the whole of
+    /// what follows naming a directory that exists.
+    Path,
+    /// Whatever follows: a skill's arguments, `/compact`'s instructions.
+    Text,
+}
+
+impl Takes {
+    pub fn fits(self, arg: &str) -> bool {
+        let arg = arg.trim();
+        match self {
+            Takes::Nothing => arg.is_empty(),
+            Takes::Words(n) => arg.split_whitespace().count() <= n,
+            Takes::Path => !arg.contains(char::is_whitespace) || std::path::Path::new(&expand_home(arg)).is_dir(),
+            Takes::Text => true,
+        }
+    }
+}
+
+/// `~/x` as the path it names — what `/cwd` was given, and what [`Takes::Path`]
+/// asks of it.
+pub fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "~".into())),
+        None => path.to_string(),
+    }
+}
+
+/// What a harness's CLI on THIS machine turned out to accept, as [`Harness::caps`]
+/// read it off the binary itself: which models, and per model which reasoning
+/// tiers. It exists so that nothing downstream has to keep a roster — a list
+/// written here would be a guess about someone else's build, and the two go out
+/// of step the moment either ships.
+///
+/// [`report`](Self::report) stamps the machine onto it; from there it travels as
+/// `reportHarnessCaps` and becomes the Customize sheet's model / effort menus.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessProbe {
+    /// The login the answer is true for, when the harness names one. A
+    /// subscription decides the roster, so another login is another answer.
+    pub account: Option<String>,
+    /// How much of this was learned, and how directly.
+    pub source: CapsSource,
+    /// The models, in the harness's own order.
+    pub models: Vec<ModelCap>,
+    /// Tiers the binary takes that the probe could not attribute to a model.
+    pub efforts: Vec<String>,
+    /// Session modes at the same dial (`ultracode`) that this build accepts.
+    pub modes: Vec<ModeCap>,
+}
+
+impl HarnessProbe {
+    /// Did the probe learn nothing at all?
+    ///
+    /// Kept apart from `CapsSource::None` on purpose: "we asked and this build
+    /// offers nothing" is a finding worth reporting, while "we couldn't ask" is
+    /// not, and collapsing them would let a timeout empty somebody's menus.
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty() && self.efforts.is_empty() && self.modes.is_empty()
+    }
+
+    /// Stamp this machine and this moment onto the answer.
+    pub fn report(self, harness: &str, version: &str) -> HarnessCaps {
+        let (machine, machine_name) = crate::session::machine();
+        HarnessCaps {
+            harness: harness.to_string(),
+            version: version.to_string(),
+            machine,
+            machine_name: Some(machine_name),
+            account: self.account,
+            probed_at: SeatHealth::now(),
+            source: self.source,
+            models: self.models,
+            efforts: self.efforts,
+            modes: self.modes,
+        }
+    }
+}
+
+/// One rate-limit window on the subscription seat behind a harness, normalized
+/// across harnesses (Claude Code's `limits[]`, Codex's `primary`/`secondary`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SeatLimit {
+    /// Harness-native window id — `"session"` / `"weekly_all"` /
+    /// `"weekly_scoped"` for Claude Code, `"<limitId>.primary"` for Codex.
+    /// Opaque to the server: it groups and dedupes, it does not interpret.
+    pub kind: String,
+    /// Display label ("Session", "Week (all models)").
+    pub label: String,
+    /// 0–100. The occupancy that actually matters when lending a seat.
+    pub percent: f64,
+    /// Epoch seconds the window rolls over, when the harness reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+}
+
+/// Liveness of the subscription seat behind a harness — "is this seat usable
+/// right now", as distinct from [`Harness::available`] ("is the CLI installed").
+///
+/// A seat can be installed and dead: credential expired, account no longer
+/// eligible, window exhausted. Lending, quota and supply decisions all need the
+/// second question answered, and only the machine holding the credential can
+/// answer it — so it rides the existing `reportHarnesses` heartbeat rather than
+/// a channel of its own.
+///
+/// Everything here is BEST EFFORT and self-reported by the host machine. It is
+/// operational telemetry for the seat's own owner, never an authorization input
+/// (§15: a flag is not a security boundary) and never billing evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeatHealth {
+    /// One of:
+    /// - `ok` — credential valid, upstream answered.
+    /// - `exhausted` — answered, but a window is full (100%).
+    /// - `unauthenticated` — no readable credential, or upstream said 401.
+    ///   The owner has to log in again.
+    /// - `rejected` — upstream said 403: the account is no longer allowed to
+    ///   use this seat (eligibility / suspension). Distinct from `unauthenticated`
+    ///   because re-logging-in does NOT fix it.
+    /// - `unreachable` — network failure, timeout, or an unexpected status.
+    /// - `unknown` — this harness has no way to probe its seat.
+    pub state: String,
+    /// Upstream HTTP status when the probe got one — the raw signal behind
+    /// `state`, kept so a new upstream behaviour is diagnosable without a CLI
+    /// release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Plan/tier label the seat reports ("Max (20x)", "Pro").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Rate-limit windows, most-occupied first.
+    pub limits: Vec<SeatLimit>,
+    /// Epoch seconds this probe ran.
+    pub checked_at: i64,
+}
+
+impl SeatHealth {
+    /// Epoch seconds now (probe stamp).
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// A seat with nothing to report — the default for harnesses that cannot
+    /// probe. Deliberately NOT `ok`: "we didn't look" and "we looked and it's
+    /// fine" must never collapse into the same value, or every consumer
+    /// silently treats unprobeable seats as healthy.
+    pub fn unknown() -> Self {
+        Self {
+            state: "unknown".into(),
+            status: None,
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+
+    /// Terminal-ish states carry no windows; build one from a status code.
+    pub fn from_status(status: u16) -> Self {
+        let state = match status {
+            401 => "unauthenticated",
+            403 => "rejected",
+            _ => "unreachable",
+        };
+        Self {
+            state: state.into(),
+            status: Some(status),
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+
+    /// A live probe: `ok`, or `exhausted` when any window is full.
+    pub fn from_limits(tier: Option<String>, mut limits: Vec<SeatLimit>) -> Self {
+        limits.sort_by(|a, b| b.percent.total_cmp(&a.percent));
+        let exhausted = limits.iter().any(|l| l.percent >= 100.0);
+        Self {
+            state: if exhausted { "exhausted" } else { "ok" }.into(),
+            status: Some(200),
+            tier,
+            limits,
+            checked_at: Self::now(),
+        }
+    }
+
+    /// No credential on disk / unreadable — same remedy as a 401, but there was
+    /// no request to get a status from.
+    pub fn unauthenticated() -> Self {
+        Self {
+            state: "unauthenticated".into(),
+            status: None,
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+
+    /// The probe never got an answer (DNS, TLS, timeout).
+    pub fn unreachable() -> Self {
+        Self {
+            state: "unreachable".into(),
+            status: None,
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+}
+
+/// A pluggable coding-agent backend.
+#[async_trait]
+pub trait Harness: Send + Sync {
+    /// Stable id — `"claude-code"`, `"opencode"`, `"codex"`, `"openclaw"`.
+    fn id(&self) -> &'static str;
+
+    /// Is the harness CLI installed / runnable on this machine?
+    fn available(&self) -> bool;
+
+    /// Can this build of mafold drive it at all, installed or not? False only
+    /// for [`unsupported::Unsupported`], the stand-in for a runtime the server
+    /// knows and this CLI doesn't — what `reportHarnesses` sends as `runs`, so
+    /// New Agent never offers a runtime the computer would refuse.
+    fn runs(&self) -> bool {
+        true
+    }
+
+    /// Can this build drive the version of it installed here (`None` = not
+    /// installed)? Your own OpenCode is driven on its 1 line only; every other
+    /// runtime, whatever is installed.
+    fn runs_version(&self, version: Option<&str>) -> bool {
+        let _ = version;
+        true
+    }
+
+    /// Can a turn of this harness be CORRECTED while it runs — i.e. does it read
+    /// [`Turn::steer_file`] and deliver what it finds to the model mid-flight?
+    ///
+    /// Default false, and the daemon behaves the same either way: a mid-turn
+    /// message is never dropped and never races the running turn. All this
+    /// decides is WHEN it arrives — at the next tool-result boundary, or as the
+    /// follow-up turn — which is the one thing the user is told, so nobody is
+    /// promised a correction that is really a queue.
+    /// Does a turn of this harness name its session ([`AgentEvent::Session`])
+    /// BEFORE anything of its own reaches the reply?
+    ///
+    /// What a restart in the middle of a turn turns on (`drafts::Journal`).
+    /// When it does, everything in the bubble ahead of that name is the
+    /// daemon's own narration, so a turn killed there has done nothing yet and
+    /// can simply run again. When it names its session only once the turn ends,
+    /// whatever is in the bubble may be the agent's work, held in a session
+    /// nobody can name — and running the turn again would do that work twice.
+    fn names_session_first(&self) -> bool {
+        false
+    }
+
+    fn can_steer(&self) -> bool {
+        false
+    }
+
+    /// Start a process for a turn that is ABOUT to run, so its startup overlaps
+    /// the work the caller still has to do before it can call [`Self::run`].
+    ///
+    /// Best-effort and fire-and-forget: a harness that keeps no processes
+    /// between turns does nothing, a failure is simply a turn that starts cold,
+    /// and `run` never depends on this having happened.
+    fn prewarm(&self, _shape: TurnShape) {}
+
+    /// Run one turn, pushing normalized events into `sink` as they arrive.
+    async fn run(
+        &self,
+        turn: Turn,
+        sink: UnboundedSender<AgentEvent>,
+    ) -> anyhow::Result<TurnOutcome>;
+
+    /// Discover the harness's slash-commands / skills for the bot's `/` menu
+    /// (a JSON array of `{command, description, arg_hint?}`).
+    fn discover(&self, workdir: &str) -> Value;
+
+    /// Try to handle a slash command locally (config dumps, /login, /stats…),
+    /// or return `Forward` to run it as a prompt.
+    /// `session` is this chat's live harness session id, when it has one — the
+    /// only reliable way to report on it, since sibling chats can share a
+    /// workdir and their transcripts race for newest-mtime. `env` is the seat
+    /// the chat runs on (see [`Turn::env`]): `/usage`, `/logout` and friends
+    /// must answer for THAT login, not for whichever one the daemon started in.
+    #[allow(clippy::too_many_arguments)]
+    async fn command(
+        &self,
+        client: &Client,
+        chat_id: &str,
+        name: &str,
+        arg: &str,
+        workdir: &str,
+        session: Option<&str>,
+        env: &[(String, String)],
+    ) -> CommandOutcome;
+
+    /// Who may run `name` through [`Self::command`]. Everything it answers
+    /// reads or changes the owner's own CLI, so by default the owner's circle;
+    /// a harness whose command touches the machine's sign-in says so.
+    fn command_who(&self, name: &str) -> Who {
+        let _ = name;
+        Who::Circle
+    }
+
+    /// What `name` takes ([`Takes`]), when [`Self::command`] answers it
+    /// itself. `None` = not one of its own: it goes to the CLI as a prompt,
+    /// where a skill or command gets whatever follows it.
+    fn command_takes(&self, name: &str) -> Option<Takes> {
+        let _ = name;
+        None
+    }
+
+    /// One-line status (e.g. auth account) appended to `/status`, for the seat
+    /// `env` selects. Empty = none.
+    async fn status_line(&self, env: &[(String, String)]) -> String {
+        let _ = env;
+        String::new()
+    }
+
+    /// Ask THIS machine's binary what it accepts — which models, which effort
+    /// tiers (see [`HarnessProbe`]). `None` = this harness can't be asked, or
+    /// the asking failed; the sheet then keeps the menus it already had,
+    /// because a probe that didn't run has discovered nothing, least of all
+    /// that the machine is empty.
+    ///
+    /// `env` is the seat (see [`Turn::env`]): the roster is per LOGIN — the
+    /// subscription decides which models exist — so the answer is only true for
+    /// the login that gave it, and the report says which one that was.
+    ///
+    /// `version` is what [`Self::cli_version`] already read, passed in so a
+    /// probe doesn't spawn the binary twice to learn the same string.
+    ///
+    /// MUST be quota-free, like [`Self::seat_health`]: measuring what a harness
+    /// offers must never cost a turn.
+    async fn caps(&self, env: &[(String, String)], version: &str) -> Option<HarnessProbe> {
+        let (_, _) = (env, version);
+        None
+    }
+
+    /// Which login a [`Self::caps`] answer is true for, as a cache key: two
+    /// logins can have two rosters, and one must never be read as the other's.
+    /// Claude Code keys its logins by directory (`crate::accounts`); a harness
+    /// that keys them some other way says so here.
+    fn seat_key(&self, env: &[(String, String)]) -> String {
+        crate::accounts::Account::from_env(env).name
+    }
+
+    /// The harness CLI's own version string (e.g. Claude Code `2.1.198`, Codex
+    /// `0.5.0`), shown on the `/status` Harness line. Empty = unknown / the CLI
+    /// isn't installed. Each harness probes ITS binary — a codex bot must never
+    /// report the `claude` version (and vice-versa).
+    async fn cli_version(&self) -> String {
+        String::new()
+    }
+
+    /// Probe the subscription seat behind this harness (see [`SeatHealth`]) —
+    /// the one `env` selects (see [`Turn::env`]; empty = the default login).
+    ///
+    /// Default is `unknown` — a harness that cannot ask its upstream "am I still
+    /// allowed, and how full is my window" must say so rather than imply health.
+    /// Implementations MUST be cheap and quota-free: this runs on every
+    /// `reportHarnesses` heartbeat, so a probe that starts a session or burns
+    /// tokens would measure the thing by consuming it. One that goes over the
+    /// network reuses its answer for a while (Claude Code: 5 minutes per login).
+    ///
+    /// Implemented for Claude Code (a plain HTTP call to the same utilization
+    /// endpoint Claude Code itself polls). **Codex is deliberately still
+    /// `unknown`**: its equivalent data (`account/rateLimits/read`) is only
+    /// reachable through the App Server, and `select()` hands out a fresh
+    /// `Codex` per call, so its connection cache is always cold here — probing
+    /// it would spawn a codex process on every heartbeat. Wiring that up needs
+    /// process-lifetime harness instances, which is a separate change; until
+    /// then `unknown` is the honest answer.
+    async fn seat_health(&self, env: &[(String, String)]) -> SeatHealth {
+        let _ = env;
+        SeatHealth::unknown()
+    }
+}
+
+/// Every harness id the CLI knows about (installed or not) — what it probes
+/// and reports, whether or not it can drive it ([`Harness::runs`]).
+pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw", "kimi-code", "opencode-own"];
+
+/// The default when a bot doesn't specify one.
+#[allow(dead_code)]
+pub const DEFAULT: &str = "claude-code";
+
+/// Resolve a harness by id (case/alias tolerant). No id means the default,
+/// Claude Code. Any other id this build can't drive — `openclaw` today, or a
+/// name it has never heard of — gets [`unsupported::Unsupported`], which
+/// keeps the id and refuses every turn. It used to get Claude Code: an agent
+/// set to OpenCode then answered as Claude Code on the machine's Claude
+/// login, and nobody could tell (10-29).
+pub fn select(id: &str) -> Arc<dyn Harness> {
+    match id.trim().to_lowercase().as_str() {
+        "claude-code" | "claude" | "claudecode" | "" => Arc::new(claude_code::ClaudeCode),
+        "codex" | "codex-cli" => Arc::new(codex::Codex),
+        "kimi-code" | "kimi" | "kimi-cli" | "kimicode" => Arc::new(kimi_code::KimiCode),
+        // Mafold Harness, by the id its tile has always had.
+        "opencode" | "open-code" => Arc::new(mafold_harness::MafoldHarness),
+        "opencode-own" | "own-opencode" => Arc::new(opencode::OwnOpenCode),
+        other => Arc::new(unsupported::Unsupported { id: intern(other) }),
+    }
+}
+
+/// A `&'static str` for an id that came in at runtime, kept once per distinct
+/// id: `Harness::id` is `'static`, and the supervisor asks `select` again on
+/// every `status`, so leaking a fresh copy each time would grow forever.
+fn intern(id: &str) -> &'static str {
+    if let Some(k) = KNOWN.iter().find(|k| **k == id) {
+        return k;
+    }
+    static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if let Some(k) = seen.get(id) {
+        return k;
+    }
+    let k: &'static str = Box::leak(id.to_string().into_boxed_str());
+    seen.insert(k);
+    k
+}
+
+/// Where a harness's CLI is looked for when asking whether it's installed.
+#[derive(Clone, Copy)]
+enum Bin {
+    /// The vendor's own install, on `$PATH` under this name.
+    OnPath(&'static str),
+    /// No binary: the runtime is part of this program (Mafold Harness), so it
+    /// is here wherever mafold is, at mafold's own version.
+    Linked,
+    /// The vendor's own install, found where its installer puts it as well as
+    /// on `$PATH` (your own OpenCode: `~/.opencode/bin`).
+    Found(fn() -> Option<PathBuf>),
+}
+
+impl Bin {
+    /// What [`resolve`] / [`program`] are handed: the name, or the path.
+    fn program(self) -> String {
+        match self {
+            Bin::OnPath(bin) => bin.to_string(),
+            Bin::Linked => crate::platform::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            // Where it was found, else its name (spawning that says it's missing).
+            Bin::Found(find) => find().map_or_else(|| "opencode".to_string(), |p| p.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// Its version, for an installed one.
+    fn version(self) -> Option<String> {
+        match self {
+            Bin::OnPath(bin) => bin_version(bin),
+            Bin::Linked => Some(env!("CARGO_PKG_VERSION").to_string()),
+            Bin::Found(find) => find().and_then(|p| version_of(&p)),
+        }
+    }
+}
+
+// (harness id, the CLI binary whose presence signals it's installed)
+const BINS: &[(&str, Bin)] = &[
+    ("claude-code", Bin::OnPath("claude")),
+    ("opencode", Bin::Linked),
+    ("codex", Bin::OnPath("codex")),
+    ("openclaw", Bin::OnPath("openclaw")),
+    ("kimi-code", Bin::OnPath("kimi")),
+    ("opencode-own", Bin::Found(opencode::own_binary)),
+];
+
+/// Probe which known harnesses are installed on THIS machine (their CLI is on
+/// PATH or where its installer puts it, or it is part of mafold) — the control plane's
+/// capability report for New-Bot recommendation. Returns `(id, available)`.
+/// Extend `BINS` as more harness impls land.
+pub fn probe() -> Vec<(&'static str, bool)> {
+    BINS.iter()
+        .map(|(id, bin)| {
+            let installed = match bin {
+                Bin::Found(find) => find().is_some(),
+                Bin::Linked => true,
+                other => on_path(&other.program()),
+            };
+            (*id, installed)
+        })
+        .collect()
+}
+
+/// `probe_with_versions` cache: version probes spawn subprocesses, so results
+/// live ~10 min — the supervisor reports every 30s and must stay cheap.
+#[allow(clippy::type_complexity)]
+static VERSION_CACHE: std::sync::Mutex<
+    Option<(
+        std::time::Instant,
+        std::collections::HashMap<&'static str, Option<String>>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+/// Like [`probe`], plus each available harness CLI's version (`<bin> --version`,
+/// first numeric-ish token). Cached ~10 min; call [`invalidate_versions`] after
+/// an install so the next report is fresh.
+pub fn probe_with_versions() -> Vec<(&'static str, bool, Option<String>)> {
+    let avail = probe();
+    let mut guard = VERSION_CACHE.lock().unwrap();
+    let fresh = guard
+        .as_ref()
+        .is_some_and(|(at, _)| at.elapsed() < std::time::Duration::from_secs(600));
+    if !fresh {
+        let mut m = std::collections::HashMap::new();
+        for ((id, bin), (_, ok)) in BINS.iter().zip(&avail) {
+            m.insert(*id, if *ok { bin.version() } else { None });
+        }
+        *guard = Some((std::time::Instant::now(), m));
+    }
+    let versions = &guard.as_ref().unwrap().1;
+    avail
+        .into_iter()
+        .map(|(id, ok)| {
+            (
+                id,
+                ok,
+                if ok {
+                    versions.get(id).cloned().flatten()
+                } else {
+                    None
+                },
+            )
+        })
+        .collect()
+}
+
+/// The `reportHarnesses` rows for this machine — availability, CLI version and
+/// seat health — built in ONE place so `mafold login` / `mafold report` and the
+/// supervisor heartbeat can never drift apart (§0). All of them send it through
+/// [`report_body`]; `mafold status` shows the same rows.
+///
+/// Seat health is probed only for harnesses actually installed (asking a missing
+/// CLI about its subscription is noise). A harness with several logins on this
+/// machine (Claude Code's account registry) reports every one of them under
+/// `accounts`, probed side by side; `health` stays the single-seat answer — the
+/// seat a turn would land on right now, i.e. the first healthy one — so a
+/// reader that only knows the older shape still gets the verdict that matters.
+pub async fn report_rows() -> Vec<Value> {
+    let probed = tokio::task::spawn_blocking(probe_with_versions)
+        .await
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(probed.len());
+    for (id, available, version) in probed {
+        // `null` (not `unknown`) when the harness isn't installed: there is no
+        // seat to have an opinion about.
+        //
+        // Only a harness this build can drive has a seat to ask about: an
+        // `opencode` row once came back "Max (20x)" with Claude's windows,
+        // when `select()` still answered every unknown id with Claude Code.
+        // Ask the harness itself (`runs`) instead of keeping a second list of
+        // "ids that are implemented" (§9).
+        let h = select(id);
+        let runs = h.runs() && h.runs_version(version.as_deref());
+        let implemented = available && runs;
+        let (health, accounts) = if implemented {
+            // Only Claude Code keys logins by directory today; every other
+            // harness has exactly one seat, its default.
+            let seats = if id == "claude-code" {
+                crate::accounts::load().accounts
+            } else {
+                vec![crate::accounts::Account::default_login()]
+            };
+            let envs: Vec<Vec<(String, String)>> = seats.iter().map(|a| a.env()).collect();
+            let probes: Vec<SeatHealth> =
+                futures_util::future::join_all(envs.iter().map(|e| h.seat_health(e))).await;
+            let lead = probes.iter().position(|s| s.state == "ok").unwrap_or(0);
+            let accounts: Vec<Value> = seats
+                .iter()
+                .zip(&probes)
+                .map(|(a, s)| serde_json::json!({ "name": a.name, "email": a.email, "health": s }))
+                .collect();
+            (probes.get(lead).cloned(), accounts)
+        } else {
+            (None, Vec::new())
+        };
+        rows.push(serde_json::json!({
+            "id": id,
+            "available": available,
+            // Mafold here can drive it (installed or not): New Agent offers
+            // only these, and createBot refuses the others on this computer.
+            "runs": runs,
+            "version": version,
+            "health": health,
+            "accounts": accounts,
+            // What it can be signed in with here (`HarnessInfo::sign_ins`).
+            "sign_ins": sign_ins_of(id, implemented).await,
+        }));
+    }
+    rows
+}
+
+/// What Mafold here can run `id` on, as the report says it: each runtime's
+/// own login; Mafold Harness on OpenCode Go and the wallet; your own OpenCode
+/// on OpenCode Go, saying whether it is signed in to Go here. Go's models are
+/// the ones Mafold Harness can talk to (`mafold_harness::go_model_ids`'s
+/// list), and for your own OpenCode the ones it lists (`opencode::go_models`).
+async fn sign_ins_of(id: &str, installed: bool) -> Value {
+    match id {
+        "claude-code" => serde_json::json!([{ "id": "claude" }]),
+        "codex" => serde_json::json!([{ "id": "codex" }]),
+        "kimi-code" => serde_json::json!([{ "id": "kimi" }]),
+        "opencode" => {
+            let m = mafold_harness::go_models().await;
+            serde_json::json!([{ "id": crate::fuel::GO, "models": m }, { "id": crate::fuel::WALLET }])
+        }
+        opencode::OWN => {
+            let m = match opencode::own_binary().filter(|_| installed) {
+                Some(bin) => tokio::task::spawn_blocking(move || opencode::go_models(&bin)).await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            serde_json::json!([{ "id": crate::fuel::GO, "signed_in": opencode::own_go_login(), "models": m }])
+        }
+        _ => serde_json::json!([]),
+    }
+}
+
+/// The whole `reportHarnesses` body for this machine as `sess` — what
+/// `mafold login` / `mafold report` send and what the supervisor sends as its
+/// 30-second heartbeat. One body for both: a heartbeat that carried less than
+/// a full report used to overwrite the logins the full report had just written
+/// (activity center K2/C1).
+pub async fn report_body(sess: &crate::session::Session) -> Value {
+    serde_json::json!({
+        "device_id": sess.device_id,
+        "device_name": sess.device_name,
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        // `macos` / `linux` / `windows`: New Agent names each computer's OS.
+        "os": std::env::consts::OS,
+        "harnesses": report_rows().await,
+    })
+}
+
+/// Drop the version cache (next `probe_with_versions` re-probes) — call after
+/// installing a runtime so its availability + version report immediately.
+pub fn invalidate_versions() {
+    *VERSION_CACHE.lock().unwrap() = None;
+}
+
+/// What `harness` accepts on this machine for the seat `env` selects, ready to
+/// report — from disk when the binary hasn't changed since we last asked, else
+/// by asking it ([`Harness::caps`]).
+///
+/// The cache is on DISK and not in this process because the thing being cached
+/// is a property of the MACHINE: a box running six bots would otherwise pay six
+/// identical probes every time the supervisor restarts them. It is keyed by
+/// harness + seat and holds only while the version it was read from is still
+/// installed, and for [`CAPS_MAX_AGE_SECS`] at most: a roster comes from the
+/// harness's server as well as its build.
+///
+/// `None` = nothing to report: no binary, no probe, or a probe that came back
+/// empty-handed. Never a report that says the machine has nothing — that claim
+/// belongs to a probe that actually ran (`CapsSource::None`).
+pub async fn caps_report(h: &dyn Harness, env: &[(String, String)]) -> Option<HarnessCaps> {
+    if !h.available() {
+        return None;
+    }
+    let version = h.cli_version().await;
+    let seat = h.seat_key(env);
+    if let Some(c) = cached_caps(h.id(), &seat) {
+        // An unknown version can't confirm freshness, and re-probing is cheap
+        // next to reporting a roster that moved. Nor can a same-version answer
+        // stand forever: codex's roster comes from its server as well as its
+        // build, and so does Claude Code's (Fable 5.2 reached 2.1.312 with no
+        // upgrade), so a model or a tier can arrive without an upgrade.
+        if !version.is_empty() && c.version == version && SeatHealth::now() - c.probed_at < CAPS_MAX_AGE_SECS {
+            return Some(c);
+        }
+    }
+    probe_and_cache(h, env, &version, &seat).await
+}
+
+/// How long a same-version answer on file is reported as-is — at daemon start,
+/// and on the daemon's hourly re-ask (`agent::keep_caps_reported`), so the
+/// bots on one machine share a probe instead of each paying for their own.
+const CAPS_MAX_AGE_SECS: i64 = 3600;
+
+/// Ask the binary ([`Harness::caps`]) and keep the answer for the seat.
+async fn probe_and_cache(h: &dyn Harness, env: &[(String, String)], version: &str, seat: &str) -> Option<HarnessCaps> {
+    let probe = h.caps(env, version).await?;
+    if probe.is_empty() {
+        return None;
+    }
+    let caps = probe.report(h.id(), version);
+    cache_caps(h.id(), seat, &caps);
+    Some(caps)
+}
+
+/// What a turn passes as its reasoning tier — held to what THIS machine's
+/// binary said the turn's model takes ([`Harness::caps`]), and to nothing
+/// written here.
+///
+/// Every harness CLI we drive treats a tier it doesn't take the same way:
+/// quietly. `claude --effort <unknown>` warns once on a stderr nobody reads and
+/// runs the default; the codex adapter used to keep its own table of four tiers
+/// and drop the rest, so `ultra` — offered by the sheet because codex itself
+/// reports it — ran at whatever `~/.codex/config.toml` said (2026-10-08, the
+/// owner picked ultra and every turn ran medium). A tier the owner picked is
+/// either run as picked or refused out loud; nothing in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffortVerdict {
+    /// Hand the harness this tier (`None` = its own default).
+    Pass(Option<String>),
+    /// The model has no reasoning dial at all (Haiku): it runs exactly as it
+    /// always can, without one — and the reply says the setting didn't apply.
+    NoDial(String),
+    /// Not a tier this model takes on this machine. The turn doesn't run; the
+    /// reply says why and what it does take.
+    Refuse(String),
+}
+
+/// How long an answer on file stands before a verdict against the owner's pick
+/// re-asks the binary even at the same version — a codex roster comes from its
+/// server as well as from its build, so a tier can appear without an upgrade.
+/// Also how long a re-ask that FAILED holds off the next one.
+const REASK_AFTER_SECS: i64 = 600;
+
+/// The most a re-ask may hold a turn up. It runs before the turn's bubble
+/// exists, so past this the answer on file stands.
+const REASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One re-ask at a time on this process, and when each seat's last one failed.
+fn reask_gate() -> &'static tokio::sync::Mutex<std::collections::HashMap<String, i64>> {
+    static GATE: OnceLock<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// Judge `effort` for a turn of `model` on `h`, for the seat `env` selects.
+///
+/// The answer on file (the daemon's probe at start and every hour, [`caps_report`]) decides —
+/// a file read, nothing spawned. Before overruling the owner's pick, though
+/// (refusing it, or dropping it as a dial the model hasn't got), the binary is
+/// asked again when it moved since (an upgrade brings tiers its old answer
+/// never had) or the answer is old: the verdict must be about the binary that
+/// would run the turn. With nothing on file at all — the probe hasn't finished,
+/// or this harness can't be asked — the tier goes through as it is and the
+/// harness answers for itself; probing from here would put a process start in
+/// front of every turn of a harness that never answers.
+pub async fn effort_for_turn(
+    h: &dyn Harness,
+    env: &[(String, String)],
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> EffortVerdict {
+    let Some(want) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
+        return EffortVerdict::Pass(None);
+    };
+    let seat = h.seat_key(env);
+    let Some(known) = cached_caps(h.id(), &seat) else {
+        return EffortVerdict::Pass(Some(want.to_lowercase()));
+    };
+    let verdict = judge_effort(&known, model, want);
+    if matches!(verdict, EffortVerdict::Pass(_)) {
+        return verdict;
+    }
+    let version = h.cli_version().await;
+    let fresh_enough = |c: &HarnessCaps| {
+        (version.is_empty() || version == c.version) && SeatHealth::now() - c.probed_at < REASK_AFTER_SECS
+    };
+    if fresh_enough(&known) {
+        return verdict;
+    }
+    let key = format!("{}/{seat}", h.id());
+    let mut failed = reask_gate().lock().await;
+    // Another turn may have re-asked while this one waited for the gate.
+    if let Some(c) = cached_caps(h.id(), &seat).filter(|c| fresh_enough(c)) {
+        return judge_effort(&c, model, want);
+    }
+    if failed.get(&key).is_some_and(|at| SeatHealth::now() - at < REASK_AFTER_SECS) {
+        return verdict;
+    }
+    match tokio::time::timeout(REASK_TIMEOUT, probe_and_cache(h, env, &version, &seat)).await {
+        Ok(Some(fresh)) => {
+            failed.remove(&key);
+            judge_effort(&fresh, model, want)
+        }
+        _ => {
+            failed.insert(key, SeatHealth::now());
+            verdict
+        }
+    }
+}
+
+/// The verdict one report gives. Pure, so every case is a test.
+fn judge_effort(caps: &HarnessCaps, model: Option<&str>, want: &str) -> EffortVerdict {
+    let is = |t: &String| t.eq_ignore_ascii_case(want);
+    let here = format!("{} {}", caps.harness, caps.version);
+    let list = |tiers: &[&String]| tiers.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ");
+    // A mode (`ultracode`) sits at the same dial for every model.
+    if let Some(m) = caps.modes.iter().find(|m| is(&m.id)) {
+        return EffortVerdict::Pass(Some(m.id.clone()));
+    }
+    // An empty list on a model means "no dial" only in a report that gives
+    // models tiers at all; in one that never does, it means the build didn't
+    // say, and the union below (empty, so it passes) is the honest answer.
+    let per_model = caps.models.iter().any(|m| !m.efforts.is_empty());
+    let named = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .and_then(|m| caps.model(m))
+        .filter(|m| per_model || !m.efforts.is_empty());
+    if let Some(m) = named {
+        if let Some(t) = m.efforts.iter().find(|t| is(t)) {
+            return EffortVerdict::Pass(Some(t.clone()));
+        }
+        if m.efforts.is_empty() {
+            return EffortVerdict::NoDial(format!(
+                "{} has no reasoning-effort setting on this machine ({here}), so `{want}` doesn't apply to it — running without one",
+                m.display
+            ));
+        }
+        return EffortVerdict::Refuse(format!(
+            "reasoning effort `{want}` isn't one {} takes on this machine ({here}) — it takes {}. \
+             Pick one of those (Customize ▸ Reasoning effort), or a model that takes `{want}` \
+             (Customize ▸ Model, or `/model` in this chat); nothing ran at another tier.",
+            m.display,
+            list(&m.efforts.iter().collect::<Vec<_>>())
+        ));
+    }
+    // No model named, or one this report doesn't list: which model the harness
+    // ends up on isn't something the report can say, so the tier is held to
+    // what ANY model here takes.
+    let mut tiers: Vec<&String> = Vec::new();
+    for t in caps.models.iter().flat_map(|m| m.efforts.iter()).chain(caps.efforts.iter()) {
+        if !tiers.contains(&t) {
+            tiers.push(t);
+        }
+    }
+    if let Some(t) = tiers.iter().find(|t| is(t)) {
+        return EffortVerdict::Pass(Some((*t).clone()));
+    }
+    // A report that names no tiers has nothing to hold the turn to.
+    if tiers.is_empty() {
+        return EffortVerdict::Pass(Some(want.to_lowercase()));
+    }
+    EffortVerdict::Refuse(format!(
+        "reasoning effort `{want}` isn't one any model takes on this machine ({here}) — the tiers here are {}. \
+         Pick one of those in Customize ▸ Reasoning effort; nothing ran at another tier.",
+        list(&tiers)
+    ))
+}
+
+fn caps_cache_path(harness: &str, seat: &str) -> PathBuf {
+    let safe = |s: &str| -> String {
+        s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home)
+        .join(".mafold/caps")
+        .join(format!("{}-{}.json", safe(harness), safe(seat)))
+}
+
+fn cached_caps(harness: &str, seat: &str) -> Option<HarnessCaps> {
+    let s = std::fs::read_to_string(caps_cache_path(harness, seat)).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn cache_caps(harness: &str, seat: &str, caps: &HarnessCaps) {
+    let path = caps_cache_path(harness, seat);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string(caps) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// `<bin> --version` → a short version string ("2.1.198"): first token that
+/// starts with a digit, else the trimmed first line. None on any failure.
+fn bin_version(bin: &str) -> Option<String> {
+    let out = crate::platform::std_command(program(bin))
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s.lines().next()?.trim();
+    let v = line
+        .split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or(line);
+    (!v.is_empty()).then(|| v.chars().take(32).collect())
+}
+
+/// [`bin_version`] of a binary at a path.
+pub(crate) fn version_of(path: &Path) -> Option<String> {
+    bin_version(&path.to_string_lossy())
+}
+
+/// Could `Command` start the file at `p`?
+pub(crate) fn is_launchable(p: &Path) -> bool {
+    launchable(p)
+}
+
+/// Is `bin` resolvable on `$PATH`? Windows-aware: also tries each `PATHEXT`
+/// extension (`codex.exe` / `claude.cmd` / …) — checking only the bare name made
+/// `probe()` report every harness unavailable on Windows, so this machine never
+/// showed up as a capable host.
+pub(crate) fn on_path(bin: &str) -> bool {
+    resolve(bin).is_some()
+}
+
+/// The program string to hand [`std::process::Command`] for `bin`: the resolved
+/// `$PATH` entry when there is one, else the bare name (so the OS reports the
+/// failure exactly as it used to).
+///
+/// EVERY spawn of a harness CLI goes through this, and `on_path` answers from the
+/// same resolver — availability can no longer promise a spawn that then fails.
+/// Windows is why: `CreateProcessW` only ever appends `.exe`, while a normal npm
+/// install of these CLIs lays down a PAIR — `claude` (a POSIX sh script, which
+/// Windows cannot start) plus `claude.cmd`. `on_path` saw the sh script and said
+/// yes; `Command::new("claude")` looked for `claude.exe`, found nothing, and the
+/// daemon answered the chat with "couldn't run `claude` … is it on PATH?" — the
+/// one question it had already answered itself. Handing over the resolved
+/// `…\claude.cmd` fixes both halves: std recognizes `.cmd`/`.bat` and routes them
+/// through `cmd.exe` with hardened quoting (CVE-2024-24576).
+pub(crate) fn program(bin: &str) -> std::ffi::OsString {
+    resolve(bin).map_or_else(|| bin.into(), Into::into)
+}
+
+/// What every Claude Code process mafold starts calls itself to Anthropic.
+/// Claude Code takes it from `CLAUDE_CODE_ENTRYPOINT`, sends it with each request
+/// (the `cc_entrypoint` in its billing header, and its User-Agent), and writes it
+/// into its transcripts and session registry. Left unset, `claude -p` calls
+/// itself `sdk-cli`, and the same tokens have been measured to use about 1.6–2.9×
+/// as much of a plan's 5-hour window under `sdk-*` as under the interactive
+/// `cli` (anthropics/claude-code#97074, which Anthropic hadn't answered as of
+/// 2026-11-03). Our own name rather than `cli`: the requests still say which
+/// client sent them. Set on every start, over an inherited value: a daemon
+/// started from a terminal's claude would otherwise hand that one down.
+pub(crate) const CLAUDE_ENTRYPOINT: &str = "claude-mafold";
+
+/// `claude`, ready to start: [`program`] with [`CLAUDE_ENTRYPOINT`] set. Every
+/// Claude Code process mafold starts comes from here or [`claude_std`]
+/// (`tests::every_claude_says_it_is_mafold` fails the build otherwise).
+pub(crate) fn claude() -> tokio::process::Command {
+    let mut cmd = crate::platform::command(program("claude"));
+    cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_ENTRYPOINT);
+    cmd
+}
+
+/// [`claude`], blocking.
+pub(crate) fn claude_std() -> std::process::Command {
+    let mut cmd = crate::platform::std_command(program("claude"));
+    cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_ENTRYPOINT);
+    cmd
+}
+
+/// First `$PATH` entry for `bin` that we could actually execute.
+pub(crate) fn resolve(bin: &str) -> Option<PathBuf> {
+    // An explicit path (`/opt/bin/claude`, `C:\tools\claude.cmd`) is not a $PATH
+    // lookup — take it as given.
+    if bin.contains('/') || bin.contains('\\') {
+        let p = PathBuf::from(bin);
+        return launchable(&p).then_some(p);
+    }
+    let names = exe_candidates(bin);
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
+        .find(|p| launchable(p))
+}
+
+/// Could `Command` start this file? Unix wants the execute bit (matching what
+/// `execvp` itself would accept while searching `$PATH`); on Windows the
+/// candidate list is already restricted to launchable extensions.
+#[cfg(not(windows))]
+fn launchable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+#[cfg(windows)]
+fn launchable(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Extensions `std::process::Command` can launch on Windows: the two it starts
+/// directly and the two it wraps in `cmd.exe`. A `.ps1`/`.vbs`/`.js` shim needs
+/// an interpreter, so it is NOT a candidate — counting it as "installed" is how
+/// detection and spawn drifted apart in the first place.
+#[cfg(windows)]
+const LAUNCHABLE_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+
+/// Filenames to look for on `$PATH` for a program. On Unix that's just the bare
+/// name; on Windows the executable is `codex.exe` / `claude.cmd` / …, so we try
+/// the bare name with each `PATHEXT` extension appended.
+#[cfg(not(windows))]
+fn exe_candidates(bin: &str) -> Vec<String> {
+    vec![bin.to_string()]
+}
+#[cfg(windows)]
+fn exe_candidates(bin: &str) -> Vec<String> {
+    // Deliberately NOT the bare name — see `program`. `PATHEXT` sets the order
+    // (the shell's own precedence); the defaults are appended so a trimmed
+    // `PATHEXT` can't hide an installed `claude.cmd`.
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    let mut names: Vec<String> = Vec::new();
+    for ext in pathext.split(';').chain(LAUNCHABLE_EXTS.iter().copied()) {
+        let ext = ext.trim().to_ascii_lowercase();
+        if LAUNCHABLE_EXTS.contains(&ext.as_str()) {
+            let name = format!("{bin}{ext}");
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Why `bin` wouldn't start — one wording for every harness. Separates the two
+/// failures the old message ran together: nothing installed at all, vs. a shim we
+/// found and still couldn't launch.
+///
+/// The second half has to carry the CAUSE. `couldn't start \`claude\`
+/// (C:\Users\…\claude.exe)` on its own is unfalsifiable — it names a file that
+/// demonstrably exists (we just resolved it) and then says nothing about which
+/// syscall refused. The `io::Error` holding that answer stays attached as the
+/// anyhow source, and the codes a spawn of an already-resolved file can fail
+/// with get spelled out here, because "os error 193" is not something the person
+/// reading the chat can act on.
+pub(crate) fn spawn_err(bin: &str, workdir: &str, e: std::io::Error) -> anyhow::Error {
+    let head = match resolve(bin) {
+        Some(p) => format!("couldn't start `{bin}` ({}) in {workdir}", p.display()),
+        None => format!(
+            "`{bin}` is not on PATH — is it installed? (looked for: {})",
+            exe_candidates(bin).join(", ")
+        ),
+    };
+    match spawn_cause(&e) {
+        Some(why) => anyhow::Error::new(e).context(format!("{head} — {why}")),
+        None => anyhow::Error::new(e).context(head),
+    }
+}
+
+/// Plain language for the handful of OS errors that can reject a program we
+/// already found on `$PATH`. Raw codes are per-OS, so each set is gated; the
+/// kinds std normalizes are matched first.
+fn spawn_cause(e: &std::io::Error) -> Option<&'static str> {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return Some("access denied — antivirus or file permissions are blocking it");
+    }
+    #[cfg(windows)]
+    {
+        // CreateProcessW's own codes (winerror.h).
+        return match e.raw_os_error() {
+            Some(2) => Some("it disappeared between the PATH lookup and the spawn"),
+            Some(193) => Some(
+                "not a valid Windows program — a truncated download or the wrong architecture; \
+                 reinstall Claude Code",
+            ),
+            Some(206) => Some(
+                "the command line is past the Windows 32,767-character limit — the prompt plus \
+                 system prompt is too long for argv",
+            ),
+            Some(267) => Some("the working directory isn't usable"),
+            Some(1455) => Some("Windows is out of commit charge (paging file too small)"),
+            _ => None,
+        };
+    }
+    #[allow(unreachable_code)]
+    {
+        // ENOEXEC / E2BIG — the two Unix equivalents worth naming.
+        match e.raw_os_error() {
+            Some(8) => Some("not an executable format — a script with no `#!` line?"),
+            Some(7) => Some("the argument list is too long for exec"),
+            _ => None,
+        }
+    }
+}
+
+/// The dying-harness fixture: a turn whose process is killed while a process it
+/// started still holds its stdout — so the stream never reaches EOF, and the
+/// only sign the turn is over is that the process is gone (the K case of
+/// `scripts/beat-alive-e2e.sh`). Shared by every harness's test so none of them
+/// can drift from the case they claim to cover.
+/// A stand-in harness binary that records where its turn told it it is
+/// (`turn_env`) and exits — so each harness's real spawn path can be checked
+/// for the env it hands its agent.
+#[cfg(all(test, unix))]
+pub(crate) mod env_probe {
+    use std::path::{Path, PathBuf};
+
+    /// `(program, record)`: running `program` writes `MAFOLD_CONV|MAFOLD_FORUM_CHANNEL`
+    /// to `record`.
+    pub fn script(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let record = dir.join("env.txt");
+        let path = dir.join("harness.sh");
+        let s = format!(
+            "#!/bin/sh\nprintf '%s|%s' \"$MAFOLD_CONV\" \"$MAFOLD_FORUM_CHANNEL\" > '{}'\n",
+            record.display()
+        );
+        std::fs::write(&path, s).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (path, record)
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_tests {
+    use super::*;
+
+    fn entrypoint_of(cmd: &std::process::Command) -> Option<&std::ffi::OsStr> {
+        cmd.get_envs().find(|(k, _)| *k == "CLAUDE_CODE_ENTRYPOINT").and_then(|(_, v)| v)
+    }
+
+    #[test]
+    fn every_claude_says_it_is_mafold() {
+        let ours = Some(std::ffi::OsStr::new(CLAUDE_ENTRYPOINT));
+        assert_eq!(entrypoint_of(claude().as_std()), ours);
+        assert_eq!(entrypoint_of(&claude_std()), ours);
+
+        // …and nothing starts one any other way: a `claude` built straight from
+        // `program("claude")` would go out as `sdk-cli` again.
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() > 20, "found the sources: {}", src.display());
+        let needle = ["program(", "\"claude\")"].concat();
+        let mut bare = Vec::new();
+        for f in files.iter().filter(|f| !f.ends_with("harness/mod.rs")) {
+            let text = std::fs::read_to_string(f).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains("command(") && line.contains(&needle) {
+                    let rel = f.strip_prefix(&src).unwrap_or(f).display().to_string();
+                    bare.push(format!("  src/{}:{}  {}", rel.replace('\\', "/"), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(bare.is_empty(), "start Claude Code with crate::harness::{{claude, claude_std}}:\n{}", bare.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod turn_env_tests {
+    use super::*;
+
+    #[test]
+    fn the_channel_comes_out_of_a_channel_surface_and_nowhere_else() {
+        assert_eq!(forum_channel_of("c1__ch-1__bot").as_deref(), Some("ch-1"));
+        assert_eq!(forum_channel_of("c1____bot"), None, "#all");
+        // A legacy key (before the bot joined it) or anything else names no channel.
+        for other in ["", "c1", "c1__ch-1", "c1__ch-1__bot__x", "__ch-1__bot", "c1__ch-1__"] {
+            assert_eq!(forum_channel_of(other), None, "{other}");
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod orphan_fixture {
+    use super::TurnProc;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// A stand-in harness: prints `line`, starts a child that inherits its
+    /// stdout (and outlives it), says so in `dir/forked`, then idles until it
+    /// is killed.
+    pub fn script(dir: &Path, line: &str) -> PathBuf {
+        let forked = dir.join("forked");
+        #[cfg(windows)]
+        {
+            // `start /b` shares this console AND its handles — the pipe included.
+            let path = dir.join("harness.cmd");
+            let s = format!(
+                "@echo off\r\necho {line}\r\nstart /b ping -n 30 127.0.0.1\r\ntype nul > \"{}\"\r\nping -n 30 127.0.0.1 >nul\r\n",
+                forked.display()
+            );
+            std::fs::write(&path, s).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("harness.sh");
+            let s = format!(
+                "#!/bin/sh\ncat <<'MAFOLD_JSON'\n{line}\nMAFOLD_JSON\nsleep 30 &\n: > '{}'\nsleep 30\n",
+                forked.display()
+            );
+            std::fs::write(&path, s).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    /// Drive `run` until the [`script`] in `dir` has printed and forked, kill
+    /// the process serving it — and give the turn `limit` to end. Returns its
+    /// outcome (None: still open at `limit`) and how long after the kill it
+    /// ended.
+    ///
+    /// On its marker, not on a clock: a fixed two seconds killed the script
+    /// before it ran at all whenever exec was slow — on macOS a brand-new
+    /// script can sit in `/bin/sh` before the real shell loads for longer
+    /// than that while other tests spawn theirs — and with nothing holding
+    /// the pipe the turn ended on EOF instead of the exit it is here to test.
+    pub async fn kill_mid_turn<F: std::future::Future>(
+        run: F,
+        proc: &TurnProc,
+        dir: &Path,
+        limit: Duration,
+    ) -> (Option<F::Output>, Duration) {
+        tokio::pin!(run);
+        let started = Instant::now();
+        let forked = dir.join("forked");
+        let pid = loop {
+            tokio::select! {
+                _ = &mut run => panic!("the turn ended before its process was killed"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            if let Some(pid) = proc.pid().filter(|_| forked.exists()) {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "the script never forked under a turn");
+        };
+        crate::platform::terminate(pid);
+        let killed = Instant::now();
+        let out = tokio::time::timeout(limit, &mut run).await.ok();
+        (out, killed.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod exit_watch_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The other half, and the one that would hurt: a process that is ALIVE
+    /// and silent — a long tool call, the very thing #651 stopped calling «No
+    /// signal» — must never be taken for gone, however long the silence. Then,
+    /// killed, it is gone within one drain.
+    #[tokio::test]
+    async fn exit_watch_never_ends_a_turn_whose_process_is_alive() {
+        let mut child = crate::platform::idle_child();
+        let mut watch = ExitWatch::new(Some(child.id()));
+        let silent = EXIT_DRAIN + Duration::from_secs(2);
+        assert!(
+            tokio::time::timeout(silent, watch.gone()).await.is_err(),
+            "ended a turn whose process was alive, after {silent:?} of silence"
+        );
+
+        child.kill().expect("kill it");
+        let killed = Instant::now();
+        tokio::time::timeout(EXIT_DRAIN + Duration::from_secs(2), watch.gone())
+            .await
+            .expect("still not gone a drain after the kill");
+        assert!(killed.elapsed() >= EXIT_DRAIN, "the drain is for the pipe — it must not be skipped");
+        let _ = child.wait();
+    }
+
+    /// No pid, nothing to watch: never resolves on its own.
+    #[tokio::test]
+    async fn exit_watch_without_a_pid_waits_forever() {
+        let mut watch = ExitWatch::new(None);
+        assert!(tokio::time::timeout(Duration::from_millis(600), watch.gone()).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    /// 10-29: an agent created with runtime `opencode` answered as Claude Code
+    /// — on the machine's Claude login, with Claude's models in its Customize
+    /// sheet — because `select` turned every id it didn't implement into
+    /// Claude Code, and the only trace was one stdout line. A runtime is run
+    /// by itself or not at all.
+    #[test]
+    fn no_runtime_is_quietly_run_by_another() {
+        for id in KNOWN {
+            assert_eq!(select(id).id(), *id, "`{id}` must be run by itself or refused, never by another runtime");
+        }
+    }
+
+    /// The runtimes this build drives say so; the others say they can't —
+    /// which is what `reportHarnesses` sends as `runs`.
+    #[test]
+    fn a_runtime_says_whether_mafold_can_run_it() {
+        for id in ["claude-code", "codex", "kimi-code", "opencode"] {
+            assert!(select(id).runs(), "{id}");
+        }
+        for id in ["openclaw", "some-new-thing"] {
+            assert!(!select(id).runs(), "{id}");
+            assert!(!select(id).available(), "{id}: nothing here can run it, installed or not");
+        }
+        // No id is the default, and aliases still find their runtime.
+        assert_eq!(select("").id(), "claude-code");
+        assert_eq!(select(" Claude ").id(), "claude-code");
+        assert_eq!(select("kimi").id(), "kimi-code");
+        assert_eq!(select("open-code").id(), "opencode");
+    }
+
+    /// Mafold Harness (`opencode`) is part of this program: here wherever
+    /// mafold is, at mafold's version, and no `opencode` anywhere counts.
+    #[test]
+    fn mafold_harness_is_here_wherever_mafold_is() {
+        let (_, bin) = BINS.iter().find(|(id, _)| *id == "opencode").expect("a row");
+        assert!(matches!(bin, Bin::Linked));
+        assert_eq!(bin.version().as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(probe().iter().find(|(id, _)| *id == "opencode").map(|(_, ok)| *ok), Some(true));
+        assert!(select("opencode").available());
+    }
+
+    /// The person talking to the agent is told what happened and what to do,
+    /// and the runtimes it names are the ones `select` really runs.
+    #[test]
+    fn a_turn_on_a_runtime_mafold_cant_run_is_refused_in_words() {
+        assert_eq!(
+            unsupported::refusal("openclaw"),
+            "This agent is set to run OpenClaw, which Mafold on this computer can't run, so nothing ran. \
+             Mafold runs Claude Code, Mafold Harness, Codex, Kimi Code and OpenCode: make a new agent on one of them."
+        );
+    }
+
+    /// One id, one string: the supervisor asks again on every `status`.
+    #[test]
+    fn an_unheard_of_id_is_kept_once() {
+        let a = select("brand-new").id();
+        let b = select("brand-new").id();
+        assert_eq!(a, "brand-new");
+        assert!(std::ptr::eq(a, b));
+    }
+}
+
+#[cfg(test)]
+mod path_resolution_tests {
+    use super::*;
+
+    /// The invariant the Windows daemon broke: whatever `on_path` calls installed,
+    /// `program` must hand back something spawnable — never the bare name that
+    /// `CreateProcessW` then fails to find.
+    #[test]
+    fn availability_implies_a_resolved_program() {
+        for (_, bin) in BINS {
+            let Bin::OnPath(bin) = bin else { continue };
+            if on_path(bin) {
+                assert_ne!(
+                    program(bin),
+                    std::ffi::OsString::from(*bin),
+                    "{bin} reported available but resolved to the bare name"
+                );
+                assert!(resolve(bin).is_some_and(|p| p.is_absolute() || p.exists()));
+            }
+        }
+    }
+
+    /// A spawn failure has to say WHY, and it has to survive the trip to chat.
+    /// The daemon renders with `{:#}`, so the `io::Error` we keep as the source —
+    /// the only part that names the syscall's refusal — must show up there;
+    /// plain `{}` shows just the context line, which is the dead end two Windows
+    /// rounds were spent staring at.
+    #[test]
+    fn spawn_error_carries_the_os_cause() {
+        // EACCES / ERROR_ACCESS_DENIED — both normalize to PermissionDenied.
+        let raw = if cfg!(windows) { 5 } else { 13 };
+        let e = spawn_err("claude", "/tmp/wd", std::io::Error::from_raw_os_error(raw));
+        let full = format!("{e:#}");
+        assert!(full.contains("access denied"), "no plain-language cause: {full}");
+        assert!(full.contains("os error"), "OS code dropped: {full}");
+        assert!(!format!("{e}").contains("os error"), "test is asserting nothing");
+    }
+
+    /// A non-executable file named like the CLI is not an install — `execvp`
+    /// skips it while searching `$PATH` and so must we. (Tests `launchable`
+    /// directly rather than mutating the process `PATH`, which would race the
+    /// other tests in this binary.)
+    #[test]
+    fn non_executable_is_not_an_install() {
+        let dir = std::env::temp_dir().join(format!("mafold-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let decoy = dir.join(if cfg!(windows) { "mafoldtest.exe" } else { "mafoldtest" });
+        std::fs::write(&decoy, "not a program").unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!launchable(&decoy));
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows has no execute bit — a launchable extension IS the install there.
+        assert!(launchable(&decoy));
+        assert!(!launchable(&dir), "a directory is not a program");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An explicit path bypasses the `$PATH` walk instead of being searched for
+    /// as a filename (`resolve` is also the door for a configured absolute CLI).
+    #[test]
+    fn explicit_path_is_taken_as_given() {
+        assert!(resolve("/definitely/not/here/claude").is_none());
+    }
+
+    /// On Windows the extensionless npm shim (a POSIX sh script) is not a
+    /// candidate, and every candidate is something `Command` can launch.
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_are_launchable_only() {
+        let names = exe_candidates("claude");
+        assert!(!names.contains(&"claude".to_string()));
+        assert!(names.contains(&"claude.cmd".to_string()));
+        assert!(names.iter().all(|n| LAUNCHABLE_EXTS
+            .iter()
+            .any(|e| n.ends_with(e))));
+    }
+}
+
+#[cfg(test)]
+mod effort_verdict_tests {
+    use super::*;
+
+    fn model(id: &str, display: &str, efforts: &[&str]) -> ModelCap {
+        ModelCap {
+            id: id.into(),
+            resolved: None,
+            aliases: Vec::new(),
+            display: display.into(),
+            description: None,
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    fn report(harness: &str, version: &str, models: Vec<ModelCap>) -> HarnessCaps {
+        HarnessCaps {
+            harness: harness.into(),
+            version: version.into(),
+            machine: "m".into(),
+            machine_name: None,
+            account: None,
+            probed_at: 0,
+            source: CapsSource::Handshake,
+            models,
+            efforts: Vec::new(),
+            modes: Vec::new(),
+        }
+    }
+
+    const FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+    const NO_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+    /// What codex 0.161.0's `model/list` said on 2026-10-08, trimmed.
+    fn codex() -> HarnessCaps {
+        report(
+            "codex",
+            "0.161.0",
+            vec![
+                model("gpt-6.1-sol", "GPT-6.1-Sol", FULL),
+                model("gpt-6-luna", "GPT-6-Luna", NO_ULTRA),
+                model("gpt-5.5", "GPT-5.5", &["low", "medium", "high", "xhigh"]),
+            ],
+        )
+    }
+
+    /// The field bug: ultra on a model that lists it goes through AS ultra —
+    /// not dropped for the config file's medium.
+    #[test]
+    fn a_tier_the_model_lists_passes_verbatim() {
+        let c = codex();
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "ultra"), EffortVerdict::Pass(Some("ultra".into())));
+        // …spelled the way the binary spells it.
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "Ultra"), EffortVerdict::Pass(Some("ultra".into())));
+        // The tiers the old table clamped to `high` are themselves again.
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "xhigh"), EffortVerdict::Pass(Some("xhigh".into())));
+        assert_eq!(judge_effort(&c, Some("gpt-6.1-sol"), "max"), EffortVerdict::Pass(Some("max".into())));
+    }
+
+    /// Per model, not per machine: Luna takes no ultra even though Sol does,
+    /// and the refusal names the model, the binary, and what it does take.
+    #[test]
+    fn a_tier_this_model_lacks_is_refused_with_its_list() {
+        let EffortVerdict::Refuse(why) = judge_effort(&codex(), Some("gpt-6-luna"), "ultra") else {
+            panic!("ultra on Luna must be refused");
+        };
+        assert!(why.contains("`ultra`"), "{why}");
+        assert!(why.contains("GPT-6-Luna"), "{why}");
+        assert!(why.contains("codex 0.161.0"), "{why}");
+        assert!(why.contains("low, medium, high, xhigh, max"), "{why}");
+        assert!(matches!(judge_effort(&codex(), Some("gpt-5.5"), "max"), EffortVerdict::Refuse(_)));
+    }
+
+    /// No model named (the harness picks its own) or one the report doesn't
+    /// list: held to what ANY model here takes.
+    #[test]
+    fn without_a_listed_model_the_union_decides() {
+        let c = codex();
+        for m in [None, Some(""), Some("gpt-7-preview")] {
+            assert_eq!(judge_effort(&c, m, "ultra"), EffortVerdict::Pass(Some("ultra".into())), "{m:?}");
+            let EffortVerdict::Refuse(why) = judge_effort(&c, m, "minimal") else {
+                panic!("no model here takes minimal any more ({m:?})");
+            };
+            assert!(why.contains("low, medium, high, xhigh, max, ultra"), "{why}");
+        }
+    }
+
+    /// Claude's own gap, same door: the 4.6 line has no xhigh while every
+    /// newer model does, so the sheet's union offers it.
+    #[test]
+    fn claude_models_are_held_to_their_own_tiers() {
+        let c = report(
+            "claude-code",
+            "2.1.289",
+            vec![
+                model("opus", "Opus 5.5", &["low", "medium", "high", "xhigh", "max"]),
+                model("claude-opus-4-6", "Opus 4.6", &["low", "medium", "high", "max"]),
+                model("haiku", "Haiku 4.5", &[]),
+            ],
+        );
+        assert_eq!(judge_effort(&c, Some("opus"), "xhigh"), EffortVerdict::Pass(Some("xhigh".into())));
+        assert!(matches!(judge_effort(&c, Some("claude-opus-4-6"), "xhigh"), EffortVerdict::Refuse(_)));
+        // A model with no dial at all runs as it always can — and says so.
+        let EffortVerdict::NoDial(note) = judge_effort(&c, Some("haiku"), "high") else {
+            panic!("haiku has no effort dial");
+        };
+        assert!(note.contains("Haiku 4.5") && note.contains("`high`"), "{note}");
+    }
+
+    /// A model is matched by any spelling the report gives it.
+    #[test]
+    fn a_model_is_found_by_its_resolved_id_too() {
+        let mut m = model("opus", "Opus 4.6", &["low", "medium", "high", "max"]);
+        m.resolved = Some("claude-opus-4-6".into());
+        let c = report("claude-code", "2.1.289", vec![m]);
+        assert!(matches!(judge_effort(&c, Some("claude-opus-4-6"), "xhigh"), EffortVerdict::Refuse(_)));
+    }
+
+    /// A mode sits at the same dial for every model.
+    #[test]
+    fn a_reported_mode_passes() {
+        let mut c = report("claude-code", "2.1.289", vec![model("opus", "Opus", &["low", "max"])]);
+        c.modes.push(ModeCap { id: "ultracode".into(), pins_effort: None });
+        assert_eq!(judge_effort(&c, Some("opus"), "ultracode"), EffortVerdict::Pass(Some("ultracode".into())));
+    }
+
+    /// A report that names no tiers can't hold anyone to them.
+    #[test]
+    fn a_report_without_tiers_judges_nothing() {
+        let c = report("codex", "0.1.0", vec![model("gpt-x", "GPT-X", &[])]);
+        assert_eq!(judge_effort(&c, None, "high"), EffortVerdict::Pass(Some("high".into())));
+        // Named, too: a build that gives no model any tiers hasn't said the
+        // model lacks a dial — the tier goes through, not dropped as "NoDial".
+        assert_eq!(judge_effort(&c, Some("gpt-x"), "High"), EffortVerdict::Pass(Some("high".into())));
+        // …and the tiers it did learn some other way (`--effort` complaint) hold.
+        let mut c = c;
+        c.efforts = vec!["low".into(), "high".into()];
+        assert_eq!(judge_effort(&c, Some("gpt-x"), "high"), EffortVerdict::Pass(Some("high".into())));
+        assert!(matches!(judge_effort(&c, Some("gpt-x"), "max"), EffortVerdict::Refuse(_)));
+    }
+
+    /// A refusal says how to get out of it from wherever the model came from —
+    /// the sheet, or a chat's own `/model`.
+    #[test]
+    fn a_refusal_names_both_ways_out() {
+        let EffortVerdict::Refuse(why) = judge_effort(&codex(), Some("gpt-6-luna"), "ultra") else {
+            panic!("ultra on Luna must be refused");
+        };
+        assert!(why.contains("Customize ▸ Reasoning effort") && why.contains("`/model`"), "{why}");
+    }
+
+    /// Unset stays unset, without looking anything up.
+    #[tokio::test]
+    async fn no_effort_is_the_harness_default() {
+        let h = codex::Codex;
+        for e in [None, Some(""), Some("  ")] {
+            assert_eq!(effort_for_turn(&h, &[], Some("gpt-6.1-sol"), e).await, EffortVerdict::Pass(None));
+        }
+    }
+}

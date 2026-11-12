@@ -1,0 +1,28 @@
+data: {"id":"evt_18e35acf5001uy42TJVW5BjoUl","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35acf3001b8JCI3K0BtIvIB","role":"user","sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","time":{"created":1793387244787},"agent":"build","model":{"providerID":"mafold","modelID":"deepseek-v4-flash"}}}}
+
+data: {"id":"evt_18e35acf7001YIMF6y2imEmO4A","type":"message.part.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","part":{"type":"text","text":"FAIL429 now","messageID":"msg_18e35acf3001b8JCI3K0BtIvIB","sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","id":"prt_18e35acf4001vSGhJpe49JqTjv"},"time":1793387244791}}
+
+data: {"id":"evt_18e35acfe001v2OQ5p6ra84Wth","type":"session.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"ses_e71ca68a0ffeNhiKRmSypfL25K","slug":"clever-knight","projectID":"global","directory":"/tmp/oc-h4c/exp/rec7/w","path":"tmp/oc-h4c/exp/rec7/w","title":"Mafold","agent":"build","model":{"id":"deepseek-v4-flash","providerID":"mafold","variant":"default"},"version":"1.19.5","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":860,"output":70,"reasoning":4,"cache":{"read":1200,"write":0}},"time":{"created":1793387239264,"updated":1793387244795}}}}
+
+data: {"id":"evt_18e35ad01001IF1ST9on0WGFZb","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35ad03001f14F5JQ229Iy46","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35ad03001m5mh2MfjoosOVv","parentID":"msg_18e35acf3001b8JCI3K0BtIvIB","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oc-h4c/exp/rec7/w","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"deepseek-v4-flash","providerID":"mafold","time":{"created":1793387244803},"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K"}}}
+
+data: {"id":"evt_18e35ad0d001N0JZ1VRZspanRV","type":"session.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"ses_e71ca68a0ffeNhiKRmSypfL25K","slug":"clever-knight","projectID":"global","directory":"/tmp/oc-h4c/exp/rec7/w","path":"tmp/oc-h4c/exp/rec7/w","title":"Mafold","agent":"build","model":{"id":"deepseek-v4-flash","providerID":"mafold","variant":"default"},"version":"1.19.5","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":860,"output":70,"reasoning":4,"cache":{"read":1200,"write":0}},"time":{"created":1793387239264,"updated":1793387244813}}}}
+
+data: {"id":"evt_18e35ad10001naF4uR2HBrJa72","type":"session.diff","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","diff":[]}}
+
+data: {"id":"evt_18e35ad15001rpv4AxL5Q1HIYU","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35ad1f001xvFiSitIMZ8eY7","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"retry","attempt":1,"message":"router says 429","next":1793387247218}}}
+
+data: {"id":"evt_18e35b674001xJPiD4OQFKPT7w","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35b67e001QAeB4uS6T2oiuW","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"retry","attempt":2,"message":"router says 429","next":1793387251759}}}
+
+data: {"id":"evt_18e35be52001iiJg6AxxDiz9mD","type":"server.heartbeat","properties":{}}
+
+data: {"id":"evt_18e35c830001jLgkEUhxl1lEvL","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35c838001kzN1oRnfD3M0wT","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"retry","attempt":3,"message":"router says 429","next":1793387260867}}}
+

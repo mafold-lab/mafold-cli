@@ -1,0 +1,3219 @@
+//! Shared Mafold client — HTTP API + WebSocket URL. Account-symmetric, so the
+//! same client serves both the human-facing commands and the agent daemon.
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+
+/// Tries for an idempotent write before giving up (400ms → 800ms → 1.6s → 3.2s:
+/// ~6s of cover). Sized for the failure actually observed — a short uplink blip
+/// / proxy TLS reset. The daemon's durable completion outbox covers longer outages.
+const RETRY_ATTEMPTS: u32 = 5;
+
+/// Tries for fetching a media attachment (600ms → 1.2s → 2.4s → 4.8s of cover).
+/// The user is waiting on the reply this attachment belongs to, so the backoff
+/// stays short — but every attempt after the first RESUMES (see `download`),
+/// asking only for the bytes still missing, so a later try costs a fraction of
+/// the first and five of them are cheaper than the three full restarts this
+/// replaced.
+const MEDIA_ATTEMPTS: u32 = 5;
+
+/// What ONE connection must keep delivering while a media attachment comes
+/// down: at least `min_bytes` in every `window`, waiting for the response head
+/// included. Below that the connection is abandoned and the download resumes
+/// on a fresh one (see `download`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StallFloor {
+    pub(crate) window: std::time::Duration,
+    pub(crate) min_bytes: u64,
+}
+
+/// 64 KiB per 15 s (~4 KB/s). 2026-10-19: a pooled connection to the CDN sank
+/// to ~1 KB/s mid-photo while a fresh one ran at ~68 KB/s; nothing ever gave up
+/// on it, so four phone photos held a reply for over an hour.
+pub(crate) const MEDIA_STALL: StallFloor =
+    StallFloor { window: std::time::Duration::from_secs(15), min_bytes: 64 * 1024 };
+
+/// Why one try at an attachment ended without the whole body.
+enum Tear {
+    /// The transport said so: a reset, a TLS shutdown, a 5xx.
+    Http(reqwest::Error),
+    /// The connection fell under the [`StallFloor`]: `got` bytes in the last
+    /// `window` (0 while still waiting on the response head).
+    Stalled { got: u64, window: std::time::Duration },
+}
+
+/// Outcome of `me_probed`: the identity, or a definitive auth rejection.
+pub enum MeProbe {
+    Me(Value),
+    AuthRejected,
+}
+
+/// What the server knows of whom a message is, ultimately, from
+/// (`messageOrigin`).
+pub struct MessageOrigin {
+    /// The person whose message started its chain; `""` when its turn
+    /// answered more than one; `None` when nobody knows for sure.
+    pub person: Option<String>,
+    /// Sent by a bot anyone at all may drive (a `*` whitelist, the paid
+    /// tier) — whose word can't vouch for whom it speaks.
+    pub open: bool,
+}
+
+/// A wallet agent's key for ONE reply (`mintReplyKey`, PR 4b/4c 10-31): a
+/// router key scoped to the reply's draft, to `models` and to six hours, and
+/// dead once the reply is finalized. It reaches the harness through the turn's
+/// env and nowhere else, so its Debug never prints it: one `{:?}` in a log
+/// line would put the owner's wallet in a file.
+#[derive(Clone, serde::Deserialize)]
+pub struct ReplyKey {
+    pub key: String,
+    /// Unix seconds; the router refuses it from then on.
+    #[serde(default)]
+    pub expires_at: i64,
+    /// The models it may call — what the router serves on chat completions
+    /// and the wallet prices; the server says, never a list kept here.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// The OpenAI-compatible router base, ending in `/v1`.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl std::fmt::Debug for ReplyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyKey")
+            .field("key", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("models", &self.models)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+/// What a reply has charged its owner's wallet so far (`getReplyCost`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct ReplyCost {
+    /// Settled charges, per currency.
+    pub totals: Vec<mafold_transcript::WalletCharge>,
+    /// Settled calls.
+    pub calls: u64,
+    /// Holds not settled or released yet: the router's settle can land a few
+    /// seconds after the stream ends, so the final figure waits for 0.
+    pub in_flight: u64,
+}
+
+/// The server's own words for a refusal — the envelope's `description`,
+/// without the `"<method> failed"` wrapper `post` puts round every error. The
+/// wallet calls' refusals are written for the error card
+/// (`mafold_transcript::failure`: grant / cap / owner-only), so they go into it
+/// as they came. A transport failure keeps its whole chain.
+fn server_words(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<mafold_core::RpcError>() {
+        Some(re @ mafold_core::RpcError::Api(_)) => anyhow::anyhow!("{re}"),
+        _ => e,
+    }
+}
+
+/// Set in an inbox turn: this process is an agent writing under a person's
+/// account, and what it sends says so (flag `a2aThreads`).
+pub const AS_AGENT_ENV: &str = "MAFOLD_SEND_AS_AGENT";
+
+/// Where a message goes. In a forum the conversation is only HALF an address:
+/// the channel, the thread it hangs under and the message it answers each narrow
+/// it further, and every one of them is part of "reply where you were asked".
+/// Carrying them in one value — built from the triggering message and passed
+/// down — is what keeps a reply on the surface it belongs to; the four
+/// half-addressed send helpers this replaced each dropped whatever they had no
+/// parameter for (see `Client::send_to`).
+#[derive(Clone, Copy, Default)]
+pub struct Dest<'a> {
+    pub chat_id: &'a str,
+    /// The forum channel; None = the `#all` main timeline.
+    pub channel_id: Option<&'a str>,
+    /// The thread root this message hangs under; None = the timeline itself.
+    pub thread_root_id: Option<&'a str>,
+    /// The message being answered (renders as a quote), if any.
+    pub reply_to_message_id: Option<&'a str>,
+}
+
+impl<'a> Dest<'a> {
+    /// A conversation's main timeline — narrow it with the builders below.
+    pub fn chat(chat_id: &'a str) -> Self {
+        Self {
+            chat_id,
+            ..Default::default()
+        }
+    }
+    /// …in this forum channel (None = `#all`).
+    pub fn channel(mut self, channel_id: Option<&'a str>) -> Self {
+        self.channel_id = channel_id;
+        self
+    }
+    /// …under this thread root (None = the timeline itself). Any message in the
+    /// thread works; the server normalizes it to the root.
+    pub fn thread(mut self, thread_root_id: Option<&'a str>) -> Self {
+        self.thread_root_id = thread_root_id;
+        self
+    }
+    /// …as a reply to this message.
+    pub fn reply_to(mut self, message_id: &'a str) -> Self {
+        self.reply_to_message_id = Some(message_id);
+        self
+    }
+}
+
+/// How long a turn waits for the link before its trigger is given up. Sized
+/// for a laptop that sleeps through a morning: on 2026-10-01 the 08:00 routine
+/// arrived during a dark wake and the next full wake was at 13:36.
+pub const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+/// How long the lost-turn notice waits before the journal takes it over.
+const NOTICE_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The error a compare-and-set write ends on when the server predates
+/// revisions (card-state §3.6): it wrote, but unchecked.
+pub const IF_REV_UNSUPPORTED: &str = "this server does not check if_rev yet";
+/// The longest single pause between connect attempts while the link is down.
+const LINK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The server refused to open a draft ON PURPOSE: a 403 whose `description`
+/// the server prefixes with `access_denied` (this sender may not drive the bot)
+/// or `payment_required` (they must authorize payment first, or are out of
+/// funds). Either way the server has ALREADY answered them in the chat, as the
+/// bot — so the daemon's whole job is to stop quietly: no turn, no retry, no
+/// lost-turn notice. Distinct from every other `create_draft` failure, which
+/// is an outage the user must be told about.
+#[derive(Debug)]
+pub struct DraftRefused(pub String);
+
+impl DraftRefused {
+    fn from_rpc(e: &mafold_core::RpcError) -> Option<Self> {
+        let mafold_core::RpcError::Api(env) = e else { return None };
+        let v: Value = serde_json::from_str(env).ok()?;
+        let desc = v.get("description").and_then(Value::as_str)?;
+        // The server wraps its refusal in `ApiError::PermissionDenied`, whose
+        // Display prefixes "permission denied: " — the contract is the code
+        // that follows it.
+        let code = desc.trim_start_matches("permission denied: ");
+        (code.starts_with("access_denied") || code.starts_with("payment_required"))
+            .then(|| DraftRefused(code.to_string()))
+    }
+}
+
+impl std::fmt::Display for DraftRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "turn refused by server: {}", self.0)
+    }
+}
+
+impl std::error::Error for DraftRefused {}
+
+/// What `getUpdates` answered.
+pub struct Updates {
+    /// `{seq, method, params}`, in the shape WS frames arrive in.
+    pub items: Vec<Value>,
+    /// The cursor the server vouches for: every event it numbered for this
+    /// account up to here is either in `items` or was never replayable. (An
+    /// older server answers the newest event it KEPT — a lower bound, which
+    /// costs at most one extra fetch.)
+    pub head: u64,
+    /// Part of the window had already aged out of the server's backlog —
+    /// `items` is what is left of it, not all of it.
+    pub truncated: bool,
+    /// How many of `items` the server rebuilt from its store because the
+    /// backlog could not reach back far enough (an api restart empties it).
+    /// Those carry no `seq`. 0 from an older server.
+    pub backfilled: usize,
+}
+
+/// Durable trigger facts needed by the daemon after reconnect. Used both by
+/// the server-side replay filter and the daemon's local compatibility filter.
+pub(crate) const REPLAY_METHODS: &[&str] = &[
+    "events.messageNew", "events.threadReply", "events.messageComplete", "events.chatCleared",
+];
+
+/// How a turn ended when it didn't end cleanly — `botFinalize`'s `outcome`.
+/// The reply's text can't say it for us: a stopped turn's whole reply may be
+/// cards a preview never reads, leaving "⏹ Stopped." as all a list shows
+/// (linsky's garden, 2026-10-07). An older server ignores the field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnEnd {
+    /// Someone stopped it.
+    Stopped,
+    /// It died on an error: the agent's, the harness's, a stall.
+    Failed,
+}
+
+#[derive(Clone)]
+pub struct Client {
+    pub http: reqwest::Client,
+    pub base: String,
+    pub token: String,
+    pub drafts: Option<std::sync::Arc<crate::drafts::Outbox>>,
+    writer_id: uuid::Uuid,
+    writer_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Client {
+    pub fn new(base: String, token: String) -> Self {
+        // Bound only the CONNECT phase: a flaky network (observed: a local proxy
+        // resetting fresh TLS connections) otherwise leaves a POST hanging
+        // indefinitely. No overall request timeout — this client also streams the
+        // multi-MB self-update download, which a blanket timeout would cut off.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            http, base, token, drafts: None,
+            writer_id: uuid::Uuid::new_v4(),
+            writer_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// The core's typed API handle for this base+token (base gains the `/api`
+    /// prefix the core convention expects).
+    fn api(&self) -> mafold_core::methods::ApiClient {
+        mafold_core::methods::ApiClient::new(format!("{}/api", self.base), &self.token)
+    }
+
+    /// POST /api/<method> through the CORE's validated transport (method-name
+    /// registry + pooled client + envelope unwrap live there now). Result is
+    /// passed through as raw JSON — no typed round-trip, so fields the wire
+    /// model hasn't caught up with can't silently vanish. The original
+    /// `RpcError` rides along in the anyhow chain (see `is_connect_error`).
+    async fn post(&self, method: &str, mut body: Value) -> Result<Value> {
+        // Nothing this machine holds leaves it in something people read: every
+        // harness's draft, every `mafold send`, every alert passes here
+        // (conceal.rs `scrub_outgoing`, by value, before the server's own net).
+        crate::conceal::scrub_outgoing(method, &mut body, &self.token);
+        match self.api().call_raw(method, &body.to_string()).await {
+            Ok(result) => {
+                serde_json::from_str(&result).with_context(|| format!("{method} returned non-JSON"))
+            }
+            Err(e) => Err(anyhow::Error::new(e).context(format!("{method} failed"))),
+        }
+    }
+
+    /// `post`, but retried with backoff on ANY transport failure — for calls
+    /// that are IDEMPOTENT, where a duplicate delivery is a no-op.
+    ///
+    /// The `is_connect_error` split below exists because a *non*-idempotent call
+    /// (botCreateDraft) can only be retried when the request provably never left
+    /// the machine. A full-snapshot write has no such constraint: replaying it
+    /// re-asserts the same final state. So these retry on timeouts and dropped
+    /// responses too — the failure modes that a connect-only retry misses and
+    /// that leave a turn's LAST push (the one that removes `{% mafold/generating %}`)
+    /// silently dropped, stranding the bubble mid-animation forever.
+    async fn post_idempotent(&self, method: &str, body: Value) -> Result<Value> {
+        let mut delay = std::time::Duration::from_millis(400);
+        for attempt in 1..=RETRY_ATTEMPTS {
+            match self.post(method, body.clone()).await {
+                Ok(v) => return Ok(v),
+                // An API-level rejection (permission, 404, malformed) is a verdict,
+                // not a blip: the server answered. Retrying just burns the backoff
+                // and hides the real error. Only transport failures get another go.
+                Err(e) if attempt == RETRY_ATTEMPTS || Self::is_api_error(&e) => return Err(e),
+                Err(e) => {
+                    // `{e:#}` — the whole chain. `post` wraps every failure in a
+                    // `"<method> failed"` context, so plain `{e}` printed that
+                    // wrapper and nothing else: 572 lines of
+                    // `botEditDraft failed (botEditDraft failed)` in one daemon
+                    // log, not one of which says whether the api refused us, was
+                    // unreachable, or timed out. A retry line that cannot
+                    // distinguish those is a retry line that costs a person an
+                    // afternoon (2026-09-17). Same trap as the attachment
+                    // downloader — see `Client::download`.
+                    eprintln!(
+                        "{method} failed ({e:#}) — retry {attempt}/{RETRY_ATTEMPTS} in {delay:?}…"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+        unreachable!("loop returns on the final attempt")
+    }
+
+    /// Did the SERVER answer with a refusal (as opposed to the request dying in
+    /// transit)? Such a call must not be retried — the answer won't change.
+    fn is_api_error(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<mafold_core::RpcError>()
+            .is_some_and(|re| matches!(re, mafold_core::RpcError::Api(_)))
+    }
+
+    /// Generic authenticated RPC for callers outside this module (login, report…).
+    pub async fn call(&self, method: &str, body: Value) -> Result<Value> {
+        self.post(method, body).await
+    }
+
+    pub async fn me(&self) -> Result<Value> {
+        self.post("getMe", json!({})).await
+    }
+
+    /// Who message `message_id` is, ultimately, from (`messageOrigin`). An
+    /// error (a server from before it) says nothing either way.
+    pub async fn message_origin(&self, message_id: &str) -> Result<MessageOrigin> {
+        let v = self.post("messageOrigin", json!({ "message_id": message_id })).await?;
+        Ok(MessageOrigin { person: v["origin"].as_str().map(str::to_lowercase), open: v["open"].as_bool().unwrap_or(false) })
+    }
+
+    /// The one-reply wallet key for `draft` ([`ReplyKey`]), asked with the bot
+    /// token. Retried on transport failures only: the server answers the same
+    /// draft with the same live key, so a repeat is harmless, and a refusal
+    /// (guest, no grant, cap, flag) is a verdict that comes back in the
+    /// server's words ([`server_words`]).
+    pub async fn mint_reply_key(&self, draft: &str) -> Result<ReplyKey> {
+        let v = self
+            .post_idempotent("mintReplyKey", json!({ "message_id": draft }))
+            .await
+            .map_err(server_words)?;
+        // Not serde's message: a wrong-typed field is quoted in it, and the
+        // field could be the key.
+        let key: ReplyKey = serde_json::from_value(v)
+            .map_err(|_| anyhow::anyhow!("mintReplyKey answered in a shape this client can't read"))?;
+        if key.key.trim().is_empty() || key.base_url.trim().is_empty() {
+            anyhow::bail!("mintReplyKey answered without a key or a router base");
+        }
+        Ok(key)
+    }
+
+    /// What `draft`'s wallet calls have charged so far ([`ReplyCost`]). One
+    /// attempt: the caller polls.
+    pub async fn reply_cost(&self, draft: &str) -> Result<ReplyCost> {
+        let v = self
+            .post("getReplyCost", json!({ "message_id": draft }))
+            .await
+            .map_err(server_words)?;
+        serde_json::from_value(v).context("getReplyCost answered in a shape this client can't read")
+    }
+
+    /// `getMe`, but with an AUTH REJECTION (401/403 — token revoked / bot
+    /// deleted) split out from ordinary failures, so a daemon whose bot was
+    /// deleted while it was offline can deprovision at startup instead of
+    /// crash-looping under the supervisor forever.
+    pub async fn me_probed(&self) -> Result<MeProbe> {
+        let resp = self
+            .http
+            .post(format!("{}/api/getMe", self.base))
+            .bearer_auth(&self.token)
+            .json(&json!({}))
+            .send()
+            .await
+            .context("getMe request failed")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Ok(MeProbe::AuthRejected);
+        }
+        let v: Value = resp.json().await.context("getMe returned non-JSON")?;
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            anyhow::bail!("getMe: {}", v["description"].as_str().unwrap_or("error"));
+        }
+        Ok(MeProbe::Me(v["result"].clone()))
+    }
+    pub async fn chats(&self) -> Result<Value> {
+        self.post("getChats", json!({})).await
+    }
+
+    /// Only the chats with something unread (main timeline or a channel) — what
+    /// the inbox glance looks at every few seconds. An api without the filter
+    /// answers with every chat; callers still check the counts themselves.
+    pub async fn unread_chats(&self) -> Result<Value> {
+        self.post("getChats", json!({ "unread_only": true })).await
+    }
+
+    /// One account (`{ username, display_name, language, … }`). The daemon reads
+    /// the OWNER's `language` — the cloud i18n setting every other Mafold client
+    /// follows — to know which language to introduce itself in. (The api names
+    /// the field `user_id` but accepts a username there.)
+    pub async fn get_user(&self, username: &str) -> Result<Value> {
+        self.post("getUser", json!({ "user_id": username })).await
+    }
+
+    /// A single conversation (`{ id, kind, participants, … }`) — used to tell a
+    /// group from a DM for the group reply gate.
+    pub async fn get_chat(&self, chat_id: &str) -> Result<Value> {
+        self.post("getChat", json!({ "chat_id": chat_id })).await
+    }
+
+    /// POST /api/getUpdates — events with hub seq > `since` from the server's
+    /// per-account replay buffer. Ask only for durable trigger events so a
+    /// reconnect does not download hundreds of draft bodies before listening.
+    /// Older servers ignore `methods`; the daemon still filters locally.
+    /// Items are
+    /// `{seq, method, params}` in the exact shape WS frames arrive, so a
+    /// reconnect replays what it missed through the same handling path.
+    ///
+    /// `since_at` — the server time of the last message-bearing event this
+    /// daemon consumed. With it, a server whose backlog cannot reach `since`
+    /// rebuilds the missing messages from its store instead of only saying
+    /// they are gone; an older server ignores it.
+    pub async fn get_updates(&self, since: u64, since_at: Option<&str>) -> Result<Updates> {
+        let mut body = json!({ "since": since, "methods": REPLAY_METHODS });
+        if let Some(at) = since_at {
+            body["since_at"] = json!(at);
+        }
+        let v = self.post("getUpdates", body).await?;
+        Ok(Updates {
+            items: v["updates"].as_array().cloned().unwrap_or_default(),
+            head: v["seq"].as_u64().unwrap_or(since),
+            truncated: v["truncated"].as_bool().unwrap_or(false),
+            backfilled: v["backfilled"].as_u64().unwrap_or(0) as usize,
+        })
+    }
+
+    /// Recent messages in a conversation (`{ items: [Message] }`). The access
+    /// gate drops non-owner messages so they never reach claude's resumed
+    /// session; for a group turn the daemon re-fetches history to rebuild the
+    /// multi-party context (see `recent_group_context`).
+    pub async fn get_chat_history(
+        &self,
+        chat_id: &str,
+        limit: usize,
+        channel_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "limit": limit });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        self.post("getChatHistory", body).await
+    }
+
+    /// Recent messages, optionally on someone else's `chat.read` ticket.
+    ///
+    /// The `on_behalf_of` arm is what `mafold read` uses for a room the caller
+    /// is not in; the page then comes back as the LENDER sees it. Kept separate
+    /// from `get_chat_history` because that one is the daemon's hot path (four
+    /// call sites, always the caller's own room) and should not grow a
+    /// parameter every one of them passes `None` to.
+    pub async fn chat_history(
+        &self,
+        chat_id: &str,
+        limit: usize,
+        channel_id: Option<&str>,
+        on_behalf_of: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "limit": limit });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        if let Some(u) = on_behalf_of {
+            body["on_behalf_of"] = json!(u);
+        }
+        self.post("getChatHistory", body).await
+    }
+
+    /// Ask a room's people for a `chat.read` ticket (.docs/chat-record-sharing-v1.md).
+    ///
+    /// `askers`: whom, outside the owner's circle, the turn asking is for
+    /// (`chat::ReadsFor::askers`). Recorded with the ticket, so it is theirs
+    /// to use and nobody else's; empty for the circle's own asks.
+    pub async fn request_chat_access(
+        &self,
+        chat_id: &str,
+        from: &str,
+        days: i64,
+        for_account: Option<&str>,
+        askers: &[String],
+    ) -> Result<Value> {
+        let mut body = json!({
+            "conversation_id": chat_id,
+            "ttl_days": days,
+            // A participant to address the card to. The server will not pick
+            // one for you: choosing would mean telling the asker who is in a
+            // room they cannot see.
+            "user": from.trim_start_matches('@'),
+        });
+        if let Some(f) = for_account {
+            body["for"] = json!(f.trim_start_matches('@'));
+        }
+        if !askers.is_empty() {
+            body["askers"] = json!(askers);
+        }
+        self.post("requestChatAccess", body).await
+    }
+
+    /// Ask for a DM by naming BOTH of its people, for a room whose uuid the
+    /// caller cannot have: a uuid is only learnable from inside.
+    ///
+    /// The answer is deliberately the same whether or not that DM exists —
+    /// otherwise this is a probe for who talks to whom. Don't add a branch
+    /// here that tries to tell the two apart.
+    pub async fn request_chat_access_pair(
+        &self,
+        of: &str,
+        with: &str,
+        days: i64,
+        for_account: Option<&str>,
+        askers: &[String],
+    ) -> Result<Value> {
+        let mut body = json!({
+            "of": of.trim_start_matches('@'),
+            "with": with.trim_start_matches('@'),
+            "ttl_days": days,
+        });
+        if let Some(f) = for_account {
+            body["for"] = json!(f.trim_start_matches('@'));
+        }
+        if !askers.is_empty() {
+            body["askers"] = json!(askers);
+        }
+        self.post("requestChatAccess", body).await
+    }
+
+    /// Lend one of MY rooms to an account, unprompted — the other direction
+    /// from `request_chat_access`. See `chat_grants::grant_chat_access`.
+    pub async fn grant_chat_access(&self, chat_id: &str, to: &str, days: i64) -> Result<Value> {
+        self.post(
+            "grantChatAccess",
+            json!({
+                "conversation_id": chat_id,
+                "to": to.trim_start_matches('@'),
+                "ttl_days": days,
+            }),
+        )
+        .await
+    }
+
+    /// Both directions of chat.read at once: `granted` (mine, lent out),
+    /// `held` (what I may read), `pending` (asks nobody has answered).
+    pub async fn list_chat_grants(&self) -> Result<Value> {
+        self.post("listChatGrants", json!({})).await
+    }
+
+    pub async fn revoke_chat_grant(&self, chat_id: &str, grantee: &str) -> Result<Value> {
+        self.post(
+            "revokeChatGrant",
+            json!({ "conversation_id": chat_id, "grantee": grantee.trim_start_matches('@') }),
+        )
+        .await
+    }
+
+    /// A thread's messages (root + replies) — used to rebuild context when the
+    /// bot is @-mentioned INSIDE a thread (thread replies aren't in the channel's
+    /// main timeline, so getChatHistory alone misses them).
+    /// One message by id, surface-agnostic.
+    ///
+    /// A message id is already unique, so needing to know WHICH channel it
+    /// lives in before you can read it is a hole, not a feature: three helpers
+    /// in `agent.rs` used to page the `#all` main timeline looking for a card
+    /// that was posted in a forum channel, find nothing, and return in silence.
+    /// This asks by the one thing the caller actually holds.
+    ///
+    /// Errors on an api that predates the route (`unknown method`), so callers
+    /// keep a paging fallback — `--base` may point at an older server.
+    pub async fn get_message(&self, message_id: &str) -> Result<Value> {
+        self.post("getMessage", json!({ "message_id": message_id })).await
+    }
+
+    /// Write one item of a message's controlled state (`.docs/card-state-v1.md`
+    /// §3.4). The first write fixes `read`/`write`; the server decides who may
+    /// create or change it. Idempotent for the same value and lists, so it is
+    /// retried.
+    pub async fn set_card_state(
+        &self,
+        message_id: &str,
+        key: &str,
+        v: &Value,
+        read: &[String],
+        write: &[String],
+    ) -> Result<Value> {
+        self.post_idempotent(
+            "setCardState",
+            json!({ "message_id": message_id, "key": key, "v": v, "read": read, "write": write }),
+        )
+        .await
+    }
+
+    /// [`Self::set_card_state`] with the lists left out unless given (an
+    /// existing item's are fixed; a new one's default to `read:[all]`,
+    /// `write:[sender]`), and optionally only if the item is still at revision
+    /// `if_rev` (`0`: only if there is none yet). Not applied is an answer, not
+    /// an error: `applied: false` and the item as it is now (§3.6).
+    pub async fn set_card_state_with(
+        &self,
+        message_id: &str,
+        key: &str,
+        v: &Value,
+        read: Option<&[String]>,
+        write: Option<&[String]>,
+        if_rev: Option<u64>,
+    ) -> Result<Value> {
+        let mut body = json!({ "message_id": message_id, "key": key, "v": v });
+        if let Some(read) = read {
+            body["read"] = json!(read);
+        }
+        if let Some(write) = write {
+            body["write"] = json!(write);
+        }
+        if let Some(rev) = if_rev {
+            body["if_rev"] = json!(rev);
+        }
+        let mut r = self.post_idempotent("setCardState", body).await?;
+        if if_rev.is_some() && r.get("applied").is_none() {
+            // A server from before revisions drops `if_rev` and writes anyway;
+            // its answer has no `applied`. Never report that as a checked write.
+            anyhow::bail!("{IF_REV_UNSUPPORTED}: {key} was written WITHOUT the revision check");
+        }
+        // Not applied, yet the item is exactly what this write said, by this
+        // account: the first attempt landed and its answer was lost, and the
+        // retry (`post_idempotent`) met its own write at the next revision.
+        if r["applied"].as_bool() == Some(false) && r["item"]["v"] == *v {
+            let me = self.me().await.ok().and_then(|m| m["username"].as_str().map(str::to_lowercase));
+            if me.is_some_and(|me| r["item"]["by"].as_str().is_some_and(|by| by.trim_start_matches('@').eq_ignore_ascii_case(&me))) {
+                r["applied"] = json!(true);
+            }
+        }
+        Ok(r)
+    }
+
+    /// What this account may read of a message's controlled state.
+    pub async fn get_card_state(&self, message_id: &str) -> Result<Value> {
+        self.post("getCardState", json!({ "message_id": message_id })).await
+    }
+
+    /// Threads this account is in with something unread (`unreadThreads`).
+    pub async fn unread_threads(&self) -> Result<Value> {
+        self.post("unreadThreads", json!({})).await
+    }
+
+    /// The message whose turn wrote `message_id`, when a turn did
+    /// (`messageOrigin`). None from an api before it said.
+    pub async fn message_trigger(&self, message_id: &str) -> Option<String> {
+        let v = self.post("messageOrigin", json!({ "message_id": message_id })).await.ok()?;
+        v["trigger"].as_str().map(str::to_string)
+    }
+
+    pub async fn get_thread_messages(
+        &self,
+        chat_id: &str,
+        root_message_id: &str,
+        limit: usize,
+    ) -> Result<Value> {
+        self.post(
+            "getThreadMessages",
+            json!({ "chat_id": chat_id, "root_message_id": root_message_id, "limit": limit }),
+        )
+        .await
+    }
+
+    /// Per-group bot dispatch settings (`{ items: [{ bot, always_on }] }`) —
+    /// tells the daemon whether it's set to always-on in this group.
+    pub async fn group_bots(&self, chat_id: &str) -> Result<Value> {
+        self.post("getGroupBots", json!({ "chat_id": chat_id }))
+            .await
+    }
+
+    // ── forum channels (Telegram-Topics-style; see channels.rs) ──
+    /// The forum's channels (`[Channel]`), decorated for the caller. `#all` is
+    /// implicit (channel_id NULL) and never in this list.
+    pub async fn list_channels(&self, chat_id: &str) -> Result<Value> {
+        self.post("listChannels", json!({ "chat_id": chat_id }))
+            .await
+    }
+    pub async fn create_channel(
+        &self,
+        chat_id: &str,
+        name: &str,
+        icon: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "name": name });
+        if let Some(i) = icon {
+            body["icon"] = json!(i);
+        }
+        self.post("createChannel", body).await
+    }
+    /// Partial edit: absent = unchanged; `icon: Some("")` clears the icon.
+    pub async fn edit_channel(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        name: Option<&str>,
+        icon: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "channel_id": channel_id });
+        if let Some(n) = name {
+            body["name"] = json!(n);
+        }
+        if let Some(i) = icon {
+            body["icon"] = json!(i);
+        }
+        self.post("editChannel", body).await
+    }
+    /// Removes the channel AND its contents (messages, threads, read state).
+    pub async fn delete_channel(&self, chat_id: &str, channel_id: &str) -> Result<Value> {
+        self.post(
+            "deleteChannel",
+            json!({ "chat_id": chat_id, "channel_id": channel_id }),
+        )
+        .await
+    }
+    pub async fn set_channel_closed(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        closed: bool,
+    ) -> Result<Value> {
+        self.post(
+            "setChannelClosed",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "closed": closed }),
+        )
+        .await
+    }
+    pub async fn set_channel_pinned(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        pinned: bool,
+    ) -> Result<Value> {
+        self.post(
+            "setChannelPinned",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "pinned": pinned }),
+        )
+        .await
+    }
+    pub async fn set_channel_archived(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        archived: bool,
+    ) -> Result<Value> {
+        self.post(
+            "setChannelArchived",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "archived": archived }),
+        )
+        .await
+    }
+
+    pub async fn list_installs(&self, conv: &str) -> Result<Value> {
+        self.post("listInstalls", json!({ "conversation_id": conv }))
+            .await
+    }
+
+    /// This bot's own per-conversation config bag (`{ config: {key: value} }`)
+    /// — the Customize sheet's chat scope. Callable with the bot's own token.
+    pub async fn bot_conv_config(&self, chat_id: &str) -> Result<Value> {
+        self.post("getBotConvConfig", json!({ "chat_id": chat_id }))
+            .await
+    }
+
+    /// **What configuration this bot is actually running under, for this turn.**
+    ///
+    /// A value can be pinned to a conversation, to a person, to both, or to
+    /// neither, and the server owns the ladder that picks between them
+    /// (`resolveBotConfig`). The daemon used to walk part of it by hand — chat
+    /// bag over owner defaults, and the per-USER bag not at all, so a member's
+    /// own Customize settings were stored, shown, and never read. Asking is both
+    /// shorter and the only way this stays in step with the other clients.
+    ///
+    /// Returns `{ bot, fields: {key: value}, sources: {key: {conv, user}} }`
+    /// with every layer already merged per key.
+    pub async fn resolved_config(&self, chat_id: &str, user: Option<&str>) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id });
+        if let Some(u) = user {
+            body["user"] = json!(u);
+        }
+        self.post("resolveBotConfig", body).await
+    }
+
+    /// The bot's OWNER-set config, callable by the bot itself. Returns `BotDetail`
+    /// — `{ bot, config, config_schema, secret_schema, secrets }`. The daemon uses
+    /// `config` (a `{key: value}` map of the owner's stored field values) to drive
+    /// the harness defaults (model / system prompt / working dir).
+    pub async fn bot(&self, username: &str) -> Result<Value> {
+        self.post("getBot", json!({ "username": username })).await
+    }
+
+    /// Post a message at `dest` — THE send path.
+    ///
+    /// Every dimension the destination carries goes on the wire, so "answer
+    /// where you were asked" is what a call site gets by default. This used to
+    /// be four overlapping helpers (`send` / `send_threaded` / `send_in` /
+    /// `send_reply_in`), each carrying only part of the address: picking one
+    /// silently dropped whatever it had no parameter for, which is how `/usage`
+    /// asked in #a kept answering in `#all`. A single destination-complete call
+    /// makes that a compile-time impossibility rather than a review item.
+    ///
+    /// Go through this, never a hand-rolled body: a hand-written gate payload
+    /// used conversation_id/content/reply_to_id instead of the API's
+    /// chat_id/text/reply_to_message_id and silently 422'd for three releases
+    /// (0.9.56→0.9.63; diagnosed in the field by @linsky:opus48).
+    pub async fn send_to(&self, dest: Dest<'_>, text: &str) -> Result<Value> {
+        self.send_message(dest, text, &[], None).await
+    }
+
+    /// [`Self::send_to`] with the rest of what one message can carry.
+    ///
+    /// `attachments` — already uploaded ([`Self::upload_attachment`]) — ride in
+    /// the SAME request as the text. Text first and media hung on afterwards
+    /// (`botAttach`) is two requests, and the first one is what wakes whoever
+    /// the message is for: an agent woken by the words started its turn
+    /// before the picture they were about had landed, seconds later.
+    ///
+    /// `client_msg_id` is the send's idempotency key: the same key again in the
+    /// same conversation gets back the message the first send stored — no
+    /// second message, no second wake (`insert_message_idempotent`, api). So a
+    /// send WITH one is retried when the transport fails (a proxy that swallows
+    /// the reply). Without one nothing changes: a send is not retried, because
+    /// a repeat would post a second message.
+    pub async fn send_message(
+        &self,
+        dest: Dest<'_>,
+        text: &str,
+        attachments: &[Value],
+        client_msg_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": dest.chat_id, "text": text });
+        // Sent from inside a turn (an agent's `mafold send`): name the turn's
+        // reply, and the server stamps this with whom the turn speaks for
+        // (`messageOrigin`). The daemon's own notices run outside any turn.
+        // The reply as it stands NOW (a steer moves it; an update turn's held
+        // bubble may not exist yet, and then there is nothing to name).
+        if let Some(draft) = crate::turnenv::draft().and_then(|d| crate::agent::reply_now(&d)) {
+            body["carries"] = json!(draft);
+        }
+        // An inbox turn is an agent writing under a person's account (`a2a.rs`).
+        if std::env::var(AS_AGENT_ENV).is_ok_and(|v| v == "1") {
+            body["by_agent"] = json!(true);
+        }
+        if let Some(ch) = dest.channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        if let Some(root) = dest.thread_root_id {
+            body["thread_root_id"] = json!(root);
+        }
+        if let Some(rid) = dest.reply_to_message_id {
+            body["reply_to_message_id"] = json!(rid);
+        }
+        // Nothing extra ⇒ the very body every send has always had.
+        if !attachments.is_empty() {
+            body["attachments"] = json!(attachments);
+        }
+        match client_msg_id {
+            Some(id) => {
+                body["client_msg_id"] = json!(id);
+                self.post_idempotent("sendMessage", body).await
+            }
+            None => self.post("sendMessage", body).await,
+        }
+    }
+
+    /// Move the caller's read position in a conversation's main timeline to
+    /// `message_id` (None = the newest message the server knows). The same
+    /// marker every client moves when a person opens a chat, so the other side
+    /// sees "read" exactly as they would for a person.
+    pub async fn mark_read(&self, chat_id: &str, message_id: Option<&str>) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id });
+        if let Some(id) = message_id {
+            body["message_id"] = json!(id);
+        }
+        self.post_idempotent("markRead", body).await.map(|_| ())
+    }
+
+    /// `mark_read` for one forum channel. Channels keep their own marker: a
+    /// read in `#all` must never drain them, and vice versa.
+    pub async fn mark_channel_read(&self, chat_id: &str, channel_id: &str, message_id: &str) -> Result<()> {
+        self.post_idempotent(
+            "markChannelRead",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "message_id": message_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn mark_thread_read(&self, chat_id: &str, root: &str, message_id: &str) -> Result<()> {
+        self.post_idempotent(
+            "markThreadRead",
+            json!({ "chat_id": chat_id, "root_message_id": root, "message_id": message_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Show (`"typing"`) or clear (anything else) the "typing…" indicator the
+    /// people in this timeline see for the caller.
+    pub async fn send_chat_action(&self, chat_id: &str, channel_id: Option<&str>, action: &str) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id, "action": action });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        self.post("sendChatAction", body).await.map(|_| ())
+    }
+
+    /// Replace the text of a message the caller SENT (`editMessage` is
+    /// sender-only). Used to stamp an ask card `answered="…"` so every device
+    /// renders it answered, the way the daemon stamps its own drafts.
+    pub async fn edit_message(&self, message_id: &str, text: &str) -> Result<()> {
+        self.post_idempotent("editMessage", json!({ "message_id": message_id, "text": text }))
+            .await
+            .map(|_| ())
+    }
+
+    /// Add (or, with `remove`, take back) the caller's `emoji` on a message.
+    pub async fn set_reaction(&self, message_id: &str, emoji: &str, remove: bool) -> Result<Value> {
+        self.post(
+            "setMessageReaction",
+            json!({ "message_id": message_id, "emoji": emoji, "remove": remove }),
+        )
+        .await
+    }
+
+    /// A tap on a card's button — the one pipe every host forwards taps
+    /// through verbatim (`MessageBubble` on the web, the RN bubble): `stop` on
+    /// a reply being written, `ask:answer` on a question, `perm:answer` on a
+    /// permission prompt, … `fields` is whatever that button carries (most
+    /// carry a string: the answer, the verdict). Who may do what is decided on
+    /// the other side, by who tapped.
+    pub async fn send_component_action(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        action: &str,
+        fields: Option<Value>,
+    ) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "message_id": message_id, "action": action });
+        if let Some(f) = fields {
+            body["fields"] = f;
+        }
+        self.post("sendComponentAction", body).await
+    }
+
+    /// Publish this bot's slash commands (the chat command panel).
+    pub async fn set_commands(&self, commands: Value) -> Result<()> {
+        self.post("setBotCommands", json!({ "commands": commands }))
+            .await?;
+        Ok(())
+    }
+
+    /// Download a media attachment. The path comes from the server, so it's NOT
+    /// trusted as an arbitrary URL: only a relative `/media/…`-style path (joined
+    /// onto our own `base`) or an absolute URL on an ALLOWED media origin is
+    /// fetched. Anything else (a foreign `http(s)://` host) is rejected so a
+    /// crafted attachment URL can't make the daemon do an SSRF request.
+    ///
+    /// RETRIED: a GET is idempotent, so re-issuing one costs nothing — and NOT
+    /// re-issuing costs the user's attachment. A single 500 from the media
+    /// redirect (2026-08-18, the api blinking under a deploy) was enough to drop
+    /// a screenshot out of the prompt, leaving the model to answer a message it
+    /// could not see, with one log line as the only trace. A 4xx is the server
+    /// saying the thing is really gone — that one is not worth repeating.
+    ///
+    /// RESUMED, which is the part that matters for big files. The retry above
+    /// used to restart from byte 0, so a 2.6 MB screenshot on a link that tears
+    /// mid-body tore on every attempt and the image was simply lost (2026-09-17,
+    /// observed five times in one afternoon, all `error decoding response body`).
+    /// Now the bytes already delivered are kept and the next try sends
+    /// `Range: bytes=<have>-`, so each attempt only has to survive what is LEFT.
+    /// A server that ignores the header answers 200 with the whole object — that
+    /// is detected and the partial prefix dropped, because appending to it would
+    /// silently corrupt the file.
+    ///
+    /// And the result is LENGTH-CHECKED: a body that ends short without raising
+    /// an error is retried rather than handed back, since a truncated screenshot
+    /// the model treats as whole is worse than a missing one.
+    ///
+    /// And FLOORED ([`MEDIA_STALL`]): a connection that slows to a crawl never
+    /// errors, so the resume above never ran — on 2026-10-19 one sank to ~1 KB/s
+    /// mid-photo and held a reply for over an hour while fresh connections ran
+    /// at ~68 KB/s. Now each try has to keep up the floor, head included; under
+    /// it the try is cut and the rest asked for on a fresh connection.
+    pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
+        self.download_with(path, MEDIA_STALL).await
+    }
+
+    /// `download`, held to `floor` instead of [`MEDIA_STALL`].
+    pub(crate) async fn download_with(&self, path: &str, floor: StallFloor) -> Result<Vec<u8>> {
+        let url = if path.starts_with("http://") || path.starts_with("https://") {
+            if !self.media_origin_allowed(path) {
+                anyhow::bail!("refusing to fetch attachment from a non-Mafold origin: {path}");
+            }
+            path.to_string()
+        } else if path.starts_with('/') {
+            // A relative server path (e.g. `/media/…`) → resolve against base.
+            format!("{}{}", self.base, path)
+        } else {
+            anyhow::bail!(
+                "refusing to fetch attachment from a non-relative, non-Mafold URL: {path}"
+            );
+        };
+        // Survives across attempts — that is the whole point of the resume.
+        let mut buf: Vec<u8> = Vec::new();
+        // The object's full size, learned from whichever response first states
+        // it. `None` = the server never said (a chunked 200), and then there is
+        // nothing to check the length against.
+        let mut total: Option<u64> = None;
+        let mut delay = std::time::Duration::from_millis(600);
+        let mut attempt = 1;
+        loop {
+            // Where this try starts. One that gets further was cut short, not
+            // refused — see `progressed` below.
+            let had = buf.len();
+            let got = async {
+                let mut req = self.http.get(&url);
+                if !buf.is_empty() {
+                    req = req.header(reqwest::header::RANGE, format!("bytes={}-", buf.len()));
+                }
+                // The head is held to the floor too: a request the far end took
+                // and never answers is the same dead connection.
+                let mut resp = match tokio::time::timeout(floor.window, req.send()).await {
+                    Ok(sent) => sent.and_then(|r| r.error_for_status()).map_err(Tear::Http)?,
+                    Err(_) => return Err(Tear::Stalled { got: 0, window: floor.window }),
+                };
+                // 206 means the range was honoured and the body continues where
+                // we stopped. ANY other success is the whole object again, so the
+                // prefix in hand has to go — appending would duplicate its head.
+                if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    buf.clear();
+                }
+                if total.is_none() {
+                    total = full_length(&resp);
+                }
+                // Chunk by chunk rather than `bytes()`, so a body that tears
+                // half-way leaves what it already delivered in `buf` instead of
+                // discarding it with the error — and so every `floor.window` can
+                // be checked for `floor.min_bytes`. Dropping `resp` short of its
+                // end takes its connection with it (this client speaks HTTP/1.1
+                // only: reqwest without `http2`), so the next try is on a fresh
+                // one rather than back on the crawl.
+                let mut since = tokio::time::Instant::now();
+                let mut got: u64 = 0;
+                loop {
+                    let left = floor.window.saturating_sub(since.elapsed());
+                    match tokio::time::timeout(left, resp.chunk()).await {
+                        Ok(Ok(Some(chunk))) => {
+                            got += chunk.len() as u64;
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => return Err(Tear::Http(e)),
+                        Err(_) => {}
+                    }
+                    if since.elapsed() >= floor.window {
+                        if got < floor.min_bytes {
+                            return Err(Tear::Stalled { got, window: floor.window });
+                        }
+                        since = tokio::time::Instant::now();
+                        got = 0;
+                    }
+                }
+                Ok::<bool, Tear>(total.is_none_or(|t| buf.len() as u64 >= t))
+            }
+            .await;
+            let err = match got {
+                Ok(true) => return Ok(std::mem::take(&mut buf)),
+                // Ended cleanly but short. Rare, and exactly the case that must
+                // not be mistaken for success.
+                Ok(false) => None,
+                // A 4xx is the server saying the thing is really gone.
+                Err(Tear::Http(e)) if e.status().is_some_and(|s| s.is_client_error()) => {
+                    return Err(anyhow::Error::new(e))
+                }
+                Err(t) => Some(t),
+            };
+            // `{e}` alone prints only the OUTERMOST layer — which is how every
+            // one of those tears logged as a bare "error decoding response body"
+            // with the reason (connection reset? incomplete message?) dropped on
+            // the floor. Walk the chain.
+            let why = match &err {
+                Some(Tear::Http(e)) => cause_chain(e),
+                Some(Tear::Stalled { got, window }) => format!(
+                    "connection stalled: {got} bytes in {window:?}, under the {} floor",
+                    floor.min_bytes
+                ),
+                None => "body ended short".to_string(),
+            };
+            // A try that brought new bytes goes again at once, on a fresh
+            // connection, without spending the budget: on a link that is slow
+            // everywhere every try gets a stretch further, and five of them
+            // used to throw the photo away half-delivered. Only tries that
+            // bring nothing count — a dead link still gives up.
+            if buf.len() > had {
+                eprintln!(
+                    "attachment fetch cut short ({why}) — {} of {} bytes in hand, resuming on a fresh connection…",
+                    buf.len(),
+                    total.map_or_else(|| "?".to_string(), |t| t.to_string()),
+                );
+                attempt = 1;
+                delay = std::time::Duration::from_millis(600);
+                continue;
+            }
+            if attempt >= MEDIA_ATTEMPTS {
+                return match err {
+                    Some(Tear::Http(e)) => Err(anyhow::Error::new(e).context(format!(
+                        "attachment download gave up after {attempt} tries with {} of {} bytes",
+                        buf.len(),
+                        total.map_or_else(|| "?".to_string(), |t| t.to_string())
+                    ))),
+                    Some(Tear::Stalled { .. }) => anyhow::bail!(
+                        "attachment download gave up after {attempt} tries with {} of {} bytes ({why})",
+                        buf.len(),
+                        total.map_or_else(|| "?".to_string(), |t| t.to_string())
+                    ),
+                    None => anyhow::bail!(
+                        "attachment body ended short: {} of {} bytes after {attempt} tries",
+                        buf.len(),
+                        total.map_or_else(|| "?".to_string(), |t| t.to_string())
+                    ),
+                };
+            }
+            eprintln!(
+                "attachment fetch failed ({why}) — {} of {} bytes in hand, resuming; \
+retry {attempt}/{} in {delay:?}…",
+                buf.len(),
+                total.map_or_else(|| "?".to_string(), |t| t.to_string()),
+                MEDIA_ATTEMPTS - 1
+            );
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+            attempt += 1;
+        }
+    }
+
+    /// Resolve a chat argument: a conversation UUID is used as-is; anything else
+    /// is treated as a username (`@name` or `name`) → open/find the DM.
+    pub async fn resolve_chat(&self, arg: &str) -> Result<String> {
+        let a = arg.trim_start_matches('@');
+        if a.len() == 36 && a.matches('-').count() == 4 {
+            return Ok(a.to_string());
+        }
+        let conv = self.post("startChat", json!({ "user_ids": [a] })).await?;
+        Ok(conv["id"]
+            .as_str()
+            .context("startChat: no conversation id")?
+            .to_string())
+    }
+
+    /// Did this request die in the CONNECT phase — i.e. it never left this
+    /// machine? Only these failures are safe to blindly retry: the server saw
+    /// nothing, so a retry can't duplicate anything. (A timeout/dropped-response
+    /// is NOT safe for non-idempotent calls like botCreateDraft — the request may
+    /// have landed, and a retry would leave an orphaned empty draft bubble.)
+    /// The classification now comes from the core's structured `RpcError`.
+    fn is_connect_error(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<mafold_core::RpcError>()
+            .is_some_and(|re| matches!(re, mafold_core::RpcError::Connect(_)))
+    }
+
+    /// Did the far end FALL OVER, as opposed to deliberately saying no? A 5xx
+    /// envelope, a gateway's non-JSON error page, a torn socket or a timeout all
+    /// mean "the same request could work a second from now"; a 4xx or an unknown
+    /// method mean "this will never work".
+    ///
+    /// Note the deliberate split from `is_api_error`, which treats EVERY
+    /// `{ok:false}` as a verdict: that is the right rule for a call being
+    /// retried freely, but a 5xx envelope is the server admitting it broke, not
+    /// answering. This one is only consulted where a single extra attempt buys
+    /// something that matters (see `create_draft`).
+    /// See [`is_server_blip`] — same classifier, exposed for the refusal check
+    /// which must run first (a 403 is neither a blip nor a connect failure).
+    fn is_server_blip(e: &mafold_core::RpcError) -> bool {
+        use mafold_core::RpcError as R;
+        match e {
+            // Timeout, dropped response, or a non-JSON body — which the core
+            // formats as "<method>: HTTP <status> …", so a deliberate 4xx is
+            // still recognizable in here and stays excluded.
+            R::Transport(s) => !s.contains("HTTP 4"),
+            R::Api(env) => serde_json::from_str::<Value>(env)
+                .ok()
+                .and_then(|v| v.get("error_code").and_then(Value::as_u64))
+                .is_some_and(|c| (500..600).contains(&c)),
+            // Connect has its own (freely repeatable) retry in `create_draft`;
+            // an unknown method is a client/server version gap, never a blip.
+            R::Connect(_) | R::UnknownMethod(_) => false,
+        }
+    }
+
+    // ── bot streaming write API (used by the agent daemon) ──
+    /// Open a streaming draft. When `thread_root_id` is set, the streamed reply
+    /// lands in that thread instead of the main channel.
+    ///
+    /// This POST is the reply pipeline's single point of failure: it runs before
+    /// any state exists, and `handle()` propagates its error — so one flaky
+    /// connect used to silently eat the user's message (bot "online but never
+    /// replies"). A connect-phase failure never reached the server, so it is
+    /// retried until the link comes back, up to [`LINK_WAIT`]. Three tries in
+    /// 1.5s was not enough: on 2026-10-01 the 08:00 routine reached the daemon
+    /// in a 28-second dark wake of a sleeping laptop, before its network was up,
+    /// and the turn was dropped.
+    ///
+    /// `trigger_id` is the incoming message this reply answers. It is what lets
+    /// the server decide, BEFORE any model runs, whether this turn is free,
+    /// billed to that sender's wallet, or refused — a draft with no trigger is
+    /// never billed. A refusal comes back as [`DraftRefused`]: the server has
+    /// already spoken in the chat, so the caller must post nothing.
+    pub async fn create_draft(
+        &self,
+        chat_id: &str,
+        thread_root_id: Option<&str>,
+        channel_id: Option<&str>,
+        trigger_id: Option<&str>,
+    ) -> Result<String> {
+        let deadline = std::time::SystemTime::now() + LINK_WAIT;
+        self.create_draft_until(chat_id, thread_root_id, channel_id, trigger_id, None, deadline).await
+    }
+
+    /// A draft that carries on a turn whose first draft is `carries` — a
+    /// steer's fresh one. No trigger (it bills nothing new); the server copies
+    /// over who the turn's chain started from (`messageOrigin`).
+    pub async fn create_draft_carrying(
+        &self,
+        chat_id: &str,
+        thread_root_id: Option<&str>,
+        channel_id: Option<&str>,
+        carries: &str,
+    ) -> Result<String> {
+        let deadline = std::time::SystemTime::now() + LINK_WAIT;
+        self.create_draft_until(chat_id, thread_root_id, channel_id, None, Some(carries), deadline).await
+    }
+
+    /// [`Self::create_draft`] with the give-up time spelled out. Wall-clock on
+    /// purpose: a sleeping Mac's monotonic clock stands still, so an `Instant`
+    /// deadline would let a laptop that slept all night keep waiting.
+    pub(crate) async fn create_draft_until(
+        &self,
+        chat_id: &str,
+        thread_root_id: Option<&str>,
+        channel_id: Option<&str>,
+        trigger_id: Option<&str>,
+        carries: Option<&str>,
+        deadline: std::time::SystemTime,
+    ) -> Result<String> {
+        // TYPED through the core: ids parse to real Uuids up front (a malformed
+        // id fails here, not as a server 400), and the result is a wire::Message.
+        let chat = uuid::Uuid::parse_str(chat_id).context("botCreateDraft: bad chat_id")?;
+        let root = thread_root_id
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .context("botCreateDraft: bad thread_root_id")?;
+        let channel = channel_id
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .context("botCreateDraft: bad channel_id")?;
+        // A trigger id we can't parse is a trigger we don't have: the turn runs
+        // free rather than dying on a malformed id nobody typed.
+        let trigger = trigger_id.filter(|t| !t.is_empty()).and_then(|t| uuid::Uuid::parse_str(t).ok());
+        let carries = carries.and_then(|c| uuid::Uuid::parse_str(c).ok());
+        let api = self.api();
+        let mut delay = std::time::Duration::from_millis(500);
+        let mut connect_tries = 0;
+        let mut blip_retried = false;
+        let draft = loop {
+            let err = match api.bot_create_draft(chat, root, channel, trigger, carries).await {
+                Ok(m) => break m,
+                Err(e) => e,
+            };
+            // A deliberate "no" (403 + a description the server prefixes on
+            // purpose): the sender may not drive this bot, or must authorize
+            // payment first. The server has already answered them in the chat
+            // as the bot, so this is not a failure to retry or announce.
+            if let Some(reason) = DraftRefused::from_rpc(&err) {
+                return Err(anyhow::Error::new(reason));
+            }
+            // Never left this machine → a retry cannot duplicate anything, so
+            // wait for the link instead of giving the trigger up.
+            if matches!(err, mafold_core::RpcError::Connect(_)) && std::time::SystemTime::now() < deadline {
+                connect_tries += 1;
+                if connect_tries <= 3 || connect_tries % 20 == 0 {
+                    eprintln!(
+                        "botCreateDraft connect failed (attempt {connect_tries}: {err}) — waiting for the link, retrying in {delay:?}…"
+                    );
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(LINK_RETRY_MAX);
+                continue;
+            }
+            // The far end fell over rather than said no. This is NOT provably
+            // duplicate-free — the draft may have been created and only the
+            // answer lost — so it gets exactly ONE more attempt, and the worst
+            // case is a single empty bubble left behind. The failure it exists
+            // for is strictly worse: on 2026-08-18 one 500 here ate the user's
+            // message whole, and because the WS cursor is pinned before
+            // `handle()` runs, nothing ever replayed it.
+            if !blip_retried && Self::is_server_blip(&err) {
+                blip_retried = true;
+                eprintln!("botCreateDraft failed ({err}) — server-side blip, one more try in 2s…");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+            return Err(anyhow::Error::new(err).context("botCreateDraft failed"));
+        };
+        let id = draft.id.to_string();
+        if let Some(outbox) = &self.drafts {
+            if let Err(e) = outbox.track(&id) {
+                eprintln!("could not journal draft {id} for restart recovery: {e:#}");
+            }
+        }
+        Ok(id)
+    }
+
+    /// A turn died BEFORE it had a bubble to die in — say so where it was asked.
+    ///
+    /// Every other failure inside a turn is surfaced in the draft itself (see
+    /// `handle`'s "ALWAYS finalize"). A `create_draft` failure has no draft to
+    /// be surfaced in, so it used to leave exactly nothing: an online bot that
+    /// read the message and never spoke, while the log kept the reason to
+    /// itself. Nothing replays the message either (the cursor is pinned before
+    /// the turn runs), so the ONLY recovery is the user sending it again — which
+    /// they can't know to do unless we say it.
+    ///
+    /// Best-effort by design: one plain send, no retry. If the API is down hard
+    /// this fails too, and the caller's log line is the last word.
+    pub async fn announce_lost_turn(&self, dest: Dest<'_>, why: &str) -> Result<()> {
+        self.announce_lost_turn_until(dest, why, std::time::SystemTime::now() + NOTICE_WAIT).await
+    }
+
+    /// The notice travels the same link the draft could not, so it waits it out
+    /// the same way; past `deadline` the caller keeps the trigger journaled
+    /// (`crate::pending`) and the next connection sends it.
+    pub(crate) async fn announce_lost_turn_until(
+        &self,
+        dest: Dest<'_>,
+        why: &str,
+        deadline: std::time::SystemTime,
+    ) -> Result<()> {
+        // Trimmed: the point of the bubble is "send it again", not a stack trace.
+        let why: String = why.chars().take(200).collect();
+        let text = format!(
+            "⚠️ I couldn't open a reply draft for your last message, so it was never processed \
+             — and it won't be retried automatically. Please send it again.\n\n`{why}`"
+        );
+        let mut delay = std::time::Duration::from_millis(500);
+        loop {
+            match self.send_to(dest, &text).await {
+                Ok(_) => return Ok(()),
+                Err(e) if Self::is_connect_error(&e) && std::time::SystemTime::now() < deadline => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(LINK_RETRY_MAX);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {
+        self.post(
+            "botAppendDelta",
+            json!({ "message_id": message_id, "delta": delta }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Replace a streaming draft's FULL content (Telegram `sendMessageDraft`
+    /// style — each push is the complete snapshot, so we can rewrite earlier
+    /// output, e.g. swap a trailing `{% mafold/generating %}` card for `{% mafold/result %}`).
+    ///
+    /// RETRIED (see `post_idempotent`): a snapshot write is idempotent, and the
+    /// final one of a turn is what takes the `{% mafold/generating %}` card away. Losing
+    /// it to a two-second uplink blip left the bubble animating forever with a
+    /// Stop button that could never resolve — the failure this retry exists for.
+    pub async fn edit_draft(&self, message_id: &str, content: &str) -> Result<()> {
+        let seq = self.writer_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.post_idempotent(
+            "botEditDraft",
+            json!({ "message_id": message_id, "content": content, "writer_id": self.writer_id, "writer_seq": seq }),
+        )
+        .await?;
+        Ok(())
+    }
+    /// Attach media to one of OUR messages (draft or already delivered). The
+    /// server appends, de-duped by attachment id — which is what makes the
+    /// retry below safe, and what keeps this independent of the text snapshots
+    /// `edit_draft` is pushing in parallel.
+    ///
+    /// RETRIED: an image that silently fails to land is exactly the bug this
+    /// whole path exists to fix — the reply says "已生成" and nothing arrives.
+    pub async fn attach(&self, message_id: &str, attachments: Value) -> Result<()> {
+        self.post_idempotent("botAttach", json!({ "message_id": message_id, "attachments": attachments })).await?;
+        Ok(())
+    }
+
+    /// Upload a local file and attach it to `message_id`, returning the
+    /// attachment JSON that landed. The one place that turns "a path on this
+    /// machine" into "media in the bubble": `mafold attach` and the agent render
+    /// loop both come through here, so the daemon and the CLI can never drift on
+    /// kind/id/mime/dimension handling.
+    ///
+    /// The wire's THREE media kinds are all reachable from here — `classify`
+    /// picks by content, not by hope. Sending everything as `photo` (what this
+    /// did before) meant a `.html` the agent wrote arrived as a broken image
+    /// bubble, which is also why agents stopped believing they could send files.
+    /// Upload a local file into the registry WITHOUT attaching it anywhere —
+    /// for a tool that needs the bytes server-side (a video ref) rather than in
+    /// a bubble. Same kind sniffing as `attach_media`. Answers the FileRef.
+    pub async fn upload_path(&self, path: &std::path::Path) -> Result<Value> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let (kind, mime) = classify(&name, &bytes);
+        let upload_name = match kind {
+            "file" => name.clone(),
+            _ => retype(&name, mime),
+        };
+        self.upload_media(bytes, &upload_name, mime).await
+    }
+
+    pub async fn attach_media(&self, message_id: &str, path: &std::path::Path) -> Result<Value> {
+        self.attach_media_as(message_id, path, AttachAs::Detected { original: false }).await
+    }
+
+    /// [`Self::attach_media`] with the kind chosen by the caller instead of the
+    /// bytes, for the one intent a file cannot carry: "send this picture as a
+    /// sticker". Same upload, same `botAttach`, same de-dup key — only the
+    /// attachment's `kind` differs, and that is exactly the renderer's contract
+    /// (bare, fixed size, no lightbox) the web and app already honour.
+    pub async fn attach_media_as(
+        &self,
+        message_id: &str,
+        path: &std::path::Path,
+        how: AttachAs<'_>,
+    ) -> Result<Value> {
+        let att = self.upload_attachment(path, how).await?;
+        self.attach(message_id, json!([att.clone()])).await?;
+        if let AttachAs::Sticker { .. } = how {
+            // Sending a sticker is how it ENTERS the sender's library — the
+            // composers do the same right after their upload — and a bot is an
+            // account like any other. After the attach, never before: the
+            // message must not wait on the library, and a failed add costs a
+            // row the next send re-creates, never the sticker in the reply.
+            let emoji: Vec<Value> = att.get("emoji").cloned().into_iter().collect();
+            let add = json!({ "file": att["file"].clone(), "emoji": emoji });
+            if let Err(e) = self.post("sticker.add", add).await {
+                eprintln!("sticker sent, but not kept in the library: {e:#}");
+            }
+        }
+        Ok(att)
+    }
+
+    /// Upload a local file and answer the attachment that names it — `{kind,
+    /// id, file}`, plus `emoji` for a sticker — WITHOUT putting it on any
+    /// message. The one place a path on this machine becomes media a message
+    /// can carry: [`Self::attach_media_as`] (`mafold attach`, the agent render
+    /// loop) hangs it on a message that already exists, `mafold send --attach`
+    /// puts it in the message it is about to send ([`Self::send_message`]).
+    /// One door, so the two can never drift on kind / name / mime / thumbnail.
+    pub async fn upload_attachment(&self, path: &std::path::Path, how: AttachAs<'_>) -> Result<Value> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let (kind, mime) = match how {
+            AttachAs::Detected { .. } => classify(&name, &bytes),
+            // Refused rather than downgraded: the caller ASKED for a sticker,
+            // and a PDF quietly arriving as a file card instead would read as
+            // "sent" to an agent that never looks at the bubble.
+            AttachAs::Sticker { .. } => ("sticker", sticker_mime(&bytes).with_context(|| {
+                format!("{} can't be a sticker — it has to be a png, jpeg, gif or webp picture", path.display())
+            })?),
+        };
+        // The upload's filename must AGREE with the bytes (the declared name is
+        // what the registry row keeps); a screenshot handed over as `shot.txt`
+        // should register as the image it is. A file keeps the caller's own
+        // name — that name is what the bubble displays.
+        let upload_name = match kind {
+            "file" => name.clone(),
+            _ => retype(&name, mime),
+        };
+        // A photo goes up as its ≤2560 view and inline strip, the original only
+        // when asked for (src/thumb.rs; flag thumbSend, evaluated for this bot
+        // and its owner). Decoding is CPU work: off the async runtime.
+        let derived = match how {
+            AttachAs::Detected { original } if kind == "photo" && crate::flags::enabled("thumbSend") => {
+                let (b, m) = (bytes.clone(), mime.to_string());
+                tokio::task::spawn_blocking(move || crate::thumb::derive(&b, &m, original)).await.ok().flatten()
+            }
+            _ => None,
+        };
+        // uploadFile answers with the FILE itself (`{id, unique_id, mime, …}`,
+        // file-id world — no urls). The attachment carries nothing but that id;
+        // name/size/dimensions live on the registry row the server just wrote.
+        let up = match derived {
+            Some(d) => {
+                let (view, view_name, view_mime) = if d.view_mime.is_empty() {
+                    (d.view, upload_name.clone(), mime)
+                } else {
+                    (d.view, retype(&name, d.view_mime), d.view_mime)
+                };
+                let orig = d.orig.map(|b| (b, upload_name.clone(), mime));
+                self.upload_media_parts(view, &view_name, view_mime, d.strip, orig).await?
+            }
+            None => self.upload_media(bytes, &upload_name, mime).await?,
+        };
+        let file_id = up["id"].as_str().context("uploadFile returned no id")?;
+        // `id` is the attachment's identity for the server's de-dup, so key it
+        // on the file — re-attaching the same upload is a no-op, not a twin.
+        let mut att = json!({ "kind": kind, "id": file_id, "file": file_id });
+        if let AttachAs::Sticker { emoji } = how {
+            if let Some(e) = emoji.map(str::trim).filter(|e| !e.is_empty()) {
+                att["emoji"] = json!(e);
+            }
+        }
+        Ok(att)
+    }
+
+    /// Hang a PUBLIC URL's bytes on a message: the server fetches + registers
+    /// them (`ingestUrl`), so a vendor's 24 h clip link never has to cross
+    /// this machine's uplink. Kind follows the registered mime.
+    pub async fn attach_url(&self, message_id: &str, url: &str) -> Result<Value> {
+        let att = self.ingest_attachment(url).await?;
+        self.attach(message_id, json!([att.clone()])).await?;
+        Ok(att)
+    }
+
+    /// The attachment a PUBLIC URL's bytes become, landed server-side
+    /// (`ingestUrl`) and put on no message yet — [`Self::upload_attachment`]
+    /// for a URL. [`Self::attach_url`] hangs it on a message that exists;
+    /// `mafold send --attach <url>` sends it in its own message.
+    pub async fn ingest_attachment(&self, url: &str) -> Result<Value> {
+        let up = self.call("ingestUrl", json!({ "url": url })).await?;
+        let file_id = up["id"].as_str().context("ingestUrl returned no id")?;
+        let mime = up["mime"].as_str().unwrap_or("");
+        let kind = if mime.starts_with("image/") {
+            "photo"
+        } else if mime.starts_with("video/") {
+            "video"
+        } else {
+            "file"
+        };
+        Ok(json!({ "kind": kind, "id": file_id, "file": file_id }))
+    }
+
+    /// Close the loop on a card tap: the API is holding the tapper's request open
+    /// on this `action_id`. `result` is `{"kind":"patch","content":…}`,
+    /// `{"kind":"error","message":…}` or `{"kind":"ok"}` — a patch is both
+    /// returned to the tapper and written into the message by the server, so the
+    /// daemon must NOT also edit it here.
+    ///
+    /// Not retried: the caller is parked on a timeout, so a slow retry answers an
+    /// audience that already left.
+    pub async fn answer_card_action(
+        &self,
+        action_id: &str,
+        result: serde_json::Value,
+    ) -> Result<()> {
+        self.post(
+            "answerCardAction",
+            json!({ "action_id": action_id, "result": result }),
+        )
+        .await?;
+        Ok(())
+    }
+    /// RETRIED: finalizing an already-finalized message is a no-op server-side,
+    /// and an unfinalized draft is precisely the "forever generating" bubble.
+    pub async fn finalize(&self, message_id: &str, success_for: Option<&str>, outcome: Option<TurnEnd>) -> Result<()> {
+        self.post_idempotent(
+            "botFinalize",
+            json!({ "message_id": message_id, "success_for": success_for, "outcome": outcome }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Persist the final snapshot before attempting either write. A periodic
+    /// daemon task retries pending entries, including after process restart.
+    pub async fn finish_draft(
+        &self,
+        message_id: &str,
+        content: &str,
+        success_for: Option<&str>,
+        outcome: Option<TurnEnd>,
+    ) -> Result<bool> {
+        if let Some(outbox) = &self.drafts {
+            if let Err(e) = outbox.complete(message_id, content, success_for, outcome) {
+                eprintln!("draft {message_id} completion journal failed: {e:#}");
+            }
+            outbox.deliver(self, message_id).await
+        } else {
+            self.edit_draft(message_id, content).await?;
+            self.finalize(message_id, success_for, outcome).await?;
+            Ok(true)
+        }
+    }
+
+    /// Throw away one of our own UNFINALIZED drafts — the row goes, with no
+    /// tombstone. The server refuses anything already finalized, so this can
+    /// never be used to erase a real message.
+    ///
+    /// Used when a turn is steered: the reply re-opens BELOW the message that
+    /// steered it, and the bubble it was streaming into has to stop existing
+    /// rather than linger above saying "deleted".
+    pub async fn discard_draft(&self, message_id: &str) -> Result<()> {
+        self.post_idempotent("discardDraft", json!({ "message_id": message_id }))
+            .await?;
+        if let Some(outbox) = &self.drafts { outbox.forget(message_id)?; }
+        Ok(())
+    }
+
+    /// Push a directed alert popup to a single user (Telegram answerCallbackQuery
+    /// `show_alert` analog). Used to tell a non-allow-listed user their Stop
+    /// request was denied. `level` ∈ {info, success, error}.
+    pub async fn push_alert(
+        &self,
+        to: &str,
+        title: Option<&str>,
+        text: &str,
+        level: &str,
+    ) -> Result<()> {
+        let mut body = json!({ "to_username": to, "text": text, "level": level });
+        if let Some(t) = title {
+            body["title"] = json!(t);
+        }
+        self.post("pushAlert", body).await?;
+        Ok(())
+    }
+
+    /// Answer a pending inline query (the user is typing `@me …`). `results` are
+    /// message bodies — each may carry `{% card %}` tags; the client shows them as
+    /// pickable suggestions and sends the chosen one.
+    pub async fn answer_inline_query(&self, query_id: &str, results: Vec<String>) -> Result<()> {
+        self.post(
+            "answerInlineQuery",
+            json!({ "query_id": query_id, "results": results }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ── developer card registry ──
+    /// Publish a compiled card bundle. `meta` carries tag/version/displayName.
+    pub async fn publish_card(&self, meta: &Value, bundle: Vec<u8>) -> Result<Value> {
+        let form = reqwest::multipart::Form::new()
+            .text("meta", serde_json::to_string(meta)?)
+            .part(
+                "bundle",
+                reqwest::multipart::Part::bytes(bundle)
+                    .file_name("card.js")
+                    .mime_str("application/javascript")?,
+            );
+        let v: Value = self
+            .http
+            .post(format!("{}/api/publishCard", self.base))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .context("publishCard request failed")?
+            .json()
+            .await
+            .context("publishCard returned non-JSON")?;
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            anyhow::bail!(
+                "publishCard: {}",
+                v["description"].as_str().unwrap_or("error")
+            );
+        }
+        Ok(v["result"].clone())
+    }
+
+    /// The caller's own cards plus global cards.
+    pub async fn list_cards(&self) -> Result<Value> {
+        self.post("listCards", json!({})).await
+    }
+
+    /// Retract a card from YOUR scope — one version, or the whole tag. Used to
+    /// clear a family shadow so the tag resolves to the global card again.
+    pub async fn unpublish_card(&self, tag: &str, version: Option<&str>) -> Result<Value> {
+        self.post("unpublishCard", json!({ "tag": tag, "version": version }))
+            .await
+    }
+
+    // ── developer mini-app registry ──
+    /// Publish a compiled mini-app bundle. `meta` is the full AppManifest JSON
+    /// (carrying `id` = `owner/slug` and `version`); the server gates publish on
+    /// owning the `owner` namespace. Mirrors `publish_card` (different route, a
+    /// manifest instead of card meta).
+    pub async fn publish_app(&self, meta: &Value, bundle: Vec<u8>) -> Result<Value> {
+        let form = reqwest::multipart::Form::new()
+            .text("meta", serde_json::to_string(meta)?)
+            .part(
+                "bundle",
+                reqwest::multipart::Part::bytes(bundle)
+                    .file_name("app.js")
+                    .mime_str("application/javascript")?,
+            );
+        let v: Value = self
+            .http
+            .post(format!("{}/api/publishApp", self.base))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .context("publishApp request failed")?
+            .json()
+            .await
+            .context("publishApp returned non-JSON")?;
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            anyhow::bail!(
+                "publishApp: {}",
+                v["description"].as_str().unwrap_or("error")
+            );
+        }
+        Ok(v["result"].clone())
+    }
+
+    /// Upload a file via `/api/uploadFile`. Returns the bare `FileRef`
+    /// (`{id, unique_id, mime, size_bytes, filename?, w?, h?}`) — NOT the
+    /// `{ok,result}` envelope. The `id` is the handle everything else uses.
+    pub async fn upload_media(&self, bytes: Vec<u8>, filename: &str, mime: &str) -> Result<Value> {
+        self.upload_media_parts(bytes, filename, mime, None, None).await
+    }
+
+    /// [`Self::upload_media`] with the parts that may ride beside a picture
+    /// (`.docs/thumbnail-v1.md`): its inline `strip` (a small JPEG), and `orig`
+    /// — the untouched original (bytes, name, mime) the uploaded view replaces.
+    pub async fn upload_media_parts(
+        &self,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        strip: Option<Vec<u8>>,
+        orig: Option<(Vec<u8>, String, &str)>,
+    ) -> Result<Value> {
+        let mut form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(bytes)
+                .file_name(filename.to_string())
+                .mime_str(mime)?,
+        );
+        if let Some(s) = strip {
+            form = form.part("strip", reqwest::multipart::Part::bytes(s).file_name("strip.jpg").mime_str("image/jpeg")?);
+        }
+        if let Some((b, name, m)) = orig {
+            form = form.part("orig", reqwest::multipart::Part::bytes(b).file_name(name).mime_str(m)?);
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/uploadFile", self.base))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .context("uploadFile request failed")?;
+        let status = resp.status();
+        let text = resp.text().await.context("uploadFile: reading body")?;
+        if !status.is_success() {
+            anyhow::bail!("uploadFile failed ({status}): {text}");
+        }
+        serde_json::from_str(&text).context("uploadFile returned non-JSON")
+    }
+
+    /// Every mini-app whose namespace the caller may manage (the "my apps" view).
+    pub async fn list_apps(&self) -> Result<Value> {
+        self.post("listApps", json!({})).await
+    }
+
+    /// Take down a mini-app the caller owns (all versions). Returns `{removed}`.
+    pub async fn remove_app(&self, id: &str) -> Result<Value> {
+        self.post("removeApp", json!({ "id": id })).await
+    }
+
+    // ── cloud language-pack registry (i18n) ──
+    /// Publish one language pack (first-party publisher only). `body` carries
+    /// `lang_code`, `version`, `name?`, `rtl?`, `strings`. Returns `{lang_code,
+    /// keyset, version, url}`.
+    pub async fn publish_langpack(&self, body: Value) -> Result<Value> {
+        self.post("publishLangPack", body).await
+    }
+    /// Resolve newest (or pinned) packs — used to read the current server version.
+    pub async fn resolve_langpacks(&self, requests: Value) -> Result<Value> {
+        self.post("resolveLangPacks", json!({ "requests": requests }))
+            .await
+    }
+    /// The languages the server currently serves (newest version each).
+    pub async fn list_languages(&self) -> Result<Value> {
+        self.post("listLanguages", json!({})).await
+    }
+
+    fn ws_url(&self) -> String {
+        let ws = self
+            .base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        // `nodrafts`: this process acts on finished messages only (see
+        // REPLAY_METHODS), so the server keeps every streaming draft snapshot,
+        // token delta and typing ping off this socket — they were ~all of its
+        // traffic (six daemons on one Mac took ~940MB each in 32 minutes).
+        format!("{ws}/api/ws?caps=nodrafts")
+    }
+
+    /// The WS handshake request — sends the bot token via an `Authorization:
+    /// Bearer` header instead of the URL query string (so the secret doesn't sit
+    /// in logs / proxies). Feed it to `ws_connect`.
+    pub fn ws_request(&self) -> tokio_tungstenite::tungstenite::ClientRequestBuilder {
+        let uri: tokio_tungstenite::tungstenite::http::Uri =
+            self.ws_url().parse().expect("ws url should be a valid URI");
+        tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
+            .with_header("Authorization", format!("Bearer {}", self.token))
+    }
+
+    /// Open the daemon's WebSocket — through the HTTP proxy the environment
+    /// names, exactly like the HTTP half of this client already does.
+    ///
+    /// This exists because the two halves disagreed by default: `reqwest` reads
+    /// `HTTPS_PROXY`/`NO_PROXY` on its own, while `tokio_tungstenite::connect_async`
+    /// reads nothing and always dials the origin direct. Behind a proxy that is
+    /// the ONLY route out (observed: `getMe` 200 through the proxy while every
+    /// WS attempt died in SYN_SENT to the origin IP), that split makes a daemon
+    /// that authenticates, publishes its command menu, and then can never
+    /// receive a single message — online-looking and deaf. A tunnelled socket
+    /// keeps the TLS peer and SNI at the origin host, so the token still only
+    /// travels inside TLS and the proxy sees nothing but `CONNECT host:443`.
+    ///
+    /// Returns the same pair `connect_async` did, so callers keep matching on
+    /// `tungstenite::Error::Http` for the 401/403 auth-rejection path.
+    pub async fn ws_connect(
+        &self,
+    ) -> Result<
+        (
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::{error::UrlError, Error};
+
+        let request = self.ws_request().into_client_request()?;
+        let uri = request.uri().clone();
+        let host = uri.host().ok_or(Error::Url(UrlError::NoHostName))?.to_string();
+        let tls = uri.scheme_str() == Some("wss");
+        let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+
+        let proxy = ws_proxy_for(&host, tls);
+        // One line per process, not per reconnect: which route the socket takes
+        // is the first thing worth knowing when a daemon won't come online, and
+        // the reconnect loop would otherwise bury it.
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        NOTE.call_once(|| match &proxy {
+            Some(p) => println!("ws transport: {host}:{port} via proxy {}", redact_proxy(p)),
+            None => println!("ws transport: {host}:{port} direct (no proxy in env)"),
+        });
+
+        let stream = match &proxy {
+            Some(p) => ws_tunnel(p, &host, port).await?,
+            None => tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(Error::Io)?,
+        };
+        // The handshake is one small write followed by a wait; Nagle would sit
+        // on it for a round trip.
+        let _ = stream.set_nodelay(true);
+
+        // `request` still carries the wss:// URI, so this does the TLS handshake
+        // against the ORIGIN (SNI + cert check on `host`) over whatever socket we
+        // just handed it — proxied or not.
+        tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await
+    }
+}
+
+/// First non-empty value among `names`. Both cases are probed because only
+/// Windows env lookup is case-insensitive; the lowercase spellings are the
+/// conventional ones on Unix.
+fn env_first(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+/// Whether `NO_PROXY` exempts `host`. Supports the three forms that actually
+/// appear in the wild: `*` (everything), a `192.168.*` prefix wildcard, and a
+/// bare or dot-led suffix (`mafold.com` / `.mafold.com`) which also matches
+/// subdomains. Keeping this honest is what stops a local `127.0.0.1:4000` dev
+/// server from being dialled through the proxy.
+fn no_proxy_matches(host: &str) -> bool {
+    let Some(list) = env_first(&["NO_PROXY", "no_proxy"]) else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    list.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .any(|pat| {
+            if pat == "*" {
+                return true;
+            }
+            if let Some(prefix) = pat.strip_suffix('*') {
+                return !prefix.is_empty() && host.starts_with(prefix);
+            }
+            let base = pat.trim_start_matches('.');
+            !base.is_empty() && (host == base || host.ends_with(&format!(".{base}")))
+        })
+}
+
+/// The proxy to dial for a WS connection to `host`, or None for direct. Same
+/// precedence reqwest applies on the HTTP side: `NO_PROXY` wins outright, then
+/// the scheme-specific variable, then `ALL_PROXY`.
+fn ws_proxy_for(host: &str, tls: bool) -> Option<String> {
+    if no_proxy_matches(host) {
+        return None;
+    }
+    let scheme_specific: &[&str] =
+        if tls { &["HTTPS_PROXY", "https_proxy"] } else { &["HTTP_PROXY", "http_proxy"] };
+    env_first(scheme_specific).or_else(|| env_first(&["ALL_PROXY", "all_proxy"]))
+}
+
+/// Credentials stripped — this string is printed, and proxy URLs carry
+/// `user:pass@` often enough to matter.
+fn redact_proxy(proxy: &str) -> String {
+    let (scheme, rest) = proxy.split_once("://").unwrap_or(("http", proxy));
+    match rest.rsplit_once('@') {
+        Some((_, addr)) => format!("{scheme}://***@{addr}"),
+        None => format!("{scheme}://{rest}"),
+    }
+}
+
+/// A TCP socket to `host:port` tunnelled through an HTTP proxy via `CONNECT`.
+///
+/// SOCKS is deliberately not handled: `reqwest` here is built without its
+/// `socks` feature, so the HTTP half ignores a `socks5://` value too — failing
+/// loudly beats the two halves silently disagreeing again.
+async fn ws_tunnel(
+    proxy: &str,
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream, tokio_tungstenite::tungstenite::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let io_err = |msg: String| {
+        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+    };
+
+    let (scheme, rest) = proxy.split_once("://").unwrap_or(("http", proxy));
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(io_err(format!(
+            "unsupported proxy scheme `{scheme}` for the WebSocket — only http:// CONNECT is handled"
+        )));
+    }
+    let rest = rest.trim_end_matches('/');
+    let (credentials, addr) = match rest.rsplit_once('@') {
+        Some((c, a)) => (Some(c.to_string()), a),
+        None => (None, rest),
+    };
+    // Bare `host` with no port is legal in these variables; 80 is the http
+    // default and what reqwest assumes too.
+    let proxy_addr = if addr.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        addr.to_string()
+    } else {
+        format!("{addr}:80")
+    };
+
+    let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
+        .await
+        .map_err(|e| io_err(format!("proxy {proxy_addr} unreachable: {e}")))?;
+
+    let target = format!("{host}:{port}");
+    let mut req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
+    if let Some(credentials) = credentials {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+        req.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
+    }
+    req.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+
+    // Byte at a time, stopping dead on the blank line: read any further and we
+    // would swallow the head of the TLS handshake that follows on this socket.
+    let mut head = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte).await.map_err(tokio_tungstenite::tungstenite::Error::Io)? {
+            0 => return Err(io_err("proxy closed the connection during CONNECT".into())),
+            _ => head.push(byte[0]),
+        }
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 8192 {
+            return Err(io_err("proxy sent an oversized CONNECT response".into()));
+        }
+    }
+
+    let status_line = String::from_utf8_lossy(&head);
+    let status_line = status_line.lines().next().unwrap_or_default().trim();
+    let accepted = status_line.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2'));
+    if !accepted {
+        return Err(io_err(format!("proxy refused CONNECT {target}: {status_line}")));
+    }
+    Ok(stream)
+}
+
+/// What a local file becomes in the bubble: `(kind, mime)`, where `kind` is one
+/// of the wire's media kinds (`photo` / `video` / `file`).
+///
+/// The BYTES decide, not the name. A file only rides the photo/video path if its
+/// header proves it is one — everything else is a `file` card with an honest
+/// mime, which is what the web composer produces for the same upload. That
+/// asymmetry is the whole bug: a name-based guess turned every attachment into a
+/// photo, so `.html`, `.pdf` and a mis-saved screenshot alike arrived as broken
+/// image bubbles.
+/// How [`Client::attach_media_as`] presents what it uploads.
+#[derive(Debug, Clone, Copy)]
+pub enum AttachAs<'a> {
+    /// Whatever the bytes are: a photo, a clip, or a file card (`classify`).
+    /// `original`: a photo goes up as its view AND the untouched original
+    /// (`mafold attach --original`, `.docs/thumbnail-v1.md` §3.3).
+    Detected { original: bool },
+    /// A sticker — the composers' `+ ▸ 表情` row. `emoji` is what it reads as
+    /// where a picture can't be shown (push text, a quoted-reply preview).
+    Sticker { emoji: Option<&'a str> },
+}
+
+fn classify(name: &str, bytes: &[u8]) -> (&'static str, &'static str) {
+    match sniff_media(bytes) {
+        Some(m) if m.starts_with("image/") => ("photo", m),
+        Some(m) => ("video", m),
+        None => ("file", mime_from_ext(name)),
+    }
+}
+
+/// Formats we can PROVE from the header and that the media pipeline serves as
+/// playable/renderable media. Deliberately narrow: anything a sniff can't
+/// confirm becomes a file card, which degrades to "a download that works"
+/// instead of "an image that doesn't".
+fn sniff_media(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if b.len() >= 12 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    // ISO-BMFF (`....ftyp<brand>`) covers HEIC, MP4 and MOV — same container,
+    // different major brand, so the brand is what tells them apart.
+    if b.len() >= 12 && &b[4..8] == b"ftyp" {
+        // Unknown brand ⇒ None on purpose: `M4A `/`M4B ` are audio, which has no
+        // media kind of its own, and a file card beats a silent video player.
+        return match &b[8..12] {
+            b"heic" | b"heix" | b"hevc" | b"heim" | b"mif1" | b"msf1" => Some("image/heic"),
+            b"qt  " => Some("video/quicktime"),
+            b"isom" | b"iso2" | b"iso4" | b"iso5" | b"mp41" | b"mp42" | b"avc1" | b"dash"
+            | b"M4V " | b"mmp4" => Some("video/mp4"),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// The pictures a sticker can be. Pictures only, like the composers' own
+/// sticker picker (`accept="image/*"`), and of those the ones every client can
+/// draw: HEIC proves itself an image but no browser decodes it (see the api's
+/// `media.rs`), so it would land as a blank square.
+fn sticker_mime(b: &[u8]) -> Option<&'static str> {
+    sniff_media(b).filter(|m| matches!(*m, "image/png" | "image/jpeg" | "image/gif" | "image/webp"))
+}
+
+/// The same basename carrying the extension that matches `mime` — what we
+/// upload media under once the header has overruled the caller's name.
+fn retype(name: &str, mime: &str) -> String {
+    let ext = match mime {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        _ => "png",
+    };
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let stem = if stem.is_empty() { "file" } else { stem };
+    format!("{stem}.{ext}")
+}
+
+/// Content type for everything else, by extension — the table the api types
+/// undeclared uploads from too (`mafold_types::mime`). Only a display/download
+/// hint: the server's own allow-list still decides how the bytes are STORED
+/// (an `.html` is kept extensionless there so it can never be served as an
+/// active same-origin document).
+fn mime_from_ext(name: &str) -> &'static str {
+    mafold_core::mafold_types::mime::for_name(name).unwrap_or("application/octet-stream")
+}
+
+/// Intrinsic size from a PNG's IHDR, so the bubble can reserve the box before
+/// the bytes arrive (no layout jump on load). Header-only — we never decode the
+/// image. `None` for anything that isn't a PNG; the attachment is still valid
+/// without `w`/`h`, the client just measures after load.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+    // 8 magic + 8 chunk header + 8 dimensions = the first 24 bytes.
+    if bytes.len() < 24 || !bytes.starts_with(MAGIC) || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let n = |o: usize| u32::from_be_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    Some((n(16), n(20)))
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::{classify, png_dimensions, retype};
+
+    /// A real PNG header: magic + IHDR length/type + 1122×1402 (the size the
+    /// codex image that started all this actually came back at).
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&13u32.to_be_bytes());
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn png_size_comes_from_the_ihdr() {
+        assert_eq!(png_dimensions(&png_header(1122, 1402)), Some((1122, 1402)));
+    }
+
+    /// No dimensions is a fine attachment (the client measures after load), so
+    /// anything that isn't a PNG must decline rather than return garbage.
+    #[test]
+    fn non_png_bytes_have_no_dimensions() {
+        assert_eq!(png_dimensions(b"\xff\xd8\xff\xe0 jpeg"), None);
+        assert_eq!(png_dimensions(b""), None);
+        assert_eq!(png_dimensions(&png_header(1, 1)[..12]), None); // truncated
+        let mut wrong_chunk = png_header(4, 4);
+        wrong_chunk[12..16].copy_from_slice(b"iTXt"); // valid PNG, not IHDR first
+        assert_eq!(png_dimensions(&wrong_chunk), None);
+    }
+
+    /// `.....ftyp<brand>` — the ISO-BMFF header MP4/MOV/HEIC all share.
+    fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 0x18];
+        v.extend_from_slice(b"ftyp");
+        v.extend_from_slice(brand);
+        v
+    }
+
+    /// Real images and clips keep riding the media path — proven by their
+    /// header, so a screenshot saved under the wrong name still lands as a photo.
+    #[test]
+    fn header_decides_the_media_kind() {
+        assert_eq!(classify("shot.png", &png_header(4, 4)), ("photo", "image/png"));
+        assert_eq!(classify("shot.txt", &png_header(4, 4)), ("photo", "image/png"));
+        assert_eq!(classify("a.jpg", b"\xff\xd8\xff\xe0JFIF"), ("photo", "image/jpeg"));
+        assert_eq!(classify("a.gif", b"GIF89a\x01\0"), ("photo", "image/gif"));
+        assert_eq!(classify("a.webp", b"RIFF\0\0\0\0WEBPVP8 "), ("photo", "image/webp"));
+        assert_eq!(classify("a.heic", &ftyp(b"heic")), ("photo", "image/heic"));
+        assert_eq!(classify("clip.mp4", &ftyp(b"isom")), ("video", "video/mp4"));
+        assert_eq!(classify("clip.mov", &ftyp(b"qt  ")), ("video", "video/quicktime"));
+    }
+
+    /// THE BUG: an `.html` the agent wrote used to go out as `image/png` under
+    /// `kind: photo`, so the bubble showed a broken image. It is a file card now,
+    /// with the same mime the web composer sends for the same upload.
+    #[test]
+    fn documents_are_files_not_photos() {
+        assert_eq!(
+            classify("demo.html", b"<!doctype html><html>"),
+            ("file", "text/html; charset=utf-8")
+        );
+        assert_eq!(classify("notes.md", b"# hi"), ("file", "text/markdown; charset=utf-8"));
+        assert_eq!(classify("data.json", b"{}"), ("file", "application/json"));
+        assert_eq!(classify("paper.pdf", b"%PDF-1.7"), ("file", "application/pdf"));
+        assert_eq!(classify("logo.svg", b"<svg xmlns="), ("file", "image/svg+xml"));
+        assert_eq!(classify("thing", b"\0\0binary"), ("file", "application/octet-stream"));
+    }
+
+    /// An Office document goes up as what it is. Its bytes are a ZIP like any
+    /// other, so the name is the only evidence — and until 10-24 the name
+    /// wasn't read: every .docx / .xlsx / .pptx a bot sent was declared
+    /// `application/octet-stream`, and every client showed it as one.
+    #[test]
+    fn office_documents_carry_their_real_type() {
+        let zip = b"PK\x03\x04\x14\0\x06\0";
+        for (name, mime) in [
+            ("报告.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            ("2027预算.XLSX", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ("Q3 复盘.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            ("old.doc", "application/msword"),
+            ("old.xls", "application/vnd.ms-excel"),
+            ("old.ppt", "application/vnd.ms-powerpoint"),
+        ] {
+            assert_eq!(classify(name, zip), ("file", mime), "{name}");
+        }
+        // Same bytes, the name says zip: still a zip.
+        assert_eq!(classify("bundle.zip", zip), ("file", "application/zip"));
+        // No extension at all is nothing to go on.
+        assert_eq!(classify("docx", zip), ("file", "application/octet-stream"));
+    }
+
+    /// Media is stored under an extension that matches its bytes — the serve path
+    /// types the file from that name, so `shot.txt` holding a PNG must not be
+    /// handed to the server as text.
+    #[test]
+    fn media_uploads_under_the_extension_its_bytes_earn() {
+        assert_eq!(retype("shot.txt", "image/png"), "shot.png");
+        assert_eq!(retype("shot", "image/png"), "shot.png");
+        assert_eq!(retype("clip.bin", "video/quicktime"), "clip.mov");
+        assert_eq!(retype("a.b.jpeg", "image/jpeg"), "a.b.jpg");
+        assert_eq!(retype(".hidden", "image/png"), "file.png");
+    }
+
+    /// A named-but-lying extension must not promote bytes onto the photo path:
+    /// an HTML error page saved as `.png` is precisely the "broken image" report,
+    /// and audio (ISO-BMFF, but no video brand) is no video: it stays a FILE,
+    /// typed by its name, which is what a bubble's sound player keys on.
+    #[test]
+    fn a_lying_extension_cannot_fake_media() {
+        assert_eq!(classify("broken.png", b"<html>404</html>"), ("file", "application/octet-stream"));
+        assert_eq!(classify("song.m4a", &ftyp(b"M4A ")), ("file", "audio/mp4"));
+    }
+
+    /// A sticker is a picture every client can draw. The header decides, as for
+    /// photos — `face.txt` holding a PNG is still a sticker — and what the
+    /// browsers can't decode (HEIC) or isn't a picture at all is refused.
+    #[test]
+    fn only_drawable_pictures_can_be_stickers() {
+        use super::sticker_mime;
+        assert_eq!(sticker_mime(&png_header(128, 128)), Some("image/png"));
+        assert_eq!(sticker_mime(b"\xff\xd8\xff\xe0JFIF"), Some("image/jpeg"));
+        assert_eq!(sticker_mime(b"GIF89a\x01\0"), Some("image/gif"));
+        assert_eq!(sticker_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sticker_mime(&ftyp(b"heic")), None);
+        assert_eq!(sticker_mime(&ftyp(b"isom")), None);
+        assert_eq!(sticker_mime(b"%PDF-1.7"), None);
+        assert_eq!(sticker_mime(b"<svg xmlns="), None);
+    }
+}
+
+#[cfg(test)]
+mod sticker_attach_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One request as the fake api saw it: the path it hit and its raw body.
+    type Seen = Vec<(String, Vec<u8>)>;
+
+    /// A stand-in api that answers the three calls a sticker send makes and
+    /// records every request, in order.
+    async fn fake_api() -> (String, tokio::task::JoinHandle<Seen>, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut seen: Seen = Vec::new();
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    s = listener.accept() => s.unwrap(),
+                    _ = &mut stopped => return seen,
+                };
+                let mut bytes = Vec::new();
+                let (path, body) = loop {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "client hung up mid-request");
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                    let header = String::from_utf8_lossy(&bytes[..end]).to_string();
+                    let len: usize = header
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().unwrap())
+                        })
+                        .expect("request without content-length");
+                    if bytes.len() < end + 4 + len {
+                        continue;
+                    }
+                    let path = header.split_whitespace().nth(1).unwrap().to_string();
+                    break (path, bytes[end + 4..end + 4 + len].to_vec());
+                };
+                let reply = match path.as_str() {
+                    // uploadFile answers with the file itself, no envelope.
+                    "/api/uploadFile" => r#"{"id":"F1","unique_id":"U1","mime":"image/png"}"#,
+                    _ => r#"{"ok":true,"result":{}}"#,
+                };
+                seen.push((path, body));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (base, server, stop)
+    }
+
+    fn picture(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v
+    }
+
+    /// THE FEATURE: the same upload and `botAttach` a photo takes, with the one
+    /// difference that matters to the renderer — `kind: sticker` — plus the
+    /// emoji it reads as, and the send puts it in the sender's library.
+    #[tokio::test]
+    async fn a_sticker_rides_botattach_as_a_sticker_and_joins_the_library() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named `.txt` on purpose: the header, not the name, makes it a picture.
+        let path = picture(&dir, "wave.txt", &png(128, 128));
+        let client = Client::new(base, "test".into());
+        let att = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.attach_media_as("M1", &path, AttachAs::Sticker { emoji: Some(" 👋 ") }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        stop.send(()).unwrap();
+        let seen = server.await.unwrap();
+
+        assert_eq!(att, json!({ "kind": "sticker", "id": "F1", "file": "F1", "emoji": "👋" }));
+        let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["/api/uploadFile", "/api/botAttach", "/api/sticker.add"]);
+
+        let upload = String::from_utf8_lossy(&seen[0].1);
+        assert!(upload.contains("filename=\"wave.png\""), "uploaded under the name its bytes earn: {upload}");
+        assert!(upload.contains("Content-Type: image/png"), "{upload}");
+
+        let attach: Value = serde_json::from_slice(&seen[1].1).unwrap();
+        assert_eq!(attach, json!({ "message_id": "M1", "attachments": [att] }));
+
+        let add: Value = serde_json::from_slice(&seen[2].1).unwrap();
+        assert_eq!(add, json!({ "file": "F1", "emoji": ["👋"] }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No emoji is a legal sticker — the composers send exactly that — and an
+    /// empty `--emoji ""` is the same as none, not a blank caption.
+    #[tokio::test]
+    async fn a_sticker_without_an_emoji_carries_none() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = picture(&dir, "blob.gif", b"GIF89a\x01\0\x01\0");
+        let client = Client::new(base, "test".into());
+        let att = client.attach_media_as("M1", &path, AttachAs::Sticker { emoji: Some("  ") }).await.unwrap();
+        stop.send(()).unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(att, json!({ "kind": "sticker", "id": "F1", "file": "F1" }));
+        let add: Value = serde_json::from_slice(&seen[2].1).unwrap();
+        assert_eq!(add, json!({ "file": "F1", "emoji": [] }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asked for a sticker, handed a PDF: refused before a single byte leaves,
+    /// rather than quietly sent as a file card the agent will report as a
+    /// sticker it never looked at.
+    #[tokio::test]
+    async fn a_non_picture_is_refused_before_anything_is_uploaded() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = picture(&dir, "paper.png", b"%PDF-1.7");
+        let client = Client::new(base, "test".into());
+        let err = client.attach_media_as("M1", &path, AttachAs::Sticker { emoji: None }).await.unwrap_err();
+        stop.send(()).unwrap();
+        assert!(format!("{err:#}").contains("can't be a sticker"), "{err:#}");
+        assert!(server.await.unwrap().is_empty(), "nothing may reach the api");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `--sticker` nothing changes: a picture is still a photo and no
+    /// library call is made.
+    #[tokio::test]
+    async fn a_plain_attach_is_still_a_photo() {
+        let (base, server, stop) = fake_api().await;
+        let dir = std::env::temp_dir().join(format!("mf-sticker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = picture(&dir, "shot.png", &png(4, 4));
+        let client = Client::new(base, "test".into());
+        let att = client.attach_media("M1", &path).await.unwrap();
+        stop.send(()).unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(att, json!({ "kind": "photo", "id": "F1", "file": "F1" }));
+        let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["/api/uploadFile", "/api/botAttach"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Media origins the attachment downloader may fetch from, on top of `base`.
+///
+/// WHY THIS EXISTS: the allowlist used to be exactly "same origin as the api".
+/// api@0.0.58 (2026-08-06) moved uploads to `cdn.mafold.com`, so `uploadFile`
+/// started handing out absolute URLs on a DIFFERENT origin — and every image
+/// sent to an agent from then on was refused right here. The caller only
+/// `eprintln!`s the error, so the failure reached nobody: the picture simply
+/// never arrived. (Older messages kept working: they store a relative
+/// `/media/…`, which resolves onto the api and follows its redirect.)
+///
+/// Deliberately a LIST, not a `*.mafold.com` wildcard — a wildcard would make
+/// every present and future subdomain, including anything an attacker might
+/// get to host there, a legal SSRF target. Overridable so a self-hosted
+/// deployment can name its own CDN.
+fn extra_media_origins() -> Vec<String> {
+    parse_media_origins(std::env::var("MAFOLD_MEDIA_ORIGINS").ok().as_deref())
+}
+
+/// Split out from the env read so it can be tested without mutating process
+/// state (env is global; a test that sets it races every other test).
+fn parse_media_origins(raw: Option<&str>) -> Vec<String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s
+            .split(',')
+            .map(|o| o.trim().trim_end_matches('/').to_string())
+            .filter(|o| !o.is_empty())
+            .collect(),
+        None => vec!["https://cdn.mafold.com".to_string()],
+    }
+}
+
+impl Client {
+    /// Is this absolute URL one we're willing to fetch an attachment from?
+    fn media_origin_allowed(&self, url: &str) -> bool {
+        same_origin(&self.base, url)
+            || extra_media_origins().iter().any(|o| same_origin(o, url))
+    }
+}
+
+/// The object's FULL size from a response: `content-length` on a plain 200, the
+/// `/<total>` tail of `content-range` on a 206. `None` when the server didn't
+/// say (a chunked body) — then there is simply nothing to verify against, and a
+/// short read stays indistinguishable from a complete one.
+fn full_length(resp: &reqwest::Response) -> Option<u64> {
+    if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let cr = resp.headers().get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+        // `bytes 1024-2047/4096` → 4096. An unknown total is spelled `*`, which
+        // fails to parse and correctly yields None.
+        return cr.rsplit('/').next()?.trim().parse().ok();
+    }
+    resp.content_length()
+}
+
+/// Every layer of an error, joined. `{e}` on its own prints ONLY the outermost
+/// one, so a reqwest body tear reads as a bare "error decoding response body"
+/// and the sentence that actually names the fault — connection reset, incomplete
+/// message, TLS shutdown — never reaches the log. Repeated layers (hyper likes
+/// to restate its child) are skipped so the line stays readable.
+fn cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        let layer = c.to_string();
+        if !out.contains(&layer) {
+            out.push_str(": ");
+            out.push_str(&layer);
+        }
+        src = c.source();
+    }
+    out
+}
+
+/// Do two URLs share the same origin (scheme + host + port)? Used to keep the
+/// attachment downloader from following an absolute URL to a foreign host.
+fn same_origin(base: &str, other: &str) -> bool {
+    fn origin(u: &str) -> Option<(String, String)> {
+        // scheme://host[:port]/…  → (scheme, host[:port]) lowercased.
+        let (scheme, rest) = u.split_once("://")?;
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.is_empty() {
+            return None;
+        }
+        Some((scheme.to_lowercase(), authority.to_lowercase()))
+    }
+    match (origin(base), origin(other)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod media_origin_tests {
+    use super::*;
+
+    fn client(base: &str) -> Client {
+        Client::new(base.to_string(), "t".into())
+    }
+
+    /// The regression this whole allowlist entry exists for: media moved to the
+    /// CDN origin in api@0.0.58 and every agent image was refused for four days.
+    #[test]
+    fn cdn_origin_is_allowed_alongside_the_api() {
+        let c = client("https://api.mafold.com");
+        assert!(c.media_origin_allowed("https://cdn.mafold.com/abc.png"));
+        assert!(c.media_origin_allowed("https://api.mafold.com/media/abc.png"));
+    }
+
+    /// A wildcard would have been the lazy fix; these are what it would let in.
+    #[test]
+    fn look_alike_and_foreign_hosts_are_refused() {
+        let c = client("https://api.mafold.com");
+        for bad in [
+            "https://evil.com/x.png",
+            "https://cdn.mafold.com.evil.com/x.png", // suffix trick
+            "https://evil.com/cdn.mafold.com/x.png", // path trick
+            "http://cdn.mafold.com/x.png",           // scheme downgrade
+            "https://sub.cdn.mafold.com/x.png",      // not the named origin
+        ] {
+            assert!(!c.media_origin_allowed(bad), "should have refused {bad}");
+        }
+    }
+
+    #[test]
+    fn origins_are_configurable_for_self_hosted_deployments() {
+        assert_eq!(parse_media_origins(None), vec!["https://cdn.mafold.com"]);
+        assert_eq!(
+            parse_media_origins(Some(" https://a.example/ , https://b.example ,, ")),
+            vec!["https://a.example", "https://b.example"]
+        );
+        // Blank means UNSET, not "allow nothing" — same rule the api applies to
+        // its keys (state.rs), because a stray `VAR=` in an env file is an
+        // accident far more often than an intent, and here that accident would
+        // silently stop every attachment from loading.
+        assert_eq!(parse_media_origins(Some("   ")), vec!["https://cdn.mafold.com"]);
+    }
+}
+
+/// The "a turn must never vanish" contract: what a failing `botCreateDraft`
+/// does, and what the user is told when it fails for good.
+#[cfg(test)]
+mod lost_turn_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A single-file HTTP stub: answers every request with `status`/`reply` and
+    /// records each (path, body) it saw. Enough server for the real transport —
+    /// retries and all — to be exercised without a network or a mock crate.
+    pub(super) async fn stub(status: u16, reply: &'static str) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        serve(listener, status, reply, seen.clone());
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The same stub, except that for the first `down` nothing listens on its
+    /// port — every connection is refused, which is what a laptop that just
+    /// came out of sleep (or one whose network is still coming up) sees.
+    async fn stub_after(
+        down: std::time::Duration,
+        status: u16,
+        reply: &'static str,
+    ) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(down).await;
+            serve(TcpListener::bind(addr).await.unwrap(), status, reply, log);
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn serve(listener: TcpListener, status: u16, reply: &'static str, log: Arc<Mutex<Vec<(String, String)>>>) {
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Read headers, then exactly Content-Length bytes of body.
+                    let (path, body) = loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        let text = String::from_utf8_lossy(&buf).into_owned();
+                        let Some(end) = text.find("\r\n\r\n") else { continue };
+                        let head = text[..end].to_string();
+                        let want: usize = head
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let body = text[end + 4..].to_string();
+                        if body.len() < want {
+                            continue;
+                        }
+                        let path = head
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split(' ').nth(1))
+                            .unwrap_or("")
+                            .to_string();
+                        break (path, body);
+                    };
+                    log.lock().unwrap().push((path, body));
+                    let out = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+    }
+
+    /// 2026-10-01: the 08:00 routine reached the daemon in a 28-second dark
+    /// wake, before the network was back. Three connect attempts in 1.5s, then
+    /// the turn was dropped for good. A refused connection never reached the
+    /// server, so waiting for the link costs nothing and duplicates nothing.
+    #[tokio::test]
+    async fn a_create_draft_waits_out_a_link_that_is_down() {
+        let (base, seen) = stub_after(
+            std::time::Duration::from_millis(2500),
+            200,
+            r#"{"ok":true,"result":{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","conversation_id":"11111111-2222-3333-4444-555555555555","sender":{"username":"ops","display_name":"Ops","kind":"human"},"content":"","created_at":"2026-10-01T00:00:00Z","reactions":[]}}"#,
+        )
+        .await;
+        let c = Client::new(base, "t".into());
+        let id = c
+            .create_draft("11111111-2222-3333-4444-555555555555", None, None, None)
+            .await
+            .expect("a link that comes back must get the draft opened");
+        assert_eq!(id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert_eq!(seen.lock().unwrap().len(), 1, "refused attempts never reach the server");
+    }
+
+    /// …but not forever: past its deadline a link that never came back is an
+    /// outage the user has to hear about, not a wait that hides it.
+    #[tokio::test]
+    async fn a_create_draft_stops_waiting_at_its_deadline() {
+        let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let c = Client::new(format!("http://{addr}"), "t".into());
+        let deadline = std::time::SystemTime::now() + std::time::Duration::from_millis(1200);
+        let err = c
+            .create_draft_until("11111111-2222-3333-4444-555555555555", None, None, None, None, deadline)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("botCreateDraft failed"), "{err:#}");
+    }
+
+    /// …and the notice that a turn WAS lost goes over the same link, so it has
+    /// to wait it out the same way — otherwise it fails in the same breath as
+    /// the draft and the chat shows nothing at all.
+    #[tokio::test]
+    async fn a_lost_turn_notice_waits_out_the_link_too() {
+        let (base, seen) = stub_after(std::time::Duration::from_millis(2500), 200, r#"{"ok":true,"result":{}}"#).await;
+        let c = Client::new(base, "t".into());
+        c.announce_lost_turn(Dest::chat("conv-1"), "botCreateDraft failed: connect failed")
+            .await
+            .expect("the notice must get through once the link is back");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    /// Every failure `post` returns is wrapped in a `"<method> failed"` context,
+    /// so the retry line MUST print the chain — with plain `{e}` it printed that
+    /// wrapper back at itself and the real reason never reached the log.
+    #[test]
+    fn a_retry_line_says_why_not_just_which_call() {
+        let real = mafold_core::RpcError::Transport("connect failed: connection refused".into());
+        let wrapped = anyhow::Error::new(real).context("botEditDraft failed");
+
+        // What the log used to say: the context, twice, and nothing else.
+        assert_eq!(format!("{wrapped}"), "botEditDraft failed");
+
+        // What it says now.
+        let chain = format!("{wrapped:#}");
+        assert!(chain.contains("botEditDraft failed"), "{chain}");
+        assert!(
+            chain.contains("connection refused"),
+            "the reason must survive into the log: {chain}"
+        );
+    }
+
+    #[test]
+    fn a_blip_is_the_far_end_falling_over_not_the_far_end_saying_no() {
+        use mafold_core::RpcError as R;
+        // It broke inside the handler → the same request may well work now.
+        assert!(Client::is_server_blip(&R::Api(
+            r#"{"ok":false,"error_code":500,"description":"boom"}"#.into()
+        )));
+        assert!(Client::is_server_blip(&R::Transport(
+            "botCreateDraft: HTTP 502 — <html>bad gateway</html>".into()
+        )));
+        assert!(Client::is_server_blip(&R::Transport(
+            "error decoding response body".into()
+        )));
+        // A verdict, a version gap, and connect (retried on its own terms).
+        assert!(!Client::is_server_blip(&R::Api(
+            r#"{"ok":false,"error_code":403,"description":"not authorized"}"#.into()
+        )));
+        assert!(!Client::is_server_blip(&R::Transport(
+            "getUser: HTTP 404 — this server has no such method".into()
+        )));
+        assert!(!Client::is_server_blip(&R::UnknownMethod("nope".into())));
+        assert!(!Client::is_server_blip(&R::Connect("refused".into())));
+    }
+
+    /// A 5xx gets one more shot — the blip that ate a message on 2026-08-18 —
+    /// but only one: the call is not idempotent, so hammering it would trade a
+    /// lost message for a row of empty bubbles.
+    #[tokio::test]
+    async fn a_5xx_create_draft_is_retried_exactly_once() {
+        let (base, seen) = stub(500, r#"{"ok":false,"error_code":500,"description":"boom"}"#).await;
+        let c = Client::new(base, "t".into());
+        let err = c
+            .create_draft("11111111-2222-3333-4444-555555555555", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("botCreateDraft failed"), "{err:#}");
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "expected one retry, got {calls:?}");
+        assert!(calls[0].0.ends_with("/api/botCreateDraft"), "{:?}", calls[0].0);
+    }
+
+    /// …and when it does fail for good, the user hears about it ON the surface
+    /// they asked from — channel and thread included, because a notice that
+    /// lands in `#all` is a notice they never see.
+    #[tokio::test]
+    async fn the_notice_lands_where_the_message_was_asked() {
+        let (base, seen) = stub(200, r#"{"ok":true,"result":{}}"#).await;
+        let c = Client::new(base, "t".into());
+        c.announce_lost_turn(
+            Dest::chat("conv-1").channel(Some("chan-2")).thread(Some("root-3")),
+            "botCreateDraft failed: HTTP 500 — boom",
+        )
+        .await
+        .unwrap();
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.ends_with("/api/sendMessage"), "{:?}", calls[0].0);
+        let body: Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(body["chat_id"], "conv-1");
+        assert_eq!(body["channel_id"], "chan-2");
+        assert_eq!(body["thread_root_id"], "root-3");
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("send it again"), "must say what to do: {text}");
+        assert!(text.contains("HTTP 500"), "must keep the reason: {text}");
+    }
+}
+
+/// The attachment downloader, against a server that tears bodies — the failure
+/// that lost five screenshots in one afternoon on 2026-09-17.
+#[cfg(test)]
+mod download_resume_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 200 deterministic bytes standing in for the 2.6 MB screenshot.
+    fn payload() -> Vec<u8> {
+        (0..200u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn read_head(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if text.contains("\r\n\r\n") {
+                return Some(text);
+            }
+        }
+    }
+
+    /// Promises 200 bytes and delivers 120 on the FIRST request, then hangs up —
+    /// which is what "error decoding response body" actually is. Later requests
+    /// are answered in full, honouring `Range` or deliberately ignoring it.
+    /// Records the `Range:` header of every request it saw.
+    async fn tearing_stub(honour_range: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+        const TEAR_AT: usize = 120;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut nth = 0u32;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let Some(head) = read_head(&mut sock).await else { continue };
+                let range = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                log.lock().unwrap().push(range.clone());
+                let body = payload();
+                nth += 1;
+                if nth == 1 {
+                    let h = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let _ = sock.write_all(&body[..TEAR_AT]).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                let from: usize = range
+                    .split('=')
+                    .nth(1)
+                    .and_then(|v| v.trim().trim_end_matches('-').parse().ok())
+                    .unwrap_or(0);
+                if honour_range && from > 0 && from < body.len() {
+                    let rest = &body[from..];
+                    let h = format!(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-type: image/png\r\n\
+content-range: bytes {}-{}/{}\r\ncontent-length: {}\r\n\r\n",
+                        from,
+                        body.len() - 1,
+                        body.len(),
+                        rest.len()
+                    );
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let _ = sock.write_all(rest).await;
+                } else {
+                    let h = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The whole point: the retry asks for what is MISSING, not for the file.
+    #[tokio::test]
+    async fn a_torn_body_resumes_instead_of_starting_over() {
+        let (base, seen) = tearing_stub(true).await;
+        let c = Client::new(base, "t".into());
+        let got = c.download("/media/shot.png").await.unwrap();
+        assert_eq!(got, payload(), "the resumed file must be byte-identical");
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one tear, one resume — got {calls:?}");
+        assert!(calls[0].is_empty(), "the first try asks for the whole thing: {:?}", calls[0]);
+        assert!(
+            calls[1].to_ascii_lowercase().contains("bytes=120-"),
+            "the retry must ask only for the remainder, got {:?}",
+            calls[1]
+        );
+    }
+
+    /// Not every server honours `Range`; one that doesn't answers 200 with the
+    /// WHOLE object. Appending that to the prefix already in hand would hand the
+    /// model a file with a duplicated head — silent corruption, worse than the
+    /// missing image this all exists to prevent.
+    #[tokio::test]
+    async fn a_server_that_ignores_range_replaces_rather_than_appends() {
+        let (base, seen) = tearing_stub(false).await;
+        let c = Client::new(base, "t".into());
+        let got = c.download("/media/shot.png").await.unwrap();
+        assert_eq!(got, payload(), "a 200 on the retry must REPLACE the partial prefix");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// How the stub below misbehaves. Every connection it does not single out
+    /// is answered in full from where its `Range` starts.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        /// The first connection delivers the head and 120 bytes, then goes
+        /// silent with the socket still open — no error, no data, forever.
+        Silent,
+        /// The first connection delivers 120 bytes, then one byte per 100 ms:
+        /// alive, and far too slow to ever finish (2026-10-19: ~1 KB/s).
+        Trickle,
+        /// EVERY connection delivers 20 bytes and goes silent — a link that is
+        /// slow everywhere, not on one connection. Ten connections to finish:
+        /// more than `MEDIA_ATTEMPTS`, each of them making progress.
+        TwentyAtATime,
+        /// One connection, the whole body at ~330 B/s: slow, but above the
+        /// test floor. The positive control — it must NOT be abandoned.
+        SlowButSteady,
+    }
+
+    /// The floor the tests hold downloads to: 32 bytes per 300 ms.
+    const TEST_FLOOR: StallFloor =
+        StallFloor { window: std::time::Duration::from_millis(300), min_bytes: 32 };
+
+    /// Serves `payload()` misbehaving as `how`; records every request's
+    /// `Range:` header. Each connection gets its own task, so one held open
+    /// does not keep the next from being answered.
+    async fn stalling_stub(how: Stall) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut nth = 0u32;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                nth += 1;
+                let first = nth == 1;
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let Some(head) = read_head(&mut sock).await else { return };
+                    let range = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    log.lock().unwrap().push(range.clone());
+                    let body = payload();
+                    let from: usize = range
+                        .split('=')
+                        .nth(1)
+                        .and_then(|v| v.trim().trim_end_matches('-').parse().ok())
+                        .unwrap_or(0)
+                        .min(body.len());
+                    let rest = &body[from..];
+                    let h = if from > 0 {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\ncontent-type: image/jpeg\r\n\
+content-range: bytes {}-{}/{}\r\ncontent-length: {}\r\n\r\n",
+                            from,
+                            body.len() - 1,
+                            body.len(),
+                            rest.len()
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: image/jpeg\r\ncontent-length: {}\r\n\r\n",
+                            body.len()
+                        )
+                    };
+                    let _ = sock.write_all(h.as_bytes()).await;
+                    let hold = || tokio::time::sleep(Duration::from_secs(60));
+                    match how {
+                        Stall::Silent if first => {
+                            let _ = sock.write_all(&rest[..120]).await;
+                            hold().await;
+                        }
+                        Stall::Trickle if first => {
+                            let _ = sock.write_all(&rest[..120]).await;
+                            for b in &rest[120..] {
+                                if sock.write_all(std::slice::from_ref(b)).await.is_err() {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                        Stall::TwentyAtATime if rest.len() > 20 => {
+                            let _ = sock.write_all(&rest[..20]).await;
+                            hold().await;
+                        }
+                        Stall::SlowButSteady => {
+                            for piece in rest.chunks(10) {
+                                if sock.write_all(piece).await.is_err() {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(30)).await;
+                            }
+                        }
+                        _ => {
+                            let _ = sock.write_all(rest).await;
+                        }
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Downloads against `how`, bounded so a hang fails the test instead of
+    /// wedging the suite. Returns the bytes, the `Range:` headers seen, and the
+    /// time it took.
+    async fn fetch_through(how: Stall) -> (Vec<u8>, Vec<String>, std::time::Duration) {
+        let (base, seen) = stalling_stub(how).await;
+        let c = Client::new(base, "t".into());
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            c.download_with("/media/photo.jpg", TEST_FLOOR),
+        )
+        .await
+        .expect("the download hung: a stalled connection was never given up on")
+        .unwrap();
+        let calls = seen.lock().unwrap().clone();
+        (got, calls, t0.elapsed())
+    }
+
+    /// The connection goes quiet mid-photo without erroring. Nothing used to
+    /// give up on it: no read timeout, and the resume only ran on an error.
+    #[tokio::test]
+    async fn a_connection_that_goes_silent_is_dropped_and_the_rest_fetched_fresh() {
+        let (got, calls, _) = fetch_through(Stall::Silent).await;
+        assert_eq!(got, payload(), "the resumed file must be byte-identical");
+        assert_eq!(calls.len(), 2, "one stalled connection, one fresh one — got {calls:?}");
+        assert!(
+            calls[1].to_ascii_lowercase().contains("bytes=120-"),
+            "the fresh connection must ask only for the remainder, got {:?}",
+            calls[1]
+        );
+    }
+
+    /// Alive but crawling — 2026-10-19's actual shape. Left alone it would
+    /// finish in 8 s on the one connection; it must be dropped long before.
+    #[tokio::test]
+    async fn a_connection_that_trickles_below_the_floor_is_dropped() {
+        let (got, calls, took) = fetch_through(Stall::Trickle).await;
+        assert_eq!(got, payload());
+        assert_eq!(calls.len(), 2, "the crawling connection must be replaced — got {calls:?}");
+        assert!(took < std::time::Duration::from_secs(4), "took {took:?}: it sat on the crawl");
+    }
+
+    /// Slow on EVERY connection, but each one gets somewhere. A retry budget
+    /// spent on connections that made progress would throw the photo away
+    /// after five of them, half-delivered.
+    #[tokio::test]
+    async fn retries_that_make_progress_do_not_use_up_the_budget() {
+        let (got, calls, _) = fetch_through(Stall::TwentyAtATime).await;
+        assert_eq!(got, payload());
+        assert_eq!(calls.len(), 10, "20 bytes a connection, 200 bytes — got {calls:?}");
+    }
+
+    /// Positive control: slow but above the floor is left alone — one
+    /// connection, no reconnect churn.
+    #[tokio::test]
+    async fn a_slow_but_steady_connection_is_not_dropped() {
+        let (got, calls, _) = fetch_through(Stall::SlowButSteady).await;
+        assert_eq!(got, payload());
+        assert_eq!(calls.len(), 1, "a steady connection must not be replaced — got {calls:?}");
+    }
+
+    /// `{e}` prints only the outermost layer — the log needs the one that names
+    /// the fault.
+    #[test]
+    fn the_cause_chain_survives_into_the_log() {
+        #[derive(Debug)]
+        struct Reset;
+        impl std::fmt::Display for Reset {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection reset by peer")
+            }
+        }
+        impl std::error::Error for Reset {}
+        #[derive(Debug)]
+        struct Decoding(Reset);
+        impl std::fmt::Display for Decoding {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error decoding response body")
+            }
+        }
+        impl std::error::Error for Decoding {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let s = cause_chain(&Decoding(Reset));
+        assert!(s.contains("error decoding response body"), "{s}");
+        assert!(s.contains("connection reset by peer"), "must keep the reason: {s}");
+    }
+}
+
+#[cfg(test)]
+mod draft_order_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn draft_retry_keeps_ordinal_and_cloned_producer_advances_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else { continue };
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let len: usize = header.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    if bytes.len() < end + 4 + len { continue; }
+                    requests.push(serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + len]).unwrap());
+                    break;
+                }
+                if attempt == 0 { continue; } // Request committed, response lost.
+                let body = r#"{"ok":true,"result":{}}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let client = Client::new(base, "test".into());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            client.edit_draft("message", "first").await.unwrap();
+            client.clone().edit_draft("message", "second").await.unwrap();
+            let bodies = server.await.unwrap();
+            assert_eq!(bodies[0], bodies[1]);
+            assert_eq!(bodies[1]["writer_id"], bodies[2]["writer_id"]);
+            assert!(bodies[2]["writer_seq"].as_u64().unwrap() > bodies[1]["writer_seq"].as_u64().unwrap());
+            assert_eq!(bodies[2]["content"], "second");
+        }).await.unwrap();
+    }
+}
+
+/// Credentials on the way out (conceal.rs `scrub_outgoing`), through the real
+/// transport: what matters is what the server RECEIVES.
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    const OK: &str = r#"{"ok":true,"result":{}}"#;
+
+    /// 2026-10-05/06: a turn ran `env | grep MAFOLD | sed …`, the filter
+    /// guessed the token's shape wrong, and the daemon pushed the bot's own
+    /// token into a group's trace card — three times in one night.
+    #[tokio::test]
+    async fn a_draft_push_never_carries_a_credential_this_machine_holds() {
+        // One held only in the environment — a turn's MAFOLD_BOT_TOKEN is
+        // exactly that — and the one the client itself calls with.
+        let planted = "zq81mlr0pp2xv7ct-redaction-probe";
+        std::env::set_var("MAFOLD_REDACTION_PROBE_TOKEN", planted);
+        crate::conceal::forget_sweep();
+        let own = "mb_0badc0de0badc0de0badc0de0badc0d";
+        let (base, seen) = super::lost_turn_tests::stub(200, OK).await;
+        let c = Client::new(base, own.into());
+
+        c.edit_draft("m1", &format!("$ env\nMAFOLD_REDACTION_PROBE_TOKEN={planted}\nMAFOLD_BOT_TOKEN={own}\nok"))
+            .await
+            .unwrap();
+        // The control: a call that carries a value on purpose goes out as built.
+        c.call("putConnection", json!({ "blob": planted })).await.unwrap();
+        std::env::remove_var("MAFOLD_REDACTION_PROBE_TOKEN");
+
+        let seen = seen.lock().unwrap().clone();
+        let (path, draft) = &seen[0];
+        assert!(path.ends_with("/botEditDraft"), "{path}");
+        assert!(!draft.contains(planted) && !draft.contains(own), "a credential reached the server: {draft}");
+        let body: Value = serde_json::from_str(draft).unwrap();
+        assert_eq!(
+            body["content"],
+            format!("$ env\nMAFOLD_REDACTION_PROBE_TOKEN={m}\nMAFOLD_BOT_TOKEN={m}\nok", m = crate::conceal::MASK)
+        );
+        assert!(seen[1].0.ends_with("/putConnection") && seen[1].1.contains(planted), "{:?}", seen[1]);
+    }
+}

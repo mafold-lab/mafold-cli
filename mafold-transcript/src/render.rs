@@ -1,0 +1,2708 @@
+//! Producer-agnostic renderer: maps normalized [`AgentEvent`]s to the chat's
+//! markdoc text + agent cards (tool / diff / todo / bash / thinking / result).
+//! Anything that emits `AgentEvent`s gets identical card rendering for free —
+//! the self-hosted daemon's harnesses and the api's own brains alike.
+
+use serde_json::Value;
+use std::collections::HashMap;
+
+use crate::event::AgentEvent;
+use mafold_types::units::{self, EN};
+
+/// The prefixes of the one-line notices this renderer writes on a producer's or
+/// the driver's behalf — a usage limit, a compaction, a steer seam. Named so the
+/// writer and the reader ([`is_notice_line`]) can never disagree by a byte.
+/// What older builds wrote for a usage limit (a plain text line). Still read as
+/// a notice so history full of them never starts counting as answers; no
+/// longer written — see [`RATE_LIMIT_CARD`].
+pub(crate) const RATE_LIMIT_PREFIX: &str = "_⏳ ";
+/// A usage limit is now a card: the reset time travels as a timestamp and the
+/// reader's device renders it in the reader's own time zone and language.
+pub(crate) const RATE_LIMIT_CARD: &str = "{% mafold/ratelimit ";
+/// Cards that ARE notices: written on the producer's behalf, never an answer.
+/// The one list both readers derive from — [`is_notice_line`] and the fold's
+/// "did the model answer after its last tool group?" (`has_own_card`). When
+/// the usage limit became a card, the fold kept its own list and read the
+/// card as the model answering in cards: a turn that ended on tools and a
+/// limit folded its last group out of sight.
+/// The compaction card joined when it started carrying the summary: it is the
+/// compaction notice line in card form. The failure card ([`failure_card`]) is
+/// a notice too: a turn that died said nothing, whatever card says so.
+pub(crate) const NOTICE_CARDS: [&str; 3] = ["mafold/ratelimit", "mafold/compact", "mafold/error"];
+pub(crate) const COMPACTED_PREFIX: &str = "_🗜️ ";
+pub(crate) const STEER_PREFIX: &str = "> ↩︎ ";
+/// A driver notice ([`AgentEvent::Notice`]): something that happened AROUND the
+/// turn and changes what the user would do — another session's message parked by
+/// policy, a model quietly downgraded, a tool denied. Same family as the three
+/// above, and registered in [`is_notice_line`] for the same reason: a notice
+/// arriving after the last tool group must not be mistaken for the ANSWER, or
+/// `finish_folded` buries the real reply in the trace (the 2026-09-06 bug).
+pub(crate) const NOTICE_PREFIX: &str = "> ⚠︎ ";
+
+/// Render one event to a markdoc string (text or a card), or `None` to skip.
+/// `names` tracks `tool_use_id → tool name` so a bash `tool_result` can be
+/// matched to its call.
+///
+/// Tool calls inside a run group don't come through here — they're held as
+/// [`ToolStep`]s so their result lands on the same card (see [`render_group`]).
+/// This path stays for the events that AREN'T paired: narration, thinking, the
+/// blocking ask, the end-of-turn stamp, and an ORPHAN result whose call is no
+/// longer in the open group — that last one keeps its old shape (a standalone
+/// output card) rather than being dropped, because a result with nowhere to go
+/// is still a result the user needs to see.
+pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<String> {
+    match ev {
+        AgentEvent::Stats(_) | AgentEvent::ToolStatus { .. } => None,
+        AgentEvent::Text(t) => Some(t.clone()),
+        // Placed by the transcript itself (`push_raw`), in time order.
+        AgentEvent::Notice(t) => Some(notice_line(t)),
+        // Never a card of its own: it belongs INSIDE the card of the call that
+        // started the subagent, which the transcript does by hand (`note`).
+        AgentEvent::SubagentStep { .. } => None,
+        AgentEvent::ToolCall { id, name, input } => {
+            names.insert(id.clone(), name.to_lowercase());
+            Some(tool_use_tag(name, input, None))
+        }
+        AgentEvent::ToolResult { id, text } => {
+            if names.get(id).map(String::as_str) != Some("bash") {
+                return None;
+            }
+            let out = text.trim();
+            if out.is_empty() {
+                return None;
+            }
+            Some(format!("\n{{% mafold/bash %}}\n{}{{% /mafold/bash %}}\n", block_esc(&cap_lines(out, 20))))
+        }
+        AgentEvent::Thinking(t) => {
+            let t = t.trim();
+            if t.is_empty() {
+                return None;
+            }
+            Some(format!("\n{{% mafold/thinking %}}\n{}{{% /mafold/thinking %}}\n", block_esc(&cap_lines(t, 14))))
+        }
+        AgentEvent::Done { duration_ms, cost_usd, tokens } => result_tag(*duration_ms, *cost_usd, *tokens),
+        AgentEvent::Session(_) => None,
+        // Removal, not content — the transcript un-says it in place
+        // (`Transcript::rewind_text`); there is nothing to render.
+        AgentEvent::TextRewind(_) => None,
+        // Not text: the render loop uploads it and attaches it to the message,
+        // so it renders as message MEDIA — the same bubble path a person's
+        // photo takes — instead of as a card in the transcript.
+        AgentEvent::Image { .. } => None,
+        // Heartbeat only — consumed by the render loop's generating card, never
+        // rendered as content.
+        AgentEvent::Pulse { .. } => None,
+        // With the summary in hand it is the same `{% mafold/compact %}` card
+        // `/compact` posts, because the summary is the part the owner needs to
+        // see: it is what the agent now reads instead of the conversation.
+        // Without one (a CLI whose compaction hook didn't run) it stays the line
+        // it always was — the card's before→after bar is no use on a count
+        // alone, and the line's job, explaining minutes of silence, needs none.
+        AgentEvent::Compacted { pre_tokens, post_tokens, summary, flagged } => Some(match (summary, pre_tokens) {
+            // The owner's part (summary, flags) is not in the card: the
+            // transcript hands it out as state (`Transcript::take_private`).
+            (Some(s), _) => compact_card(*pre_tokens, *post_tokens, true, s, flagged).0,
+            (None, Some(n)) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted ({} before)_", EN.compact(*n as f64))),
+            (None, None) => own_block(&format!("{COMPACTED_PREFIX}Context auto-compacted_")),
+        }),
+        // Only a REFUSAL is news. The `allowed_*` states are threshold
+        // warnings — the request went through, and Claude Code re-sends the
+        // same warning on EVERY turn from the moment utilization crosses 0.75
+        // until the window resets, which is days. Rendering those stamped a
+        // usage-limit line onto every single reply for most of a week, which
+        // is precisely how a line stops being read. The status still reaches
+        // the seat logic (it decides which login a turn runs on); the
+        // transcript only speaks when the seat actually said no.
+        //
+        // Matched by prefix, not by equality: an unknown future status is
+        // shown rather than swallowed — silence is only for the states we
+        // know are non-events.
+        //
+        // A card, not a sentence: the time the limit lifts is handed over as a
+        // unix timestamp and the READER's device renders it — only it knows
+        // the reader's time zone. A relative "resets in ~42m" baked in here
+        // was wrong for anyone scrolling back to it, and the hosted path had
+        // its own hand-written sentence with no time at all.
+        AgentEvent::RateLimited { kind, resets_at, status, fallback } => (!status.starts_with("allowed")).then(|| {
+            let mut attrs = format!("kind=\"{}\" status=\"{}\"", attr_esc(kind), attr_esc(status));
+            if let Some(at) = resets_at {
+                attrs.push_str(&format!(" resets_at=\"{at}\""));
+            }
+            if let Some(f) = fallback.as_deref().filter(|f| !f.trim().is_empty()) {
+                attrs.push_str(&format!(" fallback=\"{}\"", attr_esc(f)));
+            }
+            format!("\n{RATE_LIMIT_CARD}{attrs} /%}}\n")
+        }),
+        // Not rendered as new content — the render loop stamps it into the
+        // already-emitted ask card via `stamp_ask_answered`.
+        AgentEvent::AskAnswered(_) => None,
+        // A seam, not a card: [`steer_line`], spliced by the transcript so it
+        // lands after the group it interrupted rather than inside it.
+        AgentEvent::Steered(text) => Some(steer_line(text)),
+    }
+}
+
+/// The live "still generating" indicator, appended to every running snapshot
+/// and absent from the final one.
+///
+/// It is CONTENT, not a client-side animation synthesized from `finalized_at` —
+/// clients are dumb renderers. Which means its honesty lives entirely in these
+/// props, and every producer has to send the same ones:
+///
+///   * `started`  seeds the elapsed clock.
+///   * `beat`     the producer's activity counter. It must bump on stream
+///                ACTIVITY, not on content: a turn can spend half a minute
+///                producing nothing visible (thinking, writing a tool's
+///                arguments) and a frozen beat is what tells the card the
+///                difference between that and a hang. Omit it entirely and the
+///                card can observe nothing, so it assumes "live" forever — a
+///                producer that died mid-reply then looks exactly like one
+///                still working.
+///   * `beatAt`   WHEN the beat last advanced. `beat` alone is a bare counter:
+///                a card mounting on a draft whose producer died an hour ago
+///                sees a number, cannot tell it is stale, and must watch for
+///                minutes to find out — and every remount in a virtualized list
+///                restarts that wait. Only the producer knows this timestamp.
+///   * `tokens`   the real output-token count where the producer has one, an
+///                estimate otherwise.
+///   * `shells`   background shells started this turn; `0` renders nothing.
+///
+/// Old cards ignore unknown attrs and old producers emitted the bare tag, so
+/// both directions degrade safely.
+pub fn generating_tag(started_ms: u64, beat: u64, beat_at_ms: u64, tokens: u64, shells: u64) -> String {
+    generating_tag_awaiting(started_ms, beat, beat_at_ms, tokens, shells, None)
+}
+
+/// [`generating_tag`] for a turn that may be parked on a person.
+///
+///   * `awaiting` the handle of whoever has to answer the open `ask` card before
+///                the turn can go on. The beat is frozen for as long as that
+///                takes, and without this the card could only read the silence
+///                one way — «No signal» — about a turn that was simply waiting
+///                for a tap. Only the daemon knows the turn is parked, and on
+///                whom, so it says so.
+pub fn generating_tag_awaiting(
+    started_ms: u64,
+    beat: u64,
+    beat_at_ms: u64,
+    tokens: u64,
+    shells: u64,
+    awaiting: Option<&str>,
+) -> String {
+    let awaiting = match awaiting.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(who) => format!(" awaiting=\"{}\"", attr_esc(who)),
+        None => String::new(),
+    };
+    format!(
+        "\n{{% mafold/generating started={started_ms} beat={beat} beatAt={beat_at_ms} tokens={tokens} shells={shells}{awaiting} /%}}\n"
+    )
+}
+
+/// A running snapshot without its trailing [`generating_tag`] — what the reply
+/// actually SAYS so far, e.g. to carry it into the process that picks a
+/// killed turn back up.
+///
+/// Only a trailing card is stripped, and only when the tail is EXACTLY that one
+/// self-closing tag: an earlier `{% mafold/generating` in the body is the agent
+/// talking ABOUT the card, and cutting there would drop real content. The api
+/// carries a byte-identical twin (`store.rs`), which finalize enforces; it
+/// cannot share this crate (it deploys with no sibling path-deps).
+pub fn strip_trailing_generating(content: &str) -> &str {
+    let Some(i) = content.rfind("{% mafold/generating") else { return content };
+    let tail = content[i..].trim_end();
+    // `{% mafold/generating a=1 /%}` → nothing before the closer holds another `%}`,
+    // proving the card is the last thing in the message.
+    let is_lone_card = tail
+        .strip_suffix("/%}")
+        .is_some_and(|inner| !inner.contains("%}"));
+    if is_lone_card { content[..i].trim_end() } else { content }
+}
+
+/// The live [`generating_tag`] a snapshot ends with — the reply is still being
+/// written — or None for a reply that says what it says and is done.
+///
+/// One question with [`strip_trailing_generating`], so one rule: the lone card
+/// on the end. Reading "still writing" off any `{% mafold/generating` in the
+/// body turned a finished reply that QUOTED the tag into a draft that never
+/// ends — the inbox loop then skipped it, handed over the line before it on
+/// every look, and the reader's badge never cleared.
+pub fn trailing_generating(content: &str) -> Option<&str> {
+    let said = strip_trailing_generating(content);
+    (said.len() < content.len()).then(|| content[said.len()..].trim())
+}
+
+/// Stamp the user's answer into the pending (last unanswered) `{% mafold/ask %}` card
+/// in `full` by adding `answered="…"` to its opening tag. The message content
+/// itself is the durable record — a reloaded page or another device renders the
+/// card answered instead of re-offering the buttons. Returns false when no
+/// unanswered ask card is present.
+///
+/// Scans openers rather than matching the bare `{% mafold/ask %}` literal,
+/// because an ask may now carry attributes of its own: the permission prompt
+/// ships `action="perm:answer"` so its verdict is relayed to the daemon instead
+/// of posted as a message. Against the old literal needle that card was simply
+/// invisible — it would have been answered and then sat there still offering
+/// its buttons. "Already answered" is therefore a question about the tag's
+/// attributes (`answered=` present), not about its exact spelling, which is
+/// also what keeps a settled card from being re-stamped.
+pub fn stamp_ask_answered(full: &mut String, answer: &str) -> bool {
+    const OPEN: &str = "{% mafold/ask";
+    let mut search_from = full.len();
+    while let Some(pos) = full[..search_from].rfind(OPEN) {
+        search_from = pos;
+        // The opener runs to its `%}`; a container's closer (`{% /mafold/ask %}`)
+        // starts with a slash and never matches OPEN.
+        let Some(rel_end) = full[pos..].find("%}") else { continue };
+        let end = pos + rel_end + 2;
+        let attrs = &full[pos + OPEN.len()..end - 2];
+        if attrs.contains("answered=") {
+            continue; // settled already — keep looking further back
+        }
+        let val = answered_attr(answer);
+        let spaced = attrs.trim_end();
+        let rebuilt = format!("{{% mafold/ask{spaced} answered=\"{val}\" %}}");
+        full.replace_range(pos..end, &rebuilt);
+        return true;
+    }
+    false
+}
+
+/// Finalized-message variant of [`stamp_ask_answered`] — for asks the model
+/// emitted in its reply TEXT (no blocking hook; the turn already ended when
+/// the answer arrives). Returns the stamped content, or None when the message
+/// has no unanswered ask card.
+pub fn stamp_unanswered_ask(content: &str, answer: &str) -> Option<String> {
+    let mut out = content.to_string();
+    stamp_ask_answered(&mut out, answer).then_some(out)
+}
+
+/// The `answered` attribute value: `attr_esc`'s cleanup but with a cap wide
+/// enough for a multi-question answer (headers + labels), and never empty —
+/// a blank reply still has to flip the card to answered.
+fn answered_attr(answer: &str) -> String {
+    let cleaned: String = answer
+        .chars()
+        .map(|c| match c { '"' => '\'', '\n' | '\r' | '\t' => ' ', _ => c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return "✓".into();
+    }
+    if cleaned.chars().count() > 300 {
+        format!("{}…", cleaned.chars().take(300).collect::<String>())
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// The summary category for a tool call — drives the `{% mafold/run %}` group label.
+/// `None` for anything that isn't a counted action (text, tool results, thinking,
+/// the interactive ask).
+pub fn tool_kind(ev: &AgentEvent) -> Option<&'static str> {
+    match ev {
+        AgentEvent::ToolCall { name, .. } => match kind_of(name) {
+            ToolKind::Ask => None,
+            k => Some(k.count_label()),
+        },
+        _ => None,
+    }
+}
+
+/// What a tool DOES, independent of what it is called.
+///
+/// There were two tables of tool names here — one for counting, one for
+/// rendering — and they disagreed. Both said `task`, while the model had
+/// started emitting `Agent` (the `system/init` frame still advertises the tool
+/// as `Task`, so the two names are not even consistent inside one CLI), and
+/// neither had ever heard of `Workflow`. The result, verbatim off a real
+/// stream: `{% mafold/tool name="Agent" detail="" %}` — an anonymous tool card
+/// with the subagent's type and description thrown away — and "ran N subagents"
+/// stuck at zero. One table, and every name a producer might use lands in it,
+/// which is why `apply_patch` sits beside `Edit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolKind {
+    Shell,
+    Read,
+    Edit,
+    Search,
+    Web,
+    Plan,
+    Ask,
+    Subagent,
+    Workflow,
+    Skill,
+    Other,
+}
+
+impl ToolKind {
+    /// The bucket [`run_summary`] counts this under.
+    fn count_label(self) -> &'static str {
+        match self {
+            ToolKind::Shell => "shell",
+            ToolKind::Read => "read",
+            ToolKind::Edit => "edit",
+            ToolKind::Search => "search",
+            ToolKind::Web => "web",
+            ToolKind::Plan => "plan",
+            ToolKind::Subagent => "task",
+            ToolKind::Workflow => "workflow",
+            // A skill or anything unrecognised is just "a tool" in the summary.
+            ToolKind::Skill | ToolKind::Other | ToolKind::Ask => "tool",
+        }
+    }
+}
+
+pub fn kind_of(name: &str) -> ToolKind {
+    let lname = name.to_lowercase();
+    match connection_method(&lname) {
+        // A machine of one's own, driven through a connection: its shell is a
+        // shell, whatever the connection is called — "Ran 9 shell commands"
+        // on a hosted bot's card, like the daemon's Bash, not "Ran 9 tools".
+        "shell.exec" | "shell.spawn" | "shell.status" | "shell.kill" => return ToolKind::Shell,
+        _ => {}
+    }
+    match lname.as_str() {
+        "bash" | "bashoutput" => ToolKind::Shell,
+        "read" | "notebookedit" => ToolKind::Read,
+        "edit" | "write" | "multiedit" | "apply_patch" => ToolKind::Edit,
+        "glob" | "grep" => ToolKind::Search,
+        "webfetch" | "websearch" => ToolKind::Web,
+        "todowrite" => ToolKind::Plan,
+        "askuserquestion" => ToolKind::Ask,
+        // `Agent` is what the model emits today; `Task` is the historical name
+        // (and still the one `system/init` advertises). Both, always.
+        "agent" | "task" => ToolKind::Subagent,
+        "workflow" => ToolKind::Workflow,
+        "skill" => ToolKind::Skill,
+        _ => ToolKind::Other,
+    }
+}
+
+/// `{connection}.{method}` → `method`: how the hosted harness names a call it
+/// made through a connection (`computer.shell.exec`). The connection's name is
+/// whatever its owner called it, so no table can list it; the method is the
+/// provider's own. Connection names never hold a dot (`[a-z0-9_-]`), so the
+/// first one is the seam. A name with no connection in front comes back as is.
+fn connection_method(lname: &str) -> &str {
+    match lname.split_once('.') {
+        Some((_, method)) if method.contains('.') => method,
+        _ => lname,
+    }
+}
+
+/// A human label for a group of consecutive tool calls, from per-category counts:
+/// "Ran 2 shell commands", "Read 1 file, ran 1 shell command", …
+pub fn run_summary(counts: &HashMap<&'static str, usize>) -> String {
+    let n = |c: &str| counts.get(c).copied().unwrap_or(0);
+    let phrase = |n: usize, sing: &str, plur: &str| if n == 1 { format!("1 {sing}") } else { format!("{n} {plur}") };
+    let mut parts: Vec<String> = Vec::new();
+    if n("read") > 0 { parts.push(format!("read {}", phrase(n("read"), "file", "files"))); }
+    if n("edit") > 0 { parts.push(format!("edited {}", phrase(n("edit"), "file", "files"))); }
+    if n("shell") > 0 { parts.push(format!("ran {}", phrase(n("shell"), "shell command", "shell commands"))); }
+    if n("search") > 0 { parts.push(format!("ran {}", phrase(n("search"), "search", "searches"))); }
+    if n("web") > 0 { parts.push(format!("ran {}", phrase(n("web"), "web search", "web searches"))); }
+    if n("task") > 0 { parts.push(format!("ran {}", phrase(n("task"), "subagent", "subagents"))); }
+    if n("workflow") > 0 { parts.push(format!("ran {}", phrase(n("workflow"), "workflow", "workflows"))); }
+    if n("plan") > 0 { parts.push("updated the plan".into()); }
+    if n("tool") > 0 { parts.push(format!("ran {}", phrase(n("tool"), "tool", "tools"))); }
+    if parts.is_empty() {
+        return "Details".into();
+    }
+    let joined = parts.join(", ");
+    let mut ch = joined.chars();
+    ch.next().map(|f| f.to_uppercase().collect::<String>() + ch.as_str()).unwrap_or(joined)
+}
+
+/// Wrap one consecutive group of primitive cards in a collapsible `{% mafold/run %}`
+/// with its human summary. `body` is already valid markdoc (the nested cards),
+/// so it is NOT escaped; each primitive escapes its own body.
+pub fn run_card(summary: &str, body: &str) -> String {
+    format!("\n{{% mafold/run summary=\"{}\" %}}\n{}{{% /mafold/run %}}\n", attr_esc(summary), body)
+}
+
+/// The run groups already written in `md`, read back as what [`run_card`] was
+/// given: each group's per-category counts and how many items it holds — what
+/// the fold counts (`Transcript::continue_from`).
+///
+/// The items are counted exactly: a run card's body is nothing but its item
+/// cards, and every one of them escaped its own body ([`block_esc`]), so the
+/// only tags at the top of a run body ARE its items. The counts come back from
+/// the summary ([`summary_counts`]) — exact, except what [`attr_esc`] cut off a
+/// summary longer than 80 characters.
+pub fn run_groups(md: &str) -> Vec<(HashMap<&'static str, usize>, usize)> {
+    top_level_cards(md)
+        .into_iter()
+        .filter(|c| c.name == "mafold/run")
+        .map(|c| {
+            let summary = c
+                .attrs
+                .split_once("summary=\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(s, _)| s)
+                .unwrap_or("");
+            (summary_counts(summary), top_level_cards(c.body).len())
+        })
+        .collect()
+}
+
+/// [`run_summary`] read backwards: "Read 3 files, ran 1 shell command" → `read`
+/// 3, `shell` 1. Whatever doesn't parse — "Details", a part cut off by
+/// [`attr_esc`] — counts nothing. "updated the plan" carries no number, so it
+/// counts one.
+pub fn summary_counts(summary: &str) -> HashMap<&'static str, usize> {
+    const NOUNS: &[(&str, &str, &str)] = &[
+        ("shell", "shell command", "shell commands"),
+        ("search", "search", "searches"),
+        ("web", "web search", "web searches"),
+        ("task", "subagent", "subagents"),
+        ("workflow", "workflow", "workflows"),
+        ("tool", "tool", "tools"),
+    ];
+    let mut counts = HashMap::new();
+    for part in summary.split(", ") {
+        let part = part.to_lowercase();
+        if part == "updated the plan" {
+            counts.insert("plan", 1);
+            continue;
+        }
+        let Some((verb, rest)) = part.split_once(' ') else { continue };
+        let Some((n, noun)) = rest.split_once(' ') else { continue };
+        let Ok(n) = n.parse::<usize>() else { continue };
+        let key = match (verb, noun) {
+            ("read", "file" | "files") => Some("read"),
+            ("edited", "file" | "files") => Some("edit"),
+            ("ran", noun) => NOUNS.iter().find(|(_, s, p)| noun == *s || noun == *p).map(|(k, _, _)| *k),
+            _ => None,
+        };
+        if let Some(k) = key {
+            counts.insert(k, n);
+        }
+    }
+    counts
+}
+
+/// One card at the top level of a markdoc text: its name, the rest of its open
+/// tag, and its body (empty for a self-closing tag).
+struct TopCard<'a> {
+    name: &'a str,
+    attrs: &'a str,
+    body: &'a str,
+}
+
+/// The cards at the top level of `md`, in order — nested ones are part of their
+/// container's body. Same walk as [`strip_cards_where`]: an unterminated tag is
+/// text, and a container with no closer runs to the end.
+fn top_level_cards(md: &str) -> Vec<TopCard<'_>> {
+    let mut out = Vec::new();
+    let mut rest = md;
+    while let Some(i) = rest.find("{%") {
+        let after = &rest[i..];
+        let Some(close) = after.find("%}") else { break };
+        let tag_end = close + 2;
+        let inner = after[2..close].trim();
+        rest = &after[tag_end..];
+        if inner.starts_with('/') {
+            continue;
+        }
+        let (name, attrs) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
+        if name.is_empty() {
+            continue;
+        }
+        if after[..tag_end].ends_with("/%}") {
+            out.push(TopCard { name, attrs: attrs.trim_end_matches('/').trim(), body: "" });
+            continue;
+        }
+        let closer = format!("{{% /{name} %}}");
+        let body = match rest.find(&closer) {
+            Some(j) => {
+                let body = &rest[..j];
+                rest = &rest[j + closer.len()..];
+                body
+            }
+            None => std::mem::take(&mut rest),
+        };
+        out.push(TopCard { name, attrs: attrs.trim(), body });
+    }
+    out
+}
+
+/// Wrap a finished turn's WORKING TRAIL — every interim sentence and every
+/// `{% mafold/run %}` group that came before the answer — in one collapsible
+/// `{% mafold/trace %}`.
+///
+/// Live, a turn SHOULD read as it happens: that's what the run groups and the
+/// narration between them are for. Finished, that same trail is the least
+/// interesting part of the message and it is the longest — a reply whose answer
+/// is four lines arrives twenty screens tall, and the answer is at the bottom.
+/// So the trail stays exactly as it was rendered and gets one lid put on it;
+/// nothing is summarised away and nothing is dropped.
+///
+/// `body` is already valid markdoc (narration + nested cards) and is NOT escaped
+/// — each card inside escaped its own. Only a literal `{% /mafold/trace %}` is
+/// neutralised, so quoted material can never lift the lid off early.
+pub fn trace_card(summary: &str, steps: usize, body: &str) -> String {
+    let body = if body.contains("/mafold/trace") {
+        body.replace("{% /mafold/trace %}", "{ % /mafold/trace % }")
+    } else {
+        body.to_string()
+    };
+    format!(
+        "\n{{% mafold/trace summary=\"{}\" steps=\"{steps}\" %}}\n{}{{% /mafold/trace %}}\n",
+        attr_esc(summary),
+        if body.ends_with('\n') { body } else { format!("{body}\n") },
+    )
+}
+
+/// Longest summary the card carries. Claude Code's run 3–15k chars; a runaway
+/// one is still readable from its first screens, and a chat message is not the
+/// place for the rest (the full text stays in the transcript on disk).
+const SUMMARY_MAX: usize = 16_000;
+
+/// One part of a card only some readers may read — an item of the message's
+/// controlled state (`.docs/card-state-v1.md`), not text in its body. Whoever
+/// posts the card writes it with `setCardState` once the message exists, as its
+/// sender: `key`, `v`, read list `read`, write list `[sender]`. The server
+/// hands the item only to readers on `read`; the body is the same for everyone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrivateItem {
+    pub key: String,
+    pub v: serde_json::Value,
+    pub read: Vec<String>,
+}
+
+/// The `sid` a card's private part is keyed by: a hash of the value, so the
+/// same part renders the same card however often the reply is redrawn.
+pub(crate) fn sid_of(v: &serde_json::Value) -> String {
+    // FNV-1a, 64 bit: stable across builds and platforms, unlike std's hasher.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in v.to_string().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:012x}", h & 0xffff_ffff_ffff)
+}
+
+/// A read list from a card's `for` (`owner`, `sender`, `@name`, comma
+/// separated) — the same words the state's lists speak.
+pub(crate) fn read_list(audience: &str) -> Vec<String> {
+    let mut out: Vec<String> = audience
+        .split(',')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| match w.to_lowercase().as_str() {
+            "owner" | "sender" => w.to_lowercase(),
+            other => format!("@{}", other.trim_start_matches('@')),
+        })
+        .collect();
+    if out.is_empty() {
+        out.push("owner".into());
+    }
+    out
+}
+
+/// `{% mafold/compact %}` — a compaction, and what the agent will read instead
+/// of the conversation from now on. `/compact` and an auto-compaction mid-turn
+/// post the same card.
+///
+/// A count goes in only when it is known — the card draws before→after from
+/// the pair, and an `after` it had to guess would claim the whole context was
+/// freed.
+///
+/// The flagged lines and the summary are the bot OWNER's: a summary is a
+/// digest of the whole conversation, and in a group of two dozen the owner is
+/// the one person it is written for. They are not in the card: they are the
+/// returned [`PrivateItem`] (`mafold/compact/<sid>.summary`, read by `owner`),
+/// `{flags: [...], summary}`. The card says `for="owner"` and its `sid`, so it
+/// can name whose part is missing, and everyone keeps the numbers.
+pub fn compact_card(
+    before: Option<u64>,
+    after: Option<u64>,
+    auto: bool,
+    summary: &str,
+    flagged: &[String],
+) -> (String, Option<PrivateItem>) {
+    let mut attrs = String::new();
+    if let Some(b) = before {
+        attrs.push_str(&format!(" before=\"{b}\""));
+    }
+    if let (Some(_), Some(a)) = (before, after) {
+        attrs.push_str(&format!(" after=\"{a}\""));
+    }
+    if auto {
+        attrs.push_str(" auto=\"1\"");
+    }
+    if !flagged.is_empty() {
+        attrs.push_str(&format!(" flagged=\"{}\"", flagged.len()));
+    }
+    let flags: Vec<String> = flagged
+        .iter()
+        .map(|f| f.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect::<String>().trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
+    let summary = summary.trim();
+    let summary = if summary.chars().count() > SUMMARY_MAX {
+        format!("{}\n…", summary.chars().take(SUMMARY_MAX).collect::<String>())
+    } else {
+        summary.to_string()
+    };
+    if flags.is_empty() && summary.is_empty() {
+        return (format!("\n{{% mafold/compact{attrs} /%}}\n"), None);
+    }
+    let v = serde_json::json!({ "flags": flags, "summary": summary });
+    let sid = sid_of(&v);
+    let item = PrivateItem { key: format!("mafold/compact/{sid}.summary"), v, read: read_list("owner") };
+    (format!("\n{{% mafold/compact{attrs} for=\"owner\" sid=\"{sid}\" /%}}\n"), Some(item))
+}
+
+/// A failed turn, told to the reader — `{% mafold/error %}`, the one shape for
+/// every producer's failure ([`crate::failure`]).
+///
+/// The card draws the sentence from `kind` in the READER's language, so the
+/// public attributes carry only what that needs: `kind`, the provider's
+/// `status`, and `payer` — whose wallet a balance card is about, so a room can
+/// see whom to ask. Everything else is the payer's: the amounts (what the turn
+/// needed, what their wallet could give) and the raw error, which can carry a
+/// balance, a seat, a host. Those go in the body inside
+/// `{% mafold/only for="@payer" %}` (`owner` when nobody pays through a wallet),
+/// the same wrapper the compaction summary uses: the server cuts the block from
+/// everyone else's copy, and the card draws «only for …» there instead.
+///
+/// Body, inside that block: `key|value` lines first (`need`, `have`,
+/// `currency`, `usd` — the USD price per 1M units of `currency`), then the raw
+/// error, verbatim but for card delimiters. Repeated `account|{json}` lines
+/// carry account-level failures in that same private block. Older cards read
+/// the new lines as raw detail, so no existing body shape changes.
+/// No body at all ⇒ self-closing.
+pub fn failure_card(f: &crate::failure::Failure) -> String {
+    let (attrs, payer) = failure_attrs(f);
+    let mut body = String::new();
+    if let Some(n) = f.need {
+        body.push_str(&format!("need|{n}\n"));
+    }
+    if let Some(n) = f.have {
+        body.push_str(&format!("have|{n}\n"));
+    }
+    if let Some(c) = f.currency.as_deref().map(line_esc).filter(|c| !c.is_empty()) {
+        body.push_str(&format!("currency|{}\n", neutralize(&c)));
+    }
+    if let Some(u) = f.usd_out.filter(|u| u.is_finite() && *u > 0.0) {
+        body.push_str(&format!("usd|{u}\n"));
+    }
+    for account in &f.accounts {
+        // JSON keeps newlines and separators in an account name or provider
+        // message from becoming another field. Neutralize card delimiters
+        // as well: the private block must remain indivisible on the server.
+        body.push_str(&format!("account|{}\n", neutralize(&account_row(account).to_string())));
+    }
+    let raw = f.detail.trim();
+    if !raw.is_empty() {
+        body.push_str(&block_esc(raw));
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    if body.is_empty() {
+        return format!("\n{{% mafold/error{attrs} /%}}\n");
+    }
+    let only = crate::only::TAG;
+    let who = failure_audience(f, payer);
+    format!("\n{{% mafold/error{attrs} %}}\n{{% {only} for=\"{who}\" %}}\n{body}{{% /{only} %}}\n{{% /mafold/error %}}\n")
+}
+
+/// [`failure_card`] with the payer's part as controlled state instead of in
+/// the body: the amounts, the per-account refusals and the raw error are the
+/// returned [`PrivateItem`] (`mafold/error/<sid>.detail`, read by the payer —
+/// `owner` when nobody pays through a wallet), as `{need, have, currency, usd,
+/// accounts: [...], raw}` with the absent ones left out. The card keeps the
+/// public attributes, and `for` + `sid` so it can say whose part is missing.
+pub fn failure_card_private(f: &crate::failure::Failure) -> (String, Option<PrivateItem>) {
+    let (attrs, payer) = failure_attrs(f);
+    let mut v = serde_json::Map::new();
+    if let Some(n) = f.need {
+        v.insert("need".into(), n.into());
+    }
+    if let Some(n) = f.have {
+        v.insert("have".into(), n.into());
+    }
+    if let Some(c) = f.currency.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        v.insert("currency".into(), c.into());
+    }
+    if let Some(u) = f.usd_out.filter(|u| u.is_finite() && *u > 0.0) {
+        v.insert("usd".into(), u.into());
+    }
+    if !f.accounts.is_empty() {
+        v.insert("accounts".into(), f.accounts.iter().map(account_row).collect::<Vec<_>>().into());
+    }
+    let raw = f.detail.trim();
+    if !raw.is_empty() {
+        v.insert("raw".into(), raw.into());
+    }
+    if v.is_empty() {
+        return (format!("\n{{% mafold/error{attrs} /%}}\n"), None);
+    }
+    let v = serde_json::Value::Object(v);
+    let sid = sid_of(&v);
+    let who = failure_audience(f, payer);
+    let item = PrivateItem { key: format!("mafold/error/{sid}.detail"), read: read_list(&who), v };
+    (format!("\n{{% mafold/error{attrs} for=\"{who}\" sid=\"{sid}\" /%}}\n"), Some(item))
+}
+
+/// Whose a failure's private part is: the payer, else whoever it is read to
+/// (a house bot's asker), else the bot's owner.
+fn failure_audience(f: &crate::failure::Failure, payer: Option<String>) -> String {
+    let reader = f.reader.as_deref().and_then(handle);
+    payer.or(reader).map_or_else(|| "owner".to_string(), |p| format!("@{p}"))
+}
+
+fn account_row(account: &crate::failure::AccountIssue) -> serde_json::Value {
+    serde_json::json!({
+        "account": account.account,
+        "kind": account.kind.as_str(),
+        "detail": account.detail,
+        "window": account.window,
+        "resets_at": account.resets_at.filter(|t| *t > 0),
+    })
+}
+
+/// A failure card's public attributes, and its payer's handle.
+fn failure_attrs(f: &crate::failure::Failure) -> (String, Option<String>) {
+    let payer = f.payer.as_deref().and_then(handle);
+    let mut attrs = format!(" kind=\"{}\"", f.kind.as_str());
+    // A step id is a word the card looks up (`imagegen`), never prose — anything
+    // else is dropped rather than escaped into an attribute.
+    if let Some(step) = f.step.as_deref().filter(|s| is_step_id(s)) {
+        attrs.push_str(&format!(" step=\"{step}\""));
+    }
+    if let Some(s) = f.status {
+        attrs.push_str(&format!(" status=\"{s}\""));
+    }
+    if let Some(p) = &payer {
+        attrs.push_str(&format!(" payer=\"{p}\""));
+    }
+    // When a limit lifts is nobody's secret — the card says it in the reader's
+    // own clock time, so it rides in the open.
+    if let Some(w) = f.window.as_deref().map(attr_esc).filter(|w| !w.is_empty()) {
+        attrs.push_str(&format!(" window=\"{}\"", neutralize(&w)));
+    }
+    if let Some(t) = f.resets_at.filter(|t| *t > 0) {
+        attrs.push_str(&format!(" resets_at=\"{t}\""));
+    }
+    (attrs, payer)
+}
+
+/// `imagegen`, `video_submit`: lowercase ASCII words — what a step id may be.
+fn is_step_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A handle as it may go into an attribute: lowercase, no `@`, nothing that
+/// could end a quote or a tag.
+fn handle(h: &str) -> Option<String> {
+    let h = h.trim().trim_start_matches('@').to_lowercase();
+    (!h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))).then_some(h)
+}
+
+/// The tag every failure card opens with ([`failure_card`]).
+const ERROR_CARD: &str = "{% mafold/error";
+
+/// Each failure card ([`failure_card`]) as one line of words — for the readers
+/// that take a reply as TEXT: the daemon's inbox digest and `mafold read`.
+/// Both drop cards with their bodies, and a turn that failed then read as an
+/// empty reply («—»), or a half answer as a whole one; the line used to be
+/// `⚠️ Agent stopped: <raw>`. Only the kind and status go into the words: the
+/// raw error is the payer's, and a text reader is often someone else.
+pub fn failure_cards_as_text(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(at) = rest.find(ERROR_CARD) {
+        let after = &rest[at + ERROR_CARD.len()..];
+        // `{% mafold/errors …` is some other card, not this one.
+        if !after.starts_with(|c: char| c.is_whitespace() || c == '/' || c == '%') {
+            out.push_str(&rest[..at + ERROR_CARD.len()]);
+            rest = after;
+            continue;
+        }
+        let Some(close) = after.find("%}") else { break };
+        let attrs = after[..close].trim();
+        let mut end = at + ERROR_CARD.len() + close + 2;
+        if !attrs.ends_with('/') {
+            // The body is block-escaped, so the first close tag is this card's.
+            match rest[end..].find("{% /mafold/error %}") {
+                Some(k) => end += k + "{% /mafold/error %}".len(),
+                None => end = rest.len(),
+            }
+        }
+        let kind = crate::preview::attr(attrs, "kind").unwrap_or("unknown");
+        let status = crate::preview::attr(attrs, "status").map(|s| format!(" · HTTP {s}")).unwrap_or_default();
+        // A step card is one tool that failed inside an answered turn: saying
+        // «这一轮失败» there would tell another agent the whole reply is void.
+        let what = match crate::preview::attr(attrs, "step") {
+            Some(step) => format!("{step} 失败"),
+            None => "这一轮失败".to_string(),
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(&format!("⚠️ [{what}:{kind}{status}]"));
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `md` without its failure cards, bodies and all — what a reply DELIVERED,
+/// for whoever prices it by what it says (`metering::delivered_text`).
+pub fn strip_failure_cards(md: &str) -> String {
+    strip_cards_where(md, |name| name == "mafold/error")
+}
+
+/// Card delimiters in untrusted text, broken so they can't open or close a card.
+fn neutralize(s: &str) -> String {
+    s.replace("{%", "{ %").replace("%}", "% }")
+}
+
+/// The user spoke mid-turn and the driver steered with it → a one-line marker in
+/// the transcript, in time order.
+///
+/// Deliberately not a card: it is a seam in the narration, and the reply already
+/// carries their words in their own bubble above. One line that says WHERE the
+/// correction entered is the whole job.
+pub fn steer_line(text: &str) -> String {
+    own_block(&format!("{STEER_PREFIX}{}", line_esc(text)))
+}
+
+/// A driver notice ([`AgentEvent::Notice`]) — same quoted shape as a steer (it
+/// is the same kind of thing: not model output, but part of the timeline), with
+/// a different mark so the two don't read as each other.
+pub fn notice_line(text: &str) -> String {
+    own_block(&format!("{NOTICE_PREFIX}{}", line_esc(text)))
+}
+
+/// One of the transcript's own one-line notes — a steer seam, a notice, the
+/// compaction line — as a block of its own: a blank line before AND after.
+///
+/// Markdown runs a line on into whatever touches it. Text right after a
+/// `> …` line is swallowed into the quote (lazy continuation); a plain
+/// `_…_` line merges into the paragraph on either side. And what comes next
+/// is usually the model's answer: 2026-10-11 the first paragraph after a
+/// `↩︎ …` seam rendered grey, inside it, on every reply that took a steer —
+/// daemon and hosted alike, both draw it here.
+fn own_block(line: &str) -> String {
+    format!("\n\n{line}\n\n")
+}
+
+/// One atomic step in a run group: a tool CALL and, once it lands, its RESULT.
+///
+/// The pair is one card. Harnesses stream every call in an assistant message and
+/// every result in the message after it, so rendering each event as it arrives
+/// produces `bash · bash · output · output` — two calls, then two outputs, with
+/// nothing tying either output to the command that produced it. A step instead
+/// keeps its slot open: the call paints immediately (the transcript still shows
+/// middle states), and the result fills in underneath it when it arrives.
+///
+/// Re-rendering an already-committed group is free — the daemon pushes the whole
+/// markdoc snapshot on every flush (the Telegram-draft model), so a landed
+/// result simply changes what the next snapshot says.
+#[derive(Debug, Clone)]
+pub struct ToolStep {
+    pub name: String,
+    pub input: Value,
+    /// The result text — `None` while the tool is still running.
+    pub out: Option<String>,
+    /// Work a SUBAGENT did under this call, one summarized line each. Bounded:
+    /// a subagent can run for hundreds of steps, and the card is 330pt wide.
+    pub inner: Vec<String>,
+}
+
+impl ToolStep {
+    /// Past this many lines the card says "…" instead of growing.
+    const MAX_INNER: usize = 12;
+
+    pub fn new(name: &str, input: &Value) -> Self {
+        Self { name: name.to_string(), input: input.clone(), out: None, inner: Vec::new() }
+    }
+
+    /// One step the subagent under this call took.
+    pub fn note(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if self.inner.len() < Self::MAX_INNER {
+            self.inner.push(line.to_string());
+        } else if self.inner.len() == Self::MAX_INNER {
+            self.inner.push("…".into());
+        }
+    }
+    /// The result landed. First one wins: a harness that re-sends a result must
+    /// not append a second copy to a card that already shows it.
+    pub fn land(&mut self, text: &str) {
+        if self.out.is_none() {
+            self.out = Some(text.to_string());
+        }
+    }
+    pub fn tag(&self) -> String {
+        tool_use_tag_inner(&self.name, &self.input, self.out.as_deref(), &self.inner)
+    }
+}
+
+/// One line describing a tool call, for a producer that has to summarize a
+/// SUBAGENT's step before sending it ([`AgentEvent::SubagentStep`]).
+///
+/// Lives here, next to the card rendering, so a subagent's step reads like the
+/// main agent's steps do — same names, same details, same truncation.
+pub fn step_line(name: &str, input: &Value) -> String {
+    let detail = tool_detail(name, input);
+    if detail.is_empty() {
+        format!("· {name}")
+    } else {
+        format!("· {name} {detail}")
+    }
+}
+
+/// The subagent type a Task/Agent call names, with the historical spelling as a
+/// fallback so a producer that predates `subagent_type` still gets a label.
+fn subagent_type(input: &Value) -> &str {
+    input["subagent_type"]
+        .as_str()
+        .or_else(|| input["agent_type"].as_str())
+        .unwrap_or("agent")
+}
+
+/// What to call a Workflow run. The script's own `name` is the useful one; a
+/// description is the next best; otherwise say nothing rather than guess.
+fn workflow_label(input: &Value) -> &str {
+    input["name"]
+        .as_str()
+        .or_else(|| input["workflow_name"].as_str())
+        .or_else(|| input["description"].as_str())
+        .unwrap_or("")
+}
+
+/// One entry in a run group: a finished card (thinking, a legacy orphan result)
+/// or a tool step whose result may still be pending.
+#[derive(Debug, Clone)]
+pub enum GroupItem {
+    Card(String),
+    Step(ToolStep),
+}
+
+/// A run group's body — every item in arrival order, each step carrying its own
+/// result. Called on every snapshot push, so it must stay a pure function of the
+/// group: the same items always render the same markdoc.
+pub fn render_group(items: &[GroupItem]) -> String {
+    let mut out = String::new();
+    for it in items {
+        match it {
+            GroupItem::Card(s) => out.push_str(s),
+            GroupItem::Step(s) => out.push_str(&s.tag()),
+        }
+    }
+    out
+}
+
+/// A tool call (plus its result, when it has landed) → the right card.
+fn tool_use_tag(name: &str, input: &Value, out: Option<&str>) -> String {
+    tool_use_tag_inner(name, input, out, &[])
+}
+
+/// `inner` is the work a SUBAGENT did under this call (see
+/// [`AgentEvent::SubagentStep`]) — one already-summarized line each. It goes in
+/// the card's body, which is what keeps a subagent's tool calls out of the main
+/// timeline where they read as the main agent's own.
+fn tool_use_tag_inner(name: &str, input: &Value, out: Option<&str>, inner: &[String]) -> String {
+    let lname = name.to_lowercase();
+    let (summary, body) = result_parts(&lname, out);
+    // The subagent's own steps first, then whatever it reported back: the card
+    // reads top to bottom as the work and then its result.
+    let with_inner =
+        || if inner.is_empty() { body.clone() } else { format!("{}\n{body}", inner.join("\n")) };
+    match kind_of(name) {
+        ToolKind::Plan => todo_tag(input),
+        // The diff IS the result — an "updated the file" line under it says
+        // nothing the +N −M in its header doesn't already say.
+        ToolKind::Edit if lname == "write" => diff_tag_write(name, input),
+        ToolKind::Edit => diff_tag_edit(&lname, name, input),
+        ToolKind::Subagent => card(
+            "task",
+            &format!(
+                "subagent=\"{}\" desc=\"{}\"{}",
+                attr_esc(subagent_type(input)),
+                attr_esc(input["description"].as_str().unwrap_or("")),
+                summary,
+            ),
+            &with_inner(),
+        ),
+        // A workflow is a script that runs agents, not an agent — it has a name
+        // of its own, so it does not pretend to be one.
+        ToolKind::Workflow => card(
+            "task",
+            &format!("subagent=\"workflow\" desc=\"{}\"{}", attr_esc(workflow_label(input)), summary),
+            &with_inner(),
+        ),
+        ToolKind::Web if !input["url"].is_null() => {
+            card("web", &format!("url=\"{}\"{}", attr_esc(input["url"].as_str().unwrap_or("")), summary), "")
+        }
+        ToolKind::Web => card("web", &format!("query=\"{}\"{}", attr_esc(input["query"].as_str().unwrap_or("")), summary), ""),
+        ToolKind::Skill => {
+            let sname = input["command"].as_str()
+                .or_else(|| input["skill"].as_str())
+                .or_else(|| input["name"].as_str())
+                .unwrap_or("skill");
+            let args = input["args"].as_str().or_else(|| input["arguments"].as_str()).unwrap_or("");
+            card("skill", &format!("name=\"{}\" args=\"{}\"{}", attr_esc(sname), attr_esc(args), summary), "")
+        }
+        ToolKind::Ask => ask_tag(input),
+        _ => card(
+            "tool",
+            &format!("name=\"{}\" detail=\"{}\"{}", attr_esc(name), attr_esc(&tool_detail(name, input)), summary),
+            &body,
+        ),
+    }
+}
+
+/// `{% mafold/<tag> <attrs> /%}` — self-closing, or a container when there's a
+/// body to carry. One shape for every card the renderer emits, so "does this one
+/// have a body" is a question about the DATA, never about the format string.
+fn card(tag: &str, attrs: &str, body: &str) -> String {
+    if body.is_empty() {
+        format!("\n{{% mafold/{tag} {attrs} /%}}\n")
+    } else {
+        format!("\n{{% mafold/{tag} {attrs} %}}\n{}{{% /mafold/{tag} %}}\n", block_esc(body))
+    }
+}
+
+/// A landed result → (`out="…"` attribute, card body).
+///
+/// Which of the two a tool gets is about what its result IS. A shell's stdout is
+/// content and belongs in the body, verbatim and capped. A Read's result is the
+/// file the model already has — echoing it back is noise, so it collapses to
+/// "126 lines". Nothing at all is also an answer: a command that printed nothing
+/// says so, rather than looking like it never finished.
+fn result_parts(lname: &str, out: Option<&str>) -> (String, String) {
+    let Some(text) = out else {
+        return (String::new(), String::new());
+    };
+    let t = text.trim();
+    let attr = |s: String| (format!(" out=\"{}\"", attr_esc(&s)), String::new());
+    match lname {
+        "bash" => {
+            if t.is_empty() {
+                attr("no output".into())
+            } else {
+                (String::new(), cap_lines(t, 20))
+            }
+        }
+        "read" | "notebookedit" => attr(count_phrase(t, "line", "lines")),
+        "glob" | "grep" => {
+            let first = t.lines().next().unwrap_or("").trim();
+            // Claude Code's own phrasing ("Found 12 files") when the harness
+            // already summarized; the count when it handed back raw matches.
+            if first.starts_with("Found ") && first.chars().count() <= 60 {
+                attr(first.to_string())
+            } else {
+                attr(count_phrase(t, "result", "results"))
+            }
+        }
+        // The diff card already carries the outcome.
+        "edit" | "write" | "multiedit" | "apply_patch" | "todowrite" => (String::new(), String::new()),
+        "task" => (String::new(), cap_lines(t, 6)),
+        _ if t.is_empty() => (String::new(), String::new()),
+        // An unknown tool: short results read as output, long ones as a count —
+        // one rule, no per-tool table to keep in sync with anybody's tool set.
+        _ if t.lines().count() > 6 => attr(count_phrase(t, "line", "lines")),
+        _ => (String::new(), cap_lines(t, 6)),
+    }
+}
+
+/// "1 line" / "126 lines" — an empty result counts as zero, not one.
+fn count_phrase(t: &str, sing: &str, plur: &str) -> String {
+    let n = if t.is_empty() { 0 } else { t.lines().count() };
+    if n == 1 { format!("1 {sing}") } else { format!("{n} {plur}") }
+}
+
+/// AskUserQuestion → an interactive `ask` card. The body is line-encoded (mirrors
+/// the `stats` card): one `q|<header>|<multi 0/1>|<question>` per question, each
+/// followed by its `o|<label>|<description>` options. The web/iOS renderer turns
+/// every option into a tappable button and posts the chosen label(s) back as the
+/// user's next message — which `--resume` feeds straight into the same session.
+fn ask_tag(input: &Value) -> String {
+    let mut body = String::new();
+    if let Some(questions) = input["questions"].as_array() {
+        for q in questions {
+            let header = cell_esc(q["header"].as_str().unwrap_or(""));
+            let multi = if q["multiSelect"].as_bool().unwrap_or(false) { 1 } else { 0 };
+            let question = cell_esc(q["question"].as_str().unwrap_or(""));
+            body.push_str(&format!("q|{header}|{multi}|{question}\n"));
+            // `detail` (optional): text that must reach the card EXACTLY. A cell
+            // is flattened and capped, which is fine for a question and wrong
+            // for the one thing a permission prompt asks you to judge — a shell
+            // command with its pipes turned into spaces is not the command that
+            // will run. One `d|` row per line, verbatim; `d~|<n>` when the tail
+            // had to go, so the card can say so instead of passing it off whole.
+            if let Some(detail) = q["detail"].as_str().filter(|d| !d.trim().is_empty()) {
+                let total = detail.chars().count();
+                let kept: String = detail.chars().take(DETAIL_CAP).collect();
+                for line in kept.lines() {
+                    body.push_str(&format!("d|{}\n", line.trim_end_matches('\r')));
+                }
+                if total > DETAIL_CAP {
+                    body.push_str(&format!("d~|{}\n", total - DETAIL_CAP));
+                }
+            }
+            // `rule` / `ruleSource` (optional): the permission rule that stopped
+            // the call and the settings file it is written in — the WHY a
+            // permission prompt leads with. The rule is the row's last field
+            // and keeps its pipes; only the source is a plain cell.
+            if let Some(rule) = q["rule"].as_str().filter(|r| !r.trim().is_empty()) {
+                let source = cell_esc(q["ruleSource"].as_str().unwrap_or(""));
+                body.push_str(&format!("r|{source}|{}\n", line_esc(rule)));
+            }
+            // `summary` (optional): what the call is FOR, in the agent's own
+            // words (a Bash call's `description`). One line, pipes kept.
+            if let Some(summary) = q["summary"].as_str().filter(|s| !s.trim().is_empty()) {
+                body.push_str(&format!("s|{}\n", line_esc(summary)));
+            }
+            if let Some(opts) = q["options"].as_array() {
+                for o in opts {
+                    let label = cell_esc(o["label"].as_str().unwrap_or(""));
+                    let desc = cell_esc(o["description"].as_str().unwrap_or(""));
+                    body.push_str(&format!("o|{label}|{desc}\n"));
+                }
+            }
+        }
+    }
+    // `action` (optional) redirects the tap. Absent — every ask the MODEL raises
+    // — the answer becomes a real user message, because that exchange is part of
+    // the conversation. The permission prompt sets `perm:answer` instead: its
+    // verdict is a switch on a blocked process, not something anyone wants to
+    // read in the room tomorrow.
+    let action = match input["action"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => format!(" action=\"{}\"", attr_esc(a)),
+        None => String::new(),
+    };
+    // `user` (optional): the one person who may answer, when that is not
+    // whoever the reply is addressed to — a guest's permission prompt waits on
+    // the bot's owner. Drawing only (the card's `GateActions addressee`): a
+    // reader known to be someone else gets «waiting for @user» instead of
+    // buttons. Who may answer is the daemon's decision either way.
+    let user = match input["user"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(u) => format!(" user=\"{}\"", attr_esc(u)),
+        None => String::new(),
+    };
+    // `prompt` (optional): which permission prompt this card is. The card
+    // sends it back with the tap, and the daemon only counts a verdict for the
+    // prompt it names — every prompt of a turn draws in the same draft, and a
+    // late tap must not land on the next one.
+    let prompt = match input["prompt"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => format!(" prompt=\"{}\"", attr_esc(p)),
+        None => String::new(),
+    };
+    format!("\n{{% mafold/ask{action}{user}{prompt} %}}\n{}{{% /mafold/ask %}}\n", block_esc(&body))
+}
+
+/// How much of an ask's `detail` goes into the card. Under `block_esc`'s 4000 so
+/// the question and its options always survive the body cap after it.
+const DETAIL_CAP: usize = 3000;
+
+/// One pipe-delimited cell: newlines/tabs/pipes collapse to spaces (the `|`
+/// delimiter must stay unambiguous), trimmed and length-capped.
+fn cell_esc(s: &str) -> String {
+    let one: String = s
+        .chars()
+        .map(|c| match c { '\n' | '\r' | '\t' | '|' => ' ', _ => c })
+        .collect();
+    let one = one.trim();
+    if one.chars().count() > 200 {
+        format!("{}…", one.chars().take(200).collect::<String>())
+    } else {
+        one.to_string()
+    }
+}
+
+fn todo_tag(input: &Value) -> String {
+    let mut body = String::new();
+    if let Some(items) = input["todos"].as_array() {
+        for t in items {
+            let content = t["content"].as_str().or_else(|| t["activeForm"].as_str()).unwrap_or("");
+            let mark = match t["status"].as_str().unwrap_or("pending") {
+                "completed" => 'x',
+                "in_progress" => '~',
+                _ => ' ',
+            };
+            body.push_str(&format!("[{mark}] {}\n", line_esc(content)));
+        }
+    }
+    format!("\n{{% mafold/todo %}}\n{}{{% /mafold/todo %}}\n", block_esc(&body))
+}
+
+fn diff_tag_edit(lname: &str, name: &str, input: &Value) -> String {
+    let file = input["file_path"].as_str().unwrap_or("");
+    let (added, removed, body) = if lname == "multiedit" {
+        let mut a = 0; let mut r = 0; let mut body = String::new();
+        if let Some(edits) = input["edits"].as_array() {
+            for e in edits {
+                let (ea, er, eb) = synth_hunk(e["old_string"].as_str().unwrap_or(""), e["new_string"].as_str().unwrap_or(""));
+                a += ea; r += er; body.push_str(&eb);
+            }
+        }
+        (a, r, body)
+    } else {
+        synth_hunk(input["old_string"].as_str().unwrap_or(""), input["new_string"].as_str().unwrap_or(""))
+    };
+    diff_tag(file, name, added, removed, &body)
+}
+
+fn diff_tag_write(name: &str, input: &Value) -> String {
+    let file = input["file_path"].as_str().unwrap_or("");
+    let content = input["content"].as_str().unwrap_or("");
+    let lines: Vec<&str> = if content.is_empty() { vec![] } else { content.lines().collect() };
+    let mut body = String::new();
+    for l in &lines { body.push('+'); body.push_str(l); body.push('\n'); }
+    diff_tag(file, name, lines.len(), 0, &body)
+}
+
+/// `tool` names WHICH edit this was (Write / Edit / MultiEdit) — the card leads
+/// with it, the way every other step in the transcript leads with its tool name.
+fn diff_tag(file: &str, tool: &str, added: usize, removed: usize, body: &str) -> String {
+    format!(
+        "\n{{% mafold/diff file=\"{}\" tool=\"{}\" added={} removed={} %}}\n{}{{% /mafold/diff %}}\n",
+        attr_esc(file), attr_esc(tool), added, removed, block_esc(&cap_lines(body, 24)),
+    )
+}
+
+fn synth_hunk(old: &str, new: &str) -> (usize, usize, String) {
+    let oldl: Vec<&str> = if old.is_empty() { vec![] } else { old.lines().collect() };
+    let newl: Vec<&str> = if new.is_empty() { vec![] } else { new.lines().collect() };
+    let mut body = String::new();
+    for l in &oldl { body.push('-'); body.push_str(l); body.push('\n'); }
+    for l in &newl { body.push('+'); body.push_str(l); body.push('\n'); }
+    (newl.len(), oldl.len(), body)
+}
+
+pub fn result_with_stats(stats: &crate::RunStats) -> String {
+    let legacy = result_tag(stats.duration_ms, stats.cost_usd, stats.total_tokens)
+        .unwrap_or_else(|| "\n{% mafold/result /%}\n".into());
+    format!("{} %}}\n{}\n{{% /mafold/result %}}\n",
+        legacy.trim_end().trim_end_matches(" /%}"), stats.card_body())
+}
+
+fn result_tag(dur: Option<f64>, cost: Option<f64>, tokens: Option<u64>) -> Option<String> {
+    let cost = cost.filter(|c| *c > 0.0);
+    if dur.is_none() && cost.is_none() && tokens.is_none() {
+        return None;
+    }
+    // The attributes are for a card too old to read the JSON body: it shows
+    // them as they are. So they're written the way any reader would want them
+    // ("1h 1m 43s", "25.5M", "$13.44"), in English — one message, every reader;
+    // a current card formats the body's raw numbers in each reader's own
+    // language, and reads these back (client-shared/units parse*) only when a
+    // body is missing.
+    let mut attrs = String::new();
+    if let Some(d) = dur { attrs.push_str(&format!(" duration=\"{}\"", EN.duration(d))); }
+    if let Some(t) = tokens { attrs.push_str(&format!(" tokens=\"{}\"", EN.compact(t as f64))); }
+    if let Some(c) = cost { attrs.push_str(&format!(" cost=\"{}\"", units::usd(c))); }
+    Some(format!("\n{{% mafold/result{attrs} /%}}\n"))
+}
+
+/// A short, human-readable detail for a generic tool card (file, command, …).
+///
+/// The fallback matters as much as the table: an UNKNOWN tool — an MCP server's,
+/// a server-side brain's own — used to render as a bare name with `detail=""`,
+/// so a card said "deploy" and nothing about what was deployed. Rather than
+/// grow a per-tool entry for every tool anyone might ever add, fall back to the
+/// argument names tool schemas actually converge on. `detail` leads: a producer
+/// that knows what its card should say can just say it.
+fn tool_detail(name: &str, input: &Value) -> String {
+    let raw = match name.to_lowercase().as_str() {
+        "bash" => input["command"].as_str(),
+        "edit" | "write" | "multiedit" | "read" | "notebookedit" | "apply_patch" => input["file_path"].as_str(),
+        "glob" | "grep" => input["pattern"].as_str(),
+        "webfetch" => input["url"].as_str(),
+        "task" => input["description"].as_str(),
+        "todowrite" => Some("updating plan"),
+        _ => input["detail"]
+            .as_str()
+            .or_else(|| input["path"].as_str())
+            .or_else(|| input["file_path"].as_str())
+            .or_else(|| input["command"].as_str())
+            // A connection's shell (`shell.exec` / `shell.spawn`) says `cmd`.
+            .or_else(|| input["cmd"].as_str())
+            .or_else(|| input["query"].as_str())
+            .or_else(|| input["url"].as_str())
+            .or_else(|| input["name"].as_str()),
+    };
+    raw.unwrap_or("").to_string()
+}
+
+/// Strip card markup, leaving the prose.
+///
+/// A reply produced by an agent turn is mostly CARDS — a run group wrapping a
+/// diff of the file it wrote, the build output, the result stamp. That is the
+/// right thing to show a person and the wrong thing to feed back to a model on
+/// the next turn: it is a large fraction of the context window, and a model
+/// reading its own `{% mafold/diff %}` output learns to WRITE card markup as
+/// text, which renders as literal markup in the bubble.
+///
+/// Self-closing tags drop; a container drops with its body. Nesting is handled
+/// for the shapes the renderer emits (a `run` group holding differently-named
+/// cards); a card nested inside another of the SAME name would close early,
+/// which nothing produces today.
+pub fn strip_cards(md: &str) -> String {
+    strip_cards_where(md, |_| true)
+}
+
+/// Is `name` (`owner/slug`) one of the cards THIS renderer emits — the agent
+/// transcript machinery, as opposed to content a model or a person authored?
+/// The list is the renderer's own vocabulary: every `{% mafold/… %}` this file
+/// writes, plus the driver-appended stamps (`bgtasks`) and the liveness card.
+pub fn is_transcript_card(name: &str) -> bool {
+    matches!(
+        name,
+        "mafold/run"
+            | "mafold/trace"
+            | "mafold/tool"
+            | "mafold/bash"
+            | "mafold/diff"
+            | "mafold/todo"
+            | "mafold/thinking"
+            | "mafold/compact"
+            | "mafold/ratelimit"
+            | "mafold/error"
+            | "mafold/result"
+            | "mafold/generating"
+            | "mafold/bgtasks"
+    )
+}
+
+/// [`strip_cards`], but only for the cards the transcript machinery produced
+/// ([`is_transcript_card`]). A `{% mafold/html %}` the model wrote or a
+/// `{% mafold/quote %}` the person sent stays — it is content; a run group, a
+/// result stamp or a folded trace is the bot's own process and bookkeeping,
+/// which a model reading its history should not be re-taught to write.
+pub fn strip_transcript_cards(md: &str) -> String {
+    strip_cards_where(md, is_transcript_card)
+}
+
+/// [`strip_transcript_cards`] for someone READING another agent's reply: the
+/// trail and the stamps go, but the cards that say how the reply ENDED stay —
+/// the error it died on, the limit that stopped it, the background tasks it
+/// left running. Whoever decides whether to chase that agent needs all three.
+pub fn strip_trail_cards(md: &str) -> String {
+    strip_cards_where(md, |name| {
+        is_transcript_card(name) && !matches!(name, "mafold/error" | "mafold/ratelimit" | "mafold/bgtasks")
+    })
+}
+
+/// Is this line one of the renderer's own notices — a usage limit, a
+/// compaction, a steer seam? They are content (they belong in the trail, in
+/// time order) but they are not an ANSWER: when `finish_folded` asks whether the
+/// model said anything after its last tool group, a notice must not answer yes
+/// on the model's behalf.
+pub fn is_notice_line(line: &str) -> bool {
+    let t = line.trim_start();
+    [RATE_LIMIT_PREFIX, COMPACTED_PREFIX, STEER_PREFIX, NOTICE_PREFIX].iter().any(|p| t.starts_with(p))
+        || NOTICE_CARDS.iter().any(|c| t.strip_prefix("{% ").is_some_and(|r| r.starts_with(c) && r[c.len()..].starts_with(' ')))
+}
+
+/// `md` with every notice line ([`is_notice_line`]) removed.
+pub fn strip_notices(md: &str) -> String {
+    md.lines().filter(|l| !is_notice_line(l)).collect::<Vec<_>>().join("\n")
+}
+
+/// The walker behind both strips. A card whose name fails `cut` is copied
+/// through verbatim — open tag, body and close tag — and the walk continues
+/// after its open tag, so a content card nesting a transcript card still has
+/// the inner one cut.
+///
+/// What is a card at all is the renderer's grammar ([`crate::prose`], the twin
+/// of `cards/split.ts`): a tag inside a fence or a backtick span is code, shown
+/// as written, so it stays; a container runs to its close, else to the close
+/// its author misspelled, else to the end. Scanning for `{%` alone took a
+/// QUOTED tag (`` `{% mafold/generating %}` ``) for an open container with no
+/// close — and every word after the quote went with it.
+fn strip_cards_where(md: &str, cut: impl Fn(&str) -> bool) -> String {
+    use crate::prose::{code_ranges, find_close, in_code, orphan_close, parse_tag};
+    // `md[from..to]`'s code ranges, as offsets into `md`.
+    let ranges_in = |from: usize, to: usize| -> Vec<(usize, usize)> {
+        code_ranges(&md[from..to]).into_iter().map(|(a, b)| (a + from, b + from)).collect()
+    };
+    let mut ranges = code_ranges(md);
+    let mut out = String::with_capacity(md.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while let Some(rel) = md[i..].find("{%") {
+        let start = i + rel;
+        let Some(tag) = parse_tag(md, start) else {
+            i = start + 2;
+            continue;
+        };
+        i = tag.end;
+        if in_code(start, &ranges) {
+            continue;
+        }
+        let end = if tag.is_close || tag.self_close {
+            tag.end
+        } else {
+            find_close(md, tag.end, tag.name)
+                .or_else(|| orphan_close(md, tag.end, &ranges, tag.name).map(|(_, end)| end))
+                .unwrap_or(md.len())
+        };
+        // As the client does once it has taken a card: a backtick or a fence
+        // inside the card's span says nothing about code after it.
+        let recount = md[start..end].contains(['`', '~']);
+        if !cut(tag.name) {
+            // It stays, and the walk goes on inside it — its body counts its
+            // own code, and what follows the card counts afresh.
+            if recount {
+                ranges = ranges_in(tag.end, end);
+                ranges.extend(ranges_in(end, md.len()));
+            }
+            continue;
+        }
+        out.push_str(&md[copied..start]);
+        if recount {
+            ranges = ranges_in(end, md.len());
+        }
+        copied = end;
+        i = end;
+    }
+    out.push_str(&md[copied..]);
+    out
+}
+
+#[cfg(test)]
+mod result_attr_tests {
+    use super::*;
+
+    /// The screenshot that started the shared ruler (2026-10-22): an hour-long
+    /// reply's result bar read "3702.9s · 25488.3k tok · $13.4366".
+    #[test]
+    fn the_result_attributes_read_like_every_other_number() {
+        let tag = result_tag(Some(3_702_900.0), Some(13.4366), Some(25_488_300)).unwrap();
+        assert!(tag.contains(r#"duration="1h 1m 43s""#), "{tag}");
+        assert!(tag.contains(r#"tokens="25.5M""#), "{tag}");
+        assert!(tag.contains(r#"cost="$13.44""#), "{tag}");
+        let small = result_tag(Some(4_200.0), Some(0.0042), Some(812)).unwrap();
+        assert!(small.contains(r#"duration="4.2s" tokens="812" cost="$0.0042""#), "{small}");
+        assert_eq!(result_tag(None, Some(0.0), None), None, "a zero cost alone is nothing to stamp");
+    }
+
+    #[test]
+    fn the_compacted_line_counts_on_the_same_ruler() {
+        let ev = AgentEvent::Compacted { pre_tokens: Some(90_000), post_tokens: None, summary: None, flagged: Vec::new() };
+        let line = render(&ev, &mut HashMap::new()).expect("a line");
+        assert!(line.contains("Context auto-compacted (90K before)"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod strip_transcript_tests {
+    use super::*;
+
+    const MD: &str = "Here:\n{% mafold/html %}<b>x</b>{% /mafold/html %}\n\
+        {% mafold/run summary=\"Ran 1 shell command\" %}\n{% mafold/bash cmd=\"ls\" /%}\n{% /mafold/run %}\n\
+        Done.\n{% mafold/result duration=\"1.0s\" %}\n{\"tokens\":3}\n{% /mafold/result %}\n";
+
+    /// The model's own content card stays; the machinery around it — the run
+    /// group, its tool cards, the result stamp and its JSON — goes.
+    #[test]
+    fn transcript_cards_go_and_content_cards_stay() {
+        let out = strip_transcript_cards(MD);
+        assert!(out.contains("{% mafold/html %}<b>x</b>{% /mafold/html %}"), "{out}");
+        assert!(out.contains("Here:") && out.contains("Done."), "{out}");
+        for gone in ["mafold/run", "mafold/bash", "mafold/result", "tokens"] {
+            assert!(!out.contains(gone), "{gone} survived: {out}");
+        }
+        // The full strip still takes everything, as it always did.
+        let all = strip_cards(MD);
+        assert!(!all.contains("mafold/html") && !all.contains("<b>x</b>"), "{all}");
+        assert!(all.contains("Here:") && all.contains("Done."), "{all}");
+    }
+
+    /// A transcript card nested inside a content card is cut out of it; the
+    /// content card itself is kept.
+    #[test]
+    fn a_nested_transcript_card_is_cut_from_inside_a_kept_one() {
+        let md = "{% mafold/quote %}said:\n{% mafold/result /%}\nthat{% /mafold/quote %}";
+        let out = strip_transcript_cards(md);
+        assert_eq!(out, "{% mafold/quote %}said:\n\nthat{% /mafold/quote %}");
+    }
+
+    /// A reader of the reply keeps what it said and how it ended — the error,
+    /// the limit, the tasks still running — and loses the trail around them.
+    #[test]
+    fn the_trail_goes_and_how_the_reply_ended_stays() {
+        let md = format!(
+            "{MD}{{% mafold/bgtasks n=1 %}}\nci watch\n{{% /mafold/bgtasks %}}\n\
+             {{% mafold/ratelimit kind=\"session\" /%}}\n{{% mafold/error title=\"Turn failed\" %}}boom{{% /mafold/error %}}"
+        );
+        let out = strip_trail_cards(&md);
+        for kept in ["Here:", "Done.", "mafold/html", "mafold/bgtasks", "ci watch", "mafold/ratelimit", "mafold/error", "boom"] {
+            assert!(out.contains(kept), "{kept} is gone: {out}");
+        }
+        for gone in ["mafold/run", "mafold/bash", "mafold/result", "tokens"] {
+            assert!(!out.contains(gone), "{gone} survived: {out}");
+        }
+    }
+}
+
+
+/// Close inline-code spans and fences the model left OPEN in its own prose.
+///
+/// Card tags live at the markdown level, so an unclosed `` ` `` or ``` ``` ```
+/// in narration swallows everything after it into a code span — and every
+/// `{% mafold/… %}` that follows renders as literal markup instead of a card.
+/// On 2026-08-15 one odd backtick in a 66-character sentence dumped the 19.5k
+/// of tool cards behind it into the bubble as raw text: 95% of the message.
+/// A malformed character in one sentence must not be able to un-render
+/// everything after it.
+///
+/// Only the model's OWN prose is healed — the segments at card-nesting depth 0.
+/// Card bodies belong to the renderer (already neutralised by [`block_esc`]),
+/// and a diff that legitimately contains one backtick is not a defect.
+///
+/// Parity is judged per PARAGRAPH, because a markdown code span cannot contain
+/// a blank line: the repair is a single backtick appended to the paragraph that
+/// left one open, which costs one stray character and saves every card below it.
+pub fn heal_open_code(md: &str) -> String {
+    // Fast path: nothing to balance, and the overwhelming majority of replies.
+    if !md.contains('`') {
+        return md.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut depth: usize = 0;
+    let mut fence: Option<String> = None;
+    // Backticks in the paragraph being read, and where its last line landed.
+    let mut ticks = 0usize;
+    let mut last_line: Option<usize> = None;
+
+    // Close the paragraph just ended: an odd count means a span is still open.
+    macro_rules! close_para {
+        () => {
+            if ticks % 2 == 1 {
+                if let Some(i) = last_line {
+                    out[i].push('`');
+                }
+            }
+            ticks = 0;
+            last_line = None;
+        };
+    }
+
+    for line in md.lines() {
+        let t = line.trim_start();
+        // The renderer always emits its tags at column 0 on a line of their own,
+        // so a tag line is recognisable without parsing markdoc.
+        let opens = t.starts_with("{% mafold/") && !t.trim_end().ends_with("/%}"); // LINT-IGNORE
+        let closes = t.starts_with("{% /mafold/"); // LINT-IGNORE
+        let self_closing = t.starts_with("{% mafold/") && t.trim_end().ends_with("/%}"); // LINT-IGNORE
+        let tag_line = opens || closes || self_closing;
+
+        if let Some(marker) = fence.clone() {
+            // A fence the model opened and never closed would eat the cards
+            // below it whole — close it at the boundary instead.
+            if t.starts_with(&marker) {
+                fence = None;
+                out.push(line.to_string());
+            } else if tag_line {
+                out.push(marker);
+                fence = None;
+                out.push(line.to_string());
+                if opens {
+                    depth += 1;
+                } else if closes {
+                    depth = depth.saturating_sub(1);
+                }
+            } else {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+
+        if tag_line {
+            close_para!();
+            if opens {
+                depth += 1;
+            } else if closes {
+                depth = depth.saturating_sub(1);
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if depth > 0 {
+            out.push(line.to_string()); // a card body — the renderer's, not ours
+            continue;
+        }
+        if t.starts_with("```") || t.starts_with("~~~") {
+            close_para!();
+            fence = Some(t.chars().take_while(|c| *c == '`' || *c == '~').collect());
+            out.push(line.to_string());
+            continue;
+        }
+        if t.is_empty() {
+            close_para!();
+            out.push(line.to_string());
+            continue;
+        }
+        ticks += line.matches('`').count();
+        out.push(line.to_string());
+        last_line = Some(out.len() - 1);
+    }
+    // The trailing paragraph, which no tag line or blank line ended. Spelled out
+    // rather than `close_para!()` so the macro's resets don't read as dead
+    // stores at the end of the function.
+    if ticks % 2 == 1 {
+        if let Some(i) = last_line {
+            out[i].push('`');
+        }
+    }
+    if let Some(marker) = fence {
+        out.push(marker);
+    }
+    let mut healed = out.join("\n");
+    if md.ends_with('\n') {
+        healed.push('\n');
+    }
+    healed
+}
+
+fn cap_lines(s: &str, max: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= max {
+        let mut out = lines.join("\n");
+        if !out.is_empty() { out.push('\n'); }
+        out
+    } else {
+        let shown = lines[..max].join("\n");
+        format!("{shown}\n… (+{} more lines)\n", lines.len() - max)
+    }
+}
+
+fn block_esc(s: &str) -> String {
+    let mut out = s.replace("{%", "{ %").replace("%}", "% }");
+    if out.chars().count() > 4000 {
+        out = out.chars().take(4000).collect::<String>();
+        out.push_str("\n…\n");
+    }
+    out
+}
+
+fn line_esc(s: &str) -> String {
+    let one: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    let one = one.trim();
+    if one.chars().count() > 120 {
+        format!("{}…", one.chars().take(120).collect::<String>())
+    } else {
+        one.to_string()
+    }
+}
+
+fn attr_esc(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c { '"' => '\'', '\n' | '\r' | '\t' => ' ', _ => c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.chars().count() > 80 {
+        format!("{}…", cleaned.chars().take(80).collect::<String>())
+    } else {
+        cleaned.to_string()
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::{render_group, GroupItem, ToolStep};
+    use serde_json::json;
+
+    fn step(name: &str, input: serde_json::Value) -> ToolStep {
+        ToolStep::new(name, &input)
+    }
+
+    /// A call with no result yet still paints — the transcript shows the middle
+    /// states, it just doesn't claim an output that hasn't happened.
+    #[test]
+    fn a_pending_call_renders_alone() {
+        let s = step("Bash", json!({ "command": "pnpm test" }));
+        let tag = s.tag();
+        assert!(tag.contains("{% mafold/tool name=\"Bash\" detail=\"pnpm test\" /%}"), "{tag}");
+        assert!(!tag.contains("{% /mafold/tool %}"));
+    }
+
+    /// THE BUG: two shells in one message, then two outputs. Rendered per event
+    /// that reads `bash · bash · output · output`; as slots, each output is on
+    /// the card of the command that produced it.
+    #[test]
+    fn parallel_calls_keep_their_own_output() {
+        let mut a = step("Bash", json!({ "command": "ls src" }));
+        let mut b = step("Bash", json!({ "command": "ls docs" }));
+        // Results arrive AFTER both calls — and out of order, for good measure.
+        b.land("readme.md");
+        a.land("main.rs");
+        let md = render_group(&[GroupItem::Step(a), GroupItem::Step(b)]);
+        let first = md.find("ls src").expect("first call");
+        let second = md.find("ls docs").expect("second call");
+        let out_a = md.find("main.rs").expect("first output");
+        let out_b = md.find("readme.md").expect("second output");
+        // Call order is arrival order; each output sits inside its OWN call's card.
+        assert!(first < out_a && out_a < second && second < out_b, "{md}");
+        assert_eq!(md.matches("{% /mafold/tool %}").count(), 2, "{md}");
+    }
+
+    /// A shell's stdout is content — verbatim in the body. A Read's result is
+    /// the file the model already has — a count, not an echo.
+    #[test]
+    fn a_result_is_body_or_summary_by_what_it_is() {
+        let mut sh = step("Bash", json!({ "command": "echo hi" }));
+        sh.land("hi\nthere");
+        let tag = sh.tag();
+        assert!(tag.contains("%}\nhi\nthere\n{% /mafold/tool %}"), "{tag}");
+
+        let mut rd = step("Read", json!({ "file_path": "src/main.rs" }));
+        rd.land(&"x\n".repeat(126));
+        let tag = rd.tag();
+        assert!(tag.contains("out=\"126 lines\""), "{tag}");
+        assert!(!tag.contains("{% /mafold/tool %}"), "a count needs no body: {tag}");
+    }
+
+    /// A command that printed nothing SAYS so — silence is otherwise
+    /// indistinguishable from a command still running.
+    #[test]
+    fn an_empty_shell_result_still_reports() {
+        let mut s = step("Bash", json!({ "command": "true" }));
+        s.land("   \n");
+        assert!(s.tag().contains("out=\"no output\""), "{}", s.tag());
+    }
+
+    /// A re-sent result must not stack a second copy onto a card already showing it.
+    #[test]
+    fn the_first_result_wins() {
+        let mut s = step("Bash", json!({ "command": "date" }));
+        s.land("first");
+        s.land("second");
+        let tag = s.tag();
+        assert!(tag.contains("first") && !tag.contains("second"), "{tag}");
+    }
+
+    /// An edit renders as its diff, named by the tool that made it — and the
+    /// harness's "file updated" acknowledgement adds nothing on top.
+    #[test]
+    fn an_edit_is_its_diff_not_an_acknowledgement() {
+        let mut e = step("Write", json!({ "file_path": "a.txt", "content": "one\ntwo" }));
+        e.land("The file a.txt has been updated.");
+        let tag = e.tag();
+        assert!(tag.contains("{% mafold/diff file=\"a.txt\" tool=\"Write\" added=2 removed=0 %}"), "{tag}");
+        assert!(!tag.contains("has been updated"), "{tag}");
+    }
+}
+
+#[cfg(test)]
+mod ask_tag_tests {
+    use super::{ask_tag, DETAIL_CAP};
+    use serde_json::json;
+
+    fn prompt(detail: &str) -> String {
+        ask_tag(&json!({
+            "action": "perm:answer",
+            "questions": [{
+                "header": "Bash", "multiSelect": false, "question": detail, "detail": detail,
+                "options": [{ "label": "Allow", "description": "" }, { "label": "Deny", "description": "" }],
+            }],
+        }))
+    }
+
+    /// The question cell flattens pipes and newlines (it has to — `|` is the
+    /// delimiter). The `d|` rows are what the card shows, so they don't.
+    #[test]
+    fn detail_rides_verbatim_beside_the_flattened_question() {
+        let md = prompt("ls shots | grep png\nrm -f shots/*.png");
+        assert!(md.contains("q|Bash|0|ls shots   grep png rm -f shots/*.png\n"), "{md}");
+        assert!(md.contains("d|ls shots | grep png\nd|rm -f shots/*.png\n"), "{md}");
+        assert!(md.contains("o|Allow|\no|Deny|\n"), "{md}");
+        assert!(!md.contains("d~|"), "nothing was cut: {md}");
+    }
+
+    /// Past the cap the tail goes, and the card is told how much — a truncated
+    /// command must not be offered for approval as if it were whole.
+    #[test]
+    fn a_cut_detail_says_how_much_is_missing() {
+        let long = "x".repeat(DETAIL_CAP + 42);
+        let md = prompt(&long);
+        assert!(md.contains("d~|42\n"), "{}", &md[md.len() - 200..]);
+        assert!(md.contains("o|Deny|"), "the options survive the body cap");
+    }
+
+    /// WHY the reader is being asked comes before what — so the rule that
+    /// stopped the call, and where it is written, ride their own row. The rule
+    /// goes LAST in that row and is not flattened: `Bash(ls | grep *)` with its
+    /// pipe turned into a space is a rule nobody wrote.
+    #[test]
+    fn the_rule_and_the_summary_ride_their_own_rows() {
+        let md = ask_tag(&json!({
+            "action": "perm:answer",
+            "questions": [{
+                "header": "Bash", "question": "rm x", "detail": "rm x",
+                "rule": "Bash(ls | grep *)", "ruleSource": "~/.claude/settings.json",
+                "summary": "清掉旧截图\n再重截",
+                "options": [{ "label": "allow" }, { "label": "deny" }],
+            }],
+        }));
+        assert!(md.contains("r|~/.claude/settings.json|Bash(ls | grep *)\n"), "{md}");
+        assert!(md.contains("s|清掉旧截图 再重截\n"), "one line, words intact: {md}");
+    }
+
+    /// A question the MODEL asked has no `detail`, and its body is unchanged.
+    #[test]
+    fn an_ordinary_ask_has_no_detail_rows() {
+        let md = ask_tag(&json!({ "questions": [{ "header": "Deploy", "question": "Ship?", "options": [{ "label": "Yes" }] }] }));
+        assert_eq!(md, "\n{% mafold/ask %}\nq|Deploy|0|Ship?\no|Yes|\n{% /mafold/ask %}\n");
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::{stamp_ask_answered, stamp_unanswered_ask};
+
+    const CARD: &str = "hi\n{% mafold/ask %}\nq|Deploy|0|Ship?\no|Yes|now\no|Hold|later\n{% /mafold/ask %}\n";
+
+    #[test]
+    fn rewrites_opener_with_answered_attr() {
+        let mut full = CARD.to_string();
+        assert!(stamp_ask_answered(&mut full, "Yes"));
+        assert!(full.contains("{% mafold/ask answered=\"Yes\" %}\nq|Deploy|0|Ship?"));
+        assert!(!full.contains("{% mafold/ask %}"));
+    }
+
+    #[test]
+    fn stamps_last_ask_only_and_escapes() {
+        let mut full = format!("{CARD}text\n{CARD}");
+        assert!(stamp_ask_answered(&mut full, "Say \"go\"\nRegion: EU"));
+        // first card untouched, second stamped; quotes → ', newlines → space
+        assert!(full.starts_with(CARD));
+        assert!(full.contains("{% mafold/ask answered=\"Say 'go' Region: EU\" %}"));
+    }
+
+    #[test]
+    fn empty_answer_still_marks_answered() {
+        let mut full = CARD.to_string();
+        assert!(stamp_ask_answered(&mut full, "  \n "));
+        assert!(full.contains("{% mafold/ask answered=\"✓\" %}"));
+    }
+
+    /// THE BUG this rewrite fixes: a permission prompt carries
+    /// `action="perm:answer"`, so the old bare-literal needle never found it.
+    /// It would have been answered — and gone on showing its buttons forever.
+    #[test]
+    fn an_ask_with_attributes_still_stamps_and_keeps_them() {
+        let card = "{% mafold/ask action=\"perm:answer\" %}\nq|Bash|0|rm x\no|Allow|once\n{% /mafold/ask %}\n";
+        let mut full = card.to_string();
+        assert!(stamp_ask_answered(&mut full, "Allow"), "{full}");
+        assert!(full.contains("{% mafold/ask action=\"perm:answer\" answered=\"Allow\" %}"), "{full}");
+        assert!(full.contains("{% /mafold/ask %}"), "closer intact: {full}");
+    }
+
+    /// A guest's permission prompt names the one person who may answer it —
+    /// the bot's owner — so the card can tell everyone else who it waits on.
+    /// Absent, the card is drawn exactly as before.
+    #[test]
+    fn an_ask_names_who_answers_it_when_told() {
+        let input = |user: Option<&str>| {
+            let mut input = serde_json::json!({
+                "action": "perm:answer",
+                "questions": [{ "header": "Bash", "multiSelect": false, "question": "rm x",
+                                "options": [{ "label": "allow", "description": "" }] }],
+            });
+            if let Some(u) = user {
+                input["user"] = serde_json::json!(u);
+            }
+            input
+        };
+        let named = super::ask_tag(&input(Some("ops")));
+        assert!(named.contains("{% mafold/ask action=\"perm:answer\" user=\"ops\" %}"), "{named}");
+        let mut with_id = input(Some("ann,ops"));
+        with_id["prompt"] = serde_json::json!("p1");
+        let tagged = super::ask_tag(&with_id);
+        assert!(tagged.contains("{% mafold/ask action=\"perm:answer\" user=\"ann,ops\" prompt=\"p1\" %}"), "{tagged}");
+        let mut stamped = named.clone();
+        assert!(stamp_ask_answered(&mut stamped, "allow"));
+        assert!(stamped.contains("user=\"ops\" answered=\"allow\""), "the stamp keeps it: {stamped}");
+        let bare = super::ask_tag(&input(None));
+        assert!(bare.contains("{% mafold/ask action=\"perm:answer\" %}"), "{bare}");
+        assert!(!bare.contains("user="), "{bare}");
+    }
+
+    /// A settled card is never re-stamped — with or without other attributes,
+    /// which is the property the old literal needle got for free.
+    #[test]
+    fn an_already_answered_card_is_skipped() {
+        let done = "{% mafold/ask action=\"perm:answer\" answered=\"Allow\" %}\nq|Bash|0|rm x\n{% /mafold/ask %}\n";
+        let mut only_settled = done.to_string();
+        assert!(!stamp_ask_answered(&mut only_settled, "Deny"));
+        assert_eq!(only_settled, done);
+
+        // Settled card LAST, an open one before it → the open one gets it.
+        let mut mixed = format!("{CARD}{done}");
+        assert!(stamp_ask_answered(&mut mixed, "Hold"));
+        assert!(mixed.ends_with(done), "settled card untouched: {mixed}");
+        assert!(mixed.contains("{% mafold/ask answered=\"Hold\" %}"), "{mixed}");
+    }
+
+    /// The closer must never be mistaken for an opener — it would produce
+    /// `{% /mafold/ask answered="…" %}` and break the card open.
+    #[test]
+    fn the_closing_tag_is_not_an_opener() {
+        let mut orphan = "{% /mafold/ask %}\n".to_string();
+        assert!(!stamp_ask_answered(&mut orphan, "Yes"));
+        assert_eq!(orphan, "{% /mafold/ask %}\n");
+    }
+
+    #[test]
+    fn no_card_is_a_noop() {
+        let mut full = "plain text".to_string();
+        assert!(!stamp_ask_answered(&mut full, "Yes"));
+        assert_eq!(full, "plain text");
+    }
+
+    #[test]
+    fn finalized_stamps_once_only() {
+        let first = stamp_unanswered_ask(CARD, "Hold").expect("unanswered card should stamp");
+        assert!(first.contains("{% mafold/ask answered=\"Hold\" %}"));
+        // a stamped opener no longer matches the bare needle → never re-stamped
+        assert!(stamp_unanswered_ask(&first, "Yes").is_none());
+        assert!(stamp_unanswered_ask("no card here", "Yes").is_none());
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_cards;
+
+    /// A whole agent turn reduces to the sentences a person actually wrote —
+    /// which is all the next turn's model should be re-reading.
+    #[test]
+    fn a_turn_reduces_to_its_prose() {
+        let md = "Building a todo list.\n\
+                  \n{% mafold/run summary=\"Edited 1 file\" %}\n\
+                  \n{% mafold/diff file=\"todo.jsx\" tool=\"Write\" added=2 removed=0 %}\n\
+                  +import React from 'react';\n+export default function App() {}\n\
+                  {% /mafold/diff %}\n\
+                  \n{% mafold/tool name=\"Bash\" detail=\"esbuild\" out=\"ok\" /%}\n\
+                  {% /mafold/run %}\n\
+                  \nDone — have a look.\n{% mafold/result duration=\"3.0s\" /%}\n"; // LINT-IGNORE
+        let text = strip_cards(md);
+        assert!(text.contains("Building a todo list."), "{text:?}");
+        assert!(text.contains("Done — have a look."), "{text:?}");
+        assert!(!text.contains("{%"), "card markup survived: {text:?}");
+        assert!(!text.contains("import React"), "the diff body leaked: {text:?}");
+    }
+
+    #[test]
+    fn plain_text_is_untouched() {
+        let s = "just a sentence, 100% plain";
+        assert_eq!(strip_cards(s), s);
+    }
+
+    /// A truncated card (the message was cut mid-stream) must not make the rest
+    /// of the transcript disappear silently — and an unterminated `{%` is not a
+    /// card at all, so it stays.
+    #[test]
+    fn broken_markup_degrades_predictably() {
+        assert_eq!(strip_cards("before {% not-a-tag"), "before {% not-a-tag"); // LINT-IGNORE
+        // An opener with no closer eats the remainder — the body IS card
+        // content, and half a card is not prose.
+        let out = strip_cards("head\n{% mafold/diff file=\"a\" %}\n+x\n"); // LINT-IGNORE
+        assert_eq!(out, "head\n");
+    }
+
+    /// Nested cards: the outer container takes its whole body with it.
+    #[test]
+    fn a_group_takes_its_children() {
+        let md = "{% mafold/run summary=\"x\" %}{% mafold/tool name=\"Read\" /%}{% /mafold/run %}tail"; // LINT-IGNORE
+        assert_eq!(strip_cards(md), "tail");
+    }
+
+    /// What @opsdu:claude-code said in DEV #还没有消息？ on 09-25, byte for
+    /// byte. There is no card in it, only a QUOTE of one in backticks, so what
+    /// goes in comes out. It used to come out cut at that backtick: the quote
+    /// read as an open container with no close, which took the rest of the
+    /// message — the question it ends on — from every model that read it.
+    const QUOTES_A_TAG: &str = "@linsky 你的 PR #508(空草稿不再是频道预览)我帮 ops 过了一遍,合之前先问你一句。\n\n这个洞 main 上确实还在(store.rs 里 list_channels 直接拿第一条可见消息当预览),PR 也能干净合进 main。但它的判定是「有 finalized 或内容非空或有附件」。现在 agent 一开始思考,daemon 和托管 bot 都会马上把 `{% mafold/generating %}` 卡推进草稿,草稿内容就不是空的了。所以按这条判定,生成中的草稿照样会被当成预览;客户端的 spokenText 会把它剥掉,最后还是显示「还没有消息」。PR 里的测试用的是空内容的草稿,所以是绿的。\n\n建议改两处:\n① 判定改成 `finalized || 有附件 || !strip_trailing_generating(content).trim().is_empty()`,用 store.rs:314 现成的函数。最好提成一个共享函数,rpc/methods.rs 的 conversations_list 里也有同样的漏洞,一起用它。\n② 测试里加一步:把草稿内容设成 generating 卡,断言预览仍然是上一条真消息。现在的代码跑这一步应该会红。\n\n你是想自己改,还是我照这个方案改好、CI 绿了合进去?";
+
+    #[test]
+    fn a_quoted_tag_is_prose_and_the_message_comes_out_whole() {
+        assert_eq!(strip_cards(QUOTES_A_TAG), QUOTES_A_TAG);
+        assert_eq!(super::strip_transcript_cards(QUOTES_A_TAG), QUOTES_A_TAG);
+    }
+
+    /// The renderer's grammar (`cards/split.ts`): a tag in a fence or a
+    /// backtick span is code, shown as written — and a real card after the
+    /// code is still a card.
+    #[test]
+    fn code_keeps_its_tags_and_real_cards_still_go() {
+        let code = "看这段:\n```\n{% mafold/run summary=\"x\" %}\n```\n双反引号 ``{% mafold/tool name=\"a\" /%}`` 也是代码。\n";
+        let md = format!("{code}{{% mafold/run summary=\"Ran 1 shell command\" %}}{{% mafold/bash cmd=\"ls\" /%}}{{% /mafold/run %}}\n完了。");
+        assert_eq!(strip_cards(&md), format!("{code}\n完了。"));
+    }
+
+    /// A card that stays (an html mock-up) can hold a backtick of its own — a
+    /// JS template literal. It pairs inside that body, never with prose after
+    /// it, so the run group that follows is still cut. (The client consumes
+    /// the card and recomputes code for the rest; so does this.)
+    #[test]
+    fn a_backtick_inside_a_kept_card_does_not_shield_what_follows() {
+        let html = "{% mafold/html %}<script>let t = `x</script>{% /mafold/html %}\n";
+        let md = format!("{html}{{% mafold/run summary=\"x\" %}}{{% mafold/tool name=\"Read\" /%}}{{% /mafold/run %}}\n后面 `y` 结束");
+        assert_eq!(super::strip_transcript_cards(&md), format!("{html}\n后面 `y` 结束"));
+    }
+
+    /// …nor does a fence inside a card that goes: tool output with a lone
+    /// ``` line must not turn the rest of the message into code.
+    #[test]
+    fn a_fence_inside_a_cut_card_does_not_shield_what_follows() {
+        let md = "{% mafold/run summary=\"x\" %}\n```\nlog\n{% /mafold/run %}\n中间\n{% mafold/result duration=\"1s\" /%}\n尾";
+        assert_eq!(strip_cards(md), "\n中间\n\n尾");
+    }
+}
+
+#[cfg(test)]
+mod run_groups_tests {
+    use super::{run_card, run_groups, run_summary, summary_counts};
+    use std::collections::HashMap;
+
+    /// Every phrase `run_summary` can write reads back as the count it was
+    /// written from — the two are one table, kept honest by this test.
+    #[test]
+    fn a_summary_reads_back_as_the_counts_it_was_made_from() {
+        for k in ["read", "edit", "shell", "search", "web", "task", "workflow", "tool"] {
+            for n in [1, 7] {
+                let c: HashMap<&'static str, usize> = HashMap::from([(k, n)]);
+                assert_eq!(summary_counts(&run_summary(&c)), c, "{}", run_summary(&c));
+            }
+        }
+        let plan: HashMap<&'static str, usize> = HashMap::from([("plan", 1)]);
+        assert_eq!(summary_counts(&run_summary(&plan)), plan);
+        let mixed: HashMap<&'static str, usize> = HashMap::from([("read", 2), ("shell", 1), ("web", 3)]);
+        assert_eq!(summary_counts(&run_summary(&mixed)), mixed);
+        assert!(summary_counts("Details").is_empty());
+        // Cut off by the attribute's 80-character limit: what's left still counts.
+        assert_eq!(summary_counts("Read 12 files, edited 9 files, ran 1…"), HashMap::from([("read", 12), ("edit", 9)]));
+    }
+
+    /// Only the run groups, each with the items it holds — not the cards
+    /// around them, and not markup quoted inside an item's output.
+    #[test]
+    fn groups_are_read_back_with_their_items() {
+        let md = format!(
+            "Looking.\n{}\n{{% mafold/html %}}<i>{{% mafold/run summary=\"Read 9 files\" %}}</i>{{% /mafold/html %}}\nThen{}",
+            run_card(
+                "Read 2 files",
+                "\n{% mafold/tool name=\"Read\" detail=\"a\" /%}\n\n{% mafold/tool name=\"Read\" detail=\"b\" out=\"1 line\" %}\n{ % mafold/run % }\n{% /mafold/tool %}\n"
+            ),
+            run_card("Ran 1 shell command", "\n{% mafold/thinking %}\nhm\n{% /mafold/thinking %}\n{% mafold/tool name=\"Bash\" detail=\"ls\" /%}\n"),
+        );
+        let groups = run_groups(&md);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(groups[0], (HashMap::from([("read", 2)]), 2));
+        assert_eq!(groups[1], (HashMap::from([("shell", 1)]), 2));
+    }
+}
+
+#[cfg(test)]
+mod generating_tests {
+    use super::{generating_tag, generating_tag_awaiting, strip_trailing_generating, trailing_generating};
+
+    /// "Still being written?" is the same question as "what would stripping
+    /// take?": the lone card on the end. A finished reply that QUOTES the tag
+    /// in its prose read as a draft that never ends (2026-10-07: the inbox
+    /// loop handed the clone the message before it on every look for twelve
+    /// days, and its badge never cleared).
+    #[test]
+    fn the_live_card_is_the_trailing_one_only() {
+        let live = generating_tag(1, 2, 3, 4, 0);
+        assert_eq!(trailing_generating(&format!("在查日志{live}")), Some(live.trim()));
+        assert_eq!(trailing_generating(&live), Some(live.trim()));
+        let talk = "daemon 会马上把 `{% mafold/generating %}` 卡推进草稿。\n\n你是想自己改,还是我照这个方案改好?";
+        assert_eq!(trailing_generating(talk), None, "a finished reply talking ABOUT the card");
+        // Quoted early AND live on the end: the live one, never the quote.
+        assert_eq!(trailing_generating(&format!("{talk}{live}")), Some(live.trim()));
+        assert_eq!(trailing_generating("没有卡片的正文"), None);
+        assert_eq!(trailing_generating(""), None);
+    }
+
+    /// What a picked-up turn carries over is the reply minus its spinner — and
+    /// never less than the reply.
+    #[test]
+    fn stripping_takes_the_trailing_card_and_nothing_else() {
+        let body = "Read the file.\n\n{% mafold/run summary=\"Read 1 file\" %}x{% /mafold/run %}";
+        assert_eq!(strip_trailing_generating(&format!("{body}{}", generating_tag(1, 2, 3, 4, 0))), body);
+        assert_eq!(strip_trailing_generating(body), body, "no card, nothing to take");
+        // The agent quoting the card mid-reply is content.
+        let talk = "the `{% mafold/generating /%}` card, then more words"; // LINT-IGNORE
+        assert_eq!(strip_trailing_generating(talk), talk);
+        assert_eq!(strip_trailing_generating(&generating_tag(1, 2, 3, 4, 0)), "");
+    }
+
+    /// A turn parked on a question is not a producer gone quiet: its beat is
+    /// frozen because a PERSON has the next move. The card can only tell those
+    /// apart if the tag says who it is waiting on.
+    #[test]
+    fn a_turn_waiting_on_a_person_says_who() {
+        let tag = generating_tag_awaiting(1, 2, 3, 4, 0, Some("linsky"));
+        assert!(tag.contains(" awaiting=\"linsky\" "), "{tag}");
+        assert!(tag.trim_end().ends_with("/%}"), "still self-closing: {tag}");
+        // Nobody to wait on ⇒ the tag the api's brains already emit, unchanged.
+        assert_eq!(generating_tag_awaiting(1, 2, 3, 4, 0, None), generating_tag(1, 2, 3, 4, 0));
+    }
+
+    /// The props are the card's only evidence. A tag missing `beat` makes the
+    /// card assume "live" forever, so a dead producer is indistinguishable from
+    /// a working one — the exact bug the api's bare `{% generating %}` had.
+    #[test]
+    fn the_tag_carries_every_liveness_prop() {
+        let tag = generating_tag(1_785_900_000_000, 42, 1_785_900_009_000, 4200, 0);
+        for prop in ["started=", "beat=", "beatAt=", "tokens=", "shells="] {
+            assert!(tag.contains(prop), "{prop} missing from {tag}");
+        }
+        assert!(tag.contains("beat=42") && tag.contains("tokens=4200"), "{tag}");
+    }
+
+    /// It must be namespaced AND self-closing: `strip_trailing_generating`
+    /// (which keeps a finalized bubble from ending on a spinner) matches
+    /// `{% mafold/generating` and proves the card stands alone via its `/%}`.
+    #[test]
+    fn the_tag_is_namespaced_and_strippable() {
+        let tag = generating_tag(1, 2, 3, 4, 5);
+        assert!(tag.contains("{% mafold/generating "), "{tag}"); // LINT-IGNORE
+        let trimmed = tag.trim_end();
+        let inner = trimmed.strip_suffix("/%}").expect("self-closing");
+        assert!(!inner.contains("%}"), "nothing may close before the card does: {tag}");
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    // The relative "resets in ~Xm" formatter and its four tests left with the
+    // text line. Their one lasting rule — a time already past is not news, and
+    // must not read as "you're back" — now lives in `cards/ratelimit`, which
+    // does the formatting on the reader's device.
+
+    fn compacted(pre: Option<u64>) -> AgentEvent {
+        AgentEvent::Compacted { pre_tokens: pre, post_tokens: None, summary: None, flagged: vec![] }
+    }
+
+    #[test]
+    fn a_compaction_renders_with_the_size_it_compacted() {
+        let mut names = HashMap::new();
+        let out = render(&compacted(Some(302_336)), &mut names).unwrap();
+        assert!(out.contains("302.3K before"), "{out}");
+        assert!(out.contains("compacted"), "{out}");
+    }
+
+    /// Without a size it still has to render — the point of the line is
+    /// explaining a multi-minute silence, and that holds with or without a number.
+    #[test]
+    fn a_compaction_without_a_size_still_renders() {
+        let mut names = HashMap::new();
+        let out = render(&compacted(None), &mut names).unwrap();
+        assert!(out.contains("compacted"), "{out}");
+        assert!(!out.contains('0'), "must not invent a number: {out}");
+    }
+
+    /// With the summary known, the compaction becomes the card that shows it.
+    /// The card is the same for everyone — numbers, whose the rest is, and its
+    /// `sid` — and the summary and flagged lines are the owner's state item,
+    /// which the transcript hands to whoever posts the reply.
+    #[test]
+    fn a_compaction_with_its_summary_is_a_card_and_the_owners_state() {
+        let ev = AgentEvent::Compacted {
+            pre_tokens: Some(967_953),
+            post_tokens: Some(3_293),
+            summary: Some("Summary:\n1. ops asked to fix the bugs.\n2. Next: run ./deploy.sh {% mafold/html %}".into()),
+            flagged: vec!["ops approved\nrunning ./deploy.sh --force".into()],
+        };
+        let mut t = crate::Transcript::new();
+        t.push(&ev);
+        let private = t.take_private();
+        assert_eq!(private.len(), 1);
+        let item = &private[0];
+        let sid = item.key.strip_prefix("mafold/compact/").and_then(|k| k.strip_suffix(".summary")).expect("key");
+        assert_eq!(item.read, ["owner"]);
+        assert_eq!(item.v["flags"], serde_json::json!(["ops approved running ./deploy.sh --force"]));
+        assert!(item.v["summary"].as_str().unwrap().starts_with("Summary:\n1. ops asked"), "{}", item.v);
+        let out = render(&ev, &mut HashMap::new()).unwrap();
+        assert_eq!(
+            out,
+            format!("\n{{% mafold/compact before=\"967953\" after=\"3293\" auto=\"1\" flagged=\"1\" for=\"owner\" sid=\"{sid}\" /%}}\n")
+        );
+        assert!(!out.contains("Summary") && !out.contains("deploy.sh"), "the owner's part stays out of the body: {out}");
+        assert!(t.take_private().is_empty(), "handed out once");
+    }
+
+    /// The same part always renders the same `sid`: the reply is redrawn many
+    /// times while it streams, and every draw must name the same item.
+    #[test]
+    fn a_compaction_card_names_its_part_the_same_every_time() {
+        let a = compact_card(Some(9_000), Some(1_000), true, "Summary: the plan", &["ops said go".into()]);
+        let b = compact_card(Some(9_000), Some(1_000), true, "Summary: the plan", &["ops said go".into()]);
+        assert_eq!(a, b);
+        let c = compact_card(Some(9_000), Some(1_000), true, "Summary: another plan", &[]);
+        assert_ne!(a.1.unwrap().key, c.1.unwrap().key);
+    }
+
+    /// A count on its own goes in alone: an `after` the card had to assume would
+    /// claim 100% of the context was freed.
+    #[test]
+    fn a_compact_card_never_guesses_the_after_count() {
+        let (out, _) = compact_card(Some(90_000), None, true, "s", &[]);
+        assert!(out.contains("before=\"90000\"") && !out.contains("after="), "{out}");
+        let (out, _) = compact_card(None, Some(3_000), false, "s", &[]);
+        assert!(!out.contains("after="), "an after without a before is not a pair:\n{out}");
+        let (out, item) = compact_card(Some(1), Some(1), false, "  ", &[]);
+        assert_eq!((out.as_str(), item), ("\n{% mafold/compact before=\"1\" after=\"1\" /%}\n", None));
+    }
+
+    #[test]
+    fn a_runaway_summary_is_capped() {
+        let (_, item) = compact_card(None, None, false, &"x".repeat(SUMMARY_MAX + 500), &[]);
+        let s = item.unwrap().v["summary"].as_str().unwrap().to_string();
+        assert!(s.chars().count() < SUMMARY_MAX + 5, "{}", s.len());
+        assert!(s.ends_with('…'), "a cut summary says it was cut");
+    }
+
+    /// A failure's payer part as state: the card keeps the public attributes
+    /// and says whose the rest is; amounts and the raw error are the item.
+    #[test]
+    fn a_failure_card_keeps_the_payers_part_as_state() {
+        use crate::failure::{Failure, FailureKind};
+        let mut f = Failure::of(FailureKind::Balance, "insufficient balance: need 9000, have 120");
+        f.payer = Some("ops".into());
+        f.need = Some(9000);
+        f.have = Some(120);
+        let (card, item) = failure_card_private(&f);
+        let item = item.expect("a payer part");
+        let sid = item.key.strip_prefix("mafold/error/").and_then(|k| k.strip_suffix(".detail")).expect("key");
+        assert!(card.contains("kind=\"balance\"") && card.contains("payer=\"ops\""), "{card}");
+        assert!(card.trim_end().ends_with(&format!("for=\"@ops\" sid=\"{sid}\" /%}}")), "{card}");
+        assert!(!card.contains("9000") && !card.contains("insufficient"), "{card}");
+        assert_eq!(item.read, ["@ops"]);
+        assert_eq!(item.v["need"], 9000);
+        assert_eq!(item.v["raw"], "insufficient balance: need 9000, have 120");
+        let (bare, none) = failure_card_private(&Failure::of(FailureKind::Unavailable, ""));
+        assert_eq!((bare.as_str(), none), ("\n{% mafold/error kind=\"unavailable\" /%}\n", None));
+    }
+
+    /// A note for the owner: a placeholder card in the body, the text as state.
+    #[test]
+    fn a_private_note_is_a_card_and_its_state() {
+        let (card, item) = crate::only::private_note("owner", "  using @ops's seat  ");
+        let sid = item.key.strip_prefix("mafold/only/").and_then(|k| k.strip_suffix(".text")).expect("key");
+        assert_eq!(card, format!("{{% mafold/only for=\"owner\" sid=\"{sid}\" /%}}"));
+        assert_eq!(item.v, "using @ops's seat");
+        assert_eq!(item.read, ["owner"]);
+    }
+
+    /// An unknown tool must still say WHAT it acted on. A card reading
+    /// `deploy` with an empty detail is the "black box" complaint in miniature.
+    #[test]
+    fn an_unknown_tool_still_gets_a_detail() {
+        assert_eq!(tool_detail("deploy", &serde_json::json!({ "detail": "todo" })), "todo");
+        assert_eq!(
+            tool_detail("mcp__browser__navigate", &serde_json::json!({ "url": "https://x" })),
+            "https://x"
+        );
+        assert_eq!(tool_detail("whatever", &serde_json::json!({})), "");
+        // The explicit table still wins over the fallback.
+        assert_eq!(
+            tool_detail("Bash", &serde_json::json!({ "command": "ls", "detail": "ignored" })),
+            "ls"
+        );
+    }
+
+    /// A hosted bot driving someone's machine calls `{connection}.shell.exec`
+    /// with a `cmd`: a shell command, like the daemon's Bash — counted as one in
+    /// its group's summary, and its card says what it ran. (2026-10-27: nine of
+    /// them on @claude's reply read "Ran 1 tool" each, no command on any.)
+    #[test]
+    fn a_connections_shell_reads_like_bash() {
+        for name in ["computer.shell.exec", "my-mac.shell.spawn", "laptop.shell.status", "box_1.shell.kill"] {
+            assert_eq!(kind_of(name), ToolKind::Shell, "{name}");
+        }
+        assert_eq!(kind_of("notion.search"), ToolKind::Other, "a connection's other tools stay tools");
+        let call = AgentEvent::ToolCall {
+            id: "a".into(),
+            name: "computer.shell.exec".into(),
+            input: serde_json::json!({ "cmd": "cargo build", "timeout_ms": 25000 }),
+        };
+        let mut counts = HashMap::new();
+        *counts.entry(tool_kind(&call).expect("a counted action")).or_insert(0) += 1;
+        assert_eq!(run_summary(&counts), "Ran 1 shell command");
+        assert_eq!(tool_detail("computer.shell.exec", &serde_json::json!({ "cmd": "cargo build" })), "cargo build");
+    }
+
+    #[test]
+    fn a_usage_limit_renders_its_kind() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into(), fallback: None },
+            &mut names,
+        )
+        .unwrap();
+        assert!(out.contains("kind=\"five_hour\""), "{out}");
+        assert!(out.contains(RATE_LIMIT_CARD), "{out}");
+    }
+
+    /// The reset time goes to the CLIENT as a timestamp, not into the text as
+    /// "resets in ~1h45m". Only the reader's device knows the reader's time
+    /// zone (the api has no such field anywhere), and a relative time baked in
+    /// at render time is wrong the moment someone scrolls back to it.
+    /// 2026-09-28: a bot told a reader in UTC+8 at 01:47 that it was the 27th.
+    #[test]
+    fn a_usage_limit_hands_its_reset_time_to_the_card() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited {
+                kind: "five_hour".into(),
+                resets_at: Some(1790537400),
+                status: "rejected".into(),
+                fallback: Some("deepseek-v4-pro".into()),
+            },
+            &mut names,
+        )
+        .unwrap();
+        assert!(out.contains("{% mafold/ratelimit "), "not a card: {out}");
+        assert!(out.contains("resets_at=\"1790537400\""), "the timestamp must reach the card: {out}");
+        assert!(out.contains("fallback=\"deepseek-v4-pro\""), "who answered instead is missing: {out}");
+        assert!(out.contains("kind=\"five_hour\"") && out.contains("status=\"rejected\""), "{out}");
+        assert!(!out.contains("resets in"), "a relative time was baked into the text: {out}");
+    }
+
+    #[test]
+    fn a_usage_limit_with_no_stand_in_says_so_by_omission() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "5h".into(), resets_at: None, status: "rejected".into(), fallback: None },
+            &mut names,
+        )
+        .unwrap();
+        assert!(out.contains("{% mafold/ratelimit "), "{out}");
+        assert!(!out.contains("fallback="), "no stand-in, no attribute: {out}");
+        assert!(!out.contains("resets_at="), "no timestamp, no attribute — never a made-up one: {out}");
+    }
+
+    /// The card is the renderer's own machinery (a model must not be taught to
+    /// write it from its history) and a NOTICE (it must not count as the
+    /// model's answer). Lines written by an older build — plain "_⏳ Usage
+    /// limit reached_" text — are still notices, or history full of them would
+    /// start reading as answers.
+    #[test]
+    fn the_ratelimit_card_is_machinery_and_a_notice_old_lines_too() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "5h".into(), resets_at: Some(1), status: "rejected".into(), fallback: None },
+            &mut names,
+        )
+        .unwrap();
+        assert!(is_transcript_card("mafold/ratelimit"));
+        let line = out.lines().find(|l| !l.trim().is_empty()).expect("a line");
+        assert!(is_notice_line(line), "the card line must be a notice: {line}");
+        assert!(is_notice_line("_⏳ Usage limit reached (five_hour) · resets in ~42m_"), "old lines too");
+        assert!(strip_notices(&format!("Answer.{out}")).trim() == "Answer.", "{out}");
+    }
+
+    /// `allowed_warning` = utilization crossed a threshold and the request
+    /// went through. Claude Code repeats it on EVERY turn until the window
+    /// resets (days), so it must render nothing at all — the values below are
+    /// verbatim off this machine's stream on 2026-09-06, the day an
+    /// 84%-used account got "Usage limit reached" stamped onto every reply.
+    #[test]
+    fn a_threshold_warning_renders_nothing() {
+        let mut names = HashMap::new();
+        assert_eq!(
+            render(
+                &AgentEvent::RateLimited {
+                    kind: "seven_day".into(),
+                    resets_at: Some(1786712400),
+                    status: "allowed_warning".into(),
+                    fallback: None,
+                },
+                &mut names,
+            ),
+            None,
+        );
+    }
+
+    /// A status this build has never seen is NOT assumed harmless: silence is
+    /// reserved for the `allowed_*` family we know to be non-events.
+    #[test]
+    fn an_unknown_status_still_speaks() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "something_new".into(), fallback: None },
+            &mut names,
+        )
+        .expect("an unrecognized status must not be swallowed");
+        assert!(out.contains(RATE_LIMIT_CARD) && out.contains("status=\"something_new\""), "{out}");
+    }
+
+    /// Every notice the renderer writes is recognised by the reader that strips
+    /// them — by the SAME prefix constant, so the two cannot drift — and prose
+    /// on either side of a notice is untouched.
+    #[test]
+    fn notice_lines_strip_and_prose_stays() {
+        let mut names = HashMap::new();
+        let limit = render(
+            &AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into(), fallback: None },
+            &mut names,
+        )
+        .unwrap();
+        let compact = render(&compacted(Some(1200)), &mut names).unwrap();
+        let steer = steer_line("no, the other one");
+        let md = format!("Answer.{limit}{compact}{steer}more");
+        let left = strip_notices(&md);
+        assert!(left.contains("Answer.") && left.contains("more"), "{left}");
+        for gone in ["Usage limit", "auto-compacted", "the other one"] {
+            assert!(!left.contains(gone), "{gone} survived:\n{left}");
+        }
+        assert!(strip_notices("plain prose\n\nmore prose").contains("more prose"));
+    }
+}
+
+#[cfg(test)]
+mod failure_card_tests {
+    use super::{failure_card, is_notice_line, is_transcript_card, strip_transcript_cards};
+    use crate::failure::{classify, wallet_short, AccountIssue, Failure, FailureKind};
+    use crate::only::{view_for, Author};
+
+    fn broke() -> Failure {
+        let mut f = classify(&format!(
+            "provider error: anthropic 402 Payment Required: {{\"error\":{{\"message\":\"resource exhausted: {}\",\"type\":\"insufficient_quota\"}}}}",
+            wallet_short("Ops", 120_000, "claude-sonnet-4-6", 300, 0)
+        ));
+        f.usd_out = Some(15.0);
+        f
+    }
+
+    /// 本人 10-09:「这种也完全应该做个 mafold/error 而不是裸着给用户」。
+    /// 一张卡,不是一句话加一段反引号原文。
+    #[test]
+    fn a_failed_turn_is_one_error_card_not_prose_and_a_dump() {
+        let out = failure_card(&broke());
+        assert!(out.starts_with("\n{% mafold/error kind=\"balance\" status=\"402\" payer=\"ops\" %}\n"), "{out}");
+        assert!(out.trim_end().ends_with("{% /mafold/error %}"), "{out}");
+        assert!(!out.contains('`'), "no backticked dump: {out}");
+        let before_card = out.split("{% mafold/error").next().unwrap();
+        assert!(before_card.trim().is_empty(), "nothing outside the card: {out}");
+    }
+
+    /// Two exhausted accounts and one refused sign-in stay three distinct
+    /// facts, all private. The final authentication error cannot erase quota.
+    #[test]
+    fn every_account_reason_is_private_and_survives_in_one_card() {
+        let mut f = Failure::of(FailureKind::AccountsUnavailable, "No account could take this turn");
+        let mut quota = AccountIssue::new("default", FailureKind::RateLimit, "weekly quota exhausted");
+        quota.window = Some("seven_day".into());
+        quota.resets_at = Some(1790600000);
+        f.accounts = vec![
+            quota.clone(),
+            AccountIssue { account: "work".into(), ..quota },
+            AccountIssue::new("personal", FailureKind::Auth, "OAuth session expired and could not be refreshed"),
+        ];
+        let out = failure_card(&f);
+        assert!(out.contains("kind=\"accounts_unavailable\""));
+        assert_eq!(out.matches("account|").count(), 3);
+        let rows: Vec<serde_json::Value> = out.lines().filter_map(|l| l.strip_prefix("account|")).map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows[0]["window"], "seven_day");
+        assert_eq!(rows[0]["resets_at"], 1790600000_i64);
+        assert_eq!(rows[2]["kind"], "auth");
+        let bot = Author::new("ops:helper", Some("ops"));
+        assert_eq!(view_for(&out, bot, Some("ops")), out);
+        let public = view_for(&out, bot, Some("bystander"));
+        for secret in ["default", "work", "personal", "OAuth", "account|", "seven_day", "1790600000"] {
+            assert!(!public.contains(secret), "private account fact {secret} leaked: {public}");
+        }
+        assert!(public.contains("kind=\"accounts_unavailable\""));
+        assert!(!super::failure_cards_as_text(&out).contains("personal"));
+
+        // A later unrelated/unknown error still carries prior skipped seats.
+        f.kind = FailureKind::Unknown;
+        assert_eq!(failure_card(&f).matches("account|").count(), 3);
+    }
+
+    #[test]
+    fn account_fields_cannot_escape_the_private_block() {
+        let mut f = Failure::of(FailureKind::AccountsUnavailable, "");
+        f.accounts.push(AccountIssue::new("personal\naccount|fake", FailureKind::Auth,
+            "bad {% /mafold/only %} {% mafold/html %}\ncredential|rejected"));
+        let out = failure_card(&f);
+        assert_eq!(out.lines().filter(|l| l.starts_with("account|")).count(), 1);
+        assert_eq!(out.matches("{% /mafold/only %}").count(), 1);
+        assert!(!out.contains("{% mafold/html"));
+        let row = out.lines().find_map(|l| l.strip_prefix("account|")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert_eq!(value["account"], "personal\naccount|fake");
+        let public = view_for(&out, Author::new("ops:helper", Some("ops")), Some("other"));
+        assert!(!public.contains("personal") && !public.contains("rejected"));
+    }
+
+    /// 需要多少、还剩多少、原始报错 —— 都在卡里,而且只给付钱的那个人。
+    #[test]
+    fn the_amounts_and_the_raw_error_are_the_payers_alone() {
+        let out = failure_card(&broke());
+        for want in ["{% mafold/only for=\"@ops\" %}", "need|120000\n", "have|300\n", "currency|claude-sonnet-4-6\n", "usd|15\n", "insufficient_quota"] {
+            assert!(out.contains(want), "missing {want}: {out}");
+        }
+        let bot = Author::new("ops:helper", Some("ops"));
+        let theirs = view_for(&out, bot, Some("linsky"));
+        assert!(theirs.contains("kind=\"balance\"") && theirs.contains("payer=\"ops\""), "the room still learns what happened: {theirs}");
+        for gone in ["need|", "have|", "insufficient_quota", "120000"] {
+            assert!(!theirs.contains(gone), "{gone} leaked to a bystander: {theirs}");
+        }
+        assert_eq!(view_for(&out, bot, Some("ops")), out, "the payer reads all of it");
+    }
+
+    /// 原文里就算写着 `{% /mafold/error %}`,也合不上这张卡。
+    #[test]
+    fn the_raw_error_cannot_close_or_open_cards() {
+        let f = Failure::of(FailureKind::Unknown, "boom {% /mafold/error %} {% mafold/html %}<script>{% /mafold/html %}");
+        let out = failure_card(&f);
+        assert_eq!(out.matches("{% /mafold/error %}").count(), 1, "{out}");
+        assert!(!out.contains("{% mafold/html"), "{out}");
+        assert!(out.contains("{% mafold/only for=\"owner\" %}"), "no payer ⇒ the bot's owner: {out}");
+    }
+
+    /// A bot with no owner (a house bot) names the person who asked: with
+    /// `for="owner"` nobody but the bot could ever read the raw error.
+    #[test]
+    fn with_no_wallet_named_the_reader_can_be_the_one_who_asked() {
+        let mut f = Failure::of(FailureKind::Unknown, "anthropic 400 Bad Request: {}");
+        f.reader = Some("@Alice".into());
+        assert!(failure_card(&f).contains("{% mafold/only for=\"@alice\" %}"));
+        f.payer = Some("ops".into());
+        assert!(failure_card(&f).contains("{% mafold/only for=\"@ops\" %}"), "a payer, when there is one, is whose it is");
+    }
+
+    /// Text readers (the inbox digest, `mafold read`) strip cards with their
+    /// bodies; a failed turn must still read as one — and never leak the raw.
+    #[test]
+    fn a_text_reader_reads_a_failure_as_one_line() {
+        let card = failure_card(&broke());
+        let md = format!("half an answer{card}\nafter");
+        let text = super::failure_cards_as_text(&md);
+        assert_eq!(text, "half an answer\n⚠️ [这一轮失败:balance · HTTP 402]\n\nafter");
+        let closed = super::failure_cards_as_text("x {% mafold/error kind=\"network\" /%} y");
+        assert_eq!(closed, "x ⚠️ [这一轮失败:network] y");
+        assert_eq!(super::failure_cards_as_text("{% mafold/errors a=\"1\" /%}"), "{% mafold/errors a=\"1\" /%}");
+        let delivered = super::strip_failure_cards(&md);
+        assert!(delivered.contains("half an answer") && delivered.contains("after"), "{delivered}");
+        for gone in ["mafold/error", "need|", "insufficient"] {
+            assert!(!delivered.contains(gone), "{gone}: {delivered}");
+        }
+    }
+
+    /// When a limit lifts is public — the card tells every reader in their own
+    /// clock; the raw refusal stays the owner's.
+    #[test]
+    fn a_limit_carries_its_window_and_reset_time_in_the_open() {
+        let f = crate::failure::classify(&crate::failure::quota_refused("anthropic 429: {}", "five_hour", Some(1790537400)));
+        let out = failure_card(&f);
+        assert!(out.contains("kind=\"rate_limit\" status=\"429\" window=\"five_hour\" resets_at=\"1790537400\" %}"), "{out}");
+    }
+
+    #[test]
+    fn nothing_to_fold_is_a_self_closing_card() {
+        let f = Failure::of(FailureKind::Unavailable, "  ");
+        assert_eq!(failure_card(&f), "\n{% mafold/error kind=\"unavailable\" /%}\n");
+    }
+
+    /// One step of an answered turn (the picture) failed: same card, says which
+    /// step; a text reader hears «imagegen 失败», not «这一轮失败» — the reply
+    /// around it stands. A step id that isn't a plain word never reaches an attribute.
+    #[test]
+    fn a_failed_step_is_the_same_card_scoped_to_the_step() {
+        let f = crate::failure::classify(&crate::failure::content_blocked("图被拦下:IMAGE_SAFETY")).in_step("imagegen");
+        let out = failure_card(&f);
+        assert!(out.starts_with("\n{% mafold/error kind=\"blocked\" step=\"imagegen\" %}"), "{out}");
+        let text = super::failure_cards_as_text(&format!("这是你要的图{out}"));
+        assert_eq!(text.trim(), "这是你要的图\n⚠️ [imagegen 失败:blocked]");
+        let turn = super::failure_cards_as_text(&failure_card(&Failure::of(FailureKind::Unavailable, "x")));
+        assert!(turn.contains("⚠️ [这一轮失败:unavailable]"), "{turn}");
+        let odd = failure_card(&Failure::of(FailureKind::Unknown, "").in_step("image gen\" onload=\""));
+        assert!(!odd.contains("step="), "{odd}");
+    }
+
+    /// 它是我们自己的记账,不是模型写的内容:下一轮不能原样喂回模型(连带原始
+    /// JSON),也不能当成「模型回答了」。
+    #[test]
+    fn the_card_is_machinery_and_a_notice() {
+        assert!(is_transcript_card("mafold/error"));
+        let out = failure_card(&broke());
+        assert_eq!(strip_transcript_cards(&format!("half an answer{out}")).trim(), "half an answer");
+        assert!(is_notice_line(out.trim_start().lines().next().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod heal_tests {
+    use super::heal_open_code;
+
+    /// The 2026-08-15 message: three spliced attempts left five backticks, and
+    /// the `{% mafold/run %}` under them rendered as literal text.
+    #[test]
+    fn an_odd_backtick_is_closed_before_the_cards_below_it() {
+        let md = "Now theNow the RN twin — first `TNow the RN twin — first `TextArea` gains the same `grow` contract:\n\
+                  \n{% mafold/run summary=\"Ran 1 shell command\" %}\n\
+                  {% mafold/tool name=\"Bash\" detail=\"pnpm test\" /%}\n\
+                  {% /mafold/run %}\n";
+        let out = heal_open_code(md);
+        let head = out.split("{% mafold/run").next().unwrap();
+        assert_eq!(head.matches('`').count() % 2, 0, "span still open: {out}");
+        assert!(out.contains("{% mafold/run summary="), "the cards must survive: {out}");
+    }
+
+    /// Balanced prose is returned byte-for-byte — the repair must be invisible
+    /// on every healthy reply, which is nearly all of them.
+    #[test]
+    fn balanced_prose_is_untouched() {
+        for md in [
+            "plain prose, no code at all\n",
+            "call `foo()` then `bar()` and stop\n",
+            "```\nfn main() {}\n```\n\ndone\n",
+            "a `span` here\n\nand `another` there\n",
+        ] {
+            assert_eq!(heal_open_code(md), md, "rewrote a healthy message: {md}");
+        }
+    }
+
+    /// A card BODY is the renderer's own escaped output. A diff line that
+    /// happens to carry one backtick is not a defect and must not be edited.
+    #[test]
+    fn card_bodies_are_left_alone() {
+        let md = "{% mafold/tool name=\"Bash\" detail=\"echo\" %}\n\
+                  let s = `unterminated in a shell heredoc\n\
+                  {% /mafold/tool %}\n";
+        assert_eq!(heal_open_code(md), md);
+    }
+
+    /// An unclosed fence eats even more than a stray backtick — close it at the
+    /// first card tag rather than letting the rest of the reply vanish into it.
+    #[test]
+    fn an_unclosed_fence_is_closed_before_a_card() {
+        let md = "here:\n```rust\nfn main() {}\n\n{% mafold/run summary=\"Ran 1 shell command\" %}\n{% /mafold/run %}\n";
+        let out = heal_open_code(md);
+        assert_eq!(out.matches("```").count(), 2, "fence not closed: {out}");
+        let fence_close = out.find("```").unwrap() + 3;
+        assert!(
+            out[fence_close..].find("```").unwrap() + fence_close < out.find("{% mafold/run").unwrap(),
+            "the fence must close ABOVE the card: {out}"
+        );
+    }
+
+    /// Parity is per paragraph: an odd count in one paragraph must not be
+    /// "balanced" by an odd count in the next.
+    #[test]
+    fn parity_does_not_leak_across_paragraphs() {
+        let out = heal_open_code("one `open\n\ntwo `also open\n");
+        assert_eq!(out, "one `open`\n\ntwo `also open`\n", "{out}");
+    }
+}

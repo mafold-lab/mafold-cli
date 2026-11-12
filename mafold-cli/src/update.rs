@@ -1,0 +1,1941 @@
+//! Self-update — fetch the latest GitHub release and replace the binary safely.
+//!
+//! Safety (matters now that one machine runs many daemons sharing one binary):
+//! - a cross-process **flock** (`~/.mafold/update.lock`) so only one updater
+//!   touches the binary at a time;
+//! - a **version stamp** so a second updater skips a download already done;
+//! - **MANDATORY SHA256** verification against the release's `<asset>.sha256` —
+//!   the self-replacing binary runs `--dangerously-skip-permissions`, so an
+//!   unverifiable download (missing/unfetchable checksum) ABORTS the update;
+//! - a **pre-swap smoke test** (`<tmp> --version`) so a corrupt/wrong-arch binary
+//!   never gets swapped in;
+//! - a **backup** (`mafold.old`) for `mafold rollback`.
+//!
+//! Used by the supervisor (which owns updates for its daemons) and by a
+//! standalone `mafold agent` (self-update) — neither when started with
+//! `--no-auto-update`, nor while this computer's [`auto_update_on`] setting is
+//! off.
+//!
+//! Two CHANNELS (`stable` / `dev`) — see [`Channel`]. The dev channel is how a
+//! real machine runs a prerelease build without switching auto-update off for
+//! everything on it.
+
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+use mafold_core::mafold_types::units::EN;
+
+const REPO: &str = "mafold-lab/mafold-cli";
+
+pub fn current_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Which release line this machine follows.
+///
+/// STICKY, and deliberately so: the channel decides which releases are even
+/// VISIBLE to the updater, and the comparison never crosses lines. Without
+/// that, a `-dev` build would be measured against the stable release — same
+/// version digits, different bytes — and get "repaired" back to stable on the
+/// next 10-minute tick (see [`wants_update`]). Before this existed, the only
+/// way to keep a non-official binary alive on a machine was to turn auto-update
+/// off wholesale (`--no-auto-update`), which also stopped it from picking up
+/// the very fixes you were testing.
+///
+/// Leaving the dev channel is `mafold update --channel stable`, not a reinstall.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Channel {
+    #[default]
+    Stable,
+    Dev,
+}
+
+impl Channel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Dev => "dev",
+        }
+    }
+
+    /// `stable` / `dev`; anything else is `None` (callers decide what that means).
+    pub fn parse(s: &str) -> Option<Channel> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(Channel::Stable),
+            "dev" => Some(Channel::Dev),
+            _ => None,
+        }
+    }
+
+    /// This machine's channel. `MAFOLD_CHANNEL` wins (one-off overrides, CI),
+    /// then `~/.mafold/channel`, else stable.
+    ///
+    /// Anything unreadable or unrecognised resolves to STABLE, never dev: a
+    /// typo in that file must not quietly walk a production machine onto
+    /// prereleases. The file is machine-global on purpose — the supervisor and
+    /// every standalone agent read it independently, exactly like
+    /// `installed-version` and `update.lock` next to it.
+    pub fn current() -> Channel {
+        std::env::var("MAFOLD_CHANNEL")
+            .ok()
+            .and_then(|v| Channel::parse(&v))
+            .or_else(|| {
+                std::fs::read_to_string(channel_path())
+                    .ok()
+                    .and_then(|s| Channel::parse(&s))
+            })
+            .unwrap_or(Channel::Stable)
+    }
+
+    /// Persist the channel for every mafold process on this machine.
+    pub fn save(self) -> Result<()> {
+        let p = channel_path();
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        std::fs::write(&p, self.as_str()).with_context(|| format!("writing {}", p.display()))
+    }
+}
+
+/// A release available for this platform.
+#[derive(Debug)]
+pub struct Release {
+    pub version: String, // without the leading `v`
+    pub url: String,
+    pub sha256: Option<String>,
+    /// The line it came from — decides how installing it announces itself.
+    pub channel: Channel,
+}
+
+fn mafold_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".mafold")
+}
+
+fn channel_path() -> PathBuf {
+    mafold_dir().join("channel")
+}
+
+/// Does this machine install new releases by itself? A MACHINE SETTING
+/// (`~/.mafold/auto-update`, beside `channel`), read by the supervisor on every
+/// pass and by a standalone agent before each check — `mafold update
+/// --auto-update off|on` writes it, and nothing is restarted or re-registered.
+///
+/// Turning updates off used to mean re-registering the service with
+/// `--no-auto-update`. The desktop app reads a service registered with flags it
+/// would not pass as someone else's, and showed the whole computer read-only
+/// (activity center C8). The flag still works — for a local build — and still
+/// wins: updates run only when the process was started without it AND this
+/// says on.
+///
+/// Anything but `off` is on: the default, and what a garbled file means. A
+/// machine that quietly stops updating is the failure nobody notices.
+pub fn auto_update_on() -> bool {
+    auto_update_at(&auto_update_path())
+}
+
+fn auto_update_at(p: &Path) -> bool {
+    std::fs::read_to_string(p).map_or(true, |s| !s.trim().eq_ignore_ascii_case("off"))
+}
+
+/// Persist [`auto_update_on`] for every mafold process on this machine.
+pub fn set_auto_update(on: bool) -> Result<()> {
+    set_auto_update_at(&auto_update_path(), on)
+}
+
+fn set_auto_update_at(p: &Path, on: bool) -> Result<()> {
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(p, if on { "on" } else { "off" }).with_context(|| format!("writing {}", p.display()))
+}
+
+fn auto_update_path() -> PathBuf {
+    mafold_dir().join("auto-update")
+}
+
+/// This build's release-asset target triple (matches the release workflow).
+fn target_triple() -> Option<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("aarch64-apple-darwin")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("x86_64-apple-darwin")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("x86_64-pc-windows-msvc")
+    } else {
+        None
+    }
+}
+
+/// Whether self-update can run here — i.e. the release workflow builds a binary
+/// for this platform. False on e.g. linux-arm64, so `mafold update` can say
+/// "no build for your platform" instead of the misleading "already up to date".
+pub fn platform_supported() -> bool {
+    target_triple().is_some()
+}
+
+/// A comparable version: `(major, minor, patch, pre)`.
+///
+/// `pre` is what makes the dev channel orderable. A FINAL release gets
+/// `u64::MAX`; a `-dev.<N>` prerelease gets `N`. So `0.9.116-dev.7` sorts
+/// before `0.9.116-dev.8`, and both sort before the final `0.9.116` — semver's
+/// own rule, and the one the release flow needs (a dev build carries the
+/// version it is going to BECOME).
+///
+/// THE TRAP THIS CLOSES. The old parser read each dot-segment with
+/// `take_while(is_ascii_digit)`, so `0.9.116-dev.7` came out as `(0, 9, 116)` —
+/// indistinguishable from the released `0.9.116` and from every other dev
+/// build of it. Two consequences, both bad: a dev binary looked like a
+/// same-version impostor and got stomped by the stable release's checksum
+/// repair, and moving dev.7 → dev.8 had no path except that same repair, which
+/// announces itself as a REINSTALL and could just as easily walk backwards.
+///
+/// Stable-vs-stable comparisons are unchanged: both sides get `u64::MAX`.
+fn parse_version(v: &str) -> (u64, u64, u64, u64) {
+    let v = v.trim().trim_start_matches('v');
+    // Split the prerelease tail off FIRST, so the patch number parses cleanly
+    // instead of stopping at the `-`.
+    let (core, pre) = match v.split_once('-') {
+        Some((core, tail)) => (core, prerelease_ordinal(tail)),
+        None => (v, u64::MAX),
+    };
+    let mut it = core.split('.').map(|p| {
+        p.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    });
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        pre,
+    )
+}
+
+/// The ordinal in a `-dev.<N>` tail. An unparseable tail is ordinal 0 — still
+/// ordered before the final release, which is the safe direction (a build we
+/// can't read the ordinal of never claims to be newer than the real thing).
+fn prerelease_ordinal(tail: &str) -> u64 {
+    tail.rsplit('.')
+        .next()
+        .map(|n| {
+            n.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    parse_version(latest) > parse_version(current)
+}
+fn is_same_version(latest: &str, current: &str) -> bool {
+    parse_version(latest) == parse_version(current)
+}
+
+/// Should we install `r`?
+///
+/// A HIGHER version, obviously. But also the SAME version when our binary is
+/// demonstrably not the build that release published — compared by checksum,
+/// the only thing that actually identifies a build.
+///
+/// THE HOLE THIS CLOSES. `Cargo.toml` is bumped on main BEFORE the tag is cut,
+/// so every build of main in that window reports the release's version without
+/// containing it. Install one (a hand-built binary, a colleague's copy) and the
+/// version compare says "already on 0.9.81" forever: the real 0.9.81 can never
+/// arrive, because it is not *newer*. Observed 2026-08-02 — a binary built 2h
+/// before the fix it was supposed to carry sat on a machine for a day, and
+/// `/usage` rendered "Unsupported card: stats" the whole time with the daemon
+/// cheerfully reporting itself up to date.
+///
+/// Conservative on purpose: with no published checksum to compare against we
+/// never trigger a same-version install, so an unverifiable release can't put
+/// the updater into a download loop.
+fn wants_update(r: &Release, our_sha: Option<&str>) -> bool {
+    if is_newer(&r.version, current_version()) {
+        return true;
+    }
+    if !is_same_version(&r.version, current_version()) {
+        return false; // the "latest" release is older than us — leave us alone
+    }
+    match (r.sha256.as_deref(), our_sha) {
+        (Some(want), Some(got)) => !got.eq_ignore_ascii_case(want),
+        _ => false,
+    }
+}
+
+impl Release {
+    /// How to announce applying this release. A same-version install is a
+    /// REPAIR, not an upgrade — and it needs to say so out loud, because it is
+    /// the one case where the updater replaces a binary the user may have put
+    /// there deliberately. ("update v0.9.81 available" while already running
+    /// 0.9.81 reads like a bug, and hides why the swap happened.)
+    pub fn action_line(&self) -> String {
+        if is_same_version(&self.version, current_version()) {
+            // On the dev channel a same-version swap is routine — a rebuild of
+            // the same ordinal — not the "someone put a hand-built binary here"
+            // case the stable wording describes. Saying REINSTALL there would
+            // point the reader at turning updates off, i.e. at leaving the very
+            // channel they opted into.
+            if self.channel == Channel::Dev {
+                return format!("↻ v{} rebuild — refreshing the dev build", self.version);
+            }
+            format!(
+                "↻ v{} REINSTALL — this binary is not the build v{} published (checksum differs). \
+                 `mafold update --auto-update off` keeps a local build",
+                self.version, self.version,
+            )
+        } else {
+            format!("↻ update v{} available", self.version)
+        }
+    }
+}
+
+async fn get_json(http: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
+    Ok(http
+        .get(url)
+        .header("User-Agent", "mafold-cli")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// The newest release on `channel` — **mafold-api first, GitHub second**.
+///
+/// WHY. GitHub's anonymous REST quota is 60 requests/hour PER IP, and one
+/// machine spends it by itself: the supervisor polls every 10 minutes, each
+/// standalone agent polls every 10 minutes *and* on reconnect *and* on startup,
+/// and a published release nudges all of them at once. Past the cap the check
+/// just prints "update check failed" and waits another 10 minutes, so a machine
+/// can sit an hour behind a release it was told about. `cliUpdateCheck` has no
+/// such ceiling.
+///
+/// The GitHub path is a PERMANENT fallback, not a transitional one: `--base`
+/// may point at an api older than that route, or at a self-hosted one that
+/// never grows it, and such a machine must still be able to update itself.
+async fn latest(http: &reqwest::Client, base: &str, channel: Channel) -> Result<Release> {
+    match latest_from_api(http, base, channel).await {
+        Ok(Some(r)) => return Ok(r),
+        // The api answered, but has nothing usable for us yet (no manifest for
+        // this channel, or one still missing this target's checksum). Expected
+        // in the window before the first release lands on a fresh node — say so
+        // rather than failing, and go ask GitHub.
+        Ok(None) => eprintln!("update: api has no usable {} manifest yet — asking GitHub", channel.as_str()),
+        // Never silent: a quiet fallback is how the rate-limit problem comes
+        // back without anyone noticing it had been fixed.
+        Err(e) => eprintln!("update: {base}/api/cliUpdateCheck unavailable ({e:#}) — asking GitHub"),
+    }
+    latest_from_github(http, channel).await
+}
+
+/// Ask mafold-api what the newest release is. `Ok(None)` = it has no answer we
+/// can act on; the caller falls back.
+async fn latest_from_api(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<Release>> {
+    let target = target_triple().context("unsupported platform for self-update")?;
+    let url = format!("{}/api/cliUpdateCheck", base.trim_end_matches('/'));
+    let env: serde_json::Value = http
+        .post(&url)
+        .json(&serde_json::json!({ "target": target, "channel": channel.as_str() }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    release_from_api_envelope(&env, channel)
+}
+
+/// The rules for reading a `cliUpdateCheck` answer, apart from the I/O so they
+/// can be tested. `Ok(None)` = nothing usable here, fall back to GitHub.
+fn release_from_api_envelope(
+    env: &serde_json::Value,
+    channel: Channel,
+) -> Result<Option<Release>> {
+    if env["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "{}",
+            env["description"].as_str().unwrap_or("cliUpdateCheck rejected the request")
+        );
+    }
+    let r = &env["result"];
+    // `known: false` is "the server has no record", NOT "you are current" —
+    // treating those as the same would leave a machine sitting on an old build
+    // believing it had checked. That is the whole reason the field exists.
+    if r["known"].as_bool() != Some(true) {
+        return Ok(None);
+    }
+    // A manifest missing the checksum is unusable: `apply` refuses to install an
+    // unverifiable binary, so going ahead would only produce a failure later.
+    // GitHub still has the `.sha256` asset, so the fallback can genuinely do
+    // better here.
+    let (Some(version), Some(dl), Some(sha)) =
+        (r["version"].as_str(), r["url"].as_str(), r["sha256"].as_str())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Release {
+        version: version.trim_start_matches('v').to_string(),
+        url: dl.to_string(),
+        sha256: Some(sha.to_string()),
+        channel,
+    }))
+}
+
+/// The newest release on `channel`, straight from GitHub.
+///
+/// Stable reads `/releases/latest`, which GitHub defines as the newest
+/// non-draft, NON-PRERELEASE release. That definition is the entire safety
+/// property of the dev channel: every dev build is published as a prerelease,
+/// so it is invisible here no matter how new it is, and a stable machine cannot
+/// wander onto one. `install.sh` reads the same endpoint and inherits it.
+///
+/// Dev has no such endpoint, so it lists releases (newest first) and takes the
+/// first prerelease itself.
+async fn latest_from_github(http: &reqwest::Client, channel: Channel) -> Result<Release> {
+    let v = match channel {
+        Channel::Stable => {
+            get_json(http, &format!("https://api.github.com/repos/{REPO}/releases/latest")).await?
+        }
+        Channel::Dev => {
+            let list =
+                get_json(http, &format!("https://api.github.com/repos/{REPO}/releases?per_page=20"))
+                    .await?;
+            list.as_array()
+                .and_then(|a| {
+                    a.iter()
+                        .find(|r| {
+                            r["prerelease"].as_bool() == Some(true)
+                                && r["draft"].as_bool() != Some(true)
+                        })
+                        .cloned()
+                })
+                .context("no prerelease published on the dev channel yet")?
+        }
+    };
+    let tag = v["tag_name"].as_str().context("no tag_name")?.to_string();
+    let target = target_triple().context("unsupported platform for self-update")?;
+    let asset_name = format!("mafold-{target}");
+    let dl = v["assets"]
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|x| x["name"].as_str() == Some(&asset_name))
+                .and_then(|x| x["browser_download_url"].as_str())
+        })
+        .with_context(|| format!("release has no asset {asset_name}"))?
+        .to_string();
+    let sha256 = sha256_for(http, &v, &asset_name).await;
+    Ok(Release {
+        version: tag.trim_start_matches('v').to_string(),
+        url: dl,
+        sha256,
+        channel,
+    })
+}
+
+/// The expected SHA256 for `asset_name`, from its sibling `<asset>.sha256` asset
+/// (published by the release workflow). `None` if the asset is absent or the
+/// fetch fails → `apply` then ABORTS (an unverifiable binary is never swapped in).
+async fn sha256_for(
+    http: &reqwest::Client,
+    release: &serde_json::Value,
+    asset_name: &str,
+) -> Option<String> {
+    let want = format!("{asset_name}.sha256");
+    let url = release["assets"]
+        .as_array()?
+        .iter()
+        .find(|x| x["name"].as_str() == Some(want.as_str()))
+        .and_then(|x| x["browser_download_url"].as_str())?;
+    let text = http
+        .get(url)
+        .header("User-Agent", "mafold-cli")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    text.split_whitespace().next().map(|s| s.to_string())
+}
+
+/// The real binary path (resolve a PATH symlink to the file we replace).
+fn binary_path() -> Result<PathBuf> {
+    let exe = crate::platform::current_exe()?;
+    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+// ── cross-process update lock (flock) ──
+/// Holds the lock file open; the flock is released when this drops (fd closes).
+struct Lock(#[allow(dead_code)] std::fs::File);
+fn acquire_lock() -> Result<Lock> {
+    let p = mafold_dir().join("update.lock");
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&p)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            anyhow::bail!("couldn't acquire the update lock");
+        }
+    }
+    #[cfg(windows)]
+    crate::platform::lock_file_exclusive(&f).context("couldn't acquire the update lock")?;
+    Ok(Lock(f)) // released when the File (handle) drops
+}
+
+fn stamp_path() -> PathBuf {
+    mafold_dir().join("installed-version")
+}
+fn read_stamp() -> Option<String> {
+    std::fs::read_to_string(stamp_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+// ── supervisor update nudge ──
+fn nudge_path() -> PathBuf {
+    mafold_dir().join("update-nudge")
+}
+/// Ask the supervisor to run an update check NOW. A `--no-auto-update` agent
+/// child writes this on `events.cliUpdate` (supervised mode) so the SUPERVISOR —
+/// which owns updates and respawns children — applies it, instead of the child
+/// self-re-execing out from under the supervisor.
+pub fn request_nudge() {
+    let p = nudge_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(p, b"");
+}
+/// Consume a pending update nudge (true if one was set). The supervisor checks
+/// this each loop tick for an immediate (non-poll) update.
+pub fn take_nudge() -> bool {
+    let p = nudge_path();
+    if p.exists() {
+        let _ = std::fs::remove_file(&p);
+        true
+    } else {
+        false
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Checksum of a binary on disk — what a build IS, as opposed to what its
+/// `--version` claims to be. `None` when it can't be read (then every caller
+/// falls back to comparing versions, i.e. the old behaviour).
+///
+/// Cost is a ~10 MB read + hash, paid on the update poll (every 10 minutes) and
+/// on a nudge — not on any hot path.
+fn sha256_of_file(p: &Path) -> Option<String> {
+    std::fs::read(p).ok().map(|b| sha256_hex(&b))
+}
+
+/// Quick "does it run?" check on the downloaded binary before swapping it in.
+fn smoke_test(path: &Path) -> bool {
+    let mut cmd = crate::platform::std_command(path);
+    cmd.arg("--version");
+    crate::platform::output_of_new_binary(&mut cmd)
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Does the on-disk binary actually report `version`? Guards the stamp early-exit
+/// in `apply`: the stamp is machine-global (`~/.mafold/installed-version`), but a
+/// machine can end up with several mafold copies (a manual install over an
+/// updated one, a second checkout's build) — then the stamp says "vX installed"
+/// while OUR file is still older. Trusting it made apply() return Ok without
+/// doing anything, and the caller's reexec respawned the same old binary forever.
+fn binary_is(bin: &Path, version: &str) -> bool {
+    let mut cmd = crate::platform::std_command(bin);
+    cmd.arg("--version");
+    crate::platform::output_of_new_binary(&mut cmd)
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(version))
+        .unwrap_or(false)
+}
+
+// ── auto-update failure cooldown ──
+// github may be unreachable for a long stretch (offline, or blocked networks —
+// real case: release-asset downloads reset while the API is fine). Without a
+// cooldown the agent/supervisor re-download-and-fail on every tick/cliUpdate
+// nudge, spamming the log and wasting bandwidth forever. Remember the version
+// that just failed and skip re-attempts for a while; a manual `mafold update`
+// is not throttled (it never consults this).
+//
+// WALL CLOCK, NOT `Instant`. On macOS `Instant` is CLOCK_UPTIME_RAW, which
+// stops while the machine sleeps. 2026-09-27, cli@0.9.123: a download failed
+// on a TLS reset, the Mac slept on battery nine minutes later, and when it woke
+// 1h40m afterwards the "1 hour" cooldown had advanced about ten minutes — the
+// machine sat on the old build for an hour and a half with nothing in the log
+// to say why. `SystemTime` keeps counting through sleep.
+//
+// BACKOFF, NOT A FLAT HOUR. The download is already retried in place (see
+// `DOWNLOAD_RETRY_DELAYS`), so reaching here means a few tries in a row
+// failed. The first cooldown is short — most failures are a network blip that
+// is gone by the next 10-minute check — and only a version that keeps failing
+// works its way up to the old hour.
+const FAILURE_BACKOFF: [std::time::Duration; 4] = [
+    std::time::Duration::from_secs(5 * 60),
+    std::time::Duration::from_secs(15 * 60),
+    std::time::Duration::from_secs(30 * 60),
+    std::time::Duration::from_secs(60 * 60),
+];
+
+/// The last failed auto-update, for the cooldown.
+struct Failure {
+    version: String,
+    at: std::time::SystemTime,
+    /// Failed attempts at THIS version in a row (1 = first). Picks the backoff.
+    streak: usize,
+    error: String,
+}
+
+static LAST_FAILED: std::sync::Mutex<Option<Failure>> = std::sync::Mutex::new(None);
+
+fn backoff_for(streak: usize) -> std::time::Duration {
+    FAILURE_BACKOFF[streak.clamp(1, FAILURE_BACKOFF.len()) - 1]
+}
+
+impl Failure {
+    /// How long `version` still has to wait at wall-clock `now`; `None` = it
+    /// may be tried. A clock that has gone BACKWARDS since the failure counts
+    /// as "the wait is over": the safe mistake is one extra attempt, not a
+    /// machine that refuses to update until the clock catches up.
+    fn wait_left(&self, version: &str, now: std::time::SystemTime) -> Option<std::time::Duration> {
+        if self.version != version {
+            return None;
+        }
+        let since = now.duration_since(self.at).ok()?;
+        backoff_for(self.streak).checked_sub(since).filter(|d| !d.is_zero())
+    }
+}
+
+/// Record that auto-updating to `version` just failed. Returns how long the
+/// auto-updater will now leave it alone, for the caller's log line.
+pub fn mark_failed(version: &str, error: &anyhow::Error) -> std::time::Duration {
+    let mut g = LAST_FAILED.lock().unwrap();
+    let streak = match &*g {
+        Some(f) if f.version == version => f.streak + 1,
+        _ => 1,
+    };
+    *g = Some(Failure {
+        version: version.to_string(),
+        at: std::time::SystemTime::now(),
+        streak,
+        error: format!("{error:#}"),
+    });
+    backoff_for(streak)
+}
+
+// ── what the update checks found, for `mafold status` ──
+
+/// What the supervisor's update checks last found — `~/.mafold/update.json`,
+/// for `mafold status` (a separate process) to say. The cooldown itself stays
+/// in [`LAST_FAILED`]; this is only what a person is shown.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct Seen {
+    /// When a check last got an answer, epoch seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    /// The release that answer offered; none when this machine was current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered: Option<String>,
+    /// The last failed install, until one succeeds or there's nothing left to
+    /// install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<Failed>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Failed {
+    pub version: String,
+    /// The first of the failures in a row, epoch seconds.
+    pub since: i64,
+    /// The latest one.
+    pub at: i64,
+    /// Failed installs of this version in a row.
+    pub streak: usize,
+    pub error: String,
+}
+
+fn seen_path() -> PathBuf {
+    mafold_dir().join("update.json")
+}
+
+pub fn seen() -> Seen {
+    seen_at(&seen_path())
+}
+
+fn seen_at(path: &Path) -> Seen {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn note_seen(change: impl FnOnce(&mut Seen)) {
+    note_seen_at(&seen_path(), change)
+}
+
+/// Read, change, write back whole (aside, then renamed over it). The
+/// supervisor is the one writer that matters; a standalone agent's own
+/// update failure lands here too, and is as true of this machine.
+fn note_seen_at(path: &Path, change: impl FnOnce(&mut Seen)) {
+    let mut s = seen_at(path);
+    change(&mut s);
+    let Ok(json) = serde_json::to_string(&s) else { return };
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let aside = path.with_extension(format!("json.{}", std::process::id()));
+    if std::fs::write(&aside, json).is_ok() && std::fs::rename(&aside, path).is_err() {
+        let _ = std::fs::remove_file(&aside);
+    }
+}
+
+/// A check got an answer: `offered` is the release it offered, none when this
+/// machine is current — and with nothing to install, no install is failing.
+pub fn note_checked(offered: Option<&str>) {
+    let now = crate::accounts::now();
+    note_seen(|s| checked(s, offered, now));
+}
+
+/// A check by hand (`mafold update --check`) saw `latest` as the newest
+/// release. Kept against the version the supervisor here RUNS, which `status`
+/// measures with — not the version of the binary that asked — and without
+/// clearing a failed install: a binary that is current says nothing about a
+/// supervisor still behind it.
+pub fn note_looked(latest: Option<&str>, running: &str) {
+    let now = crate::accounts::now();
+    note_seen(|s| looked(s, latest, running, now));
+}
+
+fn looked(s: &mut Seen, latest: Option<&str>, running: &str, now: i64) {
+    s.checked_at = Some(now);
+    s.offered = latest.filter(|v| is_newer(v, running)).map(str::to_string);
+}
+
+fn checked(s: &mut Seen, offered: Option<&str>, now: i64) {
+    s.checked_at = Some(now);
+    s.offered = offered.map(str::to_string);
+    if offered.is_none() {
+        s.failed = None;
+    }
+}
+
+/// An install went through.
+pub fn note_installed() {
+    note_seen(|s| s.failed = None);
+}
+
+/// The supervisor's install of `version` failed. Counted here, not from the
+/// cooldown's in-memory streak: a restart in between doesn't make a version
+/// that has failed for days look like it failed once.
+pub fn note_failed(version: &str, error: &anyhow::Error) {
+    let now = crate::accounts::now();
+    note_seen(|s| failed(s, version, &format!("{error:#}"), now));
+}
+
+fn failed(s: &mut Seen, version: &str, error: &str, now: i64) {
+    let before = s.failed.take().filter(|f| f.version == version);
+    s.failed = Some(Failed {
+        version: version.to_string(),
+        since: before.as_ref().map_or(now, |f| f.since),
+        at: now,
+        streak: before.map_or(1, |f| f.streak + 1),
+        error: error.chars().take(300).collect(),
+    });
+}
+
+/// The release on offer that is newer than `running`, if the last check saw
+/// one.
+pub fn available(s: &Seen, running: &str) -> Option<String> {
+    s.offered.clone().filter(|v| is_newer(v, running))
+}
+
+/// An update worth a person's attention: installing a version newer than
+/// `running` failed twice or more in a row (once is usually a network blip
+/// the next attempt gets past), on a machine that updates itself.
+pub fn failing<'a>(s: &'a Seen, running: &str, auto_update: bool) -> Option<&'a Failed> {
+    unresolved(s, running).filter(|f| auto_update && f.streak >= 2)
+}
+
+/// The last failed install, while it is still of a version newer than
+/// `running` — an install that went through since makes it history.
+pub fn unresolved<'a>(s: &'a Seen, running: &str) -> Option<&'a Failed> {
+    s.failed.as_ref().filter(|f| is_newer(&f.version, running))
+}
+
+/// What a rollback leaves behind (activity center C9): the version it rolled
+/// back FROM, which automatic updates leave alone until a newer one is out.
+/// Without it the rollback held for one check: ~10 minutes later the updater
+/// found that same release newer than the binary rolled back to, and put it
+/// back. Its own file, not a field of `update.json`: a binary from before it
+/// rewrites that one whole and would drop a field it doesn't know.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Skip {
+    pub version: String,
+    /// When the rollback was made, epoch seconds.
+    pub at: i64,
+}
+
+fn skip_path() -> PathBuf {
+    mafold_dir().join("update-skip.json")
+}
+
+fn skip_at(path: &Path) -> Option<Skip> {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// The skip in force on this computer, if any.
+pub fn skipped() -> Option<Skip> {
+    skip_at(&skip_path())
+}
+
+fn write_skip_at(path: &Path, version: &str, at: i64) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&Skip { version: version.to_string(), at })?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The skip is over: a newer release came, or a person installed by hand.
+pub fn clear_skip() {
+    let _ = std::fs::remove_file(skip_path());
+}
+
+/// Does a rollback hold `offered` back? The version rolled back from (or an
+/// older one) is held; a NEWER release is the fix the rollback was waiting
+/// for — the skip ends and the update goes ahead. Said either way.
+fn skip_holds_at(path: &Path, offered: &str) -> bool {
+    let Some(s) = skip_at(path) else { return false };
+    if is_newer(offered, &s.version) {
+        let _ = std::fs::remove_file(path);
+        eprintln!("↻ v{offered} is newer than v{}, which this computer rolled back from — updating again", s.version);
+        return false;
+    }
+    eprintln!(
+        "↻ v{offered} available — skipped: this computer rolled back from v{} (`mafold update` installs it anyway)",
+        s.version
+    );
+    true
+}
+
+/// What this binary can do that an older one can't, by name — so another
+/// binary (a rollback's target, the desktop app) can ASK instead of guessing
+/// from a version number. `mafold capabilities` prints them; a binary from
+/// before it fails that command, which reads as "none".
+pub const CAPABILITIES: &[&str] = &[
+    // `runtime login claude-code [--name] [--console] [--json]`: the sign-in a
+    // bot's `/login` runs, without a chat.
+    "runtime-login",
+    // Honours `update-skip.json`: a rollback to this binary sticks.
+    "update-skip",
+    // `up --adopt [--check] [--json]`: moves another install's service, and
+    // its bots, onto this binary; `status --json` says `supervisor.not_ours`.
+    "adopt",
+];
+
+/// `bin`'s [`CAPABILITIES`] (empty for one from before them).
+fn capabilities_of(bin: &Path) -> Vec<String> {
+    let mut cmd = crate::platform::std_command(bin);
+    cmd.arg("capabilities");
+    let Some(out) = crate::platform::output_of_new_binary(&mut cmd).ok().filter(|o| o.status.success()) else { return Vec::new() };
+    serde_json::from_slice::<Vec<String>>(&out.stdout).unwrap_or_default()
+}
+
+/// Should the auto-updater try `version` now? When it shouldn't, it SAYS SO:
+/// a cooldown that skips without a word is indistinguishable from an updater
+/// that has stopped working, which is exactly what this looked like on
+/// 2026-09-27 (one `checking now` line in the log, then nothing for 90 min).
+/// A rollback's skip ([`Skip`]) holds it back the same way.
+pub fn should_attempt(version: &str) -> bool {
+    if skip_holds_at(&skip_path(), version) {
+        return false;
+    }
+    let g = LAST_FAILED.lock().unwrap();
+    let Some(f) = g.as_ref() else { return true };
+    let now = std::time::SystemTime::now();
+    let Some(left) = f.wait_left(version, now) else { return true };
+    let ago = now.duration_since(f.at).unwrap_or_default();
+    eprintln!(
+        "↻ v{version} available — not retrying yet: attempt {} failed {} ago ({}); cooldown ends in {}",
+        f.streak,
+        human(ago),
+        f.error,
+        human(left),
+    );
+    false
+}
+
+/// `10s` / `1m 30s` / `1h 5m` — for log lines a person reads, on the shared
+/// ruler (`mafold_types::units`).
+pub fn human(d: std::time::Duration) -> String {
+    EN.elapsed(d.as_secs() as f64 * 1000.0)
+}
+
+/// Wall-clock time since `t`. A clock that went backwards reads as "forever",
+/// so a periodic check keyed on this fires rather than stalling.
+pub fn wall_elapsed(t: std::time::SystemTime) -> std::time::Duration {
+    std::time::SystemTime::now().duration_since(t).unwrap_or(std::time::Duration::MAX)
+}
+
+/// Gaps between the in-place download attempts inside one [`apply`]: three
+/// tries over ~40 seconds before the failure counts at all. The failure this
+/// exists for — a TLS reset mid-download — is almost always gone by the
+/// second try; before this, a single one cost the machine the whole cooldown.
+/// Kept short because the supervisor's keep-alive loop waits on it.
+const DOWNLOAD_RETRY_DELAYS: [std::time::Duration; 2] =
+    [std::time::Duration::from_secs(10), std::time::Duration::from_secs(30)];
+
+/// Run `op` until it succeeds, sleeping `delays[i]` after failure `i`; the
+/// error from the last try comes back once the delays run out. Every failure
+/// and a late success are logged — the log has to show the retry happened, or
+/// the next person reading it after a slow update will guess at why.
+async fn retrying<T, Fut>(
+    what: &str,
+    delays: &[std::time::Duration],
+    mut op: impl FnMut() -> Fut,
+) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let tries = delays.len() + 1;
+    for attempt in 1.. {
+        match op().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    eprintln!("update: {what} succeeded on attempt {attempt}/{tries}");
+                }
+                return Ok(v);
+            }
+            Err(e) => match delays.get(attempt - 1) {
+                Some(d) => {
+                    eprintln!(
+                        "update: {what} failed (attempt {attempt}/{tries}: {e:#}) — retrying in {}",
+                        human(*d)
+                    );
+                    tokio::time::sleep(*d).await;
+                }
+                None => return Err(e.context(format!("{what}: {tries} attempts failed"))),
+            },
+        }
+    }
+    unreachable!("the loop only exits by returning")
+}
+
+/// One download of the release binary, checked against `want`. A checksum
+/// mismatch is retried like a network error: a body cut short or mangled by a
+/// proxy on the way in is a transient failure too.
+async fn download_verified(http: &reqwest::Client, url: &str, want: &str) -> Result<Vec<u8>> {
+    let bytes = http
+        .get(url)
+        .header("User-Agent", "mafold-cli")
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let got = sha256_hex(&bytes);
+    if !got.eq_ignore_ascii_case(want) {
+        anyhow::bail!("checksum mismatch (want {want}, got {got}) — refusing to update");
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Is a newer release available? Returns it (no download). No-ops on platforms
+/// the release workflow doesn't build a binary for (e.g. Windows) so the
+/// auto-update tick stays quiet instead of erroring every cycle.
+pub async fn check(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<Release>> {
+    Ok(latest_offer(http, base, channel).await?.and_then(|(r, wanted)| wanted.then_some(r)))
+}
+
+/// The newest release on `channel` for this platform, and whether this binary
+/// should install it ([`wants_update`]); `None` where no release is built.
+/// Downloads nothing — `mafold update --check` says the release even when there
+/// is nothing to install, [`check`] keeps only one to install.
+pub async fn latest_offer(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<(Release, bool)>> {
+    if target_triple().is_none() {
+        return Ok(None);
+    }
+    let r = latest(http, base, channel).await?;
+    // Hashed ONLY when the versions already match — the common "we're current"
+    // tick still costs nothing beyond the API call it was already making.
+    let our_sha = is_same_version(&r.version, current_version())
+        .then(|| binary_path().ok().as_deref().and_then(sha256_of_file))
+        .flatten();
+    let wanted = wants_update(&r, our_sha.as_deref());
+    Ok(Some((r, wanted)))
+}
+
+/// Safely download + verify + swap in the binary. Coordinated across processes
+/// via flock + a version stamp (a concurrent updater either wins or no-ops).
+pub async fn apply(
+    http: &reqwest::Client,
+    url: &str,
+    version: &str,
+    sha256: Option<&str>,
+) -> Result<()> {
+    let _lock = acquire_lock()?;
+    let bin = binary_path()?;
+    // Someone else already installed this version while we waited on the lock —
+    // but only trust the stamp if OUR binary really is that version (the stamp is
+    // machine-global; a stale one from another copy/install must not short-circuit
+    // us into an eternal "apply Ok → reexec the same old exe" spin).
+    //
+    // The CHECKSUM clause is what makes a same-version repair possible at all:
+    // without it, a binary that merely CLAIMS the right version satisfies both
+    // tests above and this returns Ok having done nothing — the other half of
+    // the trap `wants_update` exists to escape.
+    let already_the_published_build = match (sha256, sha256_of_file(&bin)) {
+        (Some(want), Some(got)) => got.eq_ignore_ascii_case(want),
+        // No checksum to compare: fall back to the version-only rule, exactly
+        // as before.
+        _ => true,
+    };
+    if read_stamp().as_deref() == Some(version) && binary_is(&bin, version) && already_the_published_build {
+        return Ok(());
+    }
+    // Fail CLOSED: the binary we're about to swap in runs
+    // `--dangerously-skip-permissions`, so a download we can't verify is never
+    // applied. A missing/unfetchable `<asset>.sha256` aborts the update.
+    let want = sha256.context(
+        "release is missing its .sha256 checksum asset — refusing to update an unverifiable binary",
+    )?;
+    let bytes = retrying(&format!("downloading v{version}"), &DOWNLOAD_RETRY_DELAYS, || {
+        download_verified(http, url, want)
+    })
+    .await?;
+    // Unique temp per process so concurrent updaters never clobber each other.
+    // Keep the binary's extension (Windows needs `.exe` to run the smoke test).
+    let tmp = match bin.extension().and_then(|e| e.to_str()) {
+        Some(ext) => bin.with_file_name(format!("mafold.new.{}.{ext}", std::process::id())),
+        None => bin.with_file_name(format!("mafold.new.{}", std::process::id())),
+    };
+    std::fs::write(&tmp, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    if !smoke_test(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("downloaded binary failed its `--version` smoke test — refusing to update");
+    }
+    // Back up the current binary for `mafold rollback` (reading/copying a running
+    // exe is fine on every OS), then swap the new one in.
+    let _ = std::fs::copy(&bin, bin.with_file_name("mafold.old"));
+    install_running_binary(&tmp, &bin, true)?;
+    let _ = std::fs::write(stamp_path(), version);
+    Ok(())
+}
+
+/// Install `src` as `bin`, where `bin` may be the CURRENTLY RUNNING executable.
+/// Unix renames over it (a copy goes beside it first: Linux won't open a
+/// running executable for writing — `Text file busy`). Windows can't
+/// overwrite a running `.exe`, but it CAN rename the live file aside (the running
+/// process keeps executing the moved image), so we move it out of the way first,
+/// then put the new binary at the canonical path. `mv` renames `src` in (consumes
+/// it, for apply); `!mv` copies (keeps it, for rollback's backup).
+fn install_running_binary(src: &Path, bin: &Path, mv: bool) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let aside = bin.with_file_name(format!("mafold.prev.{}.exe", std::process::id()));
+        let _ = std::fs::remove_file(&aside);
+        if bin.exists() {
+            std::fs::rename(bin, &aside).context("failed to move the running binary aside")?;
+        }
+        let placed = if mv {
+            std::fs::rename(src, bin)
+        } else {
+            std::fs::copy(src, bin).map(|_| ())
+        };
+        if let Err(e) = placed {
+            let _ = std::fs::rename(&aside, bin); // undo so we never lose the binary
+            return Err(e).context("failed to place the new binary");
+        }
+        // Best-effort: the old image is still memory-mapped by the live process, so
+        // this may fail; it then lingers harmlessly until the next launch.
+        let _ = std::fs::remove_file(&aside);
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        if mv {
+            std::fs::rename(src, bin).context("failed to replace the binary")?;
+        } else {
+            // `mafold rollback` IS the running binary, so not a copy straight
+            // over it: copy beside it, then rename in, as apply does.
+            let tmp = bin.with_file_name(format!("mafold.rollback.{}", std::process::id()));
+            let placed = std::fs::copy(src, &tmp).and_then(|_| std::fs::rename(&tmp, bin));
+            if placed.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            placed.context("failed to restore the previous binary")?;
+        }
+        Ok(())
+    }
+}
+
+/// Restore the previous binary (`mafold.old`) — `mafold rollback` — and ask
+/// the supervisor running here to move onto it (`control`), as `update` does.
+/// What `mafold rollback` was asked.
+pub struct RollbackAsk {
+    /// `--check`: say whether a rollback is possible and would stick; do nothing.
+    pub check: bool,
+    /// `--force`: roll back to a binary that can't keep it (see [`rollback`]).
+    pub force: bool,
+    /// One JSON object instead of lines — for the desktop app.
+    pub json: bool,
+}
+
+/// Can this computer roll back, and would it stay rolled back?
+#[derive(Debug, PartialEq)]
+enum CanRollBack {
+    /// No `mafold.old` beside this binary.
+    NoBackup,
+    /// The backup is from before the skip (it doesn't know
+    /// `update-skip.json`): rolled back to, it would update itself straight
+    /// back at its next check. No button for it; `--force` for a person.
+    TooOld,
+    Yes,
+}
+
+fn can_roll_back(backup: &Path, capabilities: impl FnOnce(&Path) -> Vec<String>) -> CanRollBack {
+    if !backup.exists() {
+        CanRollBack::NoBackup
+    } else if capabilities(backup).iter().any(|c| c == "update-skip") {
+        CanRollBack::Yes
+    } else {
+        CanRollBack::TooOld
+    }
+}
+
+/// `mafold rollback`: put the previous binary back and keep it — the version
+/// rolled back from is skipped by automatic updates until a newer one is out
+/// ([`Skip`]), and the supervisor here moves onto the old binary once the
+/// replies in progress are written ([`crate::supervisor::move_onto_disk`]).
+/// A backup that can't keep it (from before the skip) is refused without
+/// `--force`: the rollback would undo itself ~10 minutes later.
+///
+/// `--json` prints one object: `ok`, `code` (`possible` / `too_old` /
+/// `no_backup` from a check; `rolled_back` / `too_old` / `no_backup` /
+/// `failed` from a rollback), `from` (this binary's version), `to` (the
+/// backup's, when it says), `sticks`; after a rollback also `restart` +
+/// `moving`, as `mafold update --json` says them.
+pub fn rollback(ask: RollbackAsk) -> Result<()> {
+    let from = current_version();
+    // Not done is exit 1, as `mafold update --json` says it; a check's answer,
+    // whatever it is, is exit 0.
+    let out = |v: serde_json::Value| -> Result<()> {
+        if ask.json {
+            println!("{v}");
+            if v["ok"] == false && !ask.check {
+                std::process::exit(1);
+            }
+        }
+        Ok(())
+    };
+    let bin = binary_path()?;
+    let backup = bin.with_file_name("mafold.old");
+    let can = can_roll_back(&backup, capabilities_of);
+    let version = if can == CanRollBack::NoBackup { None } else { version_of(&backup) };
+    let to = version.as_deref().map_or_else(|| "the previous binary".to_string(), |v| format!("v{v}"));
+    let base = |code: &str| {
+        serde_json::json!({
+            "ok": matches!(code, "possible" | "rolled_back"),
+            "code": code, "from": from, "to": version, "sticks": can == CanRollBack::Yes,
+        })
+    };
+    if can == CanRollBack::NoBackup {
+        if ask.json {
+            return out(base("no_backup"));
+        }
+        anyhow::bail!("no backup to roll back to (looked for {})", backup.display());
+    }
+    if ask.check {
+        if ask.json {
+            return out(base(if can == CanRollBack::Yes { "possible" } else { "too_old" }));
+        }
+        match can {
+            CanRollBack::Yes => println!("✓ can roll back to {to}, and it stays there until a release newer than v{from}"),
+            _ => println!("• {to} is from before rollbacks could stick: it would update itself back to v{from} at its next check"),
+        }
+        return Ok(());
+    }
+    if can == CanRollBack::TooOld && !ask.force {
+        if ask.json {
+            return out(base("too_old"));
+        }
+        anyhow::bail!(
+            "{to} is from before rollbacks could stick: it would update itself back to v{from} at its next check (~10 minutes). \
+             `mafold rollback --force` rolls back anyway — then `mafold update --auto-update off` keeps it there"
+        );
+    }
+    // The skip first: the moment the old binary runs, its first check must
+    // already find it.
+    if let Err(e) = write_skip_at(&skip_path(), &from, crate::accounts::now()) {
+        if ask.json {
+            return out(serde_json::json!({ "ok": false, "code": "failed", "from": from, "to": version, "detail": format!("{e:#}") }));
+        }
+        return Err(e.context("couldn't note the version to skip — nothing rolled back"));
+    }
+    if let Err(e) = install_running_binary(&backup, &bin, false) {
+        clear_skip();
+        if ask.json {
+            return out(serde_json::json!({ "ok": false, "code": "failed", "from": from, "to": version, "detail": format!("{e:#}") }));
+        }
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(stamp_path());
+    if !ask.json {
+        println!("✓ rolled back to {to} ({}) — v{from} is skipped until a newer release is out", backup.display());
+    }
+    let mut said = base("rolled_back");
+    if crate::supervisor::supervisor_running() {
+        let (line, moving) = crate::supervisor::move_onto_disk(crate::control::Moved::Rollback, version.as_deref());
+        if ask.json {
+            said["restart"] = serde_json::json!(line);
+            said["moving"] = serde_json::json!(moving);
+        } else {
+            println!("  {line}");
+            // Forced onto a binary that doesn't know the skip: nothing keeps it there.
+            let run = crate::lifecycle::read::<crate::lifecycle::Run>(&crate::lifecycle::run_path());
+            if can == CanRollBack::TooOld && moving && run.is_none_or(|r| r.auto_update) && auto_update_on() {
+                println!("  it updates itself again at its next check (~10 minutes) — `mafold update --auto-update off` keeps it on {to}");
+            }
+        }
+    }
+    out(said)
+}
+
+/// The version a mafold binary says it is (`mafold --version`).
+fn version_of(bin: &Path) -> Option<String> {
+    let mut cmd = crate::platform::std_command(bin);
+    cmd.arg("--version");
+    let out = crate::platform::output_of_new_binary(&mut cmd).ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().last().filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit())).map(str::to_string)
+}
+
+/// Check + update if newer. Returns the new version if updated. (`mafold update`)
+pub async fn update_to_latest(
+    http: &reqwest::Client,
+    base: &str,
+    channel: Channel,
+) -> Result<Option<String>> {
+    match check(http, base, channel).await? {
+        Some(r) => {
+            apply(http, &r.url, &r.version, r.sha256.as_deref()).await?;
+            Ok(Some(r.version))
+        }
+        None => Ok(None),
+    }
+}
+
+/// What `mafold update` was asked.
+pub struct Ask {
+    /// `--check`: say what is on offer; install nothing.
+    pub check: bool,
+    /// `--auto-update on|off`: set [`auto_update_on`]; install nothing.
+    pub auto_update: Option<bool>,
+    /// `--channel`: switched (and kept) first, so what follows is on it.
+    pub channel: Option<Channel>,
+    /// One JSON object instead of lines — for the desktop app.
+    pub json: bool,
+}
+
+/// `mafold update`. Installs only when neither `--check` nor `--auto-update`
+/// is given, then asks the supervisor here to move onto the new binary — once
+/// the replies in progress are written ([`crate::supervisor::move_onto_disk`]).
+///
+/// `--json` prints one object: `ok`, `code` (`available` / `current` from a
+/// check, `set`, `updated` / `current` from an install, else `unsupported` /
+/// `failed` with `detail`), and always this binary's `version`, the `channel`
+/// and the `auto_update` setting; `latest` is the release a check or install
+/// found, `restart` + `moving` what the supervisor made of an install.
+pub async fn command(base: &str, ask: Ask) -> Result<()> {
+    let channel = ask.channel.unwrap_or_else(Channel::current);
+    let said = |code: &str, more: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "ok": !matches!(code, "failed" | "unsupported"),
+            "code": code,
+            "version": current_version(),
+            "channel": channel.as_str(),
+            "auto_update": auto_update_on(),
+        });
+        if let (Some(o), serde_json::Value::Object(m)) = (v.as_object_mut(), more) {
+            o.extend(m);
+        }
+        println!("{v}");
+    };
+    // What fails — a setting that can't be written, a check, an install —
+    // fails as itself, and with `--json` still as one object.
+    let failed = |what: &str, e: &anyhow::Error| -> ! {
+        if ask.json {
+            said("failed", serde_json::json!({ "detail": format!("{e:#}") }));
+        } else {
+            eprintln!("{what} failed: {e:#}");
+        }
+        std::process::exit(1)
+    };
+    if let Some(c) = ask.channel {
+        if let Err(e) = c.save() {
+            failed("switching the channel", &e);
+        }
+        if !ask.json {
+            println!("✓ channel → {}", c.as_str());
+        }
+    }
+    if let Some(on) = ask.auto_update {
+        if let Err(e) = set_auto_update(on) {
+            failed("setting automatic updates", &e);
+        }
+        if !ask.json {
+            println!("{}", setting_line(on));
+            if on && started_without_updates() {
+                println!("  but the supervisor here runs with --no-auto-update, and that still keeps it off");
+            }
+        }
+    }
+    if !ask.check && ask.auto_update.is_some() {
+        if ask.json {
+            said("set", serde_json::json!({}));
+        }
+        return Ok(());
+    }
+    // No release binary is built for this platform (e.g. linux-arm64) → don't
+    // claim "up to date" (the check would always no-op). Be honest instead.
+    if !platform_supported() {
+        if ask.json {
+            said("unsupported", serde_json::json!({}));
+        } else {
+            println!("no mafold release is built for your platform — self-update isn't available.\nSee https://github.com/mafold-lab/mafold-cli/releases");
+        }
+        return Ok(());
+    }
+    let http = reqwest::Client::new();
+    if ask.check {
+        let offer = match latest_offer(&http, base, channel).await {
+            Ok(o) => o,
+            Err(e) => failed("update check", &e),
+        };
+        let wanted = offer.as_ref().filter(|(_, w)| *w).map(|(r, _)| r.version.clone());
+        let latest = offer.as_ref().map(|(r, _)| r.version.clone());
+        let running = crate::supervisor::running_version().unwrap_or_else(|| current_version().to_string());
+        note_looked(latest.as_deref(), &running);
+        if ask.json {
+            let code = if wanted.is_some() { "available" } else { "current" };
+            said(code, serde_json::json!({ "latest": latest }));
+        } else {
+            println!("{}", check_line(channel, latest.as_deref(), wanted.is_some()));
+        }
+        return Ok(());
+    }
+    match update_to_latest(&http, base, channel).await {
+        Ok(Some(v)) => {
+            note_installed();
+            // A person asked for it by hand: a rollback's skip is over.
+            clear_skip();
+            // `mafold stop` only knows the old `agent --detach` — on a machine
+            // the supervisor runs, that hint stopped nothing. The supervisor
+            // is asked to move onto it (`control`), as after `rollback`.
+            let (restart, moving) = if crate::supervisor::supervisor_running() {
+                crate::supervisor::move_onto_disk(crate::control::Moved::Update, Some(&v))
+            } else {
+                ("restart a running agent with: mafold stop && mafold agent --detach …".to_string(), false)
+            };
+            if ask.json {
+                said("updated", serde_json::json!({ "latest": v, "restart": restart, "moving": moving }));
+            } else {
+                println!("✓ updated to v{v} — {restart}");
+            }
+        }
+        Ok(None) => {
+            if ask.json {
+                said("current", serde_json::json!({}));
+            } else {
+                println!("already up to date (v{}, {} channel)", current_version(), channel.as_str());
+            }
+        }
+        Err(e) => failed("update", &e),
+    }
+    Ok(())
+}
+
+fn setting_line(on: bool) -> &'static str {
+    if on {
+        "✓ automatic updates on — new releases are installed within ~10 minutes, once the replies in progress are written"
+    } else {
+        "✓ automatic updates off — this computer installs a new release only when you run `mafold update`"
+    }
+}
+
+/// The supervisor here was started with `--no-auto-update`, which the setting
+/// doesn't override.
+fn started_without_updates() -> bool {
+    crate::supervisor::started_to_update() == Some(false)
+}
+
+/// What `--check` found, as a line: `latest` is the newest release on the
+/// channel, `wanted` whether this binary should install it.
+fn check_line(channel: Channel, latest: Option<&str>, wanted: bool) -> String {
+    let here = current_version();
+    let ch = channel.as_str();
+    match latest {
+        Some(v) if wanted && is_same_version(v, here) => format!(
+            "v{v} on the {ch} channel is not this binary's build (checksum differs) — `mafold update` reinstalls it"
+        ),
+        Some(v) if wanted => format!("v{v} is available on the {ch} channel (this is v{here}) — `mafold update` installs it"),
+        Some(v) if is_newer(here, v) => format!("up to date (v{here} — newer than v{v}, the latest on the {ch} channel)"),
+        _ => format!("up to date (v{here}, {ch} channel)"),
+    }
+}
+
+/// Replace the current process with the (freshly updated) binary, keeping the
+/// same args + env. Never returns on success. Unix `exec`s in place (same pid);
+/// Windows respawns and exits — see `crate::platform::reexec`.
+pub fn reexec() -> std::io::Error {
+    // Warm `claude` connections are children of THIS process, and a unix
+    // `exec` replaces our image without touching them — they would live on as
+    // orphans holding sessions (and whatever they had spawned) that nothing
+    // will ever read from again. Close them first; this is the one choke point
+    // both platforms go through.
+    crate::harness::cc_conn::shutdown_all();
+    crate::platform::reexec()
+}
+
+/// `reexec`, but LOUD on failure. After `apply()` the binary on disk is already
+/// `new_version`; if the re-exec fails THIS process silently keeps running the
+/// old code — the "disk says new, behavior says old" stale-daemon trap (easiest
+/// to hit on Windows, where a virus scanner can hold the fresh exe just long
+/// enough for the spawn to fail). Retry once after a beat, then leave an
+/// unmissable log line instead of the old `let _ =` swallow.
+pub fn reexec_or_warn(new_version: Option<&str>) {
+    let e = reexec(); // only returns on failure
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    let e2 = reexec();
+    let onto = new_version.map_or_else(|| "the binary on disk".to_string(), |v| format!("v{v}"));
+    eprintln!(
+        "⚠️  re-exec into {onto} FAILED (first: {e}; retry: {e2}) — STILL RUNNING v{} \
+         while the binary on disk is {onto}. Restart me: `mafold down && mafold up`.",
+        current_version()
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        current_version, is_newer, parse_version, release_from_api_envelope, wants_update, Channel,
+        Release,
+    };
+
+    fn rel(version: &str, sha: Option<&str>) -> Release {
+        Release {
+            version: version.into(),
+            url: "https://example.invalid/mafold".into(),
+            sha256: sha.map(Into::into),
+            channel: Channel::Stable,
+        }
+    }
+
+    fn dev_rel(version: &str, sha: Option<&str>) -> Release {
+        Release {
+            channel: Channel::Dev,
+            ..rel(version, sha)
+        }
+    }
+
+    /// Bump the patch of whatever version this build actually is, so the tests
+    /// don't need editing every release.
+    fn newer_than_current() -> String {
+        let mut p = current_version().split('.').map(|s| s.to_string()).collect::<Vec<_>>();
+        let last = p.len() - 1;
+        p[last] = (p[last].parse::<u64>().unwrap_or(0) + 1).to_string();
+        p.join(".")
+    }
+
+    #[test]
+    fn a_newer_release_always_wins() {
+        // …and needs no checksum to do it — the version compare is enough.
+        assert!(wants_update(&rel(&newer_than_current(), None), Some("aaaa")));
+        assert!(wants_update(&rel(&newer_than_current(), Some("bbbb")), Some("aaaa")));
+        assert!(is_newer(&newer_than_current(), current_version()));
+    }
+
+    /// THE HOLE THIS CLOSES. A binary built from main after the version bump but
+    /// before the tag reports the release's version WITHOUT containing it. The
+    /// version compare calls that "up to date" forever, so the real release can
+    /// never land — the checksum is the only thing that tells them apart.
+    #[test]
+    fn a_same_version_binary_that_isnt_the_published_build_is_replaced() {
+        let r = rel(current_version(), Some("cafebabe"));
+        assert!(wants_update(&r, Some("deadbeef")));
+    }
+
+    /// …and once it IS the published build, the very next check must stop. This
+    /// is what keeps the repair from becoming a 10-minute re-download loop.
+    #[test]
+    fn the_repair_settles_after_one_install() {
+        let r = rel(current_version(), Some("cafebabe"));
+        assert!(!wants_update(&r, Some("cafebabe")));
+        assert!(!wants_update(&r, Some("CAFEBABE")), "hex case must not matter");
+    }
+
+    /// Fail SAFE, not eager: with nothing to compare we keep the old
+    /// version-only behaviour rather than re-downloading on every tick.
+    #[test]
+    fn no_checksum_to_compare_means_no_same_version_install() {
+        assert!(!wants_update(&rel(current_version(), None), Some("deadbeef")));
+        assert!(!wants_update(&rel(current_version(), Some("cafebabe")), None));
+        assert!(!wants_update(&rel(current_version(), None), None));
+    }
+
+    /// A "latest" release OLDER than us is never installed, checksum or not —
+    /// otherwise a mis-tagged release could walk every daemon backwards.
+    #[test]
+    fn an_older_release_is_never_installed() {
+        assert!(!wants_update(&rel("0.0.1", Some("cafebabe")), Some("deadbeef")));
+        assert!(!wants_update(&rel("0.0.1", None), None));
+    }
+
+    /// The repair says so in plain words: it is the one case where the updater
+    /// overwrites a binary someone may have put there on purpose.
+    #[test]
+    fn a_same_version_install_announces_itself_as_a_repair() {
+        let repair = rel(current_version(), Some("cafebabe")).action_line();
+        assert!(repair.contains("REINSTALL"), "{repair}");
+        assert!(repair.contains("mafold update --auto-update off"), "must name the escape hatch: {repair}");
+        assert!(rel(&newer_than_current(), None).action_line().contains("update v"));
+    }
+
+    // ── channels ──
+
+    /// A prerelease sorts BEFORE its final release and after the previous one,
+    /// and `-dev.N` ordinals order among themselves. The old parser collapsed
+    /// every one of these onto `(0, 9, 116)`.
+    #[test]
+    fn dev_builds_are_ordered_not_collapsed() {
+        assert!(parse_version("0.9.116-dev.7") < parse_version("0.9.116-dev.8"));
+        assert!(parse_version("0.9.116-dev.8") < parse_version("0.9.116"));
+        assert!(parse_version("0.9.115") < parse_version("0.9.116-dev.1"));
+        // …and a two-digit ordinal is not read as "1" (rsplit, not a char scan).
+        assert!(parse_version("0.9.116-dev.9") < parse_version("0.9.116-dev.12"));
+    }
+
+    /// Stable-vs-stable comparisons must be bit-for-bit what they were before
+    /// the 4th component existed — this parser change touches every update
+    /// decision on every machine.
+    #[test]
+    fn stable_comparisons_are_unchanged() {
+        assert!(is_newer("0.9.116", "0.9.115"));
+        assert!(!is_newer("0.9.115", "0.9.116"));
+        assert!(!is_newer("0.9.116", "0.9.116"));
+        assert!(is_newer("0.10.0", "0.9.999"));
+        assert_eq!(parse_version("v0.9.116"), parse_version("0.9.116"));
+    }
+
+    /// An unreadable prerelease tail must not out-rank the real release.
+    #[test]
+    fn an_unparseable_prerelease_tail_sorts_below_the_final_release() {
+        assert!(parse_version("0.9.116-wat") < parse_version("0.9.116"));
+        assert!(parse_version("0.9.116-dev") < parse_version("0.9.116"));
+    }
+
+    /// Moving between two dev builds is now an ordinary upgrade — it must NOT
+    /// need the same-version checksum repair, which is what it used to depend
+    /// on (and which announces itself as a REINSTALL).
+    #[test]
+    fn dev_to_dev_is_a_plain_upgrade() {
+        // No checksum anywhere: a newer ordinal alone is enough.
+        assert!(is_newer("0.9.116-dev.8", "0.9.116-dev.7"));
+        assert!(!is_newer("0.9.116-dev.7", "0.9.116-dev.8"));
+    }
+
+    /// The dev channel's same-version wording must not point the reader at
+    /// turning updates off — that would tell them to leave the channel they
+    /// deliberately joined.
+    #[test]
+    fn a_dev_rebuild_does_not_shout_reinstall() {
+        let line = dev_rel(current_version(), Some("cafebabe")).action_line();
+        assert!(line.contains("rebuild"), "{line}");
+        assert!(!line.contains("REINSTALL"), "{line}");
+        assert!(!line.contains("auto-update"), "{line}");
+    }
+
+    // ── mafold-api as the metadata source ──
+
+    fn envelope(result: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "ok": true, "result": result })
+    }
+
+    /// THE ONE THAT MATTERS. "The server has no manifest" must not read as "you
+    /// are up to date" — a machine that made that mistake would stop looking
+    /// exactly when the fallback is the thing that should fire.
+    #[test]
+    fn no_manifest_is_not_up_to_date() {
+        let env = envelope(serde_json::json!({ "known": false, "channel": "stable" }));
+        let got = release_from_api_envelope(&env, Channel::Stable).expect("not an error");
+        assert!(got.is_none(), "must fall through to GitHub, not report 'current'");
+    }
+
+    /// The updater refuses unverifiable binaries, so a manifest without the
+    /// checksum is not something to proceed on — GitHub still has the
+    /// `.sha256` asset, so falling back can do strictly better.
+    #[test]
+    fn a_manifest_without_a_checksum_falls_back() {
+        let env = envelope(serde_json::json!({
+            "known": true, "channel": "stable",
+            "version": "0.9.117", "url": "https://example.invalid/mafold", "size": 1,
+        }));
+        assert!(release_from_api_envelope(&env, Channel::Stable).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_complete_manifest_is_used_as_is() {
+        let env = envelope(serde_json::json!({
+            "known": true, "channel": "dev",
+            "version": "v0.9.117-dev.3",
+            "url": "https://example.invalid/mafold-aarch64-apple-darwin",
+            "size": 12345, "sha256": "CAFEBABE",
+        }));
+        let r = release_from_api_envelope(&env, Channel::Dev).unwrap().expect("usable");
+        assert_eq!(r.version, "0.9.117-dev.3", "the leading v is the tag's, not the version's");
+        assert_eq!(r.sha256.as_deref(), Some("CAFEBABE"));
+        assert_eq!(r.channel, Channel::Dev);
+    }
+
+    /// An `{ok:false}` envelope is an ERROR, not "nothing here": the caller
+    /// prints it before falling back, so a misconfigured base url is visible
+    /// instead of silently costing everyone the GitHub quota again.
+    #[test]
+    fn a_rejected_request_is_an_error_not_a_shrug() {
+        let env = serde_json::json!({
+            "ok": false, "error_code": 400, "description": "unknown target \"sparc\"",
+        });
+        let e = release_from_api_envelope(&env, Channel::Stable).expect_err("must surface");
+        assert!(e.to_string().contains("sparc"), "{e}");
+    }
+
+    // ── failure cooldown + in-place retry ──
+
+    use super::{backoff_for, human, mark_failed, retrying, Failure};
+    use std::time::{Duration, SystemTime};
+
+    fn failure(version: &str, at: SystemTime, streak: usize) -> Failure {
+        Failure { version: version.into(), at, streak, error: "tls reset".into() }
+    }
+
+    /// THE INCIDENT (2026-09-27, cli@0.9.123): the download failed, the Mac
+    /// slept, and it woke 1h40m later. Measured on the wall clock that is long
+    /// past any cooldown — the next check must try again. (On `Instant` the
+    /// sleep didn't count and the machine waited out another hour awake.)
+    #[test]
+    fn a_cooldown_measured_across_sleep_is_over() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let f = failure("0.9.123", t0, 1);
+        assert_eq!(f.wait_left("0.9.123", t0 + Duration::from_secs(100 * 60)), None);
+    }
+
+    #[test]
+    fn a_fresh_failure_holds_that_version_and_only_that_version() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let f = failure("0.9.123", t0, 1);
+        assert_eq!(
+            f.wait_left("0.9.123", t0 + Duration::from_secs(60)),
+            Some(Duration::from_secs(4 * 60))
+        );
+        // A newer release is a different download — never held by an old failure.
+        assert_eq!(f.wait_left("0.9.124", t0 + Duration::from_secs(60)), None);
+    }
+
+    /// A clock set backwards must not freeze updates until it catches up.
+    #[test]
+    fn a_clock_that_went_backwards_ends_the_cooldown() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let f = failure("0.9.123", t0, 1);
+        assert_eq!(f.wait_left("0.9.123", t0 - Duration::from_secs(3600)), None);
+    }
+
+    /// Short first, the old hour only for a version that keeps failing.
+    #[test]
+    fn repeated_failures_back_off_to_an_hour_and_stay_there() {
+        assert_eq!(backoff_for(1), Duration::from_secs(5 * 60));
+        assert_eq!(backoff_for(2), Duration::from_secs(15 * 60));
+        assert_eq!(backoff_for(3), Duration::from_secs(30 * 60));
+        assert_eq!(backoff_for(4), Duration::from_secs(60 * 60));
+        assert_eq!(backoff_for(40), Duration::from_secs(60 * 60));
+        // The only test that touches the process-wide record.
+        let e = anyhow::anyhow!("connection reset");
+        assert_eq!(mark_failed("0.0.1-streak-test", &e), backoff_for(1));
+        assert_eq!(mark_failed("0.0.1-streak-test", &e), backoff_for(2));
+        assert_eq!(mark_failed("0.0.2-streak-test", &e), backoff_for(1), "a new version starts over");
+    }
+
+    #[test]
+    fn durations_read_like_a_person_wrote_them() {
+        assert_eq!(human(Duration::from_secs(10)), "10s");
+        assert_eq!(human(Duration::from_millis(400)), "0s");
+        assert_eq!(human(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(human(Duration::from_secs(5 * 60)), "5m");
+        assert_eq!(human(Duration::from_secs(65 * 60)), "1h 5m");
+    }
+
+    /// A blip mid-download is retried in place: two failures then a success is
+    /// a SUCCESS, with no cooldown involved at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_download_that_fails_twice_then_works_is_a_success() {
+        let calls = std::cell::Cell::new(0);
+        let got = retrying("downloading v9", &super::DOWNLOAD_RETRY_DELAYS, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 3 {
+                    anyhow::bail!("tls: cannot decrypt peer's message")
+                }
+                Ok(n)
+            }
+        })
+        .await
+        .expect("third try succeeds");
+        assert_eq!(got, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_download_that_keeps_failing_gives_up_after_three_tries() {
+        let calls = std::cell::Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let e = retrying("downloading v9", &super::DOWNLOAD_RETRY_DELAYS, || {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>(anyhow::anyhow!("connection reset")) }
+        })
+        .await
+        .expect_err("all three fail");
+        assert_eq!(calls.get(), 3);
+        assert_eq!(started.elapsed(), Duration::from_secs(40), "10s + 30s between tries");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("3 attempts failed") && msg.contains("connection reset"), "{msg}");
+    }
+
+    /// Anything we can't read is STABLE. A typo in `~/.mafold/channel` must
+    /// never be the reason a production machine starts taking prereleases.
+    #[test]
+    fn an_unknown_channel_is_stable() {
+        assert_eq!(Channel::parse("dev"), Some(Channel::Dev));
+        assert_eq!(Channel::parse("  DEV\n"), Some(Channel::Dev));
+        assert_eq!(Channel::parse("stable"), Some(Channel::Stable));
+        assert_eq!(Channel::parse("nightly"), None);
+        assert_eq!(Channel::parse(""), None);
+        assert_eq!(Channel::default(), Channel::Stable);
+    }
+}
+
+#[cfg(test)]
+mod seen_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mafold-seen-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("update.json")
+    }
+
+    fn failed(version: &str, streak: usize) -> Seen {
+        Seen {
+            failed: Some(Failed { version: version.into(), since: 1, at: 2, streak, error: "x".into() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_check_says_what_is_on_offer_until_it_is_installed() {
+        let p = tmp("offer");
+        assert_eq!(seen_at(&p), Seen::default(), "nothing checked yet");
+        note_seen_at(&p, |s| checked(s, Some("0.9.151"), 10));
+        let s = seen_at(&p);
+        assert_eq!(s.checked_at, Some(10));
+        assert_eq!(available(&s, "0.9.150").as_deref(), Some("0.9.151"));
+        assert_eq!(available(&s, "0.9.151"), None, "running it already: nothing on offer");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn failures_of_one_version_add_up_across_restarts_and_another_starts_over() {
+        let mut s = Seen::default();
+        super::failed(&mut s, "0.9.151", "reset", 100);
+        super::failed(&mut s, "0.9.151", "reset again", 400);
+        let f = s.failed.clone().unwrap();
+        assert_eq!((f.streak, f.since, f.at, f.error.as_str()), (2, 100, 400, "reset again"));
+        // The release moved on: a new run of failures.
+        super::failed(&mut s, "0.9.152", "x", 900);
+        let f = s.failed.unwrap();
+        assert_eq!((f.version.as_str(), f.streak, f.since), ("0.9.152", 1, 900));
+    }
+
+    #[test]
+    fn being_current_clears_a_failure() {
+        let mut s = failed("0.9.151", 3);
+        checked(&mut s, Some("0.9.151"), 10);
+        assert!(s.failed.is_some(), "still on offer, still failing");
+        checked(&mut s, None, 20);
+        assert_eq!((s.failed, s.offered, s.checked_at), (None, None, Some(20)));
+    }
+
+    #[test]
+    fn a_failing_update_is_two_in_a_row_of_a_newer_version_on_a_machine_that_updates_itself() {
+        assert!(failing(&failed("0.9.151", 2), "0.9.150", true).is_some());
+        assert!(failing(&failed("0.9.151", 1), "0.9.150", true).is_none(), "once is a blip");
+        assert!(failing(&failed("0.9.151", 3), "0.9.151", true).is_none(), "installed after all");
+        assert!(failing(&failed("0.9.151", 3), "0.9.150", false).is_none(), "it isn't trying to");
+    }
+
+    /// A check by hand keeps what is on offer for the version the supervisor
+    /// RUNS — not the binary that asked — and leaves a failed install as it was.
+    #[test]
+    fn a_check_by_hand_is_kept_against_the_running_version() {
+        let mut s = failed("0.9.151", 3);
+        looked(&mut s, Some("0.9.151"), "0.9.150", 9);
+        assert_eq!((s.checked_at, s.offered.as_deref()), (Some(9), Some("0.9.151")));
+        assert!(s.failed.is_some(), "a check is no install");
+        looked(&mut s, Some("0.9.151"), "0.9.151", 10);
+        assert_eq!((s.checked_at, s.offered.as_deref()), (Some(10), None), "it runs that already");
+        assert!(s.failed.is_some());
+    }
+}
+
+#[cfg(test)]
+mod setting_tests {
+    use super::*;
+
+    /// Off only when the file says off. Missing, empty or garbled is on — a
+    /// machine that quietly stops updating is the failure nobody notices.
+    #[test]
+    fn auto_update_is_on_unless_it_says_off() {
+        let dir = std::env::temp_dir().join(format!("mafold-auto-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("auto-update");
+        assert!(auto_update_at(&p), "never set");
+        for (text, on) in [("off", false), ("OFF\n", false), (" off ", false), ("on", true), ("", true), ("nope", true)] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&p, text).unwrap();
+            assert_eq!(auto_update_at(&p), on, "{text:?}");
+        }
+        set_auto_update_at(&p, false).unwrap();
+        assert!(!auto_update_at(&p));
+        set_auto_update_at(&p, true).unwrap();
+        assert!(auto_update_at(&p));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--check` in words: on offer, a repair, current — and a build newer
+    /// than the latest release says so instead of claiming to be it.
+    #[test]
+    fn a_check_says_which_it_is() {
+        let here = current_version();
+        let newer = {
+            let mut p = here.split('.').map(str::to_string).collect::<Vec<_>>();
+            let last = p.len() - 1;
+            p[last] = (p[last].parse::<u64>().unwrap_or(0) + 1).to_string();
+            p.join(".")
+        };
+        let offer = check_line(Channel::Stable, Some(&newer), true);
+        assert!(offer.contains(&format!("v{newer} is available on the stable channel (this is v{here})")), "{offer}");
+        assert!(check_line(Channel::Stable, Some(here), true).contains("reinstalls it"));
+        assert_eq!(check_line(Channel::Dev, Some(here), false), format!("up to date (v{here}, dev channel)"));
+        assert!(check_line(Channel::Stable, Some("0.0.1"), false).contains("newer than v0.0.1"));
+        assert_eq!(check_line(Channel::Stable, None, false), format!("up to date (v{here}, stable channel)"));
+    }
+}
+
+/// A rollback that sticks (activity center C9): the version rolled back from
+/// is skipped by automatic updates until a newer release is out.
+#[cfg(test)]
+mod rollback_skip_tests {
+    use super::*;
+
+    fn dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mf-skip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_version_rolled_back_from_is_skipped_until_a_newer_one_is_out() {
+        let d = dir();
+        let path = d.join("update-skip.json");
+        assert!(!skip_holds_at(&path, "0.9.150"), "no rollback, nothing held");
+
+        write_skip_at(&path, "0.9.150", 1_760_000_000).unwrap();
+        assert_eq!(skip_at(&path), Some(Skip { version: "0.9.150".into(), at: 1_760_000_000 }));
+        // The release it rolled back from: held, every check, until…
+        assert!(skip_holds_at(&path, "0.9.150"));
+        assert!(skip_holds_at(&path, "0.9.150"), "the next check too — the bug was it came back ~10 minutes later");
+        assert!(skip_holds_at(&path, "0.9.149"), "nothing older either");
+        // …a newer release: it ends the skip and goes ahead.
+        assert!(!skip_holds_at(&path, "0.9.151"));
+        assert_eq!(skip_at(&path), None, "the skip is gone once a newer release is out");
+        assert!(!skip_holds_at(&path, "0.9.150"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_backup_from_before_the_skip_is_not_rolled_back_to_without_force() {
+        let d = dir();
+        let backup = d.join("mafold.old");
+        assert_eq!(can_roll_back(&backup, |_| vec!["update-skip".into()]), CanRollBack::NoBackup);
+        std::fs::write(&backup, b"#!/bin/sh\n").unwrap();
+        assert_eq!(can_roll_back(&backup, |_| vec!["update-skip".into(), "later".into()]), CanRollBack::Yes);
+        // A binary from before `mafold capabilities` fails it ⇒ no names.
+        assert_eq!(can_roll_back(&backup, |_| Vec::new()), CanRollBack::TooOld);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The probe asks the target itself: a binary from before the command
+    /// fails it, which reads as no capabilities (not a crash, not a guess).
+    #[test]
+    fn capabilities_are_asked_of_the_binary_itself() {
+        assert!(CAPABILITIES.contains(&"update-skip"));
+        assert!(capabilities_of(Path::new("/nonexistent/mafold.old")).is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let d = dir();
+            let fake = d.join("mafold.old");
+            std::fs::write(&fake, "#!/bin/sh\n[ \"$1\" = capabilities ] && echo '[\"update-skip\"]' && exit 0\nexit 2\n").unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A test thread forking as the script was written can hold it open
+            // a moment (ETXTBSY): the probe asks again itself (platform's
+            // `output_of_new_binary`), as it must for a real `mafold.old`.
+            assert_eq!(capabilities_of(&fake), vec!["update-skip".to_string()]);
+            std::fs::write(&fake, "#!/bin/sh\necho \"error: unrecognized subcommand '$1'\" >&2\nexit 2\n").unwrap();
+            assert!(capabilities_of(&fake).is_empty(), "an older binary");
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}

@@ -1,0 +1,28 @@
+data: {"id":"evt_18e35a81c001Kvhg0NEyc2e3Xy","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35a81b001Si1nwOvt9Wu61O","role":"user","sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","time":{"created":1793387243547},"agent":"build","model":{"providerID":"mafold","modelID":"deepseek-v4-flash"}}}}
+
+data: {"id":"evt_18e35a820001Norvwl1yUP20S6","type":"message.part.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","part":{"type":"text","text":"FAIL402 now","messageID":"msg_18e35a81b001Si1nwOvt9Wu61O","sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","id":"prt_18e35a81c001hi1zVt62l1T8vF"},"time":1793387243551}}
+
+data: {"id":"evt_18e35a825001SAWBXfVeM4eJTQ","type":"session.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"ses_e71ca68a0ffeNhiKRmSypfL25K","slug":"clever-knight","projectID":"global","directory":"/tmp/oc-h4c/exp/rec7/w","path":"tmp/oc-h4c/exp/rec7/w","title":"Mafold","agent":"build","model":{"id":"deepseek-v4-flash","providerID":"mafold","variant":"default"},"version":"1.19.5","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":860,"output":70,"reasoning":4,"cache":{"read":1200,"write":0}},"time":{"created":1793387239264,"updated":1793387243556}}}}
+
+data: {"id":"evt_18e35a82c001wTYPykbPFxwJzz","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35a82f001zM6yKz9bPxZZbS","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35a82f0016M2XBMgsER3RYQ","parentID":"msg_18e35a81b001Si1nwOvt9Wu61O","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oc-h4c/exp/rec7/w","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"deepseek-v4-flash","providerID":"mafold","time":{"created":1793387243567},"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K"}}}
+
+data: {"id":"evt_18e35a83f001S3PsS4Fzww4KtI","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"busy"}}}
+
+data: {"id":"evt_18e35a845001Q5HcpZAZyR0UV8","type":"session.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"ses_e71ca68a0ffeNhiKRmSypfL25K","slug":"clever-knight","projectID":"global","directory":"/tmp/oc-h4c/exp/rec7/w","path":"tmp/oc-h4c/exp/rec7/w","title":"Mafold","agent":"build","model":{"id":"deepseek-v4-flash","providerID":"mafold","variant":"default"},"version":"1.19.5","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":860,"output":70,"reasoning":4,"cache":{"read":1200,"write":0}},"time":{"created":1793387239264,"updated":1793387243588}}}}
+
+data: {"id":"evt_18e35a84a001l9Q94bQpV145qY","type":"session.diff","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","diff":[]}}
+
+data: {"id":"evt_18e35a85c001q9F0DLv814fHyC","type":"session.error","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","error":{"name":"APIError","data":{"message":"router says 402: wallet_cap_reached: @ops's monthly cap for @bot is used up","statusCode":402,"isRetryable":false,"responseHeaders":{"content-length":"131","content-type":"application/json","date":"Fri, 30 Oct 2026 19:07:23 GMT","server":"BaseHTTP/0.6 Python/3.12.3"},"responseBody":"{\"error\": {\"message\": \"router says 402: wallet_cap_reached: @ops's monthly cap for @bot is used up\", \"type\": \"insufficient_quota\"}}","metadata":{"url":"http://127.0.0.1:46189/v1/chat/completions"}}}}}
+
+data: {"id":"evt_18e35a85c002kdIECerIPZbG6J","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"idle"}}}
+
+data: {"id":"evt_18e35a85c003H6P91fUShlrnBf","type":"session.idle","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K"}}
+
+data: {"id":"evt_18e35a85d0011P0IeFqaXw2oWU","type":"message.updated","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","info":{"id":"msg_18e35a82f0016M2XBMgsER3RYQ","parentID":"msg_18e35a81b001Si1nwOvt9Wu61O","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oc-h4c/exp/rec7/w","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"deepseek-v4-flash","providerID":"mafold","time":{"created":1793387243567,"completed":1793387243612},"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","error":{"name":"APIError","data":{"message":"router says 402: wallet_cap_reached: @ops's monthly cap for @bot is used up","statusCode":402,"isRetryable":false,"responseHeaders":{"content-length":"131","content-type":"application/json","date":"Fri, 30 Oct 2026 19:07:23 GMT","server":"BaseHTTP/0.6 Python/3.12.3"},"responseBody":"{\"error\": {\"message\": \"router says 402: wallet_cap_reached: @ops's monthly cap for @bot is used up\", \"type\": \"insufficient_quota\"}}","metadata":{"url":"http://127.0.0.1:46189/v1/chat/completions"}}}}}}
+
+data: {"id":"evt_18e35a860001uf1ZK92G1BUcbZ","type":"session.status","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K","status":{"type":"idle"}}}
+
+data: {"id":"evt_18e35a860002p3iPvfYdrZz77z","type":"session.idle","properties":{"sessionID":"ses_e71ca68a0ffeNhiKRmSypfL25K"}}
+
