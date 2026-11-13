@@ -33,9 +33,9 @@ pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>
         return Outcome::Forward;
     }
     match name {
-        // ── usage stats (rich card): local transcript scan + live rate limits ──
+        // ── usage stats (rich card): every account's windows + local transcript scan ──
         "stats" | "usage" | "cost" => {
-            Outcome::Reply(stats(&fetch_limits(env).await, workdir, session))
+            Outcome::Reply(stats(&usage_body(env).await, workdir, session))
         }
         // ── auth ──
         "logout" => Outcome::Reply(logout(env).await),
@@ -102,6 +102,8 @@ pub fn who(name: &str) -> crate::harness::Who {
 /// `/logout` — clear the Anthropic credentials of the seat `env` selects.
 async fn logout(env: &[(String, String)]) -> String {
     let who = crate::accounts::Account::from_env(env).name;
+    // The owner's own doing: not a sign-out to tell them about.
+    crate::seat_watch::touched(&who);
     let out = run_claude(&["auth", "logout"], 20, env).await;
     crate::accounts::forget_seat(&who);
     format!(
@@ -939,8 +941,9 @@ fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
 /// the cache is missing or drifts we fall back to scanning everything, which
 /// computes the same fields the slow way.
 ///
-/// `limits_body` is the pre-fetched `limit|`/`kv|` lines from [`fetch_limits`]
-/// ("" = section omitted).
+/// `limits_body` is the pre-fetched lines from [`usage_body`] ("" = section
+/// omitted): its limit rows, plan chip, stamp and accounts go first, its
+/// key-values last.
 fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
     let files = jsonl_transcripts(&home().join(".claude/projects"));
     let cached = stats_cache();
@@ -1009,8 +1012,12 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
         .unwrap_or_default();
 
     let mut body = String::new();
-    // Rate-limit bars first (the thing people actually check).
-    for l in limits_body.lines().filter(|l| l.starts_with("limit|")) {
+    // Rate-limit bars first (the thing people actually check), with what the
+    // card needs to read them: the plan chip, when they were read (the card
+    // said nothing when its numbers were a 12-day-old cache — `stamp|` used
+    // to be dropped here), and every account (the MDS look draws those).
+    const FIRST: [&str; 6] = ["limit|", "chip|", "stamp|", "acct|", "win|", "pace|"];
+    for l in limits_body.lines().filter(|l| FIRST.iter().any(|p| l.starts_with(p))) {
         body.push_str(l);
         body.push('\n');
     }
@@ -1121,6 +1128,34 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
 }
 
 // ───────────────────────── rate limits (live) ─────────────────────────
+
+/// What `/usage` knows about the plan limits: every account turns can run
+/// on, in the order they try them (`crate::seat_usage`), and the first
+/// look's limit rows for the account the next turn runs on — not for the one
+/// the chat asked for. That one can be signed out: on 11-13 this card showed
+/// a red 100% from a 12-day-old cache of a login every turn had been
+/// stepping over for two days.
+async fn usage_body(env: &[(String, String)]) -> String {
+    let preferred = crate::accounts::Account::from_env(env).name;
+    let g = crate::seat_usage::gather(&preferred).await;
+    let mut out = match &g.in_use {
+        Some((v, plan)) => {
+            let mut s = parse_utilization(v, 0, false);
+            if !s.is_empty() && !plan.is_empty() {
+                s.push_str(&format!("chip|{plan}\n"));
+            }
+            s
+        }
+        // Nothing read live just now: the old ladder (cache, then asking
+        // `claude` itself) for the seat the chat names.
+        None => fetch_limits(env).await,
+    };
+    out.push_str(&g.lines);
+    if !out.lines().any(|l| l.starts_with("stamp|")) {
+        out.push_str(&format!("stamp|{}\n", now_ms()));
+    }
+    out
+}
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -1237,6 +1272,17 @@ pub(crate) fn login_expiry(env: &[(String, String)]) -> Option<i64> {
     login_expiry_from(&read_credential(env).ok()?)
 }
 
+/// One read of the seat `env` selects, and all `seat_watch` takes from it:
+/// the verdict, when its sign-in ends (epoch ms, [`login_expiry_from`]) and
+/// which credential it is ([`fingerprint_of`]). One read, because on a Mac
+/// each is a Keychain lookup.
+pub(crate) fn credential_facts(env: &[(String, String)]) -> (StoredLogin, Option<i64>, Option<String>) {
+    let raw = read_credential(env);
+    let end = raw.as_deref().ok().and_then(login_expiry_from);
+    let fingerprint = raw.as_deref().ok().and_then(fingerprint_of);
+    (stored_login_read(raw, now_ms()), end, fingerprint)
+}
+
 fn refresh_token_end(oauth: &serde_json::Value) -> Option<i64> {
     let end = &oauth["refreshTokenExpiresAt"];
     end.as_i64().or_else(|| end.as_f64().map(|f| f as i64)).filter(|ms| *ms > 0)
@@ -1298,7 +1344,11 @@ pub(crate) async fn probe_utilization(env: &[(String, String)]) -> UtilizationPr
         return UtilizationProbe::Http(res.status().as_u16());
     }
     match res.json::<serde_json::Value>().await {
-        Ok(v) => UtilizationProbe::Ok(v),
+        Ok(v) => {
+            // Every live answer is a point on the account's pace (`/usage`).
+            crate::seat_usage::record(&crate::accounts::Account::from_env(env).name, &v, crate::accounts::now());
+            UtilizationProbe::Ok(v)
+        }
         Err(_) => UtilizationProbe::Unreachable,
     }
 }
@@ -1479,10 +1529,16 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64, with_tier: bool) -
             ),
             other => cap_first(&other.replace('_', " ")),
         };
-        let note = match l["resets_at"].as_str().and_then(iso_epoch_secs) {
-            Some(at) if at > now => format!("resets in {}", fmt_dur(at - now)),
-            _ if pct == 0.0 => "not used yet".to_string(),
-            _ => String::new(),
+        let resets = l["resets_at"].as_str().and_then(iso_epoch_secs);
+        // A window whose reset has passed is over: what it said is about a
+        // window that no longer exists (the cached copy's red 100%, 11-13).
+        if resets.is_some_and(|at| at <= now) {
+            continue;
+        }
+        let note = match resets {
+            Some(at) => format!("resets in {}", fmt_dur(at - now)),
+            None if pct == 0.0 => "not used yet".to_string(),
+            None => String::new(),
         };
         out.push_str(&format!("limit|{label}|{}|{note}\n", pct.round() as i64));
     }

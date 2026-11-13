@@ -1069,11 +1069,14 @@ pub struct SeatSnapshot {
     /// Every window found full, account-wide ones first (so the first one
     /// that stops a turn is also the most useful reason to report).
     pub walls: Vec<Wall>,
+    /// The `/api/oauth/usage` answer this was read from, and when (epoch
+    /// seconds): `/usage` draws every window from it, not just the full ones.
+    pub usage: Option<(i64, Value)>,
 }
 
 impl SeatSnapshot {
     fn bare(state: SeatState) -> Self {
-        SeatSnapshot { state, credential: None, worst: None, walls: Vec::new() }
+        SeatSnapshot { state, credential: None, worst: None, walls: Vec::new(), usage: None }
     }
 
     /// The wall that stops a turn running `model`, if any.
@@ -1160,7 +1163,7 @@ pub fn snapshot_from_usage(v: &Value, now: i64) -> SeatSnapshot {
         _ if stale_full || worst.is_none() => SeatState::Unknown,
         _ => SeatState::Ok,
     };
-    SeatSnapshot { state, credential: None, worst, walls }
+    SeatSnapshot { state, credential: None, worst, walls, usage: Some((now, v.clone())) }
 }
 
 /// Probe results live a minute: a turn start must not cost a round trip every
@@ -2149,11 +2152,11 @@ mod tests {
             None => SeatState::Exhausted { kind: kind.into(), until },
             Some(_) => SeatState::Ok,
         };
-        SeatSnapshot { state, credential: None, worst: None, walls: vec![w] }
+        SeatSnapshot { state, credential: None, worst: None, walls: vec![w], usage: None }
     }
 
     fn healthy() -> SeatSnapshot {
-        SeatSnapshot { state: SeatState::Ok, credential: None, worst: None, walls: vec![] }
+        SeatSnapshot { state: SeatState::Ok, credential: None, worst: None, walls: vec![], usage: None }
     }
 
     /// The whole point of the feature: the login a turn was aimed at is out,
@@ -2331,7 +2334,7 @@ mod tests {
         let now = 1_788_600_000;
         let mut reg = seeded(&[
             ("default", full("five_hour", now + 1800, None)),
-            ("idle-held", SeatSnapshot { state: SeatState::Idle, credential: None, worst: None, walls: vec![] }),
+            ("idle-held", SeatSnapshot { state: SeatState::Idle, credential: None, worst: None, walls: vec![], usage: None }),
         ]);
         reg.mark_exhausted("idle-held", "weekly_all", now + 86400, None, None);
         let order = reg.ordered(None);

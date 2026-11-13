@@ -9,17 +9,19 @@
 //! on, carried by mafold-cli) and your own OpenCode install (`opencode-own`)
 //! where the owner has
 //! `openCodeGo` on; the wallet fuels Mafold Harness alone, where the owner has
-//! `walletOnComputers` on.
+//! `walletOnComputers` on; and a Claude login runs Mafold Harness too — each
+//! step on the real `claude` there — where the owner has `harnessOnClaude` on.
 
 /// The runtimes New Agent offers on a computer, each with what can sign it in.
 pub const RUNTIME_SIGN_INS: &[(&str, &[&str])] = &[
     ("claude-code", &["claude"]),
     ("codex", &["codex"]),
     ("kimi-code", &["kimi"]),
-    // Mafold Harness: no login of its own — your OpenCode Go plan, or the
-    // wallet (the router serves it on /v1/chat/completions, which its model
-    // client speaks; Claude Code and Codex wait for PR 4d / 4e).
-    ("opencode", &["opencode-go", "wallet"]),
+    // Mafold Harness: no login of its own — your OpenCode Go plan, the wallet
+    // (the router serves it on /v1/chat/completions, which its model client
+    // speaks), or your Claude Code login, each step run by the real `claude`
+    // on that computer.
+    ("opencode", &["opencode-go", "wallet", "claude"]),
     // Your own OpenCode: on OpenCode Go.
     ("opencode-own", &["opencode-go"]),
 ];
@@ -34,14 +36,18 @@ pub struct Gates {
     pub wallet_on_computers: bool,
     /// `openCodeGo`: OpenCode Go may sign in Mafold Harness and your own OpenCode.
     pub opencode_go: bool,
+    /// `harnessOnClaude`: a Claude login may sign in Mafold Harness. Its own
+    /// runtime, Claude Code, needs no flag.
+    pub harness_on_claude: bool,
 }
 
 impl Gates {
-    /// Whether `sign_in` is open to this owner at all.
-    fn opens(self, sign_in: &str) -> bool {
-        match sign_in {
-            "wallet" => self.wallet_on_computers,
-            "opencode-go" => self.opencode_go,
+    /// Whether `sign_in` is open to this owner on `runtime`.
+    fn opens(self, runtime: &str, sign_in: &str) -> bool {
+        match (runtime, sign_in) {
+            (_, "wallet") => self.wallet_on_computers,
+            (_, "opencode-go") => self.opencode_go,
+            ("opencode", "claude") => self.harness_on_claude,
             _ => true,
         }
     }
@@ -53,10 +59,10 @@ pub fn sign_in_runs(cloud: bool, runtime: Option<&str>, sign_in: &str, gates: Ga
     if cloud {
         return sign_in == "wallet";
     }
-    let Some((_, ins)) = runtime.and_then(|r| RUNTIME_SIGN_INS.iter().find(|(id, _)| *id == r)) else {
+    let Some((id, ins)) = runtime.and_then(|r| RUNTIME_SIGN_INS.iter().find(|(id, _)| *id == r)) else {
         return false;
     };
-    ins.contains(&sign_in) && gates.opens(sign_in)
+    ins.contains(&sign_in) && gates.opens(id, sign_in)
 }
 
 /// A runtime with no login of its own on the computer: an agent on it runs on
@@ -86,6 +92,8 @@ mod tests {
                 wallet_on_computers: c["wallet_on_computers"].as_bool().unwrap(),
                 // Absent = off: the cases from before OpenCode Go never had it.
                 opencode_go: c["opencode_go"].as_bool().unwrap_or(false),
+                // …nor the ones from before Mafold Harness on Claude Code.
+                harness_on_claude: c["harness_on_claude"].as_bool().unwrap_or(false),
             };
             assert_eq!(sign_in_runs(cloud, runtime, sign_in, gates), c["ok"].as_bool().unwrap(), "{c}");
         }

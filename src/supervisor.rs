@@ -1712,6 +1712,10 @@ pub async fn supervise(base: String, auto_update: bool) {
     // person's machine read as offline the moment somebody ran `mafold
     // account use`.
     tokio::spawn(heartbeat(http.clone(), base.clone(), crate::session::all, Ledger::here()));
+    // Say once when a Claude login here signs out, or is about to, from one
+    // of the owner's Claude Code bots (`seat_watch`). Its own task too: a
+    // send that hangs must not hold up the heartbeat.
+    tokio::spawn(watch_seats(base.clone()));
     // Wall clock, like the failure cooldown in `update.rs`: counting 10-second
     // ticks stalls while a Mac sleeps, so a laptop that wakes up an hour past
     // a release still waited up to 10 more minutes before it looked.
@@ -2230,6 +2234,27 @@ async fn heartbeat(http: reqwest::Client, base: String, sessions: fn() -> Vec<cr
             for sess in sessions() {
                 let _ = tokio::time::timeout(HEARTBEAT_ONE, report_local_harnesses(&http, &base, &sess, &ledger)).await;
             }
+        }
+    })
+    .await
+}
+
+/// How often `seat_watch` looks at the Claude logins here. A minute: it
+/// reads each credential (a Keychain item on a Mac) every time, and a
+/// sign-out is only said once it has held for a minute anyway.
+const SEAT_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `seat_watch::beat` every [`SEAT_WATCH_EVERY`], told through the bots this
+/// supervisor runs, for everyone signed in to Mafold here.
+async fn watch_seats(base: String) {
+    beat_every(SEAT_WATCH_EVERY, move || {
+        let base = base.clone();
+        async move {
+            let sessions = crate::session::all();
+            let people: Vec<String> = sessions.iter().map(|s| s.username.clone()).collect();
+            let device = sessions.first().map_or_else(crate::session::device_name, |s| s.device_name.clone());
+            let speakers = crate::seat_watch::speakers(&load().daemons, &people);
+            crate::seat_watch::beat(&base, speakers, device).await;
         }
     })
     .await

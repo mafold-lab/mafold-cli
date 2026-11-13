@@ -92,7 +92,15 @@ impl RunStats {
 
     /// Each step is one COMPLETED model request. A missing measurement in any
     /// step makes the run total unknown, rather than displaying a partial sum.
+    ///
+    /// …unless the step says it made none (`model_requests: Some(0)`): it
+    /// went on with a request already counted, so it adds nothing. Claude
+    /// Code fuel has those: one message asking for two tools, which `claude`
+    /// runs one by one, is two steps on one request.
     pub fn add_request(&mut self, step: &Self) {
+        if step.model_requests == Some(0) {
+            return;
+        }
         let first = self.model_requests.unwrap_or(0) == 0;
         macro_rules! sum { ($($f:ident),*) => { $(
             self.$f = if first { step.$f } else {
@@ -251,6 +259,23 @@ mod tests {
         assert_eq!(s.wallet_partial, Some(true), "only an explicit patch changes it");
         assert_eq!(serde_json::from_str::<RunStats>(&s.card_body()).unwrap(), s);
         assert!(!RunStats::default().card_body().contains("wallet"), "unset = not written");
+    }
+
+    /// A step that made no request of its own adds nothing: not a request,
+    /// not an unknown that would blank the total, not its empty context.
+    #[test]
+    fn a_step_on_a_request_already_counted_adds_nothing() {
+        let request = RunStats::anthropic(&json!({"input_tokens":10,"output_tokens":9}));
+        let mut total = RunStats::default();
+        total.add_request(&RunStats { context_used_tokens: Some(10), ..request.clone() });
+        total.add_request(&RunStats { model_requests: Some(0), ..Default::default() });
+        total.add_request(&RunStats { context_used_tokens: Some(30), ..RunStats::anthropic(&json!({"input_tokens":30,"output_tokens":5})) });
+        assert_eq!(total.model_requests, Some(2));
+        assert_eq!((total.input_tokens, total.output_tokens, total.total_tokens), (Some(40), Some(14), Some(54)));
+        let mut after = RunStats::default();
+        after.add_request(&RunStats { context_used_tokens: Some(10), ..request });
+        after.add_request(&RunStats { model_requests: Some(0), ..Default::default() });
+        assert_eq!(after.context_used_tokens, Some(10));
     }
 
     #[test]

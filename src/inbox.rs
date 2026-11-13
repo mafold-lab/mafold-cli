@@ -656,10 +656,11 @@ fn is_bot(m: &Value) -> bool {
 /// holds a bot's reply back — the 133 KB one that woke this loop every 40
 /// seconds while it was still being written, before the tag-only test caught up.
 ///
-/// Only the card on the END counts ([`trailing_generating`]). A finished reply
-/// that quoted the tag mid-sentence once passed for a draft: the badge counted
-/// it, this loop skipped it and handed over the line before it on every look
-/// for twelve days, and the marker never got past it.
+/// Only the card on the reply's edge counts ([`trailing_generating`]): on the
+/// end, or first over the brain card's box. A finished reply that quoted the
+/// tag mid-sentence once passed for a draft: the badge counted it, this loop
+/// skipped it and handed over the line before it on every look for twelve
+/// days, and the marker never got past it.
 ///
 /// [`trailing_generating`]: mafold_transcript::render::trailing_generating
 pub(crate) fn in_progress(m: &Value) -> bool {
@@ -3400,6 +3401,19 @@ mod tests {
         let tag = mafold_transcript::render::generating_tag(T0 - 60_000, 3, T0 - 5_000, 0, 1);
         let live = msg("l", "opsdu:claude-code", "bot", "2026-09-25T14:08:35Z", &format!("{QUOTES_THE_CARD}{tag}"));
         assert!(in_progress(&live), "the card arm alone (no finalized_at field) sees the live card");
+        let p = progress_of(live["content"].as_str().unwrap()).expect("the live card is read");
+        assert_eq!((p.started_ms, p.shells), (Some(T0 - 60_000), 1));
+    }
+
+    /// In the brain card's shape the live card is FIRST, over the box (ops
+    /// 11-13): still being written, and the status is read off that card —
+    /// not off a quote of it inside the box.
+    #[test]
+    fn the_card_over_the_brain_box_is_live_too() {
+        let tag = mafold_transcript::render::generating_tag(T0 - 60_000, 3, T0 - 5_000, 0, 1);
+        let boxed = mafold_transcript::render::brain_card(QUOTES_THE_CARD);
+        let live = msg("l", "opsdu:claude-code", "bot", "2026-11-13T05:24:00Z", &format!("{tag}{boxed}"));
+        assert!(in_progress(&live), "the card arm alone (no finalized_at field) sees the card over the box");
         let p = progress_of(live["content"].as_str().unwrap()).expect("the live card is read");
         assert_eq!((p.started_ms, p.shells), (Some(T0 - 60_000), 1));
     }

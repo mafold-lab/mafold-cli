@@ -99,6 +99,55 @@ fn has_own_card(md: &str) -> bool {
     false
 }
 
+/// A running reply in the live brain card ([`Transcript::set_brain`]). All of
+/// it goes in the box but an ask nobody has answered: the turn is parked on
+/// that card, and a question at the bottom of a box that scrolls is one nobody
+/// sees — it stays under the box, where it can be tapped.
+fn boxed(live: &str) -> String {
+    let (trail, ask) = live.split_at(open_ask_at(live).unwrap_or(live.len()));
+    let mut out = if trail.trim().is_empty() { String::new() } else { render::brain_card(trail) };
+    out.push_str(ask);
+    out
+}
+
+/// Where the `{% mafold/ask %}` a turn is parked on starts: the last one,
+/// unanswered, with nothing after it.
+fn open_ask_at(md: &str) -> Option<usize> {
+    const OPEN: &str = "{% mafold/ask";
+    const CLOSE: &str = "{% /mafold/ask %}";
+    let at = md.rfind(OPEN)?;
+    let opener_end = at + md[at..].find("%}")? + 2;
+    if md[at..opener_end].contains("answered=") {
+        return None;
+    }
+    let rest = &md[opener_end..];
+    let close = rest.find(CLOSE)?;
+    rest[close + CLOSE.len()..].trim().is_empty().then_some(at)
+}
+
+/// Where the driver's end-of-turn stamps ([`DRIVER_CARDS`]) begin in `tail`,
+/// the part of a reply after its last tool group — else its end. Read off
+/// the END, card by card: the stamps are what the driver appended last, and
+/// an answer that merely names one of them is still the answer.
+fn stamps_at(tail: &str) -> usize {
+    let mut at = tail.len();
+    'peel: loop {
+        let head = tail[..at].trim_end();
+        for name in DRIVER_CARDS {
+            let opener = format!("{{% {name}");
+            let Some(start) = head.rfind(&opener) else { continue };
+            let card = &head[start..];
+            let whole = card.ends_with(&format!("{{% /{name} %}}"))
+                || (card.ends_with("/%}") && card.matches("%}").count() == 1);
+            if whole {
+                at = start;
+                continue 'peel;
+            }
+        }
+        return at;
+    }
+}
+
 fn commit_everything(buf: &str) -> usize {
     buf.len()
 }
@@ -159,6 +208,8 @@ pub struct Transcript {
     /// See [`Tap`]. Kept by a clone, so a transcript put back after a broken
     /// step goes on telling the same listener.
     tap: Option<Tap>,
+    /// The brain card's shapes ([`Transcript::set_brain`]).
+    brain: bool,
 }
 
 impl Default for Transcript {
@@ -288,7 +339,17 @@ impl Transcript {
             last_group: (HashMap::new(), 0),
             private: Vec::new(),
             tap: None,
+            brain: false,
         }
+    }
+
+    /// Read this reply as the brain card does (flag `brainCard`,
+    /// `mafold_types::brain`): [`Transcript::snapshot`] boxes the whole trail
+    /// in one live `{% mafold/brain %}`, and [`Transcript::finish_folded`]
+    /// folds it in place, over the answer. The events and what is committed
+    /// don't change, only the two shapes read off them.
+    pub fn set_brain(&mut self, on: bool) {
+        self.brain = on;
     }
 
     /// Hand every event this transcript is fed — and what [`push_raw`]
@@ -458,7 +519,9 @@ impl Transcript {
     /// restart ever touched. Counted from the text, since the text is all that
     /// is left of the process that wrote it ([`render::run_groups`]).
     pub fn continue_from(&mut self, prior: &str) {
-        let prior = prior.trim_end();
+        // A brain-card reply's trail is in its live box: go on from what the
+        // box holds, or the next snapshot boxes the box.
+        let prior = render::live_brain_body(prior).unwrap_or(prior).trim_end();
         if prior.is_empty() {
             return;
         }
@@ -559,6 +622,13 @@ impl Transcript {
                 Advance::Immediate
             }
             AgentEvent::Steered(_) => Advance::Quiet,
+            // The agent's own message went out: a seam like a steer's, where
+            // it happened.
+            AgentEvent::Sent(text) if !text.trim().is_empty() => {
+                self.insert_raw(&render::sent_line(text));
+                Advance::Immediate
+            }
+            AgentEvent::Sent(_) => Advance::Quiet,
             // Lands where it arrived, for the same reason a steer does: WHEN it
             // happened is part of what it says. `push_raw`, never into a group —
             // a notice that opened a group of its own is exactly how the usage
@@ -687,17 +757,26 @@ impl Transcript {
     /// snapshot is a full rewrite, so recomputing it every push is correct by
     /// construction.
     pub fn snapshot(&self) -> String {
-        if self.group.is_empty() {
-            return render::heal_open_code(&self.full);
-        }
-        render::heal_open_code(&format!(
-            "{}{}",
-            self.full,
-            render::run_card(
-                &render::run_summary(&self.counts),
-                &render::render_group(&self.group),
-            )
-        ))
+        let live = if self.group.is_empty() {
+            render::heal_open_code(&self.full)
+        } else {
+            render::heal_open_code(&format!(
+                "{}{}",
+                self.full,
+                render::run_card(
+                    &render::run_summary(&self.counts),
+                    &render::render_group(&self.group),
+                )
+            ))
+        };
+        if self.brain { boxed(&live) } else { live }
+    }
+
+    /// [`Transcript::snapshot`] with the driver's live `generating` tag where
+    /// this reply's shape keeps it: under the transcript, or over the brain
+    /// card's box ([`render::with_generating`]).
+    pub fn live(&self, generating: &str) -> String {
+        render::with_generating(&self.snapshot(), generating, self.brain)
     }
 
     /// Content committed since the last call — the append-only view, for a
@@ -758,6 +837,9 @@ impl Transcript {
     ///     holding only narration, labelled with work that is sitting in the
     ///     open below it, is worse than no lid.
     pub fn finish_folded(&mut self) -> String {
+        if self.brain {
+            return self.finish_brain();
+        }
         self.seal();
         // Live shape is the fallback everywhere below, so a turn that shouldn't
         // fold takes exactly the path it always took.
@@ -837,6 +919,51 @@ impl Transcript {
         let summary = render::run_summary(&counts);
         let folded = render::trace_card(&summary, steps, &plain(head));
         format!("{folded}{}", plain(tail))
+    }
+
+    /// [`Transcript::finish_folded`] in the brain card's shape: the whole trail
+    /// folded in one `{% mafold/brain %}` where the box stood, the answer in
+    /// the open under it, then the end-of-turn stamps (ops 11-13: "steps还是
+    /// 放到顶部比较合适" — at first the fold went under the answer). The work
+    /// stays one tap away instead of going with the box.
+    ///
+    /// The answer is what was said after the last tool group. With nothing
+    /// said there — the agent told the room everything in its own messages —
+    /// the trail's last notes go in the fold too, and the fold is the reply.
+    /// A lone group with nothing beside it is already one row: it goes over
+    /// the answer as it is, not as a fold holding a fold.
+    fn finish_brain(&mut self) -> String {
+        self.seal();
+        let plain = |s: &str| render::heal_open_code(s);
+        if self.groups == 0 {
+            return plain(&self.full);
+        }
+        const CLOSE: &str = "{% /mafold/run %}";
+        let Some(i) = self.full.rfind(CLOSE) else {
+            return plain(&self.full);
+        };
+        let after_last = i + CLOSE.len();
+        let tail = &self.full[after_last..];
+        let (said, stamps) = tail.split_at(stamps_at(tail));
+        let has_answer =
+            !render::strip_notices(&render::strip_cards(said)).trim().is_empty() || has_own_card(said);
+        let (trail, answer) = if has_answer {
+            (&self.full[..after_last], said)
+        } else {
+            (&self.full[..after_last + said.len()], "")
+        };
+        let fold = if self.groups < 2 && render::strip_cards(trail).trim().is_empty() {
+            format!("\n{}\n", plain(trail).trim())
+        } else {
+            render::brain_done_card(&render::run_summary(&self.totals), self.steps, &plain(trail).trim_start_matches('\n'))
+        };
+        let answer = plain(answer);
+        let answer = answer.trim();
+        if answer.is_empty() {
+            format!("{}{}", fold.trim_start(), plain(stamps))
+        } else {
+            format!("{}\n\n{answer}\n{}", fold.trim(), plain(stamps))
+        }
     }
 }
 
@@ -1698,6 +1825,222 @@ mod fold_tests {
         }
         assert_eq!(copy.snapshot(), t.snapshot());
         assert_eq!(t.snapshot().matches("the build cache is cold").count(), 1, "{}", t.snapshot());
+    }
+}
+
+/// The brain card's two shapes (`set_brain`): the live box, and the steps
+/// folded over the answer.
+#[cfg(test)]
+mod brain_tests {
+    use super::*;
+    use serde_json::json;
+
+    const LIVE: &str = "{% mafold/brain live=true %}";
+    const CLOSE: &str = "{% /mafold/brain %}";
+
+    fn brain() -> Transcript {
+        let mut t = Transcript::new();
+        t.set_brain(true);
+        t
+    }
+    fn call(id: &str, name: &str, input: serde_json::Value) -> AgentEvent {
+        AgentEvent::ToolCall { id: id.into(), name: name.into(), input }
+    }
+    fn result(id: &str, text: &str) -> AgentEvent {
+        AgentEvent::ToolResult { id: id.into(), text: text.into() }
+    }
+    fn done() -> AgentEvent {
+        AgentEvent::Done { duration_ms: Some(1.0), cost_usd: None, tokens: Some(10) }
+    }
+    /// Two groups with a note between them, the way a working turn reads.
+    fn work(t: &mut Transcript) {
+        t.push(&AgentEvent::Text("Looking at how the sheet is sized.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "Sheet.tsx"})));
+        t.push(&result("a", "x\ny"));
+        t.push(&AgentEvent::Text("It's fixed at 680. Changing it.".into()));
+        t.push(&call("b", "Edit", json!({"file_path": "Sheet.tsx", "old_string": "680", "new_string": "min(680, 100vh)"})));
+        t.push(&result("b", "ok"));
+    }
+
+    #[test]
+    fn live_the_whole_trail_is_in_one_box_open_group_and_all() {
+        let mut t = brain();
+        assert_eq!(t.snapshot(), "", "nothing yet: the driver shows its generating card alone");
+        work(&mut t);
+        t.push(&call("c", "Bash", json!({"command": "npx vitest run"})));
+        let md = t.snapshot();
+        assert!(md.trim_start().starts_with(LIVE), "{md}");
+        assert!(md.trim_end().ends_with(CLOSE), "{md}");
+        assert_eq!(md.matches(LIVE).count(), 1, "{md}");
+        for inside in ["Looking at how", "Sheet.tsx", "It's fixed at 680", "npx vitest run"] {
+            assert!(md.contains(inside), "{inside} missing:\n{md}");
+        }
+        // The same events without the box read exactly as before.
+        let mut plain = Transcript::new();
+        work(&mut plain);
+        plain.push(&call("c", "Bash", json!({"command": "npx vitest run"})));
+        assert_eq!(render::live_brain_body(&md), Some(plain.snapshot().trim_start_matches('\n')));
+    }
+
+    #[test]
+    fn the_ask_a_turn_waits_on_stays_under_the_box_until_it_is_answered() {
+        let mut t = brain();
+        work(&mut t);
+        let ask = json!({"questions": [{"question": "Open a PR?", "header": "PR", "multiSelect": false,
+            "options": [{"label": "Yes", "description": "now"}, {"label": "No", "description": "later"}]}]});
+        t.push(&call("q", "AskUserQuestion", ask));
+        let md = t.snapshot();
+        let (close, open_ask) = (md.find(CLOSE).expect("box"), md.find("{% mafold/ask").expect("ask"));
+        assert!(close < open_ask, "the open ask is under the box:\n{md}");
+        assert!(md.trim_end().ends_with("{% /mafold/ask %}"), "{md}");
+
+        t.push(&AgentEvent::AskAnswered("PR: Yes".into()));
+        let md = t.snapshot();
+        assert!(md.trim_end().ends_with(CLOSE), "answered, it is part of the trail:\n{md}");
+        assert!(md.contains("answered=\"PR: Yes\""), "{md}");
+    }
+
+    /// Ops 11-13 ("应该是generating在上面的"): the generating row — time,
+    /// tokens, Stop — sits over the box, and an ask the turn is parked on
+    /// stays under it. Without the brain card the row stays under the reply.
+    #[test]
+    fn live_the_generating_row_goes_over_the_box() {
+        let tag = render::generating_tag(1, 2, 3, 4, 0);
+        let mut t = brain();
+        assert_eq!(t.live(&tag), tag, "nothing yet: the row alone");
+        work(&mut t);
+        let ask = json!({"questions": [{"question": "Open a PR?", "header": "PR", "multiSelect": false,
+            "options": [{"label": "Yes", "description": "now"}, {"label": "No", "description": "later"}]}]});
+        t.push(&call("q", "AskUserQuestion", ask));
+        let md = t.live(&tag);
+        let row = md.find("{% mafold/generating").expect("row");
+        let (open, ask) = (md.find(LIVE).expect("box"), md.find("{% mafold/ask").expect("ask"));
+        assert!(row < open && open < ask, "row, box, ask:\n{md}");
+        assert_eq!(render::trailing_generating(&md), Some(tag.trim()), "still being written");
+        assert_eq!(render::strip_trailing_generating(&md), t.snapshot().trim_start());
+
+        let mut plain = Transcript::new();
+        work(&mut plain);
+        assert_eq!(plain.live(&tag), format!("{}{tag}", plain.snapshot()));
+    }
+
+    /// Ops 11-13 ("steps还是放到顶部比较合适"): the box folds where it stood,
+    /// at the top, and the answer comes under it.
+    #[test]
+    fn finished_the_steps_fold_over_the_answer() {
+        let mut t = brain();
+        work(&mut t);
+        t.push(&AgentEvent::Text("Fixed: the sheet now fits short screens.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        assert!(md.starts_with("{% mafold/brain summary=\"Read 1 file, edited 1 file\" steps=\"2\" %}"), "{md}");
+        let close = md.find(CLOSE).expect("closed");
+        let answer = md.find("Fixed: the sheet now fits").expect("answer");
+        let stamp = md.find("{% mafold/result").expect("stamp");
+        assert!(close < answer && answer < stamp, "fold, answer, then the stamp:\n{md}");
+        assert!(md[close..answer].contains("\n\n"), "the answer is a paragraph of its own:\n{md}");
+        for inside in ["Looking at how", "It's fixed at 680", "{% mafold/run"] {
+            let at = md.find(inside).unwrap_or_else(|| panic!("{inside} lost:\n{md}"));
+            assert!(at < close, "{inside} outside the fold:\n{md}");
+        }
+        assert!(!md.contains("live=true"), "{md}");
+        assert!(!md.contains("mafold/trace"), "{md}");
+    }
+
+    #[test]
+    fn with_nothing_said_after_the_work_the_fold_is_the_reply() {
+        let mut t = brain();
+        work(&mut t);
+        t.push(&call("s", "Bash", json!({"command": "mafold send c1 \"done, PR is up\""})));
+        t.push(&result("s", "sent"));
+        assert_eq!(t.push(&AgentEvent::Sent("done, PR is up".into())), Advance::Immediate);
+        t.push(&done());
+        let md = t.finish_folded();
+        assert!(md.starts_with("{% mafold/brain summary="), "the fold is the whole reply:\n{md}");
+        let sent = md.find("> ↗︎ done, PR is up").expect("seam");
+        assert!(sent < md.find(CLOSE).unwrap(), "its last note is in the fold:\n{md}");
+        assert!(md.find("{% mafold/result").unwrap() > md.find(CLOSE).unwrap(), "{md}");
+    }
+
+    #[test]
+    fn a_lone_group_goes_over_the_answer_as_it_is() {
+        let mut t = brain();
+        t.push(&call("a", "Bash", json!({"command": "date"})));
+        t.push(&result("a", "Thu"));
+        t.push(&AgentEvent::Text("It's Thursday.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        assert!(md.starts_with("{% mafold/run"), "{md}");
+        assert!(!md.contains("mafold/brain"), "one row needs no fold:\n{md}");
+        let answer = md.find("It's Thursday.").expect("answer");
+        assert!(md.find("{% /mafold/run %}").unwrap() < answer, "{md}");
+        assert!(answer < md.find("{% mafold/result").unwrap(), "{md}");
+    }
+
+    #[test]
+    fn a_turn_with_no_tools_is_its_answer() {
+        let mut t = brain();
+        t.push(&AgentEvent::Text("Hi! What should I look at?".into()));
+        t.flush_text();
+        assert!(t.snapshot().contains(LIVE), "live, even words go in the box");
+        t.push(&done());
+        let md = t.finish_folded();
+        assert!(md.starts_with("Hi! What should I look at?") && !md.contains("mafold/brain"), "{md}");
+    }
+
+    #[test]
+    fn an_answer_that_names_the_result_card_is_still_all_answer() {
+        let mut t = brain();
+        work(&mut t);
+        t.push(&AgentEvent::Text("The `{% mafold/result %}` stamp goes last; I left it alone.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find(CLOSE).expect("fold");
+        let answer = md.find("The `{% mafold/result %}` stamp goes last; I left it alone.").expect("answer whole");
+        assert!(close < answer, "the answer stays whole, under the fold:\n{md}");
+    }
+
+    #[test]
+    fn a_sent_message_is_a_seam_where_it_went_out() {
+        let mut t = brain();
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Sent("found it".into()));
+        t.push(&call("b", "Read", json!({"file_path": "b.rs"})));
+        let md = t.snapshot();
+        let (a, sent, b) = (md.find("a.rs").unwrap(), md.find("> ↗︎ found it").unwrap(), md.find("b.rs").unwrap());
+        assert!(a < sent && sent < b, "{md}");
+        assert_eq!(t.push(&AgentEvent::Sent("  ".into())), Advance::Quiet);
+        assert!(render::is_notice_line("> ↗︎ found it"), "a seam is not an answer");
+    }
+
+    #[test]
+    fn a_restart_goes_on_inside_the_box_not_around_it() {
+        let mut first = brain();
+        work(&mut first);
+        let left = first.live(&render::generating_tag(1, 2, 3, 4, 0));
+        let mut t = brain();
+        t.continue_from(render::strip_trailing_generating(&left));
+        t.push(&call("c", "Bash", json!({"command": "npx vitest run"})));
+        t.push(&result("c", "14 passed"));
+        assert_eq!(t.snapshot().matches("{% mafold/brain").count(), 1, "{}", t.snapshot());
+        t.push(&AgentEvent::Text("Done.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        assert!(md.starts_with("{% mafold/brain summary="), "{md}");
+        assert!(md.contains("{% /mafold/brain %}\n\nDone."), "{md}");
+        assert!(md.contains("steps=\"3\""), "the work before the restart counts:\n{md}");
+        assert_eq!(md.matches("{% mafold/brain").count(), 1, "{md}");
+    }
+
+    #[test]
+    fn a_literal_close_in_the_trail_cannot_end_the_box() {
+        let mut t = brain();
+        t.push(&AgentEvent::Text(format!("The card closes with {CLOSE} like any other.")));
+        t.flush_text();
+        let md = t.snapshot();
+        assert_eq!(md.matches(CLOSE).count(), 1, "{md}");
+        assert!(md.trim_end().ends_with(CLOSE), "{md}");
     }
 }
 

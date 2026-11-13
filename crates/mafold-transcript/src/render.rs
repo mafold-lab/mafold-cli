@@ -31,6 +31,9 @@ pub(crate) const RATE_LIMIT_CARD: &str = "{% mafold/ratelimit ";
 pub(crate) const NOTICE_CARDS: [&str; 3] = ["mafold/ratelimit", "mafold/compact", "mafold/error"];
 pub(crate) const COMPACTED_PREFIX: &str = "_🗜️ ";
 pub(crate) const STEER_PREFIX: &str = "> ↩︎ ";
+/// The agent's own message, sent to the room mid-turn ([`AgentEvent::Sent`]):
+/// the steer seam's other direction — words that went out, not in.
+pub(crate) const SENT_PREFIX: &str = "> ↗︎ ";
 /// A driver notice ([`AgentEvent::Notice`]): something that happened AROUND the
 /// turn and changes what the user would do — another session's message parked by
 /// policy, a model quietly downgraded, a tool denied. Same family as the three
@@ -139,6 +142,8 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // A seam, not a card: [`steer_line`], spliced by the transcript so it
         // lands after the group it interrupted rather than inside it.
         AgentEvent::Steered(text) => Some(steer_line(text)),
+        // The same seam, the other way: [`sent_line`].
+        AgentEvent::Sent(text) => Some(sent_line(text)),
     }
 }
 
@@ -198,37 +203,69 @@ pub fn generating_tag_awaiting(
     )
 }
 
-/// A running snapshot without its trailing [`generating_tag`] — what the reply
+/// A running snapshot without its live [`generating_tag`] — what the reply
 /// actually SAYS so far, e.g. to carry it into the process that picks a
 /// killed turn back up.
 ///
-/// Only a trailing card is stripped, and only when the tail is EXACTLY that one
-/// self-closing tag: an earlier `{% mafold/generating` in the body is the agent
-/// talking ABOUT the card, and cutting there would drop real content. The api
-/// carries a byte-identical twin (`store.rs`), which finalize enforces; it
-/// cannot share this crate (it deploys with no sibling path-deps).
+/// Only the card on the reply's edge is stripped ([`live_card`]), and only when
+/// it is EXACTLY that one self-closing tag: an earlier `{% mafold/generating` in
+/// the body is the agent talking ABOUT the card, and cutting there would drop
+/// real content. The api carries a byte-identical twin (`store.rs`), which
+/// finalize enforces; it cannot share this crate (it deploys with no sibling
+/// path-deps).
+///
+/// "Trailing" is from when the card could only trail. In the brain card's shape
+/// it comes first, over the box ([`with_generating`]).
 pub fn strip_trailing_generating(content: &str) -> &str {
-    let Some(i) = content.rfind("{% mafold/generating") else { return content };
-    let tail = content[i..].trim_end();
-    // `{% mafold/generating a=1 /%}` → nothing before the closer holds another `%}`,
-    // proving the card is the last thing in the message.
-    let is_lone_card = tail
-        .strip_suffix("/%}")
-        .is_some_and(|inner| !inner.contains("%}"));
-    if is_lone_card { content[..i].trim_end() } else { content }
+    let Some(card) = live_card(content) else { return content };
+    if content[card.end..].trim().is_empty() {
+        content[..card.start].trim_end()
+    } else {
+        content[card.end..].trim_start()
+    }
 }
 
-/// The live [`generating_tag`] a snapshot ends with — the reply is still being
+/// The live [`generating_tag`] a snapshot carries — the reply is still being
 /// written — or None for a reply that says what it says and is done.
 ///
 /// One question with [`strip_trailing_generating`], so one rule: the lone card
-/// on the end. Reading "still writing" off any `{% mafold/generating` in the
+/// on the edge. Reading "still writing" off any `{% mafold/generating` in the
 /// body turned a finished reply that QUOTED the tag into a draft that never
 /// ends — the inbox loop then skipped it, handed over the line before it on
 /// every look, and the reader's badge never cleared.
 pub fn trailing_generating(content: &str) -> Option<&str> {
-    let said = strip_trailing_generating(content);
-    (said.len() < content.len()).then(|| content[said.len()..].trim())
+    live_card(content).map(|card| &content[card])
+}
+
+/// Where the live card is in `content`: the last thing in it, as on every reply
+/// — or the first, on a line of its own, as over the brain card's box.
+///
+/// First counts only with a line break after it: a reply that OPENS by quoting
+/// the tag goes on talking on the same line, and that is content.
+fn live_card(content: &str) -> Option<std::ops::Range<usize>> {
+    const OPEN: &str = "{% mafold/generating";
+    if let Some(i) = content.rfind(OPEN) {
+        let tail = content[i..].trim_end();
+        // `{% mafold/generating a=1 /%}` → nothing before the closer holds another `%}`,
+        // proving the card is the last thing in the message.
+        if tail.strip_suffix("/%}").is_some_and(|inner| !inner.contains("%}")) {
+            return Some(i..i + tail.len());
+        }
+    }
+    let at = content.len() - content.trim_start().len();
+    let inner = content[at..].strip_prefix(OPEN)?;
+    let close = inner.find("%}")?;
+    let lone = inner[..close].ends_with('/') && inner[close + 2..].starts_with(['\n', '\r']);
+    lone.then(|| at..at + OPEN.len() + close + 2)
+}
+
+/// A running snapshot with the driver's live [`generating_tag`] on it: under
+/// what the reply says so far — or, in the brain card's shape (`over`), first,
+/// over the box (ops 11-13: the time, the tokens and Stop sit on top of the
+/// work). Either way it is on the edge [`strip_trailing_generating`] takes it
+/// from.
+pub fn with_generating(said: &str, tag: &str, over: bool) -> String {
+    if over { format!("{tag}{said}") } else { format!("{said}{tag}") }
 }
 
 /// Stamp the user's answer into the pending (last unanswered) `{% mafold/ask %}` card
@@ -553,6 +590,51 @@ pub fn trace_card(summary: &str, steps: usize, body: &str) -> String {
     )
 }
 
+/// The brain card while the turn runs (flag `brainCard`, `cards/brain`): the
+/// whole trail so far — narration, run groups, seams — in one box that stops
+/// at a set height and keeps its newest step in view. The driver's
+/// [`generating_tag`] goes over it, first in the message ([`with_generating`]):
+/// that card is what says the reply is still being written (the api's
+/// finalize and the inbox loop read it off the reply's edge), and the box needs
+/// no live row of its own.
+///
+/// `body` is valid markdoc and is not escaped, as in [`trace_card`]; only a
+/// literal close of this card is neutralised.
+pub fn brain_card(body: &str) -> String {
+    format!("\n{{% {BRAIN} live=true %}}\n{}{{% /{BRAIN} %}}\n", brain_body(body))
+}
+
+/// The brain card at the end of the turn: the same trail, folded where the box
+/// stood, over the answer — `summary` and `steps` as on [`trace_card`]. The
+/// answer is under it in the open, and the end-of-turn stamps
+/// (`{% mafold/result %}`) after.
+pub fn brain_done_card(summary: &str, steps: usize, body: &str) -> String {
+    format!(
+        "\n{{% {BRAIN} summary=\"{}\" steps=\"{steps}\" %}}\n{}{{% /{BRAIN} %}}\n",
+        attr_esc(summary),
+        brain_body(body),
+    )
+}
+
+pub(crate) const BRAIN: &str = "mafold/brain";
+
+fn brain_body(body: &str) -> String {
+    let close = format!("{{% /{BRAIN} %}}");
+    let body = if body.contains(&close) { body.replace(&close, "{ % /mafold/brain % }") } else { body.to_string() };
+    if body.is_empty() || body.ends_with('\n') { body } else { format!("{body}\n") }
+}
+
+/// What a live [`brain_card`] holds, when `md` is one (and nothing else but
+/// whitespace) — the trail a reply carried when the process writing it died,
+/// to go on from without boxing it twice.
+pub fn live_brain_body(md: &str) -> Option<&str> {
+    let open = format!("{{% {BRAIN} live=true %}}");
+    let close = format!("{{% /{BRAIN} %}}");
+    let inner = md.trim().strip_prefix(open.as_str())?.strip_suffix(close.as_str())?;
+    // The box opens once: a second opener inside means `md` is more than one card.
+    (!inner.contains(open.as_str())).then(|| inner.trim_start_matches('\n'))
+}
+
 /// Longest summary the card carries. Claude Code's run 3–15k chars; a runaway
 /// one is still readable from its first screens, and a chat message is not the
 /// place for the rest (the full text stays in the transcript on disk).
@@ -867,6 +949,13 @@ fn neutralize(s: &str) -> String {
 /// correction entered is the whole job.
 pub fn steer_line(text: &str) -> String {
     own_block(&format!("{STEER_PREFIX}{}", line_esc(text)))
+}
+
+/// The agent sent the room a message of its own mid-turn → the same one-line
+/// seam as a steer, marked the other way. The message is in its own bubble
+/// above the reply; this says where in the work it went out.
+pub fn sent_line(text: &str) -> String {
+    own_block(&format!("{SENT_PREFIX}{}", line_esc(text)))
 }
 
 /// A driver notice ([`AgentEvent::Notice`]) — same quoted shape as a steer (it
@@ -1359,6 +1448,7 @@ pub fn is_transcript_card(name: &str) -> bool {
         name,
         "mafold/run"
             | "mafold/trace"
+            | "mafold/brain"
             | "mafold/tool"
             | "mafold/bash"
             | "mafold/diff"
@@ -1399,7 +1489,7 @@ pub fn strip_trail_cards(md: &str) -> String {
 /// on the model's behalf.
 pub fn is_notice_line(line: &str) -> bool {
     let t = line.trim_start();
-    [RATE_LIMIT_PREFIX, COMPACTED_PREFIX, STEER_PREFIX, NOTICE_PREFIX].iter().any(|p| t.starts_with(p))
+    [RATE_LIMIT_PREFIX, COMPACTED_PREFIX, STEER_PREFIX, SENT_PREFIX, NOTICE_PREFIX].iter().any(|p| t.starts_with(p))
         || NOTICE_CARDS.iter().any(|c| t.strip_prefix("{% ").is_some_and(|r| r.starts_with(c) && r[c.len()..].starts_with(' ')))
 }
 
@@ -2108,7 +2198,36 @@ mod run_groups_tests {
 
 #[cfg(test)]
 mod generating_tests {
-    use super::{generating_tag, generating_tag_awaiting, strip_trailing_generating, trailing_generating};
+    use super::{
+        brain_card, generating_tag, generating_tag_awaiting, strip_trailing_generating, trailing_generating,
+        with_generating,
+    };
+
+    /// The brain card's shape puts the card first, over the box (ops 11-13:
+    /// "应该是generating在上面的"). It is just as live there, and stripping it
+    /// leaves the box. A reply that OPENS by quoting the tag and goes on
+    /// talking on that line is content, as it is on the end.
+    #[test]
+    fn over_the_brain_box_the_first_card_is_the_live_one() {
+        let live = generating_tag(1, 2, 3, 4, 0);
+        let boxed = brain_card("Read the file.\n\n{% mafold/run summary=\"Read 1 file\" %}x{% /mafold/run %}");
+        let md = with_generating(&boxed, &live, true);
+        assert!(md.trim_start().starts_with("{% mafold/generating "), "{md}");
+        assert_eq!(trailing_generating(&md), Some(live.trim()));
+        assert_eq!(strip_trailing_generating(&md), boxed.trim_start());
+        // The api keeps a snapshot without its leading blank lines: the same reply.
+        assert_eq!(trailing_generating(md.trim_start()), Some(live.trim()));
+        // The agent quoting the card inside the box is the box's text.
+        let quoting = brain_card("the `{% mafold/generating /%}` card, then more words");
+        let md = with_generating(&quoting, &live, true);
+        assert_eq!(trailing_generating(&md), Some(live.trim()));
+        assert_eq!(strip_trailing_generating(&md), quoting.trim_start());
+        let talk = "{% mafold/generating /%} 然后我接着说了别的";
+        assert_eq!(trailing_generating(talk), None);
+        assert_eq!(strip_trailing_generating(talk), talk);
+        // Not the brain card's shape: under the reply, where it always went.
+        assert_eq!(with_generating("在查日志", &live, false), format!("在查日志{live}"));
+    }
 
     /// "Still being written?" is the same question as "what would stripping
     /// take?": the lone card on the end. A finished reply that QUOTES the tag

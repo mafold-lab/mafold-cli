@@ -117,6 +117,9 @@ pub(crate) async fn sign_in(
     let _ = events.send(Event::Started { account: name.clone(), adding: added });
 
     let mode = if ask.console { "--console" } else { "--claudeai" };
+    // A sign-in someone started is theirs: if the slot reads empty while it
+    // runs, or they walk away from it, that is not news to send them.
+    crate::seat_watch::touched(&name);
     drive(crate::harness::program("claude"), mode, &seat_env, &noop_open_dir(), code, events, LINK_WAIT, CODE_WAIT).await?;
 
     // Whatever this seat's health was, it is stale now; a fresh sign-in lifts

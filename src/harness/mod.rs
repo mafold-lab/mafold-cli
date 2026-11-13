@@ -12,6 +12,7 @@
 
 pub mod cc_conn;
 pub mod claude_code;
+pub mod claude_fuel;
 pub mod codex;
 mod codex_stats;
 // Codex uses this transport for native control data, the live thread/turn path,
@@ -1045,7 +1046,8 @@ pub async fn report_rows() -> Vec<Value> {
 }
 
 /// What Mafold here can run `id` on, as the report says it: each runtime's
-/// own login; Mafold Harness on OpenCode Go and the wallet; your own OpenCode
+/// own login; Mafold Harness on OpenCode Go, the wallet, and Claude Code where
+/// it is installed; your own OpenCode
 /// on OpenCode Go, saying whether it is signed in to Go here. Go's models are
 /// the ones Mafold Harness can talk to (`mafold_harness::go_model_ids`'s
 /// list), and for your own OpenCode the ones it lists (`opencode::go_models`).
@@ -1056,7 +1058,15 @@ async fn sign_ins_of(id: &str, installed: bool) -> Value {
         "kimi-code" => serde_json::json!([{ "id": "kimi" }]),
         "opencode" => {
             let m = mafold_harness::go_models().await;
-            serde_json::json!([{ "id": crate::fuel::GO, "models": m }, { "id": crate::fuel::WALLET }])
+            let mut ins = vec![serde_json::json!({ "id": crate::fuel::GO, "models": m }), serde_json::json!({ "id": crate::fuel::WALLET })];
+            // Claude Code, where Mafold here can drive the `claude` installed
+            // here: each step runs on it (`claude_fuel`), on the login its
+            // own row reports.
+            let claude = select("claude-code");
+            if claude.available() && claude.runs() {
+                ins.push(serde_json::json!({ "id": crate::fuel::CLAUDE }));
+            }
+            serde_json::Value::Array(ins)
         }
         opencode::OWN => {
             let m = match opencode::own_binary().filter(|_| installed) {

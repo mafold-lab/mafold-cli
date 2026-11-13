@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::client::{Client, Dest};
-use mafold_core::mafold_types::{a2a, HarnessCaps};
+use mafold_core::mafold_types::{a2a, brain, HarnessCaps};
 use crate::harness::{AgentEvent, Harness, Takes, Turn, Who};
 
 #[derive(Deserialize)]
@@ -1770,6 +1770,12 @@ impl OwnerConfig {
     fn on_go(&self) -> bool {
         crate::fuel::is_go(self.fuel.as_deref())
     }
+
+    /// The agent was signed in with Claude Code — which, for Mafold Harness,
+    /// makes Claude Code its fuel (`harness::claude_fuel`).
+    fn on_claude(&self) -> bool {
+        crate::fuel::is_claude(self.fuel.as_deref())
+    }
 }
 
 /// The owner config this daemon runs under — the one `botConfigUpdated` and a
@@ -1792,6 +1798,26 @@ async fn on_go() -> bool {
         Some(c) => c.read().await.on_go(),
         None => false,
     }
+}
+
+/// Does this agent run Mafold Harness on its owner's Claude Code login right
+/// now? A Claude Code agent's fuel says `claude` too; only Mafold Harness
+/// (`opencode`) runs on it as fuel.
+async fn harness_on_claude(harness_id: &str) -> bool {
+    harness_id == "opencode"
+        && match OWNER_CONFIG.get() {
+            Some(c) => c.read().await.on_claude(),
+            None => false,
+        }
+}
+
+/// A turn's env on Claude Code: the seat's, and the word that tells Mafold
+/// Harness its fuel (`fuel::FUEL_ENV`).
+fn claude_fuel_env(mut env: Vec<(String, String)>, on_claude: bool) -> Vec<(String, String)> {
+    if on_claude {
+        env.push((crate::fuel::FUEL_ENV.to_string(), crate::fuel::CLAUDE.to_string()));
+    }
+    env
 }
 
 /// Split a config value (comma / whitespace / newline separated) into usernames.
@@ -2753,8 +2779,8 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     // hour after that, because the answer moves under the same binary.
     {
         let (client, harness) = (client.clone(), harness.clone());
-        let (preferred, on_go) = (owner.account.clone(), owner.on_go());
-        tokio::spawn(async move { keep_caps_reported(client, harness, preferred, on_go).await });
+        let (preferred, fuel) = (owner.account.clone(), owner.fuel.clone());
+        tokio::spawn(async move { keep_caps_reported(client, harness, preferred, fuel).await });
     }
 
     // Recover only this machine's journaled drafts from dead producer PIDs.
@@ -2800,6 +2826,9 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     }
     if owner.on_go() {
         println!("fuel: @{my_username} runs on its owner's OpenCode Go plan — the key from their Connections, opened per reply");
+    }
+    if owner.on_claude() && harness.id() == "opencode" {
+        println!("fuel: @{my_username} runs Mafold Harness on its owner's Claude Code login here — a real `claude` makes each step");
     }
     let owner = Arc::new(RwLock::new(owner));
     let _ = OWNER_CONFIG.set(owner.clone());
@@ -3333,12 +3362,13 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
 /// uses. Best-effort throughout — a harness that can't be probed reports
 /// nothing and the sheet keeps whatever it had.
 ///
-/// `on_go`: the agent runs on its owner's OpenCode Go plan. Mafold Harness
-/// reports OpenCode Go's models, so it reports only then: on the wallet its
-/// models are the router's, handed over with each reply's key, and a menu of
-/// Go's would offer models no reply of it can run.
-async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>, on_go: bool) {
-    if let Some(caps) = machine_caps(harness, preferred, on_go).await {
+/// `fuel`: what the agent runs on (`getBot`'s). Mafold Harness reports
+/// OpenCode Go's models on Go, and Claude Code's on Claude Code — whose steps
+/// the real `claude` here runs; on the wallet nothing: its models are the
+/// router's, handed over with each reply's key, and a menu of Go's would offer
+/// models no reply of it can run.
+async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>, fuel: Option<String>) {
+    if let Some(caps) = machine_caps(harness, preferred, fuel.as_deref()).await {
         send_caps(client, harness, &caps).await;
     }
 }
@@ -3355,10 +3385,10 @@ const CAPS_RECHECK: Duration = Duration::from_secs(3600);
 /// the owner's sheet and this daemon's config (`botConfigUpdated`), and an
 /// unchanged roster has no reason to cause either. The seat and the fuel are
 /// read afresh each time, from the config `botConfigUpdated` keeps current.
-async fn keep_caps_reported(client: Client, harness: Arc<dyn Harness>, mut preferred: Option<String>, mut on_go: bool) {
+async fn keep_caps_reported(client: Client, harness: Arc<dyn Harness>, mut preferred: Option<String>, mut fuel: Option<String>) {
     let mut sent: Option<HarnessCaps> = None;
     loop {
-        if let Some(caps) = machine_caps(harness.as_ref(), preferred.clone(), on_go).await {
+        if let Some(caps) = machine_caps(harness.as_ref(), preferred.clone(), fuel.as_deref()).await {
             let moved = !sent.as_ref().is_some_and(|s| same_answer(s, &caps));
             if moved && send_caps(&client, harness.as_ref(), &caps).await {
                 sent = Some(caps);
@@ -3367,7 +3397,7 @@ async fn keep_caps_reported(client: Client, harness: Arc<dyn Harness>, mut prefe
         tokio::time::sleep(CAPS_RECHECK).await;
         if let Some(c) = OWNER_CONFIG.get() {
             let c = c.read().await;
-            (preferred, on_go) = (c.account.clone(), c.on_go());
+            (preferred, fuel) = (c.account.clone(), c.fuel.clone());
         }
     }
 }
@@ -3379,8 +3409,15 @@ fn same_answer(a: &HarnessCaps, b: &HarnessCaps) -> bool {
 
 /// What the harness here takes, for the seat a turn would choose
 /// ([`crate::harness::caps_report`]) — `None` when there is nothing to say.
-async fn machine_caps(harness: &dyn Harness, preferred: Option<String>, on_go: bool) -> Option<HarnessCaps> {
-    if harness.id() == "opencode" && !on_go {
+async fn machine_caps(harness: &dyn Harness, preferred: Option<String>, fuel: Option<&str>) -> Option<HarnessCaps> {
+    // Mafold Harness on Claude Code runs what Claude Code here runs, for the
+    // seat a turn would choose — its menu is Claude Code's, said as such.
+    if harness.id() == "opencode" && crate::fuel::is_claude(fuel) {
+        let claude = crate::harness::select("claude-code");
+        let env = crate::accounts::choose(preferred.as_deref(), None).await.account?.env();
+        return crate::harness::caps_report(claude.as_ref(), &env).await;
+    }
+    if harness.id() == "opencode" && !crate::fuel::is_go(fuel) {
         return None;
     }
     let env = if harness.id() == "claude-code" {
@@ -5008,6 +5045,16 @@ async fn connect_and_run(
         // are recognized via the server-stamped `reply_to_sender`, so there's
         // no recent-ids memory to feed.
         if m.sender.username.eq_ignore_ascii_case(my_username) {
+            // …but one the agent sent mid-turn (`mafold send`) has the turn's
+            // live reply above it: the reply moves under it (`sent_mid_turn`).
+            // A finished reply of ours (`messageComplete`) is not that, and a
+            // replayed one moved it already.
+            if !via_finish
+                && crate::flags::enabled(brain::FLAG)
+                && (m.id.is_empty() || seen.insert(&format!("id|{}", m.id)))
+            {
+                sent_mid_turn(&chat_states, &m).await;
+            }
             continue;
         }
         // Skip truly empty messages — but an image-only message (empty text +
@@ -6937,6 +6984,41 @@ fn listens(t: &TurnHandle, channel: Option<&str>, thread: Option<&str>) -> bool 
     steering::on_surface(t.channel.as_deref(), t.thread.as_deref(), channel, thread)
 }
 
+/// A message of the bot's own reached a room where a turn of its is running
+/// (flag `brainCard`) — the agent said something with `mafold send` while it
+/// works. It landed BELOW the turn's live reply, so every turn on that surface
+/// is told (`AgentEvent::Sent`), and moves its reply under it the way a steer
+/// does: the working card stays the last thing in the chat. Sent elsewhere —
+/// up to the timeline a thread hangs from, another channel — it strands
+/// nothing, and nothing moves. A draft's own opening frame has no words yet,
+/// and a turn's own reply is never news to it.
+async fn sent_mid_turn(chat_states: &ChatStates, m: &IncomingMessage) {
+    let Some(words) = sent_words(m) else { return };
+    let states = chat_states.lock().await;
+    let Some(st) = states.get(&m.conversation_id) else { return };
+    for (draft, t) in &st.turns {
+        if *draft != m.id && listens(t, m.channel_id.as_deref(), m.thread_root_id.as_deref()) {
+            let _ = t.events.send(AgentEvent::Sent(words.clone()));
+        }
+    }
+}
+
+/// What a message of the bot's own says, for the line its reply's trail
+/// keeps ([`sent_mid_turn`]): its text, else what it carried. None for one
+/// with neither — a draft that has only just opened.
+fn sent_words(m: &IncomingMessage) -> Option<String> {
+    let text = m.content.trim();
+    if !text.is_empty() {
+        return Some(text.to_string());
+    }
+    let names: Vec<&str> = m
+        .attachments
+        .iter()
+        .map(|a| a.file.as_ref().and_then(|f| f.filename.as_deref()).filter(|n| !n.is_empty()).unwrap_or(a.kind.as_str()))
+        .collect();
+    (!names.is_empty()).then(|| format!("📎 {}", names.join(", ")))
+}
+
 /// Mafold Harness or your own OpenCode — the runtimes that run on OpenCode Go
 /// (Mafold Harness on the wallet too).
 fn is_opencode(harness_id: &str) -> bool {
@@ -7020,8 +7102,11 @@ async fn effort_verdict(
         V::Refuse(why) => {
             println!("⛔ {why}");
             let (client, harness, preferred) = (client.clone(), harness.clone(), preferred.map(str::to_string));
-            let on_go = on_go().await;
-            tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred, on_go).await });
+            let fuel = match OWNER_CONFIG.get() {
+                Some(c) => c.read().await.fuel.clone(),
+                None => None,
+            };
+            tokio::spawn(async move { report_caps(&client, harness.as_ref(), preferred, fuel).await });
             (None, None, Some(why))
         }
     }
@@ -7164,7 +7249,9 @@ async fn handle_control(
             let st = states.entry(chat_id.to_string()).or_default();
             if arg.is_empty() {
                 let cur = st.model.clone().unwrap_or_else(|| "default".into());
-                let example = model_examples(harness.id(), &go_ids);
+                // On Claude Code, Claude's names: it is Claude Code that runs them.
+                let names_from = if harness_on_claude(harness.id()).await { "claude-code" } else { harness.id() };
+                let example = model_examples(names_from, &go_ids);
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Model for this chat: {cur}\nSet with `/model <name>` ({example}) or `/model reset`.")).await;
             } else if arg.eq_ignore_ascii_case("reset") || arg.eq_ignore_ascii_case("default") {
                 st.model = None;
@@ -8625,7 +8712,19 @@ chat, not a side channel: the humans here read every turn and can cut in at any 
     // — name the command, and say where the work goes when the room won't allow
     // it (`createChannel` answers "only managers may create channels here").
     s.push_str(&forum_channels_advice(crate::flags::enabled("forumEverywhere"), crate::flags::enabled(a2a::FLAG)));
+    // The brain card (ops 11-13): the turn's work shows in one card that stops
+    // at a set height, and the agent talks to the room in messages of its own
+    // while it works. The card is drawn whatever the agent does; this is what
+    // tells it that its narration is in the card and its messages are not.
+    s.push_str(&brain_line(crate::flags::enabled(brain::FLAG)));
     s
+}
+
+/// The WHILE YOU WORK paragraph (`mafold_types::brain`), where the brain card
+/// is on for this bot — an agent told its narration lands in a card it
+/// doesn't have would stop answering in its reply.
+fn brain_line(on: bool) -> String {
+    if on { format!("\n\n{}", brain::advice(true)) } else { String::new() }
 }
 
 /// The MAIL paragraph for a turn (flag `mailbox`, evaluated as this bot — its
@@ -9930,9 +10029,14 @@ async fn handle(
     if let Some(why) = &wallet_refused {
         println!("⛔ wallet: not starting a reply for @{turn_sender} in chat {chat_id} — {why}");
     }
+    // Mafold Harness on its owner's Claude Code login runs a real `claude`
+    // for each model step (`harness::claude_fuel`): it gets a seat the way a
+    // Claude Code agent does, failover included.
+    let claude_fuel = !wallet && harness_on_claude(harness.id()).await;
+    let on_claude_login = harness.id() == "claude-code" || claude_fuel;
     // Choose before ANY account-dependent work, including capability probes
     // and prewarming. Known blocked accounts must not start a Claude process.
-    let choice = if harness.id() == "claude-code" && !wallet {
+    let choice = if on_claude_login && !wallet {
         Some(crate::accounts::choose(account.as_deref(), model.as_deref()).await)
     } else {
         None
@@ -9945,8 +10049,8 @@ async fn handle(
         Some(c) => (c.account, c.skipped),
         None => (None, Vec::new()),
     };
-    let no_usable_account = harness.id() == "claude-code" && seat.is_none();
-    let mut env = seat.as_ref().map(|a| a.env()).unwrap_or_default();
+    let no_usable_account = on_claude_login && seat.is_none();
+    let mut env = claude_fuel_env(seat.as_ref().map(|a| a.env()).unwrap_or_default(), claude_fuel);
     let mut attempted_credential = seat.as_ref().and_then(|_| crate::commands::credential_fingerprint(&env));
     // The reasoning tier, held to what THIS machine's binary says the turn's
     // model takes (`harness::effort_for_turn`) — before anything is started
@@ -9954,13 +10058,15 @@ async fn handle(
     // What was ASKED is what the journal keeps: a turn picked up after a
     // restart is judged again, never run at the verdict's `None`.
     let requested_effort = effort.clone();
+    // On Claude Code the tiers are Claude Code's: it is what runs the step.
+    let tiers_from = if claude_fuel { crate::harness::select("claude-code") } else { harness.clone() };
     // `mut`: a wallet reply whose key the server refuses (below) ends the
     // same way, once its draft exists.
     let (effort, effort_note, mut refused) = if no_usable_account || wallet_refused.is_some() {
         (effort, None, wallet_refused)
     } else { effort_verdict(
         client,
-        harness,
+        &tiers_from,
         &env,
         model.as_deref(),
         requested_effort.as_deref(),
@@ -10107,9 +10213,10 @@ async fn handle(
         let _ = client
             .edit_draft(
                 &msg_id,
-                &format!(
-                    "{said}{}",
-                    mafold_transcript::render::generating_tag(turn_started_ms, 0, turn_started_ms, 0, 0)
+                &mafold_transcript::render::with_generating(
+                    &said,
+                    &mafold_transcript::render::generating_tag(turn_started_ms, 0, turn_started_ms, 0, 0),
+                    crate::flags::enabled(brain::FLAG),
                 ),
             )
             .await;
@@ -10519,7 +10626,7 @@ async fn handle(
                 },
             );
         }
-        env = next.env();
+        env = claude_fuel_env(next.env(), claude_fuel);
         attempted_credential = crate::commands::credential_fingerprint(&env);
         let again = Turn {
             // Work already landed under the first login stays in the session;
@@ -12902,6 +13009,10 @@ async fn render_loop(
         crate::cardtags::commit_boundary,
         crate::cardtags::qualify,
     );
+    // The brain card (flag `brainCard`, read as this bot): the trail goes in
+    // one live box, and the finished reply is the answer with the steps
+    // folded under it. The generating card goes over the box (`tx.live`).
+    tx.set_brain(crate::flags::enabled(brain::FLAG));
     tx.continue_from(&said);
     // Whether the harness has named the session this turn is written into —
     // what tells the agent's own output from the daemon's narration in the
@@ -12984,9 +13095,9 @@ async fn render_loop(
     let mut session_now: Option<String> = None;
 
     // Show the generating card immediately (covers the model's initial latency)
-    // — under whatever the bubble already says.
+    // — under whatever the bubble already says, or over the brain card's box.
     if !held {
-        let _ = client.edit_draft(&msg_id, &format!("{}{}", tx.snapshot(), generating_tag!())).await;
+        let _ = client.edit_draft(&msg_id, &tx.live(&generating_tag!())).await;
     }
 
     // Push the running snapshot, throttled. `$force` bypasses the throttle
@@ -13001,7 +13112,7 @@ async fn render_loop(
         ($force:expr) => {
             if !held && ($force || last_push.elapsed() >= THROTTLE) {
                 let _ = client
-                    .edit_draft(&msg_id, &format!("{}{}", tx.snapshot(), generating_tag!()))
+                    .edit_draft(&msg_id, &tx.live(&generating_tag!()))
                     .await;
                 last_push = std::time::Instant::now();
             }
@@ -13278,6 +13389,12 @@ async fn render_loop(
                 // The timing the whole thing rests on is free: we only hear
                 // about a steer AFTER the server stored their message, so a
                 // draft created now can only be newer.
+                //
+                // The agent's own message moves it the same way (`Sent`, the
+                // brain card): a `mafold send` mid-turn lands below the live
+                // reply just as a person's words do, and the working card
+                // belongs under it. Heard from the server too, so the same
+                // timing holds.
                 if matches!(ev, AgentEvent::Steered(_)) && held {
                     // Spoken to while holding its bubble: it opens now — below
                     // their message already, so there is nothing to move.
@@ -13286,7 +13403,13 @@ async fn render_loop(
                     push_running!(true);
                     continue;
                 }
-                if matches!(ev, AgentEvent::Steered(_)) {
+                if matches!(ev, AgentEvent::Sent(_)) && held {
+                    // Nothing on screen to move: the bubble, when it opens,
+                    // opens below it. The trail still says it went out.
+                    tx.push(&ev);
+                    continue;
+                }
+                if matches!(ev, AgentEvent::Steered(_) | AgentEvent::Sent(_)) {
                     tx.push(&ev); // the seam goes in first, so it travels along
                     // No trigger on the replacement: the server bills one
                     // draft per triggering message, and the one it opened for
@@ -13294,7 +13417,7 @@ async fn render_loop(
                     // does carry over is who the turn's chain started from.
                     match client.create_draft_carrying(&chat_id, thread_root.as_deref(), channel_id.as_deref(), &msg_id).await {
                         Ok(fresh) => {
-                            let carried = format!("{}{}", tx.snapshot(), generating_tag!());
+                            let carried = tx.live(&generating_tag!());
                             if client.edit_draft(&fresh, &carried).await.is_ok() {
                                 // The turn's journal moves with the reply.
                                 if let Some(outbox) = &client.drafts {
@@ -18598,6 +18721,8 @@ mod wall_footer_tests {
             "API Error: Connection error.",
             "API Error: 529 overloaded",
             "error sending request for url (https://api.anthropic.com/v1/messages): operation timed out",
+            // 2026-11-13: Anthropic's Cloudflare blocked a login that was fine.
+            "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare",
         ] {
             assert!(net_cut(&ended_on(cut)), "{cut}");
         }
@@ -18640,6 +18765,7 @@ mod wall_footer_tests {
         assert_eq!(handover_cause(&transient), None);
         assert!(!seat_trouble(&transient));
         assert_eq!(handover_cause(&ended_on("API Error: 529 overloaded")), None);
+        assert_eq!(handover_cause(&ended_on("Failed to authenticate. API Error: 403 Attention Required! | Cloudflare")), None);
         let stopped = crate::harness::TurnOutcome { stopped: true, ..refused };
         assert_eq!(handover_cause(&stopped), None, "/stop is the user's, not the account's");
     }
@@ -19937,6 +20063,98 @@ mod bgtask_watch_tests {
         assert!(speaks("CI is green."));
         assert_eq!(strip_silence("done.\n\n[[silent]]"), "done.");
         assert!(QUIET_NOTE.contains(SILENCE));
+    }
+
+    fn turn_on(thread: Option<&str>, events: tokio::sync::mpsc::UnboundedSender<AgentEvent>) -> TurnHandle {
+        TurnHandle {
+            cancel: Arc::new(Notify::new()), ask_file: None, perm: None, owner: GATE_OWNER.into(),
+            channel: None, thread: thread.map(str::to_string), events, steer_file: "/nonexistent-mailbox".into(),
+            can_steer: true, pays: false, guest: false,
+        }
+    }
+
+    fn own(id: &str, chat: &str, content: &str, thread: Option<&str>) -> IncomingMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "conversation_id": chat, "content": content, "thread_root_id": thread,
+            "sender": { "username": BOT, "kind": "bot" },
+        }))
+        .unwrap()
+    }
+
+    /// The brain card: a message the agent sent mid-turn reaches the turns on
+    /// the surface it landed on, and only those. A draft opening (no words
+    /// yet) and the turn's own reply are not news to anyone.
+    #[tokio::test]
+    async fn the_agents_own_message_reaches_the_turns_where_it_landed() {
+        let states: ChatStates = Default::default();
+        let (main_tx, mut main_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (thread_tx, mut thread_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut s = states.lock().await;
+            let st = s.entry("c1".into()).or_default();
+            st.turns.insert("d-main".into(), turn_on(None, main_tx));
+            st.turns.insert("d-thread".into(), turn_on(Some("root"), thread_tx));
+        }
+        sent_mid_turn(&states, &own("m1", "c1", "found it", None)).await;
+        assert!(matches!(main_rx.try_recv(), Ok(AgentEvent::Sent(w)) if w == "found it"));
+        assert!(thread_rx.try_recv().is_err(), "a thread's turn isn't stranded by the timeline");
+
+        sent_mid_turn(&states, &own("m2", "c1", "  ", None)).await;
+        sent_mid_turn(&states, &own("d-main", "c1", "Done.", None)).await;
+        sent_mid_turn(&states, &own("m3", "c2", "elsewhere", None)).await;
+        assert!(main_rx.try_recv().is_err(), "an opening draft, its own reply, another chat: nothing");
+
+        sent_mid_turn(&states, &own("m4", "c1", "in the thread", Some("root"))).await;
+        assert!(matches!(thread_rx.try_recv(), Ok(AgentEvent::Sent(w)) if w == "in the thread"));
+        assert!(main_rx.try_recv().is_err());
+    }
+
+    /// …and the turn moves its reply under it, the way a steer does: a fresh
+    /// draft carrying what the reply says, the old one discarded, the turn's
+    /// handle re-keyed — and the trail keeps a line saying what went out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_agents_own_message_moves_the_reply_under_it() {
+        let (base, api) = fake_api().await;
+        let client = Client::new(base, "test".into());
+        let conv = uuid::Uuid::new_v4().to_string();
+        let draft = uuid::Uuid::new_v4().to_string();
+        let live = Arc::new(std::sync::Mutex::new(draft.clone()));
+        let states: ChatStates = Default::default();
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        states.lock().await.entry(conv.clone()).or_default().turns.insert(draft.clone(), turn_on(None, etx));
+        let final_md = Arc::new(std::sync::Mutex::new(String::new()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = tokio::spawn(render_loop(
+            rx, client, draft.clone(), None, None, live.clone(), states.clone(), conv.clone(),
+            "sent-surface".into(), "/nonexistent-ask".into(), Default::default(), final_md.clone(),
+            crate::bgtasks::now_ms(), Default::default(), String::new(), Default::default(), Default::default(), None, None,
+        ));
+        for ev in [tool(), AgentEvent::Sent("found it".into()), AgentEvent::Text("Fixed.".into()), done()] {
+            tx.send(ev).unwrap();
+        }
+        drop(tx);
+        r.await.unwrap();
+
+        let moved = live.lock().unwrap().clone();
+        assert_ne!(moved, draft, "the reply moved");
+        let calls = |m: &str| -> Vec<Value> {
+            api.lock().unwrap().calls.iter().filter(|(x, _)| x == m).map(|(_, b)| b.clone()).collect()
+        };
+        assert_eq!(calls("botCreateDraft").len(), 1);
+        assert_eq!(calls("discardDraft").iter().map(|b| b["message_id"].clone()).collect::<Vec<_>>(), [serde_json::json!(draft)]);
+        let keys: Vec<String> = states.lock().await.get(&conv).map(|s| s.turns.keys().cloned().collect()).unwrap_or_default();
+        assert_eq!(keys, [moved.clone()], "the handle follows the reply");
+        let carried = api.lock().unwrap().messages.get(&moved).cloned().unwrap_or_default();
+        assert!(carried.contains("> ↗︎ found it") && carried.contains("Fixed."), "{carried}");
+    }
+
+    #[test]
+    fn the_while_you_work_paragraph_is_there_only_with_the_card() {
+        assert!(brain_line(false).is_empty());
+        assert!(brain_line(true).contains("WHILE YOU WORK:"), "{}", brain_line(true));
+        assert!(brain_line(true).contains("`mafold send <chat>"));
+        let preamble = mafold_preamble("ops:claude", "ops", &[]);
+        assert_eq!(preamble.contains("WHILE YOU WORK:"), crate::flags::enabled(brain::FLAG), "{preamble}");
     }
 }
 

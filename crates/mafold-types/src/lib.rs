@@ -15,6 +15,9 @@ use uuid::Uuid;
 /// Work one agent hands another: where its replies land, how it comes back
 /// (`a2a.rs`, `.docs/a2a-threads.md`).
 pub mod a2a;
+/// The brain card: an agent's turn shown as one working card, and the prompt
+/// paragraph that tells the agent to talk in messages of its own (`brain.rs`).
+pub mod brain;
 pub mod connections;
 /// A person's computers and their agents at work on them: the machine report,
 /// the computers list, presence (`computers.rs`).
@@ -59,6 +62,9 @@ pub mod sandbox;
 /// What may sign a new agent in, by where it runs and its runtime — the Rust
 /// half of `client-shared/newAgent.ts`, tested against the same table.
 pub mod agent_setup;
+/// Which model is answering: the prompt line that names it — one text for the
+/// hosted harness and Mafold Harness on a computer (`which_model.rs`).
+pub mod which_model;
 pub use connections::{
     provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
     PROVIDERS,

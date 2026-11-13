@@ -142,4 +142,10 @@ pub enum AgentEvent {
     /// activity that had already happened, before whatever the correction
     /// caused. Harnesses never emit this.
     Steered(String),
+    /// (driver-internal) The agent's own message reached the room while this
+    /// turn was running — a `mafold send` (flag `brainCard`). Carries what it
+    /// said. The reply was above it, so the driver moves the reply below it,
+    /// as it does for a steer; the trail keeps a line saying what went out
+    /// and when. Harnesses never emit this.
+    Sent(String),
 }

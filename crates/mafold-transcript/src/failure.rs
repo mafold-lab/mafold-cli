@@ -382,7 +382,7 @@ impl Failure {
 /// only a provider's explicit authentication refusal may sign an account out.
 pub fn is_auth_refusal(text: &str) -> bool {
     let low = text.to_ascii_lowercase();
-    if transient_refresh(&low).is_some() {
+    if transient_refresh(&low).is_some() || edge_page(&low) {
         return false;
     }
     low.contains("please run /login")
@@ -407,6 +407,24 @@ fn transient_refresh(low: &str) -> Option<FailureKind> {
         return Some(FailureKind::Network);
     }
     None
+}
+
+/// Cloudflare's own block or challenge page where the API's answer should be:
+/// the provider's front door turned the request away before its API read the
+/// credential. Claude Code keeps only the page's title
+/// (`API Error: 403 Attention Required! | Cloudflare`); other producers pass
+/// the page itself. Cloudflare's own wording only — a gateway that merely runs
+/// on Cloudflare still answers a bad key with its own JSON, which stays Auth.
+fn edge_page(low: &str) -> bool {
+    [
+        "attention required! | cloudflare",
+        "just a moment...",
+        "used cloudflare to restrict access",
+        "sorry, you have been blocked",
+        "cloudflare ray id",
+    ]
+    .iter()
+    .any(|s| low.contains(s))
 }
 
 /// Read a raw error string into a [`Failure`]. Never fails: what it can't
@@ -504,6 +522,13 @@ pub fn classify(err: &str) -> Failure {
     } else if matches!(upstream_status(&detail), Some(401..=403))
         || (low.contains("上游") && has(&["insufficient balance", "credit", "payment required"]))
     {
+        FailureKind::Unavailable
+    // A 401/403 that is the provider's edge, not its API ([`edge_page`]): the
+    // provider is down for us, not the key. 2026-11-13 Anthropic's Cloudflare
+    // blocked cicd for three minutes right after a run of `503 credential
+    // validation failed`; the same login worked before and after, but the card
+    // said «credential rejected, sign in again» and the turn ended unretried.
+    } else if matches!(status, Some(401 | 403)) && edge_page(&low) {
         FailureKind::Unavailable
     } else if status == Some(402)
         || has(&[
@@ -883,6 +908,27 @@ mod tests {
         let f = classify(&routed);
         assert_eq!((f.kind, f.payer.as_deref()), (FailureKind::Grant, Some("ops")), "{f:?}");
         assert_eq!(classify("provider error: anthropic 403 Forbidden: {\"error\":{\"type\":\"permission_error\"}}").kind, FailureKind::Auth);
+    }
+
+    /// 2026-11-13 本人截图:cicd 上四个回合死在 `API Error: 403 Attention
+    /// Required! | Cloudflare`,卡片说「凭据被拒,重新登录」。那是 Anthropic 的
+    /// Cloudflare 把请求拦在门外 —— 同一个登录前后都好好的。读成「对方不可用」
+    /// (daemon 会等一会儿再跑),也不许把账户当成登出;普通的 403 照旧是凭据。
+    #[test]
+    fn a_cloudflare_page_is_the_provider_down_not_a_refused_key() {
+        for raw in [
+            "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare",
+            "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare · Please run /login",
+            "API Error: 403 Just a moment...",
+            "API Error: 403 Access denied | api.anthropic.com used Cloudflare to restrict access",
+            "provider error: anthropic 403 Forbidden: <!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1><span>Cloudflare Ray ID: a59ceb3c2c2fcb70</span></body></html>",
+            // What the same outage said first, before the edge stepped in.
+            "API Error: 503 credential validation failed",
+        ] {
+            assert_eq!(classify(raw).kind, FailureKind::Unavailable, "{raw}");
+            assert!(!is_auth_refusal(raw), "the login is fine: {raw}");
+        }
+        assert_eq!(classify("API Error: 403 Forbidden").kind, FailureKind::Auth, "a bare 403 is still the key");
     }
 
     /// 限流:哪个窗口、什么时候恢复,三种来路都读出来 —— 卡片按读者时区说时间。

@@ -1091,6 +1091,11 @@ mod tests {
         // Nothing on screen but the card it was left on: only the failure card.
         let (empty, _) = cut_off("{% mafold/generating started=1 beat=2 beatAt=3 tokens=0 shells=0 /%}", "x", None);
         assert!(empty.starts_with("{% mafold/error kind=\"interrupted\""), "{empty}");
+        // The brain card's shape: the card over the box goes, the box stays.
+        let boxed = mafold_transcript::render::brain_card("Checking dark mode next.");
+        let tag = mafold_transcript::render::generating_tag(1, 2, 3, 4, 0);
+        let (brain, _) = cut_off(&format!("{tag}{boxed}"), "x", None);
+        assert!(brain.starts_with("{% mafold/brain live=true %}") && !brain.contains("mafold/generating"), "{brain}");
         // A house bot's: the details are for whoever asked.
         let (house, _) = cut_off("half an answer", "x", Some("ann".into()));
         assert!(house.starts_with("half an answer\n\n{% mafold/error") && house.contains("for=\"@ann\""), "{house}");

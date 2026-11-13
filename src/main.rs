@@ -55,6 +55,8 @@ mod permission_mcp;
 mod platform;
 mod runtime_login;
 mod sandbox;
+mod seat_usage;
+mod seat_watch;
 mod session;
 mod session_life;
 mod sites;
@@ -674,6 +676,11 @@ enum Cmd {
     /// ask card and blocks on the tap. Not for humans.
     #[command(hide = true)]
     PermissionMcp,
+    /// (internal) The stdio MCP server claude starts for a Mafold Harness turn
+    /// on Claude Code — a pipe to that turn, which serves the harness's tools
+    /// (`harness::claude_fuel`). Not for humans.
+    #[command(hide = true)]
+    HarnessBridge,
     /// (internal, debug builds) One wallet reply through the daemon's own
     /// wallet steps — mint the draft's key, the OpenCode harness, the reply's
     /// total onto the result card — printed as one JSON line. What the billing
@@ -782,6 +789,9 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::PermissionMcp) {
         return permission_mcp::run();
+    }
+    if matches!(cli.cmd, Cmd::HarnessBridge) {
+        return harness::claude_fuel::bridge_main();
     }
 
     // `--account` decides whose session the person-shaped commands speak with,
@@ -1128,7 +1138,7 @@ async fn main() -> Result<()> {
         | Cmd::Account { .. } | Cmd::Report
         | Cmd::Up { .. } | Cmd::Down { .. } | Cmd::Restart { .. } | Cmd::Logs { .. } | Cmd::Diagnose { .. } | Cmd::Rm { .. }
         | Cmd::Rollback { .. } | Cmd::Capabilities | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
-        | Cmd::SteerHook | Cmd::DriveHook | Cmd::CompactHook { .. } | Cmd::PermissionMcp => unreachable!(),
+        | Cmd::SteerHook | Cmd::DriveHook | Cmd::CompactHook { .. } | Cmd::PermissionMcp | Cmd::HarnessBridge => unreachable!(),
         #[cfg(windows)]
         Cmd::BackgroundWorker { .. } => unreachable!(),
     }

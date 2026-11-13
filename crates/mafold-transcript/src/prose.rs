@@ -244,8 +244,9 @@ const NEST_MAX: usize = 32;
 /// and `cards/run` do. Every other container draws its body its own way —
 /// `cards/only` as plain text (`splitMarkers`), a tool or a diff as output —
 /// so a card tag in there reads as its source (review 10-09). A container
-/// whose `card.tsx` starts rendering `children` belongs here.
-const NESTS: &[&str] = &["mafold/trace", "mafold/run"];
+/// whose `card.tsx` starts rendering `children` belongs here: `cards/brain`
+/// does, live and folded.
+const NESTS: &[&str] = &["mafold/trace", "mafold/brain", "mafold/run"];
 
 /// Every card named `name` a reader sees in `text`, at any depth, in reading
 /// order: at the top, or in the body of a container that draws its body's

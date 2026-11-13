@@ -122,6 +122,37 @@ pub fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// Read, change, write back under one cross-process lock, for a small file
+/// more than one process writes (`seat_watch`: the supervisor every
+/// heartbeat, a bot's `/logout` or `/login` in between). The lock is a
+/// separate inode (`<file>.lock`) so it survives the renames of the file
+/// itself. A file that won't read is the default; best effort — a lock that
+/// can't be had still records. `change` says whether it changed anything.
+pub fn update<D, T>(path: &Path, change: impl FnOnce(&mut D) -> (T, bool)) -> T
+where
+    D: Default + Serialize + serde::de::DeserializeOwned,
+{
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(path.with_extension("lock"));
+    if let Ok(lock) = &lock {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        }
+        #[cfg(windows)]
+        let _ = crate::platform::lock_file_exclusive(lock);
+    }
+    let mut d: D = read(path).unwrap_or_default();
+    let (out, dirty) = change(&mut d);
+    if dirty {
+        write(path, &d);
+    }
+    out // the lock goes with `lock`
+}
+
 /// Whole-file replace (write aside, rename over), so a reader in another
 /// process never sees half a file.
 fn write<T: Serialize>(path: &Path, v: &T) {

@@ -70,6 +70,33 @@ pub fn is_go(fuel: Option<&str>) -> bool {
     fuel.is_some_and(|f| f.trim().eq_ignore_ascii_case(GO))
 }
 
+// ── Claude Code (ops 11-13) ─────────────────────────────────────────────────
+//
+// Mafold Harness signed in with Claude Code runs each model step on the real
+// `claude` here, on its owner's Claude Code login (`harness::claude_fuel`).
+// Like Go it bills the owner's own plan; unlike Go there is no key to open:
+// the login is this computer's, a seat picked the way a Claude Code agent's
+// is (`accounts::choose`). The turn only has to be told, which [`FUEL_ENV`]
+// does.
+
+/// `getBot`'s `fuel` for an agent signed in with Claude Code — a Claude Code
+/// agent's, and a Mafold Harness agent's on Claude Code.
+pub const CLAUDE: &str = "claude";
+
+/// Tells a Mafold Harness turn its fuel (`Turn.env`), where the wallet's and
+/// Go's keys say it by being there.
+pub const FUEL_ENV: &str = "MAFOLD_FUEL";
+
+/// Is `fuel` Claude Code?
+pub fn is_claude(fuel: Option<&str>) -> bool {
+    fuel.is_some_and(|f| f.trim().eq_ignore_ascii_case(CLAUDE))
+}
+
+/// Does this turn's env say it runs on Claude Code?
+pub fn claude_in(env: &[(String, String)]) -> bool {
+    is_claude(env.iter().rev().find(|(k, _)| k == FUEL_ENV).map(|(_, v)| v.as_str()))
+}
+
 /// The turn's Go step, for an agent on OpenCode Go running `harness`: the
 /// owner's key joins `env`, and the guard that masks it comes back for the
 /// turn to hold — or nothing, for the owner's own OpenCode that is signed in
@@ -342,6 +369,18 @@ mod tests {
         for other in [None, Some(""), Some("claude"), Some("opencode-go")] {
             assert!(!is_wallet(other), "{other:?}");
         }
+    }
+
+    #[test]
+    fn only_claude_is_claude_and_the_turn_env_says_it() {
+        assert!(is_claude(Some("claude")) && is_claude(Some(" Claude ")));
+        for other in [None, Some(""), Some("wallet"), Some("opencode-go"), Some("claude-code")] {
+            assert!(!is_claude(other), "{other:?}");
+        }
+        let env = |v: &str| vec![("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), "/x".to_string()), (FUEL_ENV.to_string(), v.to_string())];
+        assert!(claude_in(&env("claude")));
+        assert!(!claude_in(&env("wallet")));
+        assert!(!claude_in(&[]));
     }
 
     #[test]

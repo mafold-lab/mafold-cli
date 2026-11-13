@@ -278,6 +278,28 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Daemon],
         server: NotRead,
     },
+    // Ops 11-13 (the mafold/brain card, demo → "Build it"): an agent's turn
+    // shows its work in one card that stops at a set height, the agent talks
+    // to the room with `mafold send` while it works, and the turn ends on its
+    // summary with the steps folded under it. Read by the daemon as the bot,
+    // per person like the two above; off until seen on the real page.
+    FlagMeta {
+        key: "brainCard",
+        default: false,
+        dev_default: false,
+        label: "Agents: the brain card",
+        description: "While an agent works, its thinking, reads, edits and commands go into one \
+                      card that stops at a set height and scrolls, with the time, tokens and Stop \
+                      under it. The agent tells the room what matters with `mafold send` as it \
+                      goes, and the card moves below each message it sends, so it stays last. \
+                      When the agent finishes, the card gives way to its summary, with the steps \
+                      folded under it. Off = the reply grows as the agent works and its trail \
+                      folds into a lid above the answer, as before.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Daemon],
+        server: NotRead,
+    },
     // Owner 10-09: the left rail is fine as the wide-screen default, but it
     // goes out behind this flag, off, with its own line on the release card —
     // on only once the owner has clicked it there.
@@ -679,8 +701,8 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
     },
     // Garden and the Activity Center as one drawer (ops 11-08, demo rounds
     // 1–5 in their DM's #设计系统统一): the header's garden button goes, and
-    // the M slides the panel out of the window's left edge. Web only for now:
-    // the phone's panel hasn't been drawn.
+    // the M slides the panel out of the window's left edge. The web's; the
+    // phone reads activityDrawerPhone.
     FlagMeta {
         key: "activityDrawer",
         default: false,
@@ -692,6 +714,23 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       tab bar steps aside while it's open; the header's garden button goes. Off = \
                       the garden button and the Activity Center that grows out of the M.",
         owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
+    // linsky 11-13: the old garden's 收藏, native in the drawer that replaced the garden page —
+    // a 收藏 tab between Works and Tasks, read from the garden's pins (GET /api/pins).
+    FlagMeta {
+        key: "drawerSaved",
+        default: false,
+        dev_default: true,
+        label: "Activity drawer: 收藏 (Saved)",
+        description: "A 收藏 tab in the Activity drawer, between Works and Tasks: what you saved to \
+                      the garden (select ▸ forward ▸ 园地, and the old garden's collection) on its \
+                      five fixed shelves — 网站, 文章&书籍, 图片, 视频, 消息 — each with its own card. \
+                      Read from the garden's own pins; a website's card comes from \
+                      getViewerLinkCards (gardenSavedV2). Off = the drawer without 收藏.                       The web's drawer for now; the phone's drawer follows.",
+        owner: "linsky",
         added: "2026-11",
         clients: &[Web],
         server: NotRead,
@@ -846,6 +885,28 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       OpenCode, only where this is on for the owner.",
         owner: "ops",
         added: "2026-10",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // Mafold Harness on Claude Code (ops 11-13, "add a mafold harness fuel
+    // option: claude code"): New Agent offers Claude Code as Mafold Harness's
+    // sign-in, and each model step runs on the real `claude` on that computer,
+    // on the owner's Claude Code login (mafold-cli harness/claude_fuel.rs).
+    // Server-read on the owner: createBot takes `sign_in: claude` with
+    // Mafold Harness only where this is on.
+    FlagMeta {
+        key: "harnessOnClaude",
+        default: false,
+        dev_default: false,
+        label: "New Agent: Mafold Harness on Claude Code",
+        description: "New Agent on one of your computers offers Claude Code as the sign-in for \
+                      Mafold Harness. The harness keeps its own prompt, tools and sessions, and \
+                      each model step runs on the real Claude Code installed on that computer, on \
+                      your Claude Code login there, spending your Claude plan. The api takes \
+                      createBot with Mafold Harness on Claude Code only where this is on for the \
+                      owner.",
+        owner: "ops",
+        added: "2026-11",
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
@@ -1287,6 +1348,104 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web],
         server: NotRead,
     },
+    // The phone's twin of headerMenu (ops 11-12, "☰ panel" on the card about
+    // the design work that never reached the app). Its own key because
+    // headerMenu is on for everyone already: a phone release would otherwise
+    // hand it to every phone at once, before ops has used it on theirs. Both
+    // go together once it's on for everyone here too.
+    FlagMeta {
+        key: "headerMenuPhone",
+        default: false,
+        dev_default: false,
+        label: "Chat header on the phone: one ☰ for the apps and the chat's pages",
+        description: "The phone's chat header gets web's ☰ in its top-right corner, in every chat. \
+                      Tapped, it grows into a solid panel: search in this chat, every app here plus \
+                      Add, Media · Files · Pinned · Channels, the rows for that kind of chat (an \
+                      agent's Customize and working directory, a group's members, a person's \
+                      moments), mute, and clear history, leave or block. Off = the app launcher, \
+                      shown only in chats with apps.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Phone],
+        server: NotRead,
+    },
+    // The phone's twin of activityDrawer (ops 11-12, "M drawer: Build it as
+    // shown" on the web drawer drawn at phone width). ops then chose "To
+    // everyone" for each phone item: this goes on for every phone once the
+    // app.js@ that carries it is out. Its own key so the phone's drawer can be
+    // turned off without taking the web's with it.
+    FlagMeta {
+        key: "activityDrawerPhone",
+        default: false,
+        dev_default: false,
+        label: "Activity on the phone: one drawer for Garden and the Activity Center",
+        description: "Tapping the M slides one panel out of the screen's left edge, from under the \
+                      status bar to the tab bar's foot and as wide as the chat list up to its \
+                      new-chat button, with Now, Agents, Works and Tasks. The M rolls into its \
+                      bottom-right corner and the tab bar steps aside while it's open; the \
+                      header's garden button goes. Off = the garden button and the Activity \
+                      Center that grows out of the M.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Phone],
+        server: NotRead,
+    },
+    // Moments rows fold long posts the way X does (ops 11-13, "Fold + short
+    // leads": a 1,306px @gemini post was 1.5 screens of a phone). One key for
+    // web and phone: the rule is client-shared/momentFold.ts. The public
+    // mafold.com/@ pages have no signed-in reader to ask, so they fold when
+    // this goes to everyone and the gate comes out.
+    FlagMeta {
+        key: "momentFold",
+        default: false,
+        dev_default: false,
+        label: "Moments: fold long posts in the feed",
+        description: "A feed row shows a post's words up to 280 characters (140 Chinese), then \
+                      \"… Show more\", and one box under them with its first picture, clip or \
+                      card, 16:9 at most; a taller card fades at the box's foot. Tapping the \
+                      row opens the post with everything. Off = every post in full.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // Stickers rounded out (ops 11-13 20:30, demo OK'd 12:45Z): "Add to my
+    // stickers" on any sticker in a chat (linsky 11-06), a bar over the panel
+    // (search + your sets as tabs), and Settings > Stickers to manage sets.
+    // One shared page on both apps: client-shared/stickerPanel.tsx. The set
+    // routes answer everyone — they only touch the caller's own library.
+    FlagMeta {
+        key: "stickerSets",
+        default: false,
+        dev_default: false,
+        label: "Stickers: sets, search and Add to my stickers",
+        description: "Right-click (long-press on the phone) a sticker in a chat to add it to \
+                      your stickers. The sticker panel gets a bar: search, then a tab per set. \
+                      Settings > Stickers lists your sets: reorder them, rename, delete, move \
+                      stickers between sets (on a computer, drag them onto a set), add and \
+                      remove single stickers. Off = the plain grid.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // $1 in every new wallet (ops 11-13 「1$ in every new users wallet」, then
+    // "No limit"): minted straight into the wallet at sign-up, no packet to
+    // open. Read for the account being registered, so it is turned on for
+    // everyone, not per person.
+    FlagMeta {
+        key: "welcomeDollar",
+        default: false,
+        dev_default: false,
+        label: "$1 in every new wallet",
+        description: "A new account starts with $1 in its wallet, minted at sign-up at the \
+                      official price, the way an invite's $6 is paid. No limit per device. \
+                      Off = a new wallet starts empty.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -1423,6 +1582,28 @@ mod tests {
         assert_eq!(m.clients, &[Web], "the web reads it");
         assert_eq!(m.server, NotRead, "only the header's corner");
         assert!(!server_default("headerMenu"), "nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn header_menu_phone_ships_dark_everywhere() {
+        // The phone's ☰: off until ops turns it on for someone, dev included,
+        // whatever headerMenu says on the web. Only the phone reads it.
+        let m = meta("headerMenuPhone").expect("headerMenuPhone registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Phone], "the phone reads it");
+        assert_eq!(m.server, NotRead, "only the header's corner");
+        assert!(!server_default("headerMenuPhone"), "nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn activity_drawer_phone_ships_dark_everywhere() {
+        // The phone's drawer: off until ops turns it on for someone, dev
+        // included, whatever activityDrawer says on the web. Only the phone reads it.
+        let m = meta("activityDrawerPhone").expect("activityDrawerPhone registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert_eq!(m.clients, &[Phone], "the phone reads it");
+        assert_eq!(m.server, NotRead, "only the bottom bar's M");
+        assert!(!server_default("activityDrawerPhone"), "nothing server-side opens without a record");
     }
 
     #[test]
@@ -1587,6 +1768,19 @@ mod tests {
         // createBot and listHarnessHosts read it on the owner; dev stays off
         // too until a record opens it for someone.
         let k = "openCodeGo";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn harness_on_claude_is_a_server_gate_that_ships_dark() {
+        // createBot reads it on the owner; dev stays off too until a record
+        // opens it, since a turn on it spends a real Claude plan.
+        let k = "harnessOnClaude";
         let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
         assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
         assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
