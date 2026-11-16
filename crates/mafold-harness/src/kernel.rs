@@ -321,7 +321,9 @@ pub fn run(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
 /// No tools: one completion, prose streamed as it arrives, then the same
 /// result details the tool loop stamps.
 fn plain(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
-    let Turn { ctx, runtime, messages, model: model_override, fallback, live, stopped_line, bill, tap, keep, .. } = turn;
+    let Turn { ctx, runtime, plugins, messages, model: model_override, fallback, live, stopped_line, bill, tap, keep, .. } = turn;
+    // A reply that shows no working, when a plugin asks for one.
+    let quiet = plugins.iter().any(|p| p.quiet(&ctx));
     let mut messages = messages;
     let mut keep = keep;
     let s = async_stream::stream! {
@@ -332,7 +334,7 @@ fn plain(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
         // usage still produces a bill instead of a free ride.
         let mut out_chars = 0usize;
         let mut usage = TokenUsage::default();
-        let mut tx = Transcript::new();
+        let mut tx = if quiet { Transcript::new().quiet() } else { Transcript::new() };
         if let Some(t) = &tap { tx.set_tap(t.clone()); }
         let mut stats = RunStats {
             run_id: Some(ctx.draft_id.unwrap_or_else(Uuid::new_v4).to_string()),
@@ -547,6 +549,7 @@ fn plain(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
 /// answers without calling one, or someone presses Stop.
 fn tool_loop(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
     let Turn { ctx, runtime, plugins, tools, messages, model: model_override, fallback, live, stopped_line, bill, tap, keep } = turn;
+    let quiet = plugins.iter().any(|p| p.quiet(&ctx));
     let mut messages = messages;
     let mut keep = keep;
     let route = tools.route;
@@ -562,7 +565,7 @@ fn tool_loop(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
         // daemon's "Ran 10 shell commands", not ten "Ran 1 tool" pills.
         // `sent` is what the dispatcher holds; [`catch_up`] says the
         // difference.
-        let mut tx = Transcript::new();
+        let mut tx = if quiet { Transcript::new().quiet() } else { Transcript::new() };
         // What a tool writes while it runs, heard as it writes it. `tx` is
         // the tool's until it returns, so without this its call card would
         // reach the person together with its result — a minute late, for a
@@ -761,6 +764,11 @@ fn tool_loop(turn: Turn) -> BoxStream<'static, Result<Frame, String>> {
                         "{label}: {OUTPUT_CAP_NO_ANSWER} — the model spent its whole output cap ({} tokens) without writing an answer",
                         turn.tokens
                     ));
+                } else if silent && quiet && !last_prose.trim().is_empty() {
+                    // …or it already said its piece before its last tool
+                    // call, in a reply that shows no working: everything it
+                    // said is on screen, and asked again it says it again
+                    // (prod 11-14: the welcome guide's answer, four times).
                 } else if silent {
                     // …or it ended its turn with nothing for the person to
                     // read. Asked once more, the way Claude Code does: the
@@ -1087,6 +1095,47 @@ mod tap_tests {
 
     async fn heard(script: Vec<Vec<ChatEvent>>, plugins: Vec<Arc<dyn HarnessPlugin>>) -> Vec<AgentEvent> {
         heard_and_kept(script, plugins).await.0
+    }
+
+    /// `lookup`, in a reply that shows no working.
+    struct QuietLookup;
+
+    #[async_trait]
+    impl HarnessPlugin for QuietLookup {
+        fn id(&self) -> &'static str {
+            "quiet-lookup"
+        }
+        async fn tools(&self, ctx: &TurnCtx) -> Vec<ToolSpec> {
+            Lookup.tools(ctx).await
+        }
+        fn quiet(&self, _: &TurnCtx) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            ctx: &TurnCtx,
+            state: &mut (dyn std::any::Any + Send),
+            tx: &mut Transcript,
+            call: &ToolCall,
+        ) -> String {
+            Lookup.execute(ctx, state, tx, call).await
+        }
+    }
+
+    /// A quiet reply that said its piece before its last tool call ends
+    /// there: asked again, it said it again (prod 11-14, the welcome guide,
+    /// four times). One that shows its working is still asked once more.
+    #[tokio::test]
+    async fn a_quiet_reply_that_already_spoke_is_not_asked_to_speak_again() {
+        let call = || ToolCall { id: "c1".into(), name: "lookup".into(), arguments: "{}".into(), ..Default::default() };
+        let script = || vec![vec![done("Alpha means something.", vec![call()])], vec![done("", vec![])]];
+        // Scripted panics if it is asked for a step it doesn't have.
+        let (_, kept) = heard_and_kept(script(), vec![Arc::new(QuietLookup)]).await;
+        assert_eq!(roles(&kept).last().map(String::as_str), Some("tool"), "{:?}", roles(&kept));
+        let mut asked = script();
+        asked.push(vec![done("Alpha means something.", vec![])]);
+        let (_, kept) = heard_and_kept(asked, vec![Arc::new(Lookup)]).await;
+        assert_eq!(roles(&kept).last().map(String::as_str), Some("assistant:Alpha means something."));
     }
 
     /// Who said what, in the kept conversation.

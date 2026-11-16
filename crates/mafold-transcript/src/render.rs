@@ -203,6 +203,15 @@ pub fn generating_tag_awaiting(
     )
 }
 
+/// [`generating_tag`] for a reply that shows none of its working
+/// (`Transcript::quiet`): `plain=true`, and no `tokens` or `shells` to draw.
+/// The card then reads as someone typing — no running time, no token count,
+/// only «No signal» if the producer really goes silent. The liveness props
+/// stay: a plain card must still be able to tell a hang from a pause.
+pub fn generating_tag_plain(started_ms: u64, beat: u64, beat_at_ms: u64) -> String {
+    format!("\n{{% mafold/generating started={started_ms} beat={beat} beatAt={beat_at_ms} plain=true /%}}\n")
+}
+
 /// A running snapshot without its live [`generating_tag`] — what the reply
 /// actually SAYS so far, e.g. to carry it into the process that picks a
 /// killed turn back up.
@@ -2199,7 +2208,7 @@ mod run_groups_tests {
 #[cfg(test)]
 mod generating_tests {
     use super::{
-        brain_card, generating_tag, generating_tag_awaiting, strip_trailing_generating, trailing_generating,
+        brain_card, generating_tag, generating_tag_awaiting, generating_tag_plain, strip_trailing_generating, trailing_generating,
         with_generating,
     };
 
@@ -2282,6 +2291,18 @@ mod generating_tests {
             assert!(tag.contains(prop), "{prop} missing from {tag}");
         }
         assert!(tag.contains("beat=42") && tag.contains("tokens=4200"), "{tag}");
+    }
+
+    /// A plain card keeps what tells a hang from a pause, and carries nothing
+    /// that would draw a machine's numbers — and it strips like any other.
+    #[test]
+    fn a_plain_card_keeps_its_liveness_and_draws_no_numbers() {
+        let tag = generating_tag_plain(1_785_900_000_000, 42, 1_785_900_009_000);
+        for prop in ["started=", "beat=42", "beatAt=", "plain=true"] {
+            assert!(tag.contains(prop), "{prop} missing from {tag}");
+        }
+        assert!(!tag.contains("tokens=") && !tag.contains("shells="), "{tag}");
+        assert_eq!(strip_trailing_generating(&format!("在想{tag}")), "在想");
     }
 
     /// It must be namespaced AND self-closing: `strip_trailing_generating`

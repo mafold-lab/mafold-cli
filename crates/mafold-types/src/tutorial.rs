@@ -36,6 +36,10 @@ pub struct TutorialState {
     pub agent_username: Option<String>,
     pub agent_chat_id: Option<String>,
     pub usage_tx_id: Option<String>,
+    /// The DM with the onboarding guide, when the guide greeted this account
+    /// (`onboardingClerk`): its welcome chat, which a first visit opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

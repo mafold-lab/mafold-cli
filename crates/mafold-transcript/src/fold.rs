@@ -33,6 +33,27 @@ pub const ATTR_MAX: usize = 200;
 /// written; a container runs to its close, else to the close its author
 /// misspelled, else to the end of the message.
 pub fn fold(md: &str, open: Option<&str>) -> String {
+    replace_cards(md, |c| folded_card(c.name, c.attrs, c.self_close, c.body, open))
+}
+
+/// One top-level card in a message, as [`replace_cards`] hands it over.
+pub struct Card<'a> {
+    pub name: &'a str,
+    /// Everything between the name and the tag's close, as written.
+    pub attrs: &'a str,
+    pub self_close: bool,
+    /// What sits between the open and close tags (empty when self-closing).
+    pub body: &'a str,
+    /// The whole card as written, tags included.
+    pub raw: &'a str,
+}
+
+/// `md` with every top-level card replaced by what `f` makes of it, prose
+/// outside the cards untouched — [`fold`]'s walk, for a reader that wants
+/// something other than a fold note in a card's place. Same grammar: a tag in
+/// code stays as written, a container runs to its close, else to the close its
+/// author misspelled, else to the end of the message.
+pub fn replace_cards(md: &str, mut f: impl FnMut(&Card) -> String) -> String {
     let ranges_in = |from: usize, to: usize| -> Vec<(usize, usize)> {
         code_ranges(&md[from..to]).into_iter().map(|(a, b)| (a + from, b + from)).collect()
     };
@@ -59,7 +80,13 @@ pub fn fold(md: &str, open: Option<&str>) -> String {
                 .unwrap_or((md.len(), md.len()))
         };
         out.push_str(&md[copied..start]);
-        out.push_str(&folded_card(tag.name, tag.attrs, tag.self_close, &md[tag.end..body_end], open));
+        out.push_str(&f(&Card {
+            name: tag.name,
+            attrs: tag.attrs,
+            self_close: tag.self_close,
+            body: &md[tag.end..body_end],
+            raw: &md[start..end],
+        }));
         // A backtick inside the card's span says nothing about code after it.
         if md[start..end].contains(['`', '~']) {
             ranges = ranges_in(end, md.len());
@@ -280,4 +307,21 @@ mod tests {
             assert_eq!(fold(md, OPEN), md);
         }
     }
+
+    /// `replace_cards` hands over each top-level card whole — name, attributes,
+    /// body and the span as written — and leaves the prose around it alone.
+    #[test]
+    fn replace_cards_sees_each_card_whole() {
+        let md = "a {% x/y k=\"v\" %}body{% /x/y %} b {% z /%} `{% q %}` c";
+        let mut seen = Vec::new();
+        let out = replace_cards(md, |c| {
+            seen.push((c.name.to_string(), c.attrs.trim().to_string(), c.self_close, c.body.to_string(), c.raw.to_string()));
+            format!("<{}>", c.name)
+        });
+        assert_eq!(out, "a <x/y> b <z> `{% q %}` c");
+        assert_eq!(seen[0], ("x/y".into(), "k=\"v\"".into(), false, "body".into(), "{% x/y k=\"v\" %}body{% /x/y %}".into()));
+        assert_eq!((seen[1].0.as_str(), seen[1].2, seen[1].4.as_str()), ("z", true, "{% z /%}"));
+        assert_eq!(seen.len(), 2, "a tag in code is code");
+    }
+
 }

@@ -1213,6 +1213,39 @@ fn stored_login_read(raw: Result<String, crate::accounts::NoStoredLogin>, now: i
     }
 }
 
+/// How early Claude Code renews an access token: once it has five minutes
+/// left, not when it lapses (2.1.312's `isOAuthTokenExpired`:
+/// `now + 300000 >= expiresAt`).
+const CLAUDE_RENEWS_EARLY_MS: i64 = 300_000;
+
+/// Whether a `claude` started now on the seat `env` selects could renew its
+/// login before `within` is up: the access token falls due by then or has
+/// already lapsed ([`StoredLogin::Stale`]), or the login can't be read to say.
+/// False when there is nothing to renew — no login, or a token that never
+/// expires.
+///
+/// For the processes started only to ASK something (the roster handshake in
+/// `harness::claude_code`), which must never be the ones that renew. A renewal
+/// retires the refresh token upstream before the new one is saved, so a process
+/// that dies in between leaves a retired token on disk; whichever process
+/// renews next is refused, and Claude Code wipes the login. That is the likely
+/// story of cicd's `default`, wiped 2026-11-11 and 11-14 with no turn running,
+/// 16 and 20 minutes after an hourly probe that was killed the moment it
+/// answered — on 11-14 just after its access token had lapsed. Turns renew;
+/// a question waits until one has.
+pub(crate) fn renewal_due(env: &[(String, String)], within: std::time::Duration) -> bool {
+    renewal_due_read(read_credential(env), now_ms(), within.as_millis() as i64)
+}
+
+/// [`renewal_due`] on a credential read already, at `now` — split out so the
+/// verdict is testable without a login.
+fn renewal_due_read(raw: Result<String, crate::accounts::NoStoredLogin>, now: i64, within_ms: i64) -> bool {
+    matches!(
+        stored_login_read(raw, now + within_ms + CLAUDE_RENEWS_EARLY_MS),
+        StoredLogin::Stale | StoredLogin::Unreadable(_)
+    )
+}
+
 /// The seat's stored credential blob, from wherever Claude Code keeps it —
 /// the same reader `connection --import` uses ([`crate::accounts::LoginStore`]).
 fn read_credential(env: &[(String, String)]) -> Result<String, crate::accounts::NoStoredLogin> {
@@ -2892,5 +2925,35 @@ mod stored_login_tests {
     fn junk_is_missing() {
         assert!(matches!(stored_login_from("not json", NOW), StoredLogin::Unreadable(_)));
         assert_eq!(stored_login_from("{}", NOW), StoredLogin::Missing);
+    }
+
+    /// The roster probe asks only while the token outlives it by Claude Code's
+    /// own five minutes; inside that, `claude` would renew partway through.
+    #[test]
+    fn a_renewal_is_due_once_the_token_has_five_minutes_left_after_the_asking() {
+        let due = |expires: i64, within: i64| super::renewal_due_read(Ok(cred(Some("a"), Some("r"), Some(expires))), NOW, within);
+        let minute = 60_000;
+        assert!(!due(NOW + 8 * 60 * minute, 95_000), "a token renewed this morning");
+        assert!(!due(NOW + 5 * minute + 95_000 + 1, 95_000), "outlives the asking by just over five minutes");
+        assert!(due(NOW + 5 * minute + 95_000, 95_000), "Claude Code renews at exactly five minutes left");
+        assert!(due(NOW + 6 * minute, 95_000), "falls due while the probe runs");
+        assert!(due(NOW - 2 * 60 * minute, 95_000), "lapsed, as at the 2026-11-14 21:05 probe");
+    }
+
+    /// Nothing to renew is not a reason to hold the question back: a signed-out
+    /// seat, a lapsed token nothing can renew, a `claude setup-token` token.
+    /// Storage that can't be read can't vouch for its token, so it waits.
+    #[test]
+    fn a_renewal_is_due_only_where_one_can_happen() {
+        let due = |raw: &str| super::renewal_due_read(Ok(raw.to_string()), NOW, 95_000);
+        assert!(!due(&cred(Some("a"), None, Some(NOW - 1))));
+        assert!(!due(&cred(Some("a"), None, None)));
+        assert!(due("not json"));
+        let dir = std::env::temp_dir().join(format!("mafold-renewal-due-{}", std::process::id()));
+        let store = crate::accounts::LoginStore { file: dir.join("absent.json"), keychain_service: "synthetic".into() };
+        let empty = |_: &str| Ok(None);
+        let locked = |_: &str| Err("login Keychain is locked".to_string());
+        assert!(!super::renewal_due_read(store.read_with(Some(&empty)), NOW, 95_000));
+        assert!(super::renewal_due_read(store.read_with(Some(&locked)), NOW, 95_000));
     }
 }

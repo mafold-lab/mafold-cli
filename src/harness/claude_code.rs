@@ -761,7 +761,21 @@ impl Harness for ClaudeCode {
     ///
     /// Every answer here is about the binary in front of us: nothing in this
     /// function names a model, and the one place a tier is named is a question.
+    ///
+    /// Nothing is asked while the login is due to renew
+    /// ([`crate::commands::renewal_due`]): the handshake's `claude` would renew
+    /// it, and a question must never be what renews a login. `None` then, as
+    /// for any probe that didn't run — the menus stay as they are until a turn
+    /// has renewed it and the next hourly ask goes through.
     async fn caps(&self, env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
+        if crate::commands::renewal_due(env, EFFORT_PROBE_WAIT + HANDSHAKE_ANSWER + HANDSHAKE_EXIT + HANDSHAKE_STOP) {
+            eprintln!(
+                "[caps] not asking claude what it takes on `{}` yet: its access token is due for renewal \
+                 (or its login can't be read), and a question mustn't be what renews it",
+                self.seat_key(env)
+            );
+            return None;
+        }
         // (2) first — it is ~300ms and it decides how (3) may be read.
         let complaint = effort_probe(env, EFFORT_NONSENSE).await;
         let valid = complaint.as_deref().and_then(valid_efforts);
@@ -899,7 +913,7 @@ async fn effort_probe(env: &[(String, String)], value: &str) -> Option<String> {
         .arg("--version")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null());
-    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+    let out = tokio::time::timeout(EFFORT_PROBE_WAIT, cmd.output())
         .await
         .ok()?
         .ok()?;
@@ -908,6 +922,9 @@ async fn effort_probe(env: &[(String, String)], value: &str) -> Option<String> {
     }
     Some(String::from_utf8_lossy(&out.stderr).into_owned())
 }
+
+/// The most one [`effort_probe`] is waited for.
+const EFFORT_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Did the binary refuse `value` as a tier it doesn't know?
 fn complains_about(stderr: &str, value: &str) -> bool {
@@ -997,38 +1014,87 @@ async fn handshake(env: &[(String, String)]) -> Option<Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = cmd.spawn().ok()?;
-    let _guard = super::ChildGuard::new(child.id());
+    let guard = super::ChildGuard::new(child.id());
     let req = serde_json::json!({
         "type": "control_request",
         "request_id": HANDSHAKE_ID,
         "request": { "subtype": "initialize" },
     });
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(format!("{req}\n").as_bytes()).await;
-        // EOF: there is no prompt coming, and claude exits once it has answered.
-        drop(stdin);
-    }
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take()?;
-    let mut lines = BufReader::new(stdout).lines();
-    let found = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-            if v["type"] == "control_response" && v["response"]["request_id"] == HANDSHAKE_ID {
-                return Some(v["response"]["response"].clone());
-            }
+    let (tx, answered) = tokio::sync::oneshot::channel();
+    // The process gets a task of its own, which hands the answer over and then
+    // lets claude finish (`let_finish`): answered is not done, it still saves
+    // on its way out, and a caller that stops waiting — a turn's re-ask gives
+    // up after 10 s — must not cut that short either.
+    tokio::spawn(async move {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(format!("{req}\n").as_bytes()).await;
+            // EOF: there is no prompt coming, and claude exits once it has answered.
+            drop(stdin);
         }
-        None
-    })
-    .await
-    .ok()
-    .flatten();
-    // Nothing more is wanted from it, and a build that waits for more input
-    // must not outlive the question.
-    let _ = child.start_kill();
-    found
+        let mut lines = BufReader::new(stdout).lines();
+        let found = tokio::time::timeout(HANDSHAKE_ANSWER, async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                if v["type"] == "control_response" && v["response"]["request_id"] == HANDSHAKE_ID {
+                    return Some(v["response"]["response"].clone());
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let _ = tx.send(found);
+        let_finish(child, lines, guard).await;
+    });
+    answered.await.ok().flatten()
 }
 
 const HANDSHAKE_ID: &str = "mafold-caps";
+
+/// How long the handshake's answer is waited for.
+const HANDSHAKE_ANSWER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a handshake's `claude` is given to exit by itself once nothing
+/// more is wanted from it. It takes about half a second (2.1.312, measured
+/// 2026-11-15: answer at 0.67 s, `~/.claude.json` written at 0.79 s, exit at
+/// 1.2 s).
+const HANDSHAKE_EXIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one still running after [`HANDSHAKE_EXIT`] is given to stop when
+/// asked, before it is made to.
+const HANDSHAKE_STOP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Let the handshake's `claude` end the way it ends by itself: wait for it to
+/// exit, reading out whatever it still prints meanwhile (a full pipe would
+/// stall it). Only a build that waits for more input after all — still there
+/// after [`HANDSHAKE_EXIT`] — is asked to stop, and killed after
+/// [`HANDSHAKE_STOP`].
+///
+/// It used to be killed the moment it had answered, which is while it saves:
+/// cicd had a half-written `~/.claude.json.tmp.<pid>.*` left by each of six
+/// hourly probes (2026-11-09…13), and a login renewed in that stretch would be
+/// lost the same way (see [`crate::commands::renewal_due`]).
+async fn let_finish(
+    mut child: tokio::process::Child,
+    mut rest: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    _guard: super::ChildGuard,
+) {
+    let drain = tokio::spawn(async move { while let Ok(Some(_)) = rest.next_line().await {} });
+    if tokio::time::timeout(HANDSHAKE_EXIT, child.wait()).await.is_err() {
+        if let Some(pid) = child.id() {
+            crate::platform::terminate(pid);
+        }
+        if tokio::time::timeout(HANDSHAKE_STOP, child.wait()).await.is_err() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+    // Something it started may still hold the pipe; nothing on it matters now.
+    drain.abort();
+}
 
 /// The `--mcp-config` that mounts our permission server and nothing else.
 ///
@@ -2377,6 +2443,38 @@ mod tests {
         assert!(valid_efforts("2.1.272 (Claude Code)").is_none());
         // Wording drift must not turn one sentence into five bogus tiers.
         assert!(valid_efforts("Valid values: none at all here").is_none());
+    }
+
+    /// The handshake's `claude` saves on its way out (2.1.312 writes
+    /// `~/.claude.json` about 0.1 s after answering). The stand-in here
+    /// answers, then writes a file a moment later: killed on answering, as the
+    /// probe used to be, the file never appears; let finish, it does, and the
+    /// process ends on its own well before any deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_that_has_answered_still_finishes_saving() {
+        let dir = std::env::temp_dir().join(format!("mafold-let-finish-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("saved");
+        let mut child = crate::platform::command("sh")
+            .arg("-c")
+            .arg(r#"cat >/dev/null; echo answered; sleep 0.3; echo done > "$1""#)
+            .arg("sh")
+            .arg(&saved)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take()); // the EOF the handshake gives it
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("answered"));
+        let guard = super::super::ChildGuard::new(child.id());
+        let began = std::time::Instant::now();
+        let_finish(child, lines, guard).await;
+        assert!(began.elapsed() < HANDSHAKE_EXIT, "it ended by itself, not at the deadline");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap().trim(), "done");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole probe against the `claude` on THIS machine — the only test

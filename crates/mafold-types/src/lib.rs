@@ -860,11 +860,44 @@ pub struct Sidecar {
     /// An agent's turn wrote this under a person's account (`a2a.rs`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub by_agent: bool,
+    /// What the sender chose for the link card under this message
+    /// (`chatLinkCards`): absent = the first link in the text gets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_preview: Option<LinkPreviewOptions>,
 }
 
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
-        self.state.is_empty() && !self.state_more && !self.by_agent
+        self.state.is_empty() && !self.state_more && !self.by_agent && self.link_preview.is_none()
+    }
+}
+
+/// The sender's word on a message's link card — `sendMessage`'s
+/// `link_preview_options`, Telegram's name and shape. The card itself is never
+/// sent: every reader asks `resolvePage` for the URL, so all a sender decides
+/// is which link, or none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkPreviewOptions {
+    /// No card: the links stay links.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_disabled: bool,
+    /// The link that gets the card, as written in the text. Absent = the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl LinkPreviewOptions {
+    /// What is worth keeping of a sender's choice for `text`: a URL the text
+    /// does not contain (or one too long to be fetched) says nothing, and a
+    /// choice that says nothing is no choice.
+    pub fn kept_for(mut self, text: &str) -> Option<Self> {
+        if self.url.as_deref().is_some_and(|u| u.is_empty() || u.len() > 2048 || !text.contains(u)) {
+            self.url = None;
+        }
+        if self.is_disabled {
+            self.url = None;
+        }
+        (self.is_disabled || self.url.is_some()).then_some(self)
     }
 }
 
@@ -958,6 +991,10 @@ pub struct PageSlot {
     pub domain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// What the page says it is about (og:description → meta description):
+    /// a post's words on X, a profile's line on 小红书.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// The re-hosted icon.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "opt_file_ref")]
     pub icon: Option<FileRef>,
@@ -1993,3 +2030,23 @@ mod langpack_checksum_tests {
     }
 }
 pub mod tutorial;
+
+#[cfg(test)]
+mod link_preview_tests {
+    use super::*;
+
+    #[test]
+    fn a_link_preview_choice_keeps_only_what_the_text_backs() {
+        let t = "a https://a.example/1 b https://b.example/2";
+        let pick = |u: &str| LinkPreviewOptions { is_disabled: false, url: Some(u.into()) };
+        assert_eq!(pick("https://b.example/2").kept_for(t), Some(pick("https://b.example/2")));
+        assert_eq!(pick("https://c.example/").kept_for(t), None, "not in the text");
+        assert_eq!(pick("").kept_for(t), None);
+        assert_eq!(LinkPreviewOptions::default().kept_for(t), None, "says nothing");
+        let off = LinkPreviewOptions { is_disabled: true, url: Some("https://a.example/1".into()) };
+        assert_eq!(off.kept_for(t), Some(LinkPreviewOptions { is_disabled: true, url: None }));
+        let empty = Sidecar { link_preview: Some(LinkPreviewOptions { is_disabled: true, url: None }), ..Default::default() };
+        assert!(!empty.is_empty(), "a choice is worth carrying");
+        assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({"link_preview": {"is_disabled": true}}));
+    }
+}

@@ -76,6 +76,14 @@ pub struct FieldSpec {
     /// `label_key` / `placeholder_key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint_key: Option<String>,
+    /// The options a picker shows up front, in this order, each with one line
+    /// on what it's good for (`label`, langpack `label_key`); the rest of
+    /// `options` sit behind "All". The first is the one a new pick starts on
+    /// (ops 11-14: "默认model选一个好的"), which is why it is not `default`:
+    /// that one is what an agent with nothing saved RUNS, and moving it would
+    /// move every such agent. A value not among `options` is skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub featured: Vec<FieldOption>,
 }
 fn yes() -> bool {
     true

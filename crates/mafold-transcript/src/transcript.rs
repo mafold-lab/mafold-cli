@@ -205,6 +205,13 @@ pub struct Transcript {
     /// Parts of cards this turn rendered that only some readers may read —
     /// state for whoever posts the reply to write ([`Transcript::take_private`]).
     private: Vec<crate::render::PrivateItem>,
+    /// No working shown ([`Transcript::quiet`]): tool steps draw nothing and
+    /// the turn ends without its stamp.
+    quiet: bool,
+    /// A quiet tool step stood between the narration so far and whatever is
+    /// said next — which then starts a paragraph of its own, the way it would
+    /// have below the step's card.
+    quiet_break: bool,
     /// See [`Tap`]. Kept by a clone, so a transcript put back after a broken
     /// step goes on telling the same listener.
     tap: Option<Tap>,
@@ -338,6 +345,8 @@ impl Transcript {
             groups: 0,
             last_group: (HashMap::new(), 0),
             private: Vec::new(),
+            quiet: false,
+            quiet_break: false,
             tap: None,
             brain: false,
         }
@@ -368,6 +377,17 @@ impl Transcript {
         let mut copy = self.clone();
         copy.tap = None;
         copy
+    }
+
+    /// A reply that shows none of its working: no tool cards, no
+    /// `{% mafold/result %}` stamp at the end — only what was said, and the
+    /// cards the model wrote. For a voice that has to read as a person
+    /// talking, not a machine running (the onboarding stage's clerk: a
+    /// newcomer's first sight was «Ran 1 tool» and «2.3 s · 23.4K tok», owner
+    /// 2026-11-07). The stats are still kept; nothing draws them.
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
+        self
     }
 
     /// Commit as much pending narration as the text policy allows. Called on
@@ -464,6 +484,16 @@ impl Transcript {
     pub fn seal(&mut self) {
         self.flush_text_all();
         self.close_group();
+    }
+
+    /// Commit everything pending, then rewrite the whole reply with `f` — for
+    /// a caller that must take something back out of a reply at its end (a
+    /// line its model copied out of its own history). The next snapshot is a
+    /// rewrite; an append-only consumer just resyncs to the new end.
+    pub fn rewrite_content(&mut self, f: impl FnOnce(&str) -> String) {
+        self.seal();
+        self.full = f(&self.full);
+        self.emitted = self.emitted.min(self.full.len());
     }
 
     /// The private parts of cards rendered since the last call: controlled
@@ -578,6 +608,14 @@ impl Transcript {
                 // transcript is a time series, and text that arrived after a
                 // tool call must not be printed above it.
                 self.close_group();
+                if !t.is_empty() && std::mem::take(&mut self.quiet_break) {
+                    let said = if self.buf.is_empty() { &self.full } else { &self.buf };
+                    let have = said.len() - said.trim_end_matches('\n').len();
+                    let lead = t.len() - t.trim_start_matches('\n').len();
+                    for _ in (have + lead)..2 {
+                        self.buf.push('\n');
+                    }
+                }
                 self.buf.push_str(t);
                 if self.buf.len() >= TEXT_BATCH {
                     self.flush_text();
@@ -638,6 +676,10 @@ impl Transcript {
                 Advance::Immediate
             }
             AgentEvent::Notice(_) => Advance::Quiet,
+            AgentEvent::Done { .. } if self.quiet => {
+                self.seal();
+                Advance::Done
+            }
             AgentEvent::Done { duration_ms, cost_usd, tokens } => {
                 self.seal();
                 let rendered = if let Some(stats) = self.stats.as_mut() {
@@ -689,6 +731,14 @@ impl Transcript {
                     }
                     None => Advance::Quiet,
                 }
+            }
+            // A quiet reply's working draws nothing; what is said after it
+            // starts a paragraph of its own.
+            _ if self.quiet => {
+                if !(self.full.is_empty() && self.buf.is_empty()) {
+                    self.quiet_break = true;
+                }
+                Advance::Quiet
             }
             // tool / diff / bash result / thinking → into the current group.
             _ => {
@@ -990,6 +1040,37 @@ mod tests {
         assert_eq!(md.matches("{% mafold/tool").count(), 1, "{md}");
         assert!(md.contains("pnpm test") && md.contains("42 passed"), "{md}");
         assert!(md.contains("{% mafold/run summary=\"Ran 1 shell command\""), "{md}");
+    }
+
+    /// A quiet reply is only what was said and the cards the model wrote: no
+    /// run card, no fold, no stamp — and what came after a step still starts
+    /// a paragraph of its own, not glued to the sentence before it.
+    #[test]
+    fn a_quiet_reply_shows_what_was_said_and_none_of_its_working() {
+        let mut t = Transcript::new().quiet();
+        t.push(&AgentEvent::Stats(crate::RunStats::default()));
+        assert_eq!(t.push(&call("a", "show_menu", json!({"done":"look"}))), Advance::Quiet);
+        assert_eq!(t.push(&result("a", "The menu goes under your reply")), Advance::Quiet);
+        t.push(&AgentEvent::Text("Hi linsky，我是 camellia。".into()));
+        t.push(&call("b", "open_url", json!({"url":"https://example.com"})));
+        t.push(&result("b", "page text"));
+        t.push(&AgentEvent::Text("看完了。\n{% mafold/html %}<b>toy</b>{% /mafold/html %}".into()));
+        t.push(&call("c", "make_toy", json!({"kind":"gomoku"})));
+        t.push(&AgentEvent::Text("\n\n点一个就行".into()));
+        assert_eq!(t.push(&AgentEvent::Done { duration_ms: Some(2300.0), cost_usd: None, tokens: Some(23_400) }), Advance::Done);
+        let md = t.finish_folded();
+        assert_eq!(
+            md,
+            "Hi linsky，我是 camellia。\n\n看完了。\n{% mafold/html %}<b>toy</b>{% /mafold/html %}\n\n点一个就行"
+        );
+        // The same events, not quiet: the working is there.
+        let mut loud = Transcript::new();
+        loud.push(&AgentEvent::Stats(crate::RunStats::default()));
+        loud.push(&AgentEvent::Text("Hi.".into()));
+        loud.push(&call("a", "show_menu", json!({})));
+        loud.push(&AgentEvent::Done { duration_ms: Some(1.0), cost_usd: None, tokens: None });
+        let md = loud.finish_folded();
+        assert!(md.contains("{% mafold/run") && md.contains("{% mafold/result"), "{md}");
     }
 
     /// Narration that arrives AFTER a tool call must print after it. A

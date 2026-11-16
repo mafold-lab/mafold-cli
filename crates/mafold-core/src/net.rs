@@ -93,6 +93,33 @@ fn unwrap_envelope_ex(status: u16, method: &str, text: String) -> Result<String,
     }
 }
 
+/// The page's own early answer to `getLangPackDiff {lang, from_version: 0}`,
+/// if it asked one (mafold-web/src/app/app/langPrefetch.ts): the request goes
+/// out from the HTML's first line, a second before this core exists, and is
+/// left on `globalThis.__mafoldLangPrefetch[lang]` as a promise of the reply's
+/// text. Taken once. `None` whenever there is none, it failed, or it wasn't an
+/// `ok` envelope — the caller then asks the server itself, as it always did.
+#[cfg(target_arch = "wasm32")]
+pub async fn primed_langpack(lang: &str) -> Option<String> {
+    use wasm_bindgen::JsCast;
+    let bag = js_sys::Reflect::get(&js_sys::global(), &"__mafoldLangPrefetch".into()).ok()?;
+    if !bag.is_object() {
+        return None;
+    }
+    let key: wasm_bindgen::JsValue = lang.into();
+    let pending = js_sys::Reflect::get(&bag, &key).ok()?;
+    let _ = js_sys::Reflect::delete_property(bag.unchecked_ref::<js_sys::Object>(), &key);
+    let pending = pending.dyn_into::<js_sys::Promise>().ok()?;
+    let text = wasm_bindgen_futures::JsFuture::from(pending).await.ok()?.as_string()?;
+    unwrap_envelope_ex(200, "getLangPackDiff", text).ok()
+}
+
+/// Native clients have no page to have asked early.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn primed_langpack(_lang: &str) -> Option<String> {
+    None
+}
+
 /// Legacy flat-string surface (existing FFI callers). Same behaviour as before:
 /// api errors collapse to their description string.
 pub async fn rpc(base: &str, token: &str, method: &str, body: &str) -> Result<String, String> {

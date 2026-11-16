@@ -69,7 +69,8 @@ use FlagServer::{ClosedWithoutRecord, NotRead, OpenWithoutRecord};
 pub const KNOWN_FLAGS: &[FlagMeta] = &[
     // `provider:<id>` holds a connection provider back for a cohort: "add a
     // connection" offers it only where the flag resolves on (web's
-    // `providerOffered`). Google's app is in Testing — Google lets only listed
+    // `providerOffered`; the onboarding guide asks the same before it names
+    // Google). Google's app is in Testing — Google lets only listed
     // test accounts consent — so its rollout is an account list, not a percent.
     FlagMeta {
         key: "provider:google",
@@ -77,11 +78,12 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         dev_default: true,
         label: "Google connection",
         description: "Offers Google (Gmail + Calendar) under Add connection. Its Google app is in \
-                      Testing: only invited test accounts can consent.",
+                      Testing: only invited test accounts can consent. The onboarding guide reads \
+                      it too, to offer Gmail only where the card can open it.",
         owner: "ops",
         added: "2026-09",
         clients: &[Web],
-        server: NotRead,
+        server: ClosedWithoutRecord,
     },
     // ModelArk (a user's OWN Seedance key) is held back until the video line's
     // e2e passes on devapi (@realopsdu 2026-10-06). Registered BEFORE the
@@ -597,6 +599,27 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // One request card for every consent (ops 11-11, on opus48's 14-card set):
+    // Mafold asks, the request is held by the server beside the card, and the
+    // tap names only a choice among what the card offered. Only the api reads
+    // it — it decides which card a request is posted as, keyed on whoever is
+    // being asked; the card draws whatever it is sent.
+    FlagMeta {
+        key: "consentV2",
+        default: false,
+        dev_default: false,
+        label: "Requests: one consent card",
+        description: "A request to use a connection, spend from a wallet, read a chat or build \
+                      apps is posted as one card, mafold/consent: who asks, what of yours, why in \
+                      its own words, and the length, cap or scopes as choices, the asked one picked. \
+                      The request is held by the server; a tap carries only the choice. Allowed \
+                      cards say what was given and until when, and can take it back. Off = the four \
+                      cards of before.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     // The update pill and its loading screen (owner 10-22, demo upd-demo v4:
     // copy 「A 说清楚」, loading screen 「A 回到徽章」). Two flags, not one: the
     // loading screen is seen on every open and may go out on its own, ahead
@@ -717,6 +740,29 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         added: "2026-11",
         clients: &[Web],
         server: NotRead,
+    },
+    // linsky/opsdu 11-14: a link in a chat message draws a card under it, the
+    // way WeChat draws a shared link — the page's name, title, words and
+    // picture, from the same page cache the garden's site cards read
+    // (`resolvePage`). The composer shows the card before it goes, with a ✕
+    // to send the link bare. Server-read: `resolvePage` answers for pages
+    // with this on (as it does with inlineMedia), and `sendMessage` keeps the
+    // sender's `link_preview_options` only from someone it is on for.
+    FlagMeta {
+        key: "chatLinkCards",
+        default: false,
+        dev_default: true,
+        label: "Chat: link cards",
+        description: "A link in a message draws a card under it: the site's name and icon, the \
+                      page's title, a line of what it says and its picture (resolvePage, the \
+                      cache the garden's site cards share). A message that is only a link becomes \
+                      the card. The composer shows the card above the box before sending, with a \
+                      ✕ to send the link bare and a switch when the text has several links. \
+                      Off = links stay links, as before.",
+        owner: "linsky",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
     },
     // linsky 11-13: the old garden's 收藏, native in the drawer that replaced the garden page —
     // a 收藏 tab between Works and Tasks, read from the garden's pins (GET /api/pins).
@@ -1110,6 +1156,28 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web],
         server: NotRead,
     },
+    // ops 11-14: an agent uses a site tab on the desktop app, with its cursor
+    // on the site and real clicks (mafold-use). The `mafold/browse` card asks;
+    // the shell's own dialog lets it in (cap `site-agent`). Needs `inAppBrowser`.
+    // Web reads it (mafold-web lib/agentTabs.ts); the api reads it for whether
+    // an agent is offered the card (the manifest's `agent.flag`).
+    FlagMeta {
+        key: "agentTabs",
+        default: false,
+        dev_default: true,
+        label: "Agents can use a tab in the desktop app",
+        description: "On the desktop app, an agent's mafold/browse card can open a site tab and, once \
+                      you allow it in the app's own dialog, look at the site and click, type and \
+                      scroll in it, with its cursor drawn on the site and a Stop bar over it. Never \
+                      a password field, never another tab. Needs links in the app (inAppBrowser) and \
+                      a shell that offers it. Agents are told about the card only where this is on \
+                      for their owner (listCards `offered`). Off = the card says it can't open a \
+                      tab here, and agents aren't offered it.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: ClosedWithoutRecord,
+    },
     // ops 11-02: opening an app shifts the columns one place left instead of
     // asking Full or Split. Client-only (client-shared/appBeside.ts).
     FlagMeta {
@@ -1207,6 +1275,25 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       Mafold's Search Console (GOOGLE_SEARCH_KEY). Needs the sites Worker that \
                       answers the files (sites@). Off = no switch, and the api refuses to turn \
                       one on.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-15 「Show it to new users」 then 「用icon」: a newcomer's Spaces show an
+    // example site (Skyclock) beside New space, until they have one of their
+    // own. Which site is the example is a setting on the server
+    // (`setSiteExample`); this decides who is shown it. listSites says, so no
+    // client reads it.
+    FlagMeta {
+        key: "spaceExample",
+        default: false,
+        dev_default: false,
+        label: "Example space for newcomers",
+        description: "Someone with no site of their own (nor their agents') sees the example \
+                      sites in their Spaces, marked Example, beside New space; its page offers \
+                      Make your own. Which sites are examples is set with setSiteExample. \
+                      Read by listSites; no client reads it. Off = no example.",
         owner: "ops",
         added: "2026-11",
         clients: &[],
@@ -1391,19 +1478,20 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         server: NotRead,
     },
     // Moments rows fold long posts the way X does (ops 11-13, "Fold + short
-    // leads": a 1,306px @gemini post was 1.5 screens of a phone). One key for
-    // web and phone: the rule is client-shared/momentFold.ts. The public
-    // mafold.com/@ pages have no signed-in reader to ask, so they fold when
-    // this goes to everyone and the gate comes out.
+    // leads": a 1,306px @gemini post was 1.5 screens of a phone). The rule is
+    // client-shared/momentFold.ts. On for everyone 11-13 (audit #167), then
+    // the gate came out: every row folds, the public mafold.com/@ pages too
+    // (they have no signed-in reader to ask). Web up to 0.1.230 and app.js up
+    // to 71 still read the key, so its record stays on.
     FlagMeta {
         key: "momentFold",
         default: false,
         dev_default: false,
         label: "Moments: fold long posts in the feed",
-        description: "A feed row shows a post's words up to 280 characters (140 Chinese), then \
-                      \"… Show more\", and one box under them with its first picture, clip or \
-                      card, 16:9 at most; a taller card fades at the box's foot. Tapping the \
-                      row opens the post with everything. Off = every post in full.",
+        description: "Retired: every feed row folds now, its words up to 280 characters (140 \
+                      Chinese), then \"… Show more\", and one box under them with its first \
+                      picture, clip or card. Only web up to 0.1.230 and app.js up to 71 read \
+                      this key: keep it on so they fold too. Off = those show every post in full.",
         owner: "ops",
         added: "2026-11",
         clients: &[Web, Phone],
@@ -1429,6 +1517,64 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // GIF search in the sticker panel (ops 11-14: 「搜索功能接一下Google的那个gif
+    //工具」 → Tenor is gone → KLIPY). The search box says "Search KLIPY" and its
+    // answers show as their own section under your stickers; a tapped GIF is
+    // kept on our CDN (gif.keep) and sent as a sticker. Needs stickerSets (the
+    // panel with the bar). The two routes answer everyone: a search costs a
+    // cached KLIPY call, a keep is an ingest like any upload.
+    FlagMeta {
+        key: "stickerGifs",
+        default: false,
+        dev_default: false,
+        label: "Stickers: GIF search (KLIPY)",
+        description: "The sticker panel's search box says \"Search KLIPY\" and also finds GIFs: \
+                      they show under your own stickers, in KLIPY's order. Tap one to send it; \
+                      it is copied to Mafold's CDN first, so it stays in the chat and can be \
+                      added to your stickers. Only with stickerSets on. Off = the search finds \
+                      your stickers only.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // Drag a sticker to a new place in the composer sheet's sticker panel (ops
+    // 11-14: 「这个stickers的composer sheet 我要能拖动表情包来调整位置」, demo
+    // OK'd "Build it"). Client only: it moves stickers with sticker.move, the
+    // call Settings ▸ Stickers already makes. Needs stickerSets (the panel).
+    FlagMeta {
+        key: "stickerDrag",
+        default: false,
+        dev_default: false,
+        label: "Stickers: drag to reorder in the sticker panel",
+        description: "In the composer's sticker panel, drag a sticker to a new place: within its \
+                      set, into another set's section, or onto a set's tab (it goes first there). \
+                      On a computer it lifts once the pointer moves; on the phone, hold it first. \
+                      A tap still sends. Only with stickerSets on. Off = tap to send only.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // Clear history can also clear the other person's side of a one-to-one
+    // chat (ops 11-15: 「根本无法delete all」, after an agent kept answering
+    // from a chat he had cleared; "Build it"). Client only: the dialog gains
+    // "Also delete for @name" and clears through clearHistory, which covers
+    // the whole chat instead of the messages the app had loaded.
+    FlagMeta {
+        key: "clearForBoth",
+        default: false,
+        dev_default: false,
+        label: "Clear history: also delete for the other person",
+        description: "In a one-to-one chat, Clear conversation history asks whether to also delete \
+                      for the other person. On: the words are taken back for both and neither side \
+                      keeps the rows. Either way the whole chat is cleared on the server, not just \
+                      what the app had loaded. Off = clears only the loaded messages, for you.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
     // $1 in every new wallet (ops 11-13 「1$ in every new users wallet」, then
     // "No limit"): minted straight into the wallet at sign-up, no packet to
     // open. Read for the account being registered, so it is turned on for
@@ -1444,6 +1590,27 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         owner: "ops",
         added: "2026-11",
         clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    // The onboarding guide greets newcomers (ops 11-13 「这个变成一个mafold
+    // harness的一个plugin 这个onboarding agent会启用」, account @zhenchendu):
+    // a new account whose flag is on gets its welcome DM from the guide, who
+    // speaks first, instead of @mafold's three fixed messages. Read at sign-up
+    // for the account being made, so a rollout is On for everyone, or a list
+    // of test accounts on dev.
+    FlagMeta {
+        key: "onboardingClerk",
+        default: false,
+        dev_default: false,
+        label: "Newcomers greeted by the onboarding guide",
+        description: "A new account's welcome DM is with the onboarding guide (@zhenchendu), \
+                      who opens it in its own words on the onboarding plugin's handbook. Off = \
+                      @mafold's steward line, card and choice card, as before. On for an \
+                      account, its apps don't open the Activity Center by themselves on a first \
+                      visit, and the web opens the guide's chat instead.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
 ];
@@ -1630,6 +1797,27 @@ mod tests {
     }
 
     #[test]
+    fn chat_link_cards_ship_dark() {
+        let m = meta("chatLinkCards").expect("chatLinkCards registered");
+        assert!(!m.default, "off in production until a record opens it");
+        assert_eq!(m.clients, &[Web, Phone]);
+        assert_eq!(m.server, ClosedWithoutRecord, "resolvePage and sendMessage read it");
+        assert!(!server_default("chatLinkCards"));
+    }
+
+    #[test]
+    fn one_consent_card_is_shut_without_a_record() {
+        // It changes how every grant is asked for and answered: opened on
+        // purpose, account by account.
+        let m = meta("consentV2").expect("consentV2 registered");
+        assert!(!m.default && !m.dev_default);
+        assert!(m.clients.is_empty(), "the api decides; no client reads it");
+        assert_eq!(m.server, ClosedWithoutRecord);
+        assert!(!server_default("consentV2"));
+        assert_eq!(server_key("consentV2"), "consentV2");
+    }
+
+    #[test]
     fn new_friends_card_ships_dark_everywhere() {
         // Off in production until ops opens it, and off in dev builds too:
         // the api reads it (it opens the card's one mark), and a dev client
@@ -1668,6 +1856,16 @@ mod tests {
             assert!(!server_default(key));
             assert_eq!(server_key(key), key);
         }
+    }
+
+    #[test]
+    fn the_example_space_ships_dark_and_only_the_api_reads_it() {
+        let m = meta("spaceExample").expect("spaceExample registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev builds");
+        assert!(m.clients.is_empty(), "listSites says whether there is an example");
+        assert_eq!(m.server, ClosedWithoutRecord);
+        assert!(!server_default("spaceExample"));
+        assert_eq!(server_key("spaceExample"), "spaceExample");
     }
 
     #[test]

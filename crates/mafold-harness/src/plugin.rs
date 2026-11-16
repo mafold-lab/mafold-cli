@@ -132,6 +132,12 @@ pub trait HarnessPlugin: Send + Sync {
         None
     }
 
+    /// Does this turn's reply hide its working — no tool cards, no result
+    /// stamp ([`Transcript::quiet`])? Any plugin saying so makes it quiet.
+    fn quiet(&self, _ctx: &TurnCtx) -> bool {
+        false
+    }
+
     /// Fresh per-turn scratch state, handed back to `execute`/`finish`.
     fn new_turn(&self) -> Box<dyn std::any::Any + Send> {
         Box::new(())

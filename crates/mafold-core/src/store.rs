@@ -213,10 +213,17 @@ impl<S: Storage> Store<S> {
         // `a.b.c` keys, even though one tier had arrived intact. Whatever we got
         // goes in; whatever we missed falls back to the on-device cache of the
         // same cloud pack; the error is reported so the host can retry.
-        let en = self.sync_pack(base, token, "en").await;
-        let active = match code {
-            "en" => None,
-            _ => Some(self.sync_pack(base, token, code).await),
+        //
+        // The two tiers are fetched TOGETHER: neither depends on the other, and
+        // one after the other a first-time Chinese reader waited two round
+        // trips on a blank screen instead of one.
+        let (en, active) = match code {
+            "en" => (self.sync_pack(base, token, "en").await, None),
+            _ => {
+                let (en, active) =
+                    futures::join!(self.sync_pack(base, token, "en"), self.sync_pack(base, token, code));
+                (en, Some(active))
+            }
         };
 
         // Cache reads happen HERE, before the lock: `lang` is a std RwLock whose
@@ -309,7 +316,18 @@ impl<S: Storage> Store<S> {
         let mut cached = self.cached_pack(lang).await;
         let body =
             serde_json::json!({ "lang_code": lang, "from_version": cached.version }).to_string();
-        let resp = crate::net::rpc(base, token, "getLangPackDiff", &body).await?;
+        // Nothing cached ⇒ the page may already have asked this exact question
+        // from its first line (mafold-web langPrefetch.ts), while its scripts
+        // and this core were still loading. Take that answer instead of asking
+        // again a second later; anything wrong with it ⇒ ask as before.
+        let primed = match cached.version {
+            0 => crate::net::primed_langpack(lang).await,
+            _ => None,
+        };
+        let resp = match primed {
+            Some(r) if serde_json::from_str::<DiffResp>(&r).is_ok() => r,
+            _ => crate::net::rpc(base, token, "getLangPackDiff", &body).await?,
+        };
         let diff: DiffResp = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
         for (k, v) in diff.strings {
             cached.strings.insert(k, v);
