@@ -168,6 +168,11 @@ struct IncomingMessage {
     /// US is how the daemon learns it was just dropped into a group.
     #[serde(default)]
     service: Option<ServiceNotice>,
+    /// When a PERSON last edited this message (`Store::edit_message`; an
+    /// author's card rewrite never sets it). Read on `messageEdited` only —
+    /// see [`edit_steers`].
+    #[serde(default)]
+    edited_at: Option<String>,
 }
 
 /// A service notice's server-stamped shape (`chat_api::post_service_notice`).
@@ -1355,6 +1360,33 @@ async fn fetch_missed(client: &Client, since: u64, since_at: Option<&str>, what:
 /// (`fire_bots_on_finish`), so a finish is judged alike on both bot families.
 fn machine_authored(sender_kind: &str, via_finish: bool) -> bool {
     via_finish || sender_kind.eq_ignore_ascii_case("bot")
+}
+
+/// How old an edit may be and still count. `messageEdited` is not replayed
+/// after a reconnect, but the same frame also goes out when an author rewrites
+/// its own card or hangs a picture on a finished message — and that copy still
+/// carries the edit from days ago, which must not ask again.
+const EDIT_FRESH: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Does this `messageEdited` frame mean a PERSON just reworded something they
+/// said (ops 11-18)? Then it goes the way a new message goes: into the reply
+/// running on its surface as a steer, or — that reply finished — a new turn,
+/// whenever the edited words call me (an @, a reply to me, a DM: the gates
+/// below don't change). Never an agent's edit: bots stamp their own cards
+/// with `editMessage` all day, and one replying to me would ask me again on
+/// every stamp — the loop this keeps shut.
+fn edit_steers(m: &IncomingMessage, my_username: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let fresh = m
+        .edited_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| now.signed_duration_since(t) < EDIT_FRESH);
+    fresh
+        && m.service.is_none()
+        && m.forwarded_from.is_none()
+        && !m.by_agent
+        && !machine_authored(&m.sender.kind, false)
+        && !m.sender.username.eq_ignore_ascii_case(my_username)
 }
 
 /// Did THIS sender address the bot in THIS message? An `@handle` in the words the
@@ -4940,7 +4972,10 @@ async fn connect_and_run(
             }
             continue;
         }
-        let Some(raw_msg) = trigger_message(method, &env) else { continue };
+        // A person's edit of their own message (`edit_steers`) — taken past
+        // here only when it is one, and then down the same road as a message.
+        let edit = method == "events.messageEdited";
+        let Some(raw_msg) = trigger_message(method, &env).or_else(|| edit.then(|| env["params"].clone())) else { continue };
         // A finished stream is machine-authored whatever the account kind says
         // — see `machine_authored`.
         let via_finish = method == "events.messageComplete";
@@ -4953,6 +4988,9 @@ async fn connect_and_run(
             .cloned()
             .unwrap_or_default();
         let m: IncomingMessage = match serde_json::from_value(raw_msg) { Ok(m) => m, Err(_) => continue };
+        if edit && !edit_steers(&m, my_username, std::time::SystemTime::now().into()) {
+            continue;
+        }
         // SERVICE NOTICE — "X joined", "bot Y was added", "renamed to Z". Never
         // a prompt (it always falls through to `continue` below), but the one
         // naming US is the daemon finding out it was just dropped into a group.
@@ -5085,8 +5123,16 @@ async fn connect_and_run(
         // half-seen pair can't slip through; the set is process-local — across
         // restarts the pinned cursor is what prevents replays.
         {
-            let mut fresh = if m.id.is_empty() { true } else { seen.insert(&format!("id|{}", m.id)) };
-            if let Some(cid) = m.client_msg_id.as_deref() {
+            // An edit is the same row and the same send, said anew: it is
+            // keyed by when it was made, so each edit counts once.
+            let mut fresh = if edit {
+                seen.insert(&format!("edit|{}|{}", m.id, m.edited_at.as_deref().unwrap_or("")))
+            } else if m.id.is_empty() {
+                true
+            } else {
+                seen.insert(&format!("id|{}", m.id))
+            };
+            if let Some(cid) = m.client_msg_id.as_deref().filter(|_| !edit) {
                 fresh &= seen.insert(&format!("send|{}|{sender_lc}|{cid}", m.conversation_id));
             }
             if !fresh {
@@ -5118,6 +5164,12 @@ async fn connect_and_run(
         };
         if let_in && !allowed {
             println!("← @{} (not on the allow-list — but this answers my own card, so it's my request)", m.sender.username);
+        }
+        if !let_in && edit {
+            // Their first version already got its answer here, gate card and
+            // all; rewording it is not another knock.
+            println!("← @{} (not on the allow-list → their edit is ignored)", m.sender.username);
+            continue;
         }
         if !let_in {
             // Non-whitelisted sender. If a HUMAN @-mentioned me (directed at me,
@@ -5180,6 +5232,14 @@ async fn connect_and_run(
 
         let trimmed = m.content.trim();
 
+        // An edit asks again: it is never a sign-in code, an answer to a
+        // question, a rewrite request or a command a second time. Those were
+        // the first version's to be, once.
+        if edit && trimmed.starts_with('/') {
+            println!("  (an edited /command → not run again)");
+            continue;
+        }
+
         // If a `/login` in this chat is waiting for the pasted Authentication
         // Code, this message IS that code — feed it to the login process (don't
         // treat it as a prompt). `/stop` cancels the sign-in. Only the SAME sender
@@ -5194,7 +5254,7 @@ async fn connect_and_run(
                 }
             })
         };
-        if let Some((tx, login_channel)) = pending_login {
+        if let Some((tx, login_channel)) = pending_login.filter(|_| !edit) {
             // Answer where the sign-in is happening — the channel `/login` was
             // started in, not wherever the code happened to be pasted.
             let dest = Dest::chat(&m.conversation_id).channel(login_channel.as_deref());
@@ -5221,7 +5281,7 @@ async fn connect_and_run(
         // the draft was put in front of one person, and nobody else's words
         // get to become the version that goes public.
         let redraft = match m.reply_to_id.as_deref() {
-            Some(rid) if !trimmed.is_empty() => pending_reviews
+            Some(rid) if !trimmed.is_empty() && !edit => pending_reviews
                 .lock()
                 .await
                 .get(rid)
@@ -5286,7 +5346,7 @@ async fn connect_and_run(
         // never a yes (only a tap on its card approves; `Answer::Words`).
         // Refused, the reply goes on as words to the running turn. `/stop`
         // falls through to cancel instead.
-        if let Some(rid) = m.reply_to_id.as_deref() {
+        if let Some(rid) = m.reply_to_id.as_deref().filter(|_| !edit) {
             // `/stop` falls through to cancel instead of being read as an answer.
             if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
                 let standing = allow.read().await.standing(&sender_lc, None);
@@ -5397,7 +5457,10 @@ async fn connect_and_run(
         if !should_respond(client, &m.conversation_id, my_username, agent_wrote, m.forwarded_from.is_some(), &m.content, reply_to_me, sender_pays, chat_states).await {
             println!("  (group/bot · not @{my_username} → skip)");
             // Not for me — but said where I may be working (`note_in_running_turns`).
-            feed_background(chat_states, &m, &raw_attachments, is_forward).await;
+            // An edit was background once already.
+            if !edit {
+                feed_background(chat_states, &m, &raw_attachments, is_forward).await;
+            }
             continue;
         }
 
@@ -5630,7 +5693,7 @@ async fn connect_and_run(
             // answer: a guest typing `allow` under the owner's permission
             // prompt), and stamping their words into it would show «allowed»
             // over a prompt still waiting.
-            if let Some(rid) = reply_to_id.as_deref() {
+            if let Some(rid) = reply_to_id.as_deref().filter(|_| !edit) {
                 if !has_turn(&chat_states, &chat_id, Some(rid)).await {
                     // THE ONE THE USER REPORTED. `channel_id` used to be dropped
                     // here, so an ask card posted in a forum channel was looked for
@@ -5692,6 +5755,8 @@ async fn connect_and_run(
                     pays: sender_pays,
                 };
                 let carried = steering::carried(attachments.iter().map(|a| a.kind.as_str()));
+                // An edit's line in the reply says it is one.
+                let carried = if edit { format!("{carried} {}", steering::EDIT_MARK).trim().to_string() } else { carried };
                 // Once, on going into the line: the running reply hears that
                 // it is coming — so it neither answers it nor tells the room
                 // somebody else has it (10-30 22:42Z) — and the room hears it waits.
@@ -5718,6 +5783,7 @@ async fn connect_and_run(
                         let _ = client.send_to(dest, &note).await;
                     }
                 };
+                let (client_ref, attachments_ref) = (&client, &attachments);
                 let steered = steer_in_order(
                     &chat_states, &arrived, &chat_id, channel_id.as_deref(), thread_root.as_deref(),
                     // A bot passing on someone outside the owner's circle is
@@ -5727,7 +5793,11 @@ async fn connect_and_run(
                     // Borrows only — the normal-turn path below still owns both,
                     // and re-downloads nothing: whatever this fetched is already
                     // in `~/.mafold/attachments` under the same content name.
-                    |t| attach_context(&client, t, &attachments, &[]),
+                    |t| async move {
+                        let body = attach_context(client_ref, t, attachments_ref, &[]).await;
+                        // Only words that made it into a body are an edit's.
+                        if edit && !body.trim().is_empty() { steering::edited(&body) } else { body }
+                    },
                     waiting,
                 ).await;
                 // The turn it went into, when that is somebody else's.
@@ -5829,6 +5899,9 @@ async fn connect_and_run(
             // finished transcript, and its run groups, tool output and usage
             // stamp are how it got there, not what it is asking.
             let said = mafold_transcript::render::strip_transcript_cards(&said_as);
+            // The session already holds the first version and what was said to
+            // it: the new wording says it replaces that one.
+            let said = if edit { steering::edited(&said) } else { said };
             // Work in a thread (`.docs/a2a-threads.md`): whose thread this is
             // says which of the two jobs the agent has.
             let role = match (&thread_root, agent_wrote && crate::flags::enabled(a2a::FLAG)) {
@@ -8815,7 +8888,23 @@ app built, you can put it online yourself. `mafold sites deploy <folder>` publis
 files (index.html at its root) to `<name>.mafold.app` and prints the address; `--site <name>` updates \
 one you published before, at the same address. What you publish counts against your owner's plan — \
 the refusal says so when it is full. `mafold apps register --help` turns a site into an app people open \
-from a chat.";
+from a chat (`mafold apps init <owner/slug>` scaffolds one).\n\
+AN APP CAN HAVE ITS OWN BACKEND — decide where the data lives first: only for this moment in this chat \
+(a poll, one round of a game) is a `{% mafold/html %}` card with shared state, not an app; only this \
+device's preference is the page's `storage`; data that must outlive the chat and follow people (a team's \
+board, everyone's scores, a person's records) is a backend. A backend is a Worker on the same site, \
+answering `/api/*`, with a SQLite (D1) database of your owner's: `mafold d1 create <db>` (or reuse one \
+from `mafold d1 list`; start every table name with the app's slug), `mafold apps register <owner/slug> \
+--url https://<site>.mafold.app`, `mafold sites worker helper <dir>` (writes the platform's `mafold.js`: \
+`verifyLaunch`, `migrate`, `publish`, `roster`, `json`, `HttpError`), then `mafold sites worker deploy \
+<site> worker.js --dir <dir> --d1 DB=<db> --app <owner/slug>` — `worker.js` is `export default { fetch: \
+json(async (request, env) => …) }` with `env.DB`. Identity is Mafold's, never a sign-up form: the page \
+runs `await Mafold.auth()` and calls its backend with `Authorization: Bearer ${Mafold.initData}` \
+(`Mafold.refreshInitData()` on a 401); the Worker's `verifyLaunch(request, env)` says who is calling \
+(`{ id, owner_id, username, display_name, conv }`) and checks it on every route — key rows on `id`, \
+group data on `conv`. `apps register --methods` declares what agents may call on it (`mafold app call`); \
+`mafold sites call <owner/slug> POST /api/… --json '…'` tries it as yourself; `mafold sites usage` shows \
+the monthly allowance (over it, `/api/*` pauses with 503).";
 
 /// The FORUM CHANNELS paragraph of the preamble. With channels in every chat
 /// (flag `forumEverywhere`, evaluated as this bot — its owner's record covers
@@ -15139,12 +15228,26 @@ mod inbound_file_tests {
     }
 
     /// Every agent can publish a site (11-09); one on a computer does it with
-    /// `mafold sites`, and is told so — except on a guest's turn, since what
-    /// it publishes counts against the owner's plan.
+    /// `mafold sites`, and is told so — the backend too (11-17) — except on a
+    /// guest's turn, since what it publishes counts against the owner's plan.
     #[test]
     fn the_sites_line_teaches_publishing_and_skips_guests() {
         let line = sites_advice(false);
-        for want in ["mafold sites deploy <folder>", "--site <name>", ".mafold.app", "owner's plan", "mafold apps register"] {
+        for want in [
+            "mafold sites deploy <folder>",
+            "--site <name>",
+            ".mafold.app",
+            "owner's plan",
+            "mafold apps register",
+            // The backend half (ops 11-17: agents didn't know apps have one).
+            "mafold d1 create",
+            "mafold sites worker helper",
+            "mafold sites worker deploy",
+            "--app <owner/slug>",
+            "verifyLaunch",
+            "Mafold.initData",
+            "--methods",
+        ] {
             assert!(line.contains(want), "missing {want:?} in {line}");
         }
         assert_eq!(sites_advice(true), "");
@@ -15656,6 +15759,28 @@ mod gate_tests {
         let a = super::event_time("events.messageNew", &json!({"created_at": "2026-09-26T21:19:55.7Z"})).unwrap();
         let b = super::event_time("events.messageNew", &json!({"created_at": "2026-09-26T21:19:55.69Z"})).unwrap();
         assert!(a > b);
+    }
+
+    /// ops 11-18: a person rewording what called me asks again. An agent's
+    /// edit (a card stamp), an old edit carried along by a card rewrite, and
+    /// my own never do.
+    #[test]
+    fn only_a_persons_fresh_edit_steers() {
+        use crate::agent::{edit_steers, IncomingMessage};
+        use serde_json::json;
+        let now: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00Z").unwrap().into();
+        let msg = |sender: serde_json::Value, edited: Option<&str>, extra: serde_json::Value| -> IncomingMessage {
+            let mut v = json!({ "id": "m1", "conversation_id": "c1", "content": "@bot make it blue", "sender": sender, "edited_at": edited });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let ada = json!({ "username": "ada", "kind": "human" });
+        assert!(edit_steers(&msg(ada.clone(), Some("2026-11-18T09:59:30Z"), json!({})), "bot", now));
+        assert!(!edit_steers(&msg(ada.clone(), None, json!({})), "bot", now), "no edited_at: an author's rewrite");
+        assert!(!edit_steers(&msg(ada.clone(), Some("2026-11-16T10:00:00Z"), json!({})), "bot", now), "an old edit riding a card rewrite");
+        assert!(!edit_steers(&msg(json!({ "username": "x:claude", "kind": "bot" }), Some("2026-11-18T09:59:30Z"), json!({})), "bot", now));
+        assert!(!edit_steers(&msg(ada.clone(), Some("2026-11-18T09:59:30Z"), json!({ "by_agent": true })), "bot", now));
+        assert!(!edit_steers(&msg(json!({ "username": "Bot", "kind": "human" }), Some("2026-11-18T09:59:30Z"), json!({})), "bot", now));
     }
 
     /// A streamed reply is born empty and finishes as `messageComplete`. The

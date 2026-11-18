@@ -1178,6 +1178,54 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web],
         server: ClosedWithoutRecord,
     },
+    // ops 11-17 (11-07 design): Settings ▸ Connections ▸ Browsers — your Chrome
+    // and Safari profiles' logins brought into the desktop app's browser, one
+    // session per profile; the `chrome` / `safari` registry rows. Server-read:
+    // putConnection takes those rows only where this is on.
+    FlagMeta {
+        key: "browserProfiles",
+        default: false,
+        dev_default: true,
+        label: "Connections: your Chrome and Safari profiles",
+        description: "Settings ▸ Connections gets a Browsers tab with Chrome and Safari. In the \
+                      desktop app on a Mac it lists the profiles on that computer; Import brings \
+                      one's logins (cookies, as they are now) into Mafold's browser, in a session \
+                      of that profile's own, after one Keychain prompt (Chrome) or Full Disk \
+                      Access (Safari). The logins stay on that computer; the connection row only \
+                      names the profile. Site tabs can then open in that profile. Off = no \
+                      Browsers tab, and the api refuses those rows.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-16: the page of tabs gets the window's three lights, flat (red
+    // closes, yellow minimizes into a "N tabs" pill in the folders row, green
+    // fills the window); a page with no chat open takes the pane; dragging the
+    // chat | page line far left offers "Release to collapse". Phones: links open
+    // in a full-screen browser with one small pill at the bottom. Client-only
+    // (client-shared/appTabs.ts, mafold-rn lib/phoneBrowser.ts).
+    FlagMeta {
+        key: "browserPill",
+        default: false,
+        dev_default: true,
+        label: "Tabs page: lights, minimize, phone browser",
+        description: "Desktop: the page of tabs (apps and sites) starts with the window's three \
+                      lights, flat — red closes it, yellow minimizes it with its tabs still \
+                      running into a \"N tabs\" pill left of + in the chat list's folders row, \
+                      green fills the window. Clicking the pill lists the minimized tabs; picking \
+                      one brings the page back beside the open chat, or over the whole right side \
+                      when no chat is open. Dragging the chat | page line far left shows \
+                      \"Release to collapse\": letting go closes the chat and the page takes the \
+                      right side. Phones: a link opens in a full-screen browser inside the app \
+                      with one small address pill at the bottom; tapping it shows ✕ and ⋯, and ✕ \
+                      asks Close or Minimize. Off = ✕ and ⤢ discs, and links leave the phone \
+                      app for the system browser.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
     // ops 11-02: opening an app shifts the columns one place left instead of
     // asking Full or Split. Client-only (client-shared/appBeside.ts).
     FlagMeta {
@@ -1612,6 +1660,45 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         added: "2026-11",
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
+    },
+    // Sign in with Instagram by DM code (ops 11-17 「想要一个有login with
+    // instagram 会感觉更年轻一点」, "Build it"): the login page offers
+    // "Continue with Instagram" and Settings ▸ Privacy and Security lists an
+    // Instagram row. The signed-out door reads the flag's verdict for no
+    // account, so it opens there only with a rollout of On for everyone.
+    FlagMeta {
+        key: "instagramLogin",
+        default: false,
+        dev_default: false,
+        label: "Sign in with Instagram (DM a code)",
+        description: "The login page offers Continue with Instagram: you send a code to \
+                      @getmafold on Instagram and you're signed in, or a new account is made from \
+                      your Instagram name and picture. Settings ▸ Privacy and Security lists \
+                      Instagram, to link it to an account you already have. Off = neither \
+                      shows; accounts already linked can still sign in and unlink.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    // Staged attachments sync across your devices (ops 11-16: 「如果有
+    // attachments 比如有图片的时候 草稿无法多端同步」, "Build it, 25 MB cap").
+    // Client only: a picked file uploads as it is staged and saveDraft lists it
+    // (the server keeps the list whether or not this is on).
+    FlagMeta {
+        key: "draftFiles",
+        default: false,
+        dev_default: false,
+        label: "Drafts: staged files sync across your devices",
+        description: "A photo or file staged on the input bar uploads right away and shows on \
+                      every device you're signed in on, ready to send from any of them. Files \
+                      over 25 MB stay on the device that picked them; the others show them as \
+                      being on another device. Off = staged files stay on the device that picked \
+                      them and upload when you send.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
     },
 ];
 

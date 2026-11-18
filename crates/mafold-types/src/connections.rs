@@ -537,6 +537,35 @@ const COMPUTER_BINDING: &[SecretField] = &[
     },
 ];
 
+/// A browser profile brought into Mafold's browser (`chrome`, `safari`): which
+/// profile, on which computer. The logins themselves never come here — they
+/// stay in that computer's desktop app, in a session of the profile's own
+/// (mafold-desktop `browserProfiles`); this row is what every other surface
+/// sees of them, and what an agent is given.
+const BROWSER_BINDING: &[SecretField] = &[
+    // The browser's own id for it on that computer (`chrome:Profile 1`),
+    // written by the desktop app that imported it.
+    SecretField {
+        key: "profile",
+        label: "Profile",
+        required: true,
+        issued: true,
+    },
+    SecretField {
+        key: "machine",
+        label: "Machine name",
+        required: false,
+        issued: true,
+    },
+    // When its logins were last brought in, epoch seconds as a string.
+    SecretField {
+        key: "imported_at",
+        label: "Imported at",
+        required: false,
+        issued: true,
+    },
+];
+
 const OAUTH_BAG: &[SecretField] = &[
     SecretField {
         key: "access_token",
@@ -1192,6 +1221,49 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         flag: None,
         oauth_client: None,
     },
+    // Your Chrome and Safari profiles (ops 11-07 design, 11-17 build): the
+    // logins of one profile, brought into Mafold's browser on the Mac that
+    // has it. Nothing is pasted or consented to: the desktop app reads the
+    // profile (one Keychain prompt for Chrome, Full Disk Access for Safari)
+    // and writes this row itself. The cookies never reach the vault — the row
+    // only names the profile and its computer, so `device_bound` and the
+    // `browser` driver, which a client reads as "its own tab, Browsers".
+    ProviderSpec {
+        id: "chrome",
+        display: "Chrome",
+        blurb: "Bring the logins of a Chrome profile into Mafold's browser",
+        badge: "chrome",
+        kind: ProviderKind::ApiKey,
+        fields: BROWSER_BINDING,
+        import_path: None,
+        env_var: None,
+        auth: BEARER,
+        oauth_capable: false,
+        help_url: None,
+        mcp_url: None,
+        native_api: Some("browser"),
+        device_bound: true,
+        flag: Some("browserProfiles"),
+        oauth_client: None,
+    },
+    ProviderSpec {
+        id: "safari",
+        display: "Safari",
+        blurb: "Bring the logins of a Safari profile into Mafold's browser",
+        badge: "safari",
+        kind: ProviderKind::ApiKey,
+        fields: BROWSER_BINDING,
+        import_path: None,
+        env_var: None,
+        auth: BEARER,
+        oauth_capable: false,
+        help_url: None,
+        mcp_url: None,
+        native_api: Some("browser"),
+        device_bound: true,
+        flag: Some("browserProfiles"),
+        oauth_client: None,
+    },
     // Any MCP server the user can name — the one row that is not a vendor.
     //
     // This exists for the vendors this table does not have yet (owner,
@@ -1826,6 +1898,8 @@ mod tests {
                 "github",
                 "google",
                 "computer",
+                "chrome",
+                "safari",
                 "mcp",
             ]
         );
@@ -2710,7 +2784,7 @@ mod tests {
                 panic!("client-shared/connections.cases.json is not the registry — rerun with MAFOLD_WRITE_CASES=1");
             }
         }
-        let tabs = ["logins", "models", "apps", "computers", "secrets"];
+        let tabs = ["logins", "models", "apps", "computers", "browsers", "secrets"];
         let cat = table["category"].as_object().expect("category");
         let ids: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
         for id in &ids {

@@ -124,6 +124,25 @@ unless @{owner} says so.{mic}]\n{}",
     )
 }
 
+/// What the model is told when the person went back and EDITED a message that
+/// called it (ops 11-18: an edited @ or reply steers the reply still running,
+/// and asks again once that reply has finished). Without it the new wording
+/// reads as a second message saying nearly the same thing, and the agent
+/// answers it twice. Who edited is the message's sender: someone other than
+/// the turn's person still gets [`cross_frame`] around this.
+pub fn edited(body: &str) -> String {
+    format!(
+        "[The message that called you was EDITED — what follows is its new wording, replacing \
+what it said before. Go by this version: redo whatever the change affects, and if your \
+answer already covers it, say so in a line.]\n{}",
+        body.trim()
+    )
+}
+
+/// What an edit's [`seam`] carries beside the new words, so the reply shows
+/// the line came from an edit and not from a new message.
+pub const EDIT_MARK: &str = "✏️";
+
 /// The line drawn into the VISIBLE reply where words arrived. Someone else's
 /// carry their name, because the reply they land in is visibly another
 /// person's turn — bare, never `@name`: an @ in a reply summons an agent, and
@@ -389,6 +408,16 @@ pub mod mailbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_says_it_replaces_the_old_wording() {
+        let f = edited("  make it blue  ");
+        assert!(f.starts_with("[The message that called you was EDITED"));
+        assert!(f.ends_with("]\nmake it blue"));
+        // Someone else's edit is still framed as theirs, outside the edit note.
+        let other = cross_frame(&Speaker::person("bob"), "alice", &f);
+        assert!(other.contains("NOT @alice") && other.ends_with("make it blue"));
+    }
 
     struct T {
         owner: &'static str,

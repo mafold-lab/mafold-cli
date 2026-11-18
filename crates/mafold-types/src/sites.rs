@@ -188,3 +188,10 @@ mod tests {
         }
     }
 }
+
+/// `./mafold.js` — the platform's half of every app backend: `verifyLaunch`,
+/// `migrate`, `publish`, `roster`, … The hosted builder ships it beside every
+/// Worker it writes; `mafold sites worker helper` hands an agent on a computer
+/// the same file. Here, not in the api, because the cli is public and builds
+/// without it.
+pub const WORKER_HELPER: &str = include_str!("worker_mafold.js");

@@ -155,6 +155,15 @@ pub enum WorkerCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Write the platform's `mafold.js` into a Worker's folder — `verifyLaunch`
+    /// (who is calling, from the launch token), `migrate`, `publish`,
+    /// `roster`, `json`, `HttpError`: the same file the hosted builder ships
+    /// beside every backend it writes. Run it again to take a newer one.
+    Helper {
+        /// The Worker's folder (default: here). Writes `<DIR>/mafold.js`.
+        #[arg(default_value = ".")]
+        dir: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -443,6 +452,13 @@ pub async fn run(cmd: SitesCmd, client: &Client) -> Result<()> {
                 } else {
                     println!("{site} had no Worker");
                 }
+            }
+            WorkerCmd::Helper { dir } => {
+                let path = Path::new(&dir).join("mafold.js");
+                std::fs::write(&path, mafold_core::mafold_types::sites::WORKER_HELPER)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!("✓ wrote {} — `import {{ verifyLaunch, migrate, publish, json, HttpError }} from './mafold.js'`", path.display());
+                println!("  deploy with --dir {dir} --app <owner/slug>, so verifyLaunch gets MAFOLD_APP_ID + MAFOLD_APP_SECRET");
             }
             WorkerCmd::Resume { site, force } => {
                 let out = client.call("resumeSiteWorker", json!({ "site": site, "force": force })).await?;
