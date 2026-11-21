@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::event::AgentEvent;
+use crate::prose;
 use crate::render::{self, GroupItem, ToolStep};
 
 /// Narration is committed in batches this large so a snapshot isn't rewritten
@@ -171,6 +172,11 @@ pub struct Transcript {
     full: String,
     /// Narration the model has produced but that isn't committed yet.
     buf: String,
+    /// Lines of our own ([`Transcript::insert_raw`]: a steer seam, a notice,
+    /// a usage limit) that arrived while the reply ended inside an open card
+    /// or fence. Put there, a line is part of the card's body; it goes in right
+    /// after the block closes instead ([`Transcript::commit`]).
+    held: String,
     /// The pending consecutive tool cards → one `{% mafold/run %}`. Held as
     /// SLOTS, not as appended text: a call takes its slot immediately (so it
     /// paints right away) and holds it for its result, which is what lets the
@@ -333,6 +339,7 @@ impl Transcript {
             compactions: 0,
             full: String::new(),
             buf: String::new(),
+            held: String::new(),
             group: Vec::new(),
             open: HashMap::new(),
             counts: HashMap::new(),
@@ -402,8 +409,7 @@ impl Transcript {
             return;
         }
         let tagged = self.buf[..n].contains("{%");
-        self.full.push_str(&self.buf[..n]);
-        self.buf.drain(..n);
+        self.commit(n);
         // Only re-canonicalise when a tag actually landed: `qualify` walks the
         // whole message, and most commits are plain prose.
         if tagged {
@@ -413,10 +419,35 @@ impl Transcript {
 
     fn flush_text_all(&mut self) {
         if !self.buf.is_empty() {
-            self.full.push_str(&self.buf);
-            self.buf.clear();
+            self.commit(self.buf.len());
         }
         self.full = (self.qualify)(&self.full);
+    }
+
+    /// Move the first `n` bytes of pending narration into the reply, and with
+    /// them the [`held`] lines, right after the close of the block they waited
+    /// on once this text closes it.
+    ///
+    /// The block is found again on every commit, never kept as an offset:
+    /// `qualify` and a rewind rewrite committed content (see `finish_folded`).
+    ///
+    /// [`held`]: Transcript::held
+    fn commit(&mut self, n: usize) {
+        let open = (!self.held.is_empty()).then(|| prose::open_block(&self.full));
+        let from = self.full.len();
+        self.full.push_str(&self.buf[..n]);
+        self.buf.drain(..n);
+        let at = match open {
+            None => return,
+            Some(Some(start)) => match prose::block_end(&self.full[start..]) {
+                Some(end) => start + end,
+                None => return,
+            },
+            // A rewind took the block back: nothing left to wait for.
+            Some(None) => from,
+        };
+        let held = std::mem::take(&mut self.held);
+        self.full.insert_str(at, &held);
     }
 
     /// Un-say narration the producer abandoned (see [`AgentEvent::TextRewind`]).
@@ -486,6 +517,19 @@ impl Transcript {
         self.close_group();
     }
 
+    /// [`seal`] at the END of the turn, and what [`held`] still has goes in
+    /// at the end: nothing more is coming to close its block, and a card left
+    /// open runs to the end of the message anyway. Not in [`seal`] itself — a
+    /// hosted brain seals after every delta, mid-card.
+    ///
+    /// [`seal`]: Transcript::seal
+    /// [`held`]: Transcript::held
+    fn seal_last(&mut self) {
+        self.seal();
+        let held = std::mem::take(&mut self.held);
+        self.full.push_str(&held);
+    }
+
     /// Commit everything pending, then rewrite the whole reply with `f` — for
     /// a caller that must take something back out of a reply at its end (a
     /// line its model copied out of its own history). The next snapshot is a
@@ -533,11 +577,23 @@ impl Transcript {
     /// and hearing its line again as text would draw it twice for a driver
     /// that renders from the events.
     ///
+    /// Not inside a card or a fence the model is still writing: there the line
+    /// would be part of the card's page or the code. A notice that landed
+    /// mid-script left an HTML card blank (2026-11-19, a watcher finishing
+    /// while a 38 KB demo streamed); it waits in [`held`] for the close.
+    ///
     /// [`push_raw`]: Transcript::push_raw
+    /// [`held`]: Transcript::held
     fn insert_raw(&mut self, md: &str) {
         self.flush_text();
         self.close_group();
-        self.full.push_str(md);
+        if prose::open_block(&self.full).is_some() {
+            self.held.push_str(md);
+        } else {
+            let held = std::mem::take(&mut self.held);
+            self.full.push_str(&held);
+            self.full.push_str(md);
+        }
     }
 
     /// Start from a reply another process was writing when it died — `prior`
@@ -677,11 +733,11 @@ impl Transcript {
             }
             AgentEvent::Notice(_) => Advance::Quiet,
             AgentEvent::Done { .. } if self.quiet => {
-                self.seal();
+                self.seal_last();
                 Advance::Done
             }
             AgentEvent::Done { duration_ms, cost_usd, tokens } => {
-                self.seal();
+                self.seal_last();
                 let rendered = if let Some(stats) = self.stats.as_mut() {
                     stats.duration_ms = duration_ms.or(stats.duration_ms)
                         .or(Some(self.stats_started.elapsed().as_secs_f64() * 1000.0));
@@ -861,7 +917,7 @@ impl Transcript {
     /// WITHOUT one — an error, a kill — where the pending narration and the
     /// half-built group are still the best record of what happened.
     pub fn finish(&mut self) -> String {
-        self.seal();
+        self.seal_last();
         render::heal_open_code(&self.full)
     }
 
@@ -890,7 +946,7 @@ impl Transcript {
         if self.brain {
             return self.finish_brain();
         }
-        self.seal();
+        self.seal_last();
         // Live shape is the fallback everywhere below, so a turn that shouldn't
         // fold takes exactly the path it always took.
         let plain = |s: &str| render::heal_open_code(s);
@@ -983,7 +1039,7 @@ impl Transcript {
     /// A lone group with nothing beside it is already one row: it goes over
     /// the answer as it is, not as a fold holding a fold.
     fn finish_brain(&mut self) -> String {
-        self.seal();
+        self.seal_last();
         let plain = |s: &str| render::heal_open_code(s);
         if self.groups == 0 {
             return plain(&self.full);
@@ -1715,6 +1771,100 @@ mod fold_tests {
         let before = t.content().to_string();
         assert_eq!(t.push(&AgentEvent::Steered("   ".into())), Advance::Quiet);
         assert_eq!(t.content(), before);
+    }
+
+    /// The daemon's text policy (`cardtags::commit_boundary`): hold back from
+    /// a `{%` with no `%}` yet.
+    fn hold_half_tags(buf: &str) -> usize {
+        match buf.rfind("{%") {
+            Some(i) if !buf[i..].contains("%}") => i,
+            _ => buf.len(),
+        }
+    }
+
+    /// 2026-11-19: a watcher finished while a 38 KB HTML demo streamed, and its
+    /// notice landed mid-`<script>` — the card came up blank. A line of our
+    /// own that arrives inside a card the model is still writing goes in right
+    /// after the close, in the order the lines came; the card is exactly what
+    /// the model wrote.
+    #[test]
+    fn a_line_that_arrives_mid_card_waits_for_the_close() {
+        let mut t = Transcript::with_text_policy(hold_half_tags, verbatim);
+        let script = format!("<script>\n{}</script>\n", "go(1);\n".repeat(80));
+        let (head, tail) = script.split_at(300);
+        t.push(&AgentEvent::Text("Here's the demo.\n\n{% mafold/html %}\n".into()));
+        t.push(&AgentEvent::Text(head.into()));
+        t.push(&AgentEvent::Notice("a background task finished".into()));
+        t.push(&AgentEvent::Steered("make it blue".into()));
+        assert!(!t.snapshot().contains("background task"), "nothing drawn inside the card: {}", t.snapshot());
+        t.push(&AgentEvent::Text(tail.into()));
+        t.push(&AgentEvent::Text("{% /mafold/ht".into()));
+        t.flush_text();
+        assert!(!t.snapshot().contains("background task"), "a half close tag closes nothing");
+        t.push(&AgentEvent::Text("ml %}\n\nAfter the card.".into()));
+        t.push(&done());
+        let md = t.finish();
+        let cards = prose::cards_named(&md, "mafold/html");
+        assert_eq!(cards.len(), 1, "{md}");
+        assert_eq!(&md[cards[0].body.clone().unwrap()], format!("\n{script}"), "the card's page as written");
+        let close = cards[0].span.end;
+        let notice = md.find("> ⚠︎ a background task finished").expect("notice");
+        let steer = md.find("> ↩︎ make it blue").expect("steer");
+        let after = md.find("After the card.").unwrap();
+        assert!(close <= notice && notice < steer && steer < after, "{md}");
+    }
+
+    /// The same for a fence: a line there would be part of the code.
+    #[test]
+    fn a_line_that_arrives_mid_fence_waits_for_the_fence() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Run this:\n\n```sh\ncargo test \\\n".into()));
+        t.push(&AgentEvent::Notice("a background task finished".into()));
+        t.push(&AgentEvent::Text("  -p mafold-transcript\n```\n\nThen look.".into()));
+        let md = t.finish();
+        let code = &md[md.find("```sh").unwrap()..md.rfind("```").unwrap()];
+        assert!(!code.contains("background task"), "{md}");
+        let notice = md.find("background task").expect("notice");
+        assert!(md.rfind("```").unwrap() < notice && notice < md.find("Then look.").unwrap(), "{md}");
+    }
+
+    /// A card the model never closes still gets the line, at the end of the
+    /// turn and before the stamp: nothing more is coming to close it.
+    #[test]
+    fn a_card_that_never_closes_still_gets_the_line() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("{% mafold/html %}\n<p>half".into()));
+        t.push(&AgentEvent::Notice("a background task finished".into()));
+        t.push(&done());
+        let md = t.finish();
+        let notice = md.find("background task").expect("notice kept");
+        assert!(notice < md.find("{% mafold/result").expect("stamp"), "{md}");
+    }
+
+    /// A hosted brain seals after every delta and streams append-only: it gets
+    /// the line after the card too, and what it streamed adds up to the reply.
+    #[test]
+    fn an_append_only_stream_gets_the_line_after_the_card() {
+        let mut t = Transcript::new();
+        let mut sent = String::new();
+        for chunk in ["Here.\n\n{% mafold/html %}\n<p>one</p>\n", "<p>two</p>\n"] {
+            t.push(&AgentEvent::Text(chunk.into()));
+            t.seal();
+            sent.push_str(&t.take_committed());
+        }
+        t.push(&AgentEvent::Notice("a background task finished".into()));
+        sent.push_str(&t.take_committed());
+        assert!(!sent.contains("background task"), "{sent}");
+        t.push(&AgentEvent::Text("<p>three</p>\n{% /mafold/html %}\n\nThat's all.".into()));
+        t.seal();
+        sent.push_str(&t.take_committed());
+        t.push(&done());
+        let md = t.finish();
+        sent.push_str(&t.take_committed());
+        assert_eq!(sent, md);
+        let card = &prose::cards_named(&md, "mafold/html")[0];
+        assert_eq!(&md[card.body.clone().unwrap()], "\n<p>one</p>\n<p>two</p>\n<p>three</p>\n");
+        assert!(card.span.end <= md.find("background task").unwrap(), "{md}");
     }
 
     /// THE BUG (2026-09-06): Claude Code reports its usage-limit state after

@@ -937,14 +937,14 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         flag: None,
         oauth_client: None,
     },
-    // The key to someone's OpenCode Go plan. Mafold Harness and their own
-    // OpenCode run on it: the computer opens it for each reply
+    // The key to someone's OpenCode Go plan. Mafold Harness runs on it: the
+    // computer opens it for each reply
     // (`connection::open_owner_key` reads `api_key`). Go has no sign-in a
     // browser or a machine could run, so this is a paste — once, here.
     ProviderSpec {
         id: "opencode-go",
         display: "OpenCode Go",
-        blurb: "Your OpenCode Go plan, for Mafold Harness and OpenCode agents",
+        blurb: "Your OpenCode Go plan, for Mafold Harness agents",
         badge: "opencode",
         kind: ProviderKind::ApiKey,
         fields: API_KEY,

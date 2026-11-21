@@ -128,7 +128,7 @@ fn a_stopped_supervisor_is_the_one_thing_said_besides_a_refused_login() {
         &home,
         "daemons.json",
         r#"{"daemons":[{"name":"a:one","token":"mb_1","workdir":"/tmp"},
-                       {"name":"a:two","token":"mb_2","workdir":"/tmp","harness":"opencode"}]}"#,
+                       {"name":"a:two","token":"mb_2","workdir":"/tmp","harness":"mafold-harness"}]}"#,
     );
     // Everything that would be news with the supervisor up: a daemon that
     // keeps dying, a runtime that isn't there, an update that keeps failing,

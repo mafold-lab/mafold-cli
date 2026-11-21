@@ -222,8 +222,9 @@ pub struct Account {
     pub template: Option<String>,
     /// For external (locally-driven) bots, which agent harness the user's
     /// mafold-cli daemon should drive: `"claude-code"` / `"codex"` /
-    /// `"kimi-code"` / `"opencode"` / `"openclaw"`. The daemon reads this from
-    /// `getMe` (cloud-first); None ⇒ the daemon's default (claude-code).
+    /// `"kimi-code"` / `"mafold-harness"` / `"openclaw"`
+    /// ([`agent_setup::runtime_id`]). The daemon reads this from `getMe`
+    /// (cloud-first); None ⇒ the daemon's default (claude-code).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
     /// Preferred UI language (BCP-47, e.g. "zh-Hans" / "en"). A cloud setting that
@@ -255,6 +256,25 @@ pub struct Account {
     /// there `premium` is still the membership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub premium_member: Option<bool>,
+    /// Mafold's Nth account — people and agents in ONE count (ops 11-19,
+    /// "Count: People and agents"). Given when the account is made and never
+    /// handed out again; accounts from before it were numbered once, in the
+    /// order they first showed up in a chat. The default profile cover says
+    /// it: "I'm Mafold's 18th user".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_number: Option<u64>,
+    /// A live cover, drawn in place of [`Self::banner`]: one published card's
+    /// self-closing tag (`{% owner/slug … /%}`), the same field a group has
+    /// (`Conversation::cover_card`). Set with `updateProfile`, or by a tap on
+    /// a `mafold/cover-draft` someone designed; a new picture clears it. An
+    /// account with neither has the default cover here, put on by the server:
+    /// `{% mafold/cover-joined n="18" /%}`, always its own number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_card: Option<String>,
+    /// Who designed [`Self::cover_card`] — the sender of the draft that was
+    /// used. None for a cover the account picked itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_by: Option<String>,
 }
 
 /// A slash command a bot advertises — shown in the chat's command panel when

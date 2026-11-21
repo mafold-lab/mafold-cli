@@ -158,7 +158,7 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         default: false,
         dev_default: false,
         label: "New garden (mafold/garden)",
-        description: "The garden button opens mafold/garden and 收进园地 writes its pins, on web and phone \
+        description: "The garden opens mafold/garden and 收进园地 writes its pins, on web and phone \
                       alike. Off = the pre-switch path (web: opsdu/garden-beta + the old garden room; \
                       phone: the garden DM). Turn on for everyone once garden.mafold.app is switched, \
                       then delete the old path with this flag.",
@@ -723,9 +723,9 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         server: ClosedWithoutRecord,
     },
     // Garden and the Activity Center as one drawer (ops 11-08, demo rounds
-    // 1–5 in their DM's #设计系统统一): the header's garden button goes, and
-    // the M slides the panel out of the window's left edge. The web's; the
-    // phone reads activityDrawerPhone.
+    // 1–5 in their DM's #设计系统统一): the M slides the panel out of the
+    // window's left edge. (The header's garden button it replaced is gone
+    // for everyone, ops 11-18.) The web's; the phone reads activityDrawerPhone.
     FlagMeta {
         key: "activityDrawer",
         default: false,
@@ -734,8 +734,8 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         description: "Tapping the M slides one panel out of the window's left edge, as tall as the \
                       chat list and as wide as the list up to its new-chat button, with Now, \
                       Agents, Works and Tasks. The M rolls into its bottom-right corner and the \
-                      tab bar steps aside while it's open; the header's garden button goes. Off = \
-                      the garden button and the Activity Center that grows out of the M.",
+                      tab bar steps aside while it's open. Off = the Activity Center that grows \
+                      out of the M.",
         owner: "ops",
         added: "2026-11",
         clients: &[Web],
@@ -775,7 +775,49 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       the garden (select ▸ forward ▸ 园地, and the old garden's collection) on its \
                       five fixed shelves — 网站, 文章&书籍, 图片, 视频, 消息 — each with its own card. \
                       Read from the garden's own pins; a website's card comes from \
-                      getViewerLinkCards (gardenSavedV2). Off = the drawer without 收藏.                       The web's drawer for now; the phone's drawer follows.",
+                      getViewerLinkCards (gardenSavedV2). Off = the drawer without 收藏. The web's \
+                      drawer (activityDrawer) and the phone's (activityDrawerPhone) alike; on the \
+                      phone a document's cover is the server's drawing of its first page \
+                      (fileCovers), else a book's face.",
+        owner: "linsky",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // linsky 11-17: the avatar being chosen wears a ring in its own colours, like
+    // Dia's tile frame — the folded list, the forward picker and drop rows alike.
+    FlagMeta {
+        key: "avatarHalo",
+        default: false,
+        dev_default: true,
+        label: "Avatar halo while choosing",
+        description: "Where the reader is choosing a chat by its avatar — the folded chat list, \
+                      the forward picker's rows, a chat row a file is dragged over — the avatar \
+                      gets a thin ring in its own colours, each where it sits in the picture \
+                      (lib/avatarHalo.ts). Under the pointer the ring turns, a soft glow breathes \
+                      outside it and the avatar comes forward a little; once chosen it slows to a \
+                      stop and the glow goes out; the folded list's open chat keeps it, still. \
+                      Off = the accent ring and the accent breathing circle, as before.",
+        owner: "linsky",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
+    // linsky 11-18 (demo v3, msg 8f7ff775): the drawer's cards go into a chat by
+    // dragging them there; opsdu 11-18: nothing goes without a confirm.
+    FlagMeta {
+        key: "drawerDrag",
+        default: false,
+        dev_default: true,
+        label: "Activity drawer: drag cards into a chat",
+        description: "A card in the Activity drawer's 收藏 and 作品 can be dragged out. Beside an \
+                      open chat: let go over its messages and a confirm asks before it goes; let \
+                      go on the composer and it waits there to be sent (a file as an attachment, a \
+                      website as its address). Without a chat beside it (a narrow window): the \
+                      drawer steps aside, the chat list is where it goes, and the me pill at the \
+                      top says to whom and holds the confirm. Files go by their id (no upload), \
+                      websites as their address (chatLinkCards draws the card), saved messages \
+                      and cards as a forward. Off = the cards only open, as before.",
         owner: "linsky",
         added: "2026-11",
         clients: &[Web],
@@ -911,24 +953,21 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
-    // OpenCode Go (ops 10-31): Mafold Harness and your own OpenCode install,
-    // signed in with your OpenCode Go plan. The key is pasted once in
-    // Settings ▸ Connections (the one pasted-key exception, ops 10-29) and
-    // opened by your computer for each reply; your own OpenCode may use the
-    // Go login it already has. Server-read on the owner: createBot takes
-    // `sign_in: opencode-go`, and listHarnessHosts offers your own OpenCode,
-    // only where this is on.
+    // OpenCode Go (ops 10-31): Mafold Harness signed in with your OpenCode Go
+    // plan. The key is pasted once in Settings ▸ Connections (the one
+    // pasted-key exception, ops 10-29) and opened by your computer for each
+    // reply. Server-read on the owner: createBot takes `sign_in: opencode-go`
+    // only where this is on. (Your own OpenCode install rode on it too until
+    // it went, 11-20.)
     FlagMeta {
         key: "openCodeGo",
         default: false,
         dev_default: false,
         label: "New Agent: OpenCode Go",
         description: "New Agent on one of your computers offers OpenCode Go as the sign-in for \
-                      Mafold Harness and for your own OpenCode install, which becomes a runtime of \
-                      its own. The Go key is pasted once in Settings ▸ Connections and opened by \
-                      your computer for each reply; your own OpenCode may use the Go login it \
-                      already has. The api takes createBot with OpenCode Go, and offers your own \
-                      OpenCode, only where this is on for the owner.",
+                      Mafold Harness. The Go key is pasted once in Settings ▸ Connections and \
+                      opened by your computer for each reply. The api takes createBot with \
+                      OpenCode Go only where this is on for the owner.",
         owner: "ops",
         added: "2026-10",
         clients: &[Web, Phone],
@@ -997,6 +1036,38 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       the post cuts its files off too. An agent can write a post as a draft card, \
                       and the person it's for publishes it with a tap, under their own name.",
         owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    FlagMeta {
+        key: "momentsFriends",
+        default: false,
+        dev_default: false,
+        label: "Moments: friends only",
+        description: "A post can be Friends only: your friends see it on their timeline and \
+                      your profile, nobody else does, and it is never on the web, the sitemap or \
+                      search. A friend is, for now, someone you have each sent a message to in \
+                      your direct chat (your contacts). Parked (linsky + ops 11-20): who counts \
+                      as a friend isn't settled, so it stays off and no client offers it.",
+        owner: "linsky",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // Moments stay public; what an author gets is one pinned post and a say in
+    // how far back everyone else sees their posts (linsky + ops 11-20 「先公开，
+    // 加 n 天内可见」). Split from momentsFriends so these open on their own.
+    FlagMeta {
+        key: "momentsWindow",
+        default: false,
+        dev_default: false,
+        label: "Moments: a pinned post, and how far back people can see",
+        description: "You can pin one post to the top of your profile, and limit what others \
+                      see of your posts to the last three days, month or half year: older ones \
+                      leave timelines, your profile, their links, the web and the sitemap for \
+                      everyone but you. A pinned post stays visible however old it is.",
+        owner: "linsky",
         added: "2026-11",
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
@@ -1333,6 +1404,31 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
     // own. Which site is the example is a setting on the server
     // (`setSiteExample`); this decides who is shown it. listSites says, so no
     // client reads it.
+    // Profile covers (ops 11-19, the cover demo's round 3 and then "Build it",
+    // "Count: People and agents"): a person's or an agent's profile with no
+    // picture shows the default cover — the homepage's ground and "I'm
+    // Mafold's Nth user" — and its owner gets Personalize: pick an agent, which
+    // designs a cover and sends it back as a draft card; a tap puts it on.
+    // The default cover is a published card (mafold/cover-joined) the server
+    // puts on every account with nothing of its own, whatever the flag; web and
+    // phone read the flag to draw account covers at all; the api reads it on
+    // the person who taps a draft (`profile_cover`), and an agent is told about
+    // the draft card only while it's on for whoever the turn answers to.
+    FlagMeta {
+        key: "profileCover",
+        default: false,
+        dev_default: false,
+        label: "Profile covers: default + Personalize",
+        description: "A profile with no picture shows a cover of its own: the homepage's ground \
+                      and \"I'm Mafold's Nth user\" (people and agents in one count). Its owner \
+                      gets Personalize: pick one of their agents or an official one, which designs \
+                      a cover and sends it back as a draft card; Use as cover puts it on the \
+                      profile. Visitors see Make yours, or who designed it.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
     FlagMeta {
         key: "spaceExample",
         default: false,
@@ -1517,9 +1613,8 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         description: "Tapping the M slides one panel out of the screen's left edge, from under the \
                       status bar to the tab bar's foot and as wide as the chat list up to its \
                       new-chat button, with Now, Agents, Works and Tasks. The M rolls into its \
-                      bottom-right corner and the tab bar steps aside while it's open; the \
-                      header's garden button goes. Off = the garden button and the Activity \
-                      Center that grows out of the M.",
+                      bottom-right corner and the tab bar steps aside while it's open. Off = the \
+                      Activity Center that grows out of the M.",
         owner: "ops",
         added: "2026-11",
         clients: &[Phone],
@@ -1599,6 +1694,25 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
                       set, into another set's section, or onto a set's tab (it goes first there). \
                       On a computer it lifts once the pointer moves; on the phone, hold it first. \
                       A tap still sends. Only with stickerSets on. Off = tap to send only.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
+    // New Folder as rules, Telegram-style (ops 11-19 「优化一下chat folder的新建
+    //机制」, demos OK'd "Build both"): chat types in, muted/read and chats by
+    // name out, two panes on a computer, a picker page on a phone. Client
+    // only: saveFolder keeps the rules whoever saves, and every client works
+    // a folder's chats out of them flag or no flag — this gates the editor.
+    FlagMeta {
+        key: "folderRules",
+        default: false,
+        dev_default: false,
+        label: "Chat folders: include chat types, exclude muted/read",
+        description: "New Folder and Edit Folder take chat types (People, Agents, Groups) as well as \
+                      chats, and can exclude Muted or Read chats and chats by name; a group joined \
+                      later lands in a Groups folder by itself. Two panes on a computer, a picker \
+                      page on a phone. Off = the folder is a list of chats you tick.",
         owner: "ops",
         added: "2026-11",
         clients: &[Web, Phone],
@@ -1700,6 +1814,84 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: NotRead,
     },
+    // The send flight on the phone (ops 11-19 picked "Telegram iOS" on the demo
+    // card, then on web's preview: 「这个可以 你可以merge了 然后把appjs的部分也做
+    // 了」). Web ships it on; the phone half moves native layout on the UI thread
+    // and hasn't been seen on a device yet, so it starts behind this. Client only.
+    FlagMeta {
+        key: "sendFlightPhone",
+        default: false,
+        dev_default: false,
+        label: "Phone: Telegram's send motion",
+        description: "In the phone app, a message you send grows out of the text field, swings \
+                      right, then rises into place in 0.3 s, while the messages above make room \
+                      on the same curve; the send button presses down while held. The web app \
+                      already does this. Off = the bubble just appears.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Phone],
+        server: NotRead,
+    },
+    // Appearance stays on the device; a chat gets its own (ops 11-20: "appearance的
+    // 选项 全部保留本地 … 「使用其他设备的壁纸」 需要其他设备在线 … 新增群组内的
+    // appearance选项(wallpaper和color)", then "照这个做" on the demo). The
+    // wallpaper stops syncing with or without it; this gates the two new ways
+    // in and the endpoints behind them (askDeviceWallpapers, setChatAppearance).
+    FlagMeta {
+        key: "chatAppearance",
+        default: false,
+        dev_default: false,
+        label: "Chat appearance + another device's wallpaper",
+        description: "A group or direct chat's profile gets Chat appearance: a wallpaper and a \
+                      colour that everyone in it sees over their own, set by whoever may edit \
+                      the group's info (either side of a direct chat), with a line in the chat \
+                      saying who. Appearance ▸ Chat Wallpaper gets \"Use another device's \
+                      wallpaper\", which asks your other open devices for theirs. Off = neither.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // The onboarding modal (ops 11-20: 「start tutorial的modal弹窗 这个是不太合适的
+    // 撤掉 … 我需要一个平滑的过渡」, A + 「我需要这个时候有一个大modal」, then the
+    // content: 「必须的两步是: (1) 设置我的display name 还有头像 (2) 必须创建一个agent」,
+    // "Build it"). Read at the door, with the new account's token, before
+    // Continue to Mafold.
+    FlagMeta {
+        key: "onboardingModal",
+        default: false,
+        dev_default: false,
+        label: "Sign-up: onboarding modal",
+        description: "Continue to Mafold on a new account grows the door's card into a big \
+                      modal over the chat list (no loading screen in between): welcome, your \
+                      name / username / photo (required), what you use AI for, make your own AI \
+                      on Mafold Cloud (required), say hi to it, and who to start with. Finishing \
+                      tucks the card into the chat list. The old \"Welcome to Mafold / Start \
+                      first steps\" pop-up doesn't show. Off = the door goes straight to the \
+                      chat list, as before. ?onboarding opens it as a dry run on any account.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
+    // ops 11-21 「personal agent的接入体验 现在太过粗糙」 + 「知识库可以共享」:
+    // an AI you already use (Muse, ChatGPT…) connects through a link and your
+    // Approve, and reads the same Mafold guide the other agents get.
+    FlagMeta {
+        key: "aiConnect",
+        default: false,
+        dev_default: false,
+        label: "Agents: connect an AI you already use",
+        description: "Picking API token on an agent's brain card gives a one-sentence link \
+                      for the AI you already use instead of a raw key: the AI reads the page \
+                      (who it will be, the calls, how to write cards), asks to connect, you tap \
+                      Approve on the card, and its next call collects a key made for it alone. \
+                      Off = the card points at the token in Customize ▸ Settings, as before.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -1783,7 +1975,7 @@ mod tests {
     #[test]
     fn activity_drawer_ships_dark_on_web() {
         // Off everywhere until ops turns it on for someone, dev included: it
-        // takes the header's garden button away. Only the web reads it.
+        // changes where the Activity Center opens. Only the web reads it.
         let m = meta("activityDrawer").expect("activityDrawer registered");
         assert!(!m.default && !m.dev_default, "off in production and in dev");
         assert_eq!(m.clients, &[Web], "the web reads it");
@@ -1869,6 +2061,29 @@ mod tests {
         assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "web and phone read it");
         assert_eq!(m.server, NotRead, "gates the clients only");
         assert!(!server_default("newAgentFlow"), "nothing server-side opens without a record");
+    }
+
+    #[test]
+    fn moments_friends_ships_dark() {
+        // Friends only reaches fewer people than public, but who counts as a
+        // friend is still being settled: opened account by account, never by a
+        // missing record.
+        let m = meta("momentsFriends").expect("momentsFriends registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord);
+        assert!(!server_default("momentsFriends"));
+    }
+
+    #[test]
+    fn moments_window_ships_dark_on_its_own() {
+        // Pinning and "how far back" open without Friends only: account by
+        // account, never by a missing record.
+        let m = meta("momentsWindow").expect("momentsWindow registered");
+        assert!(!m.default && !m.dev_default, "off in production and in dev");
+        assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord);
+        assert!(!server_default("momentsWindow"));
     }
 
     #[test]
@@ -2008,6 +2223,29 @@ mod tests {
         assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
         assert_eq!(m.server, NotRead, "{k}: read by the clients only");
         assert_eq!((m.owner, m.added), ("ops", "2026-11"), "{k}: owner and month");
+    }
+
+    #[test]
+    fn avatar_halo_ships_dark_on_web() {
+        // linsky 11-17: the own-colour ring round an avatar being chosen.
+        // Production off until it is turned on for someone; dev builds see it.
+        let k = "avatarHalo";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert_eq!(m.clients, &[Web], "{k}: only the web reads it");
+        assert_eq!(m.server, NotRead, "{k}: read by the client only");
+        assert_eq!((m.owner, m.added), ("linsky", "2026-11"), "{k}: owner and month");
+    }
+
+    #[test]
+    fn drawer_drag_ships_dark_on_web() {
+        // linsky 11-18: drag the drawer's cards into a chat, behind a confirm.
+        let k = "drawerDrag";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert_eq!(m.clients, &[Web], "{k}: only the web reads it");
+        assert_eq!(m.server, NotRead, "{k}: read by the client only");
+        assert_eq!((m.owner, m.added), ("linsky", "2026-11"), "{k}: owner and month");
     }
 
     #[test]
@@ -2168,5 +2406,13 @@ mod tests {
     fn server_key_is_the_key() {
         const K: &str = server_key("inlineMedia");
         assert_eq!(K, "inlineMedia");
+    }
+
+    #[test]
+    fn the_phone_send_flight_ships_dark_and_only_the_phone_reads_it() {
+        let m = meta("sendFlightPhone").expect("sendFlightPhone registered");
+        assert!(!m.default && !m.dev_default, "unseen on a device: on for someone first");
+        assert_eq!(m.clients, &[Phone], "web flies every send already");
+        assert_eq!(m.server, NotRead);
     }
 }

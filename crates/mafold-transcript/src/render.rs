@@ -957,21 +957,39 @@ fn neutralize(s: &str) -> String {
 /// carries their words in their own bubble above. One line that says WHERE the
 /// correction entered is the whole job.
 pub fn steer_line(text: &str) -> String {
-    own_block(&format!("{STEER_PREFIX}{}", line_esc(text)))
+    own_block(&format!("{STEER_PREFIX}{}", seam_esc(text)))
 }
 
 /// The agent sent the room a message of its own mid-turn → the same one-line
 /// seam as a steer, marked the other way. The message is in its own bubble
 /// above the reply; this says where in the work it went out.
 pub fn sent_line(text: &str) -> String {
-    own_block(&format!("{SENT_PREFIX}{}", line_esc(text)))
+    own_block(&format!("{SENT_PREFIX}{}", seam_esc(text)))
 }
 
 /// A driver notice ([`AgentEvent::Notice`]) — same quoted shape as a steer (it
 /// is the same kind of thing: not model output, but part of the timeline), with
 /// a different mark so the two don't read as each other.
 pub fn notice_line(text: &str) -> String {
-    own_block(&format!("{NOTICE_PREFIX}{}", line_esc(text)))
+    own_block(&format!("{NOTICE_PREFIX}{}", seam_esc(text)))
+}
+
+/// A seam's words as one line of text. What was said can be a whole card — a
+/// forwarded chat record IS its `{% mafold/chatrecord %}` tag, JSON and close
+/// — and a seam is one line, so each card becomes a mark and its title (else
+/// its name), the same for every card. [`line_esc`] then neutralises whatever
+/// tag is left, and cuts.
+///
+/// 2026-11-18: a record forwarded into a long turn went in raw; the 120-char
+/// cut kept its open tag and dropped the close, every run card and word after
+/// it became that record's body, and the bubble sat on «聊天记录 · 0 条» for
+/// the rest of the turn — daemon and hosted alike, both draw it here.
+fn seam_esc(text: &str) -> String {
+    let marked = crate::fold::replace_cards(text, |c| {
+        let what = crate::preview::attr(c.attrs, "title").map(str::trim).filter(|t| !t.is_empty()).unwrap_or(c.name);
+        format!(" 🃏 {what} ")
+    });
+    line_esc(&marked.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// One of the transcript's own one-line notes — a steer seam, a notice, the
@@ -1785,8 +1803,12 @@ fn block_esc(s: &str) -> String {
     out
 }
 
+/// One line of text that can't open or close a card: newlines flattened, the
+/// tag delimiters broken like [`neutralize`], cut at 120 chars. A cut through
+/// a tag would otherwise keep its open and drop its close.
 fn line_esc(s: &str) -> String {
     let one: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    let one = neutralize(&one);
     let one = one.trim();
     if one.chars().count() > 120 {
         format!("{}…", one.chars().take(120).collect::<String>())
@@ -2315,6 +2337,51 @@ mod generating_tests {
         let trimmed = tag.trim_end();
         let inner = trimmed.strip_suffix("/%}").expect("self-closing");
         assert!(!inner.contains("%}"), "nothing may close before the card does: {tag}");
+    }
+}
+
+#[cfg(test)]
+mod seam_card_tests {
+    use super::*;
+
+    /// A forwarded chat record, as its message's text: the card IS the text.
+    fn record() -> String {
+        let rows: Vec<String> = (0..40).map(|i| format!(r#"{{"from":"linsky","text":"line {i} 第{i}行"}}"#)).collect();
+        format!("{{% mafold/chatrecord title=\"Rei 与 linsky\" %}}\n[{}]\n{{% /mafold/chatrecord %}}", rows.join(",")) // LINT-IGNORE
+    }
+
+    // 2026-11-18: a record forwarded into a long turn was cut at 120 chars
+    // with its open tag kept and its close dropped; the rest of the turn
+    // became its body and the bubble read «聊天记录 · 0 条».
+    #[test]
+    fn a_forwarded_record_is_a_mark_and_never_opens_a_card() {
+        for line in [steer_line(&record()), sent_line(&record()), notice_line(&record())] {
+            assert!(!line.contains("{%") && !line.contains("%}"), "{line}");
+            assert!(line.contains("🃏 Rei 与 linsky"), "{line}");
+        }
+        let said = format!("linsky: look at this {}", record());
+        assert_eq!(steer_line(&said).trim(), "> ↩︎ linsky: look at this 🃏 Rei 与 linsky");
+        let bare = steer_line("{% mafold/cite src=\"https://a.b\" /%}"); // LINT-IGNORE
+        assert_eq!(bare.trim(), "> ↩︎ 🃏 mafold/cite");
+    }
+
+    #[test]
+    fn a_tag_that_is_not_a_card_is_still_broken_before_the_cut() {
+        let half = format!("{} {{% mafold/chatrecord title=\"x\" %}} [", "a".repeat(100)); // LINT-IGNORE
+        let line = steer_line(&half);
+        assert!(!line.contains("{%") && !line.contains("%}"), "{line}");
+    }
+
+    #[test]
+    fn the_whole_transcript_stays_balanced_around_a_seam() {
+        let md = format!("{}{}{}Answer.", run_card("Ran 1 command", "a\n"), steer_line(&record()), run_card("Ran 2 commands", "b\n"));
+        let mut cards = Vec::new();
+        let rest = crate::fold::replace_cards(&md, |c| {
+            cards.push((c.name.to_string(), c.body.contains("Answer.")));
+            String::new()
+        });
+        assert_eq!(cards, [("mafold/run".to_string(), false), ("mafold/run".to_string(), false)], "{md}");
+        assert!(rest.contains("🃏 Rei 与 linsky") && rest.contains("Answer."), "{rest}");
     }
 }
 

@@ -1834,9 +1834,9 @@ async fn on_go() -> bool {
 
 /// Does this agent run Mafold Harness on its owner's Claude Code login right
 /// now? A Claude Code agent's fuel says `claude` too; only Mafold Harness
-/// (`opencode`) runs on it as fuel.
+/// runs on it as fuel.
 async fn harness_on_claude(harness_id: &str) -> bool {
-    harness_id == "opencode"
+    harness_id == crate::harness::MAFOLD_HARNESS
         && match OWNER_CONFIG.get() {
             Some(c) => c.read().await.on_claude(),
             None => false,
@@ -2771,11 +2771,9 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         eprintln!("⚠️  working directory does not exist: {workdir} — the harness will fail. Check --workdir.");
     }
     if !harness.runs() {
-        // Never another runtime in its place (10-29: an OpenCode agent ran as
-        // Claude Code). Every turn answers with the reason instead.
+        // Never another runtime in its place (10-29: a Mafold Harness agent
+        // ran as Claude Code). Every turn answers with the reason instead.
         eprintln!("⚠️  this agent's runtime `{}` isn't one Mafold can run — every reply will say so.", harness.id());
-    } else if !harness.available() && harness.id() == crate::harness::opencode::OWN {
-        eprintln!("⚠️  OpenCode isn't installed on this computer — replies will fail until it is (`mafold install opencode-own`).");
     } else if !harness.available() {
         eprintln!("⚠️  harness `{}` CLI not found on PATH — replies will fail until it's installed.", harness.id());
         if harness.id() == "claude-code" {
@@ -2827,16 +2825,6 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         mark_intro(&my_username, &key);
         println!("intro: `{key}` was said by the previous process — its reply is delivered from the outbox");
     }
-    // A server of the OpenCode build Mafold Harness ran on before it became
-    // part of mafold, left mid-turn by the previous process (an older mafold
-    // that died hard: no shutdown handler ran), would finish its reply on the
-    // wallet's key into a session nobody reads, then never exit. Ended before
-    // the turns are picked back up (`harness::opencode::end_orphan`).
-    for (pid, start) in outbox.take_orphans() {
-        if tokio::task::spawn_blocking(move || crate::harness::opencode::end_orphan(pid, start)).await.unwrap_or(false) {
-            println!("ended OpenCode server pid {pid}, left running by the previous process");
-        }
-    }
     {
         let client = client.clone();
         tokio::spawn(async move {
@@ -2859,7 +2847,7 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     if owner.on_go() {
         println!("fuel: @{my_username} runs on its owner's OpenCode Go plan — the key from their Connections, opened per reply");
     }
-    if owner.on_claude() && harness.id() == "opencode" {
+    if owner.on_claude() && harness.id() == crate::harness::MAFOLD_HARNESS {
         println!("fuel: @{my_username} runs Mafold Harness on its owner's Claude Code login here — a real `claude` makes each step");
     }
     let owner = Arc::new(RwLock::new(owner));
@@ -3053,11 +3041,6 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
                 for key in outbox.take_settled() {
                     mark_intro(&bot, &key);
                 }
-                for (pid, start) in outbox.take_orphans() {
-                    if tokio::task::spawn_blocking(move || crate::harness::opencode::end_orphan(pid, start)).await.unwrap_or(false) {
-                        println!("ended OpenCode server pid {pid}, left running by a stopped process");
-                    }
-                }
                 resume_turns(&client, &bot, &sessions, &coord, &chat_states, &harness);
                 // The ones closed as cut off say so now, not a tick later.
                 outbox.retry(&client).await;
@@ -3228,9 +3211,9 @@ const CONTROL: &[ControlCommand] = &[
     // The whole chat's model: the owner's, as the usage card's switch is.
     ControlCommand { name: "model", description: "Switch the model for this chat", arg_hint: Some("name | reset"), menu: Menu::All, effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
     // A Claude Code budget (MAX_THINKING_TOKENS); codex's depth is the owner-set effort,
-    // and Mafold Harness and your own OpenCode have neither.
+    // and Mafold Harness has neither.
     // The whole chat's thinking, so the owner's, as its model is.
-    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except(&["codex", "opencode", "opencode-own"]), effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
+    ControlCommand { name: "think", description: "Toggle extended thinking for this chat", arg_hint: Some("on | off | <tokens>"), menu: Menu::Except(&["codex", crate::harness::MAFOLD_HARNESS]), effect: Effect::Reversible, who: Who::Owner, takes: Takes::Words(1) },
     ControlCommand { name: "resume", description: "Resume an earlier session (terminal ones pick up their live state)", arg_hint: Some("id | last"), menu: Menu::Only("claude-code"), effect: Effect::Reversible, who: Who::Circle, takes: Takes::Words(1) },
     // Irreversible by its worst form: `forget` drops a saved login from the machine.
     ControlCommand { name: "account", description: "Which Claude account this chat runs on — list, pin, forget", arg_hint: Some("name | reset | forget <name>"), menu: Menu::Only("claude-code"), effect: Effect::Irreversible, who: Who::Owner, takes: Takes::Words(2) },
@@ -3444,12 +3427,12 @@ fn same_answer(a: &HarnessCaps, b: &HarnessCaps) -> bool {
 async fn machine_caps(harness: &dyn Harness, preferred: Option<String>, fuel: Option<&str>) -> Option<HarnessCaps> {
     // Mafold Harness on Claude Code runs what Claude Code here runs, for the
     // seat a turn would choose — its menu is Claude Code's, said as such.
-    if harness.id() == "opencode" && crate::fuel::is_claude(fuel) {
+    if harness.id() == crate::harness::MAFOLD_HARNESS && crate::fuel::is_claude(fuel) {
         let claude = crate::harness::select("claude-code");
         let env = crate::accounts::choose(preferred.as_deref(), None).await.account?.env();
         return crate::harness::caps_report(claude.as_ref(), &env).await;
     }
-    if harness.id() == "opencode" && !crate::fuel::is_go(fuel) {
+    if harness.id() == crate::harness::MAFOLD_HARNESS && !crate::fuel::is_go(fuel) {
         return None;
     }
     let env = if harness.id() == "claude-code" {
@@ -3597,8 +3580,8 @@ fn is_our_stock_seed(schema: &[serde_json::Value]) -> bool {
             && schema[0]["options"].as_array().is_some_and(|o| {
                 o.iter().any(|x| x["value"].as_str().is_some_and(|v| v.starts_with("kimi-code/")))
             }))
-        // …or the stock of Mafold Harness and your own OpenCode: the one
-        // shape with neither effort nor thinking. Its menu is whatever the
+        // …or the stock of Mafold Harness (or of your own OpenCode, before it
+        // went): the one shape with neither effort nor thinking. Its menu is whatever the
         // machine reported, so the shape and the stock model label are the
         // fingerprint, not an option.
         || (keys == ["model", "system_prompt", "cwd"] && schema[0]["label_key"] == "botField.model.label")
@@ -3692,16 +3675,15 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
             ]),
             "model / system prompt / thinking / cwd / whitelist / blacklist / greeting / access",
         ),
-        // Mafold Harness and your own OpenCode: a model menu, and nothing for
-        // effort, thinking or a Claude login — each runs a model as its
-        // provider serves it, with no tier or budget this daemon could pass,
-        // and the one login an agent has is what it was made with (its fuel).
-        // They used to fall through to Claude Code's sheet below: an agent on
-        // OpenCode Go was offered Fable, Opus, Sonnet and Haiku, none of which
-        // Go runs (ops 10-31). The menu is a BOOTSTRAP, as Claude Code's is:
-        // an agent on Go reports Go's models as this computer lists
-        // them ([`report_caps`]), and the server draws the menu from that.
-        "opencode" | crate::harness::opencode::OWN => (
+        // Mafold Harness: a model menu, and nothing for effort, thinking or a
+        // Claude login — it runs a model as its provider serves it, with no
+        // tier or budget this daemon could pass, and the one login an agent
+        // has is what it was made with (its fuel). It used to fall through to
+        // Claude Code's sheet below: an agent on OpenCode Go was offered
+        // Fable, Opus, Sonnet and Haiku, none of which Go runs (ops 10-31).
+        // The menu is a BOOTSTRAP, as Claude Code's is: an agent on Go reports
+        // Go's models ([`report_caps`]), and the server draws the menu from that.
+        crate::harness::MAFOLD_HARNESS => (
             serde_json::json!([
                 { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "", "show_on_profile": true,
                   "options": [
@@ -7092,19 +7074,11 @@ fn sent_words(m: &IncomingMessage) -> Option<String> {
     (!names.is_empty()).then(|| format!("📎 {}", names.join(", ")))
 }
 
-/// Mafold Harness or your own OpenCode — the runtimes that run on OpenCode Go
-/// (Mafold Harness on the wallet too).
-fn is_opencode(harness_id: &str) -> bool {
-    harness_id == "opencode" || harness_id == crate::harness::opencode::OWN
-}
-
-/// What a control command's answer calls an OpenCode runtime.
-fn runtime_name(harness_id: &str) -> &str {
-    match harness_id {
-        "opencode" => "Mafold Harness",
-        crate::harness::opencode::OWN => "OpenCode",
-        other => other,
-    }
+/// Mafold Harness — the runtime that runs on OpenCode Go, the wallet, or its
+/// owner's Claude Code login, with no thinking budget or context command of
+/// its own.
+fn is_mafold_harness(harness_id: &str) -> bool {
+    harness_id == crate::harness::MAFOLD_HARNESS
 }
 
 /// `/model`'s examples, as "e.g. …": for an agent on Go, the first of Go's
@@ -7114,8 +7088,7 @@ fn model_examples(harness_id: &str, go_ids: &[String]) -> String {
     match harness_id {
         "codex" => "e.g. gpt-5.6-sol".into(),
         _ if !go_ids.is_empty() => format!("e.g. {}", go_ids.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", ")),
-        "opencode" => "one of the model ids its wallet or OpenCode Go runs".into(),
-        crate::harness::opencode::OWN => "one of OpenCode Go's model ids".into(),
+        crate::harness::MAFOLD_HARNESS => "one of the model ids its wallet or OpenCode Go runs".into(),
         _ => "e.g. opus, sonnet, haiku".into(),
     }
 }
@@ -7259,11 +7232,11 @@ async fn handle_control(
             if harness.id() == "codex" {
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
                     "Codex manages its own context automatically — there's no `/compact` for it. Use `/clear` to start a fresh conversation when you want to reset.").await;
-            } else if is_opencode(harness.id()) {
-                // Its session is OpenCode's: Claude Code's `/compact` has
-                // nothing to act on, and must not be started for it.
+            } else if is_mafold_harness(harness.id()) {
+                // Its session is its own: Claude Code's `/compact` has nothing
+                // to act on, and must not be started for it.
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
-                    &format!("{} compacts its own context: OpenCode summarizes the conversation by itself when it fills up. Use `/clear` to start fresh.", runtime_name(harness.id()))).await;
+                    "Mafold Harness keeps its own context: when a conversation grows long, its oldest exchanges are left out by themselves. Use `/clear` to start fresh.").await;
             } else {
                 // Genuinely compact this conversation's Claude session (summarize the
                 // prior context to free tokens, keeping continuity). Spawned so the
@@ -7306,14 +7279,11 @@ async fn handle_control(
             }
         }
         "model" => {
-            // An agent on Go runs what Go serves, as this computer lists it
-            // (your own OpenCode's list; Mafold Harness's from models.dev):
-            // the examples come from that list, and a name not on it is
-            // refused here instead of by Go in the middle of the next reply.
-            // Asked before the lock — the list can take a process to read.
-            let go_ids = if harness.id() == crate::harness::opencode::OWN {
-                crate::harness::opencode::go_model_ids().await
-            } else if is_opencode(harness.id()) && on_go().await {
+            // An agent on Go runs what Go serves (Mafold Harness's list, from
+            // models.dev): the examples come from that list, and a name not on
+            // it is refused here instead of by Go in the middle of the next
+            // reply. Asked before the lock — the list can take a fetch.
+            let go_ids = if is_mafold_harness(harness.id()) && on_go().await {
                 crate::harness::mafold_harness::go_model_ids().await
             } else {
                 Vec::new()
@@ -7346,10 +7316,10 @@ async fn handle_control(
                     "Codex has no per-chat thinking budget. Its reasoning depth is set by **Reasoning effort** in this bot's Customize sheet — the tiers there are the ones this machine's codex offers for each model.").await;
                 return;
             }
-            // Nor has OpenCode: it runs a model as its provider serves it.
-            if is_opencode(harness.id()) {
+            // Nor has Mafold Harness: it runs a model as its provider serves it.
+            if is_mafold_harness(harness.id()) {
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
-                    &format!("{} has no thinking setting: each model thinks the way it's served, so `/think` would change nothing. Pick the model with `/model` instead.", runtime_name(harness.id()))).await;
+                    "Mafold Harness has no thinking setting: each model thinks the way it's served, so `/think` would change nothing. Pick the model with `/model` instead.").await;
                 return;
             }
             // Default budget for a bare `/think on` — enough for visible reasoning
@@ -7418,8 +7388,8 @@ async fn handle_control(
             }
             // The `/think` budget is Claude-Code-only; omit the meaningless
             // "thinking off" for codex, whose depth is the owner-set effort,
-            // and for OpenCode, which has neither.
-            if harness.id() == "codex" || is_opencode(harness.id()) {
+            // and for Mafold Harness, which has neither.
+            if harness.id() == "codex" || is_mafold_harness(harness.id()) {
                 body.push_str(&format!("kv|Model|{model}\n"));
             } else {
                 let think = match thinking { Some(n) => format!("on ({n} tokens)"), None => "off".into() };
@@ -7586,15 +7556,10 @@ async fn handle_control(
         "help" => {
             // Harness-aware: codex has no /compact, no /think, and its headless
             // menu carries no discovered skills — so its help omits all three.
-            let opencode;
             let text = if harness.id() == "codex" {
                 "I'm a Codex agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nReasoning depth is set by the **Reasoning effort** field in this bot's Customize sheet."
-            } else if is_opencode(harness.id()) {
-                opencode = format!(
-                    "I'm an agent running {} on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /access — who may use this bot, and who pays\n• /status — agent info\n• /cwd [path] — the folder replies here run in; with a path, set it for this chat\n\nThe model and the working directory for every chat are set in this bot's Customize sheet.",
-                    runtime_name(harness.id())
-                );
-                opencode.as_str()
+            } else if is_mafold_harness(harness.id()) {
+                "I'm an agent running Mafold Harness on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /access — who may use this bot, and who pays\n• /status — agent info\n• /cwd [path] — the folder replies here run in; with a path, set it for this chat\n\nThe model and the working directory for every chat are set in this bot's Customize sheet."
             } else {
                 "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — owner only: switch model for this chat\n• /think on|off|<tokens> — owner only: toggle extended thinking for this chat\n• /account [name] — owner only: which Claude account this chat runs on (I move to another one by myself when a usage window fills up)\n• /login [name] — owner only: sign in to Anthropic; with a name, add a second account on this machine\n• /access — who may use this bot, and who pays\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
             };
@@ -8465,108 +8430,14 @@ fn cards_from_list(v: &Value) -> Option<(Vec<String>, Vec<OfferedCard>)> {
 /// who the bot is, the conversation it's replying in, and that it can embed cards
 /// inline — so a "pure" coding agent knows it's acting as a Mafold bot.
 fn mafold_preamble(bot: &str, peer: &str, cards: &[OfferedCard]) -> String {
-    use mafold_transcript::catalog;
     let mut s = format!(
         "You are an AI agent running as a Mafold bot — your Mafold username is @{bot}. \
 You are replying inside a Mafold conversation with @{peer}; your output this turn is \
 delivered to that conversation as a chat message from you. Write a chat reply \
-(conversational), not terminal output.\n\n\
-You can embed CARDS in your reply: write a Markdoc tag inline and Mafold renders it as a \
-native card. Write the tag directly — do NOT wrap it in a code fence or escape it. \
-A card reference is ALWAYS `owner/slug` — a bare name renders as \"Unsupported card\":\n  \
-{{% owner/cardname attribute=\"value\" /%}}\n"
+(conversational), not terminal output.\n\n"
     );
-    if cards.is_empty() {
-        s.push_str("(No custom cards are published for you yet — plain text/Markdown is fine.)");
-    } else {
-        s.push_str(&catalog::render(cards));
-        s.push_str("\nUse a card when it communicates better than prose; otherwise reply normally.");
-    }
-    // The two interactive cards worth reaching for constantly — write the tag
-    // yourself, inline, rather than relying on a tool. They beat plain-text
-    // fallbacks, so spell out the exact syntax and encourage liberal use.
-    s.push_str(
-        "\n\nTWO CARDS WORTH USING OFTEN — write the tag yourself, inline:\n\
-\n• {% mafold/ask %} — a tap-to-answer question card; the most reliable way to offer the user choices \
-here. Line-encoded body: one `q|<header>|<multi 0/1>|<question>` line per question, each followed by \
-its `o|<label>|<description>` option lines. End your turn with it — the user's tap comes back as \
-their next message and you continue. Example:\n\
-{% mafold/ask %}\nq|Deploy|0|Ship to prod now?\no|Yes|blue-green, ~2 min\no|Hold|I'll review first\n{% /mafold/ask %}\n\
-\n• {% mafold/html %} — a sandboxed mini-UI (charts, demos, small games, rich layouts, dashboards). Put \
-your HTML between the tags and CLOSE with {% /mafold/html %} (NOT a second {% mafold/html %} — a common mistake \
-that breaks the card). ",
-    );
-    s.push_str(catalog::HTML_NETWORK);
-    s.push(' ');
-    s.push_str(catalog::PICTURES_BY_URL);
-    s.push_str(
-        " Reach for it whenever something visual communicates better than text.\n\
-  COLOURS: the frame hands you the READER'S OWN theme as CSS variables. Use them and your card is \
-correct in light and dark without a single media query:\n\
-    --mf-text  --mf-muted  --mf-subtle      (foreground, in three weights)\n\
-    --mf-bg  --mf-bubble  --mf-float  --mf-card   (surfaces, back to front)\n\
-    --mf-border  --mf-accent  --mf-on-accent  --mf-error  --mf-success\n\
-  `html[data-theme]` is `light` or `dark` if you need to branch, and the frame's background is \
-TRANSPARENT — the bubble shows through, so don't paint your own page background unless you mean to. \
-DON'T hardcode a palette and DON'T write `@media (prefers-color-scheme: …)`: that follows the \
-reader's OPERATING SYSTEM, while the app has its own appearance setting, and the two disagree often \
-enough that it is the single most common way one of these cards comes out unreadable.\n\
-  SHARED STATE — a poll, a shared checklist, a two-player game: the page gets `window.mafold`, data \
-that lives with THIS message, read and written by everyone in the chat as themselves (the server \
-checks every write). `await mafold.ready` → `{available}`; `mafold.viewer` → `{username,name}` or \
-null; `mafold.writable` (signed in, message finished, online). Each person writes their OWN \
-fields — `mafold.state.setMine(\"vote\", 2)`; `mafold.state.mine(\"vote\")`; \
-`mafold.state.all(\"vote\")` lists everyone's as `{v,by,at,rev,user}` in write order (`rev` orders \
-writes: first to take a seat wins). Nobody can write as someone else. `setMine(f, v, \
-{readers:\"sender\"})` lets only you, the sender, see it — an anonymous vote you tally. A field \
-everyone edits together is declared on the tag, `{% mafold/html shared=\"items\" %}`, and changed \
-with `mafold.state.update(\"items\", list => [...(list||[]), x])` — concurrent edits all land. \
-Repaint on `mafold.state.on(fn)` and `mafold.on(\"writable\", fn)`. You read and write the same \
-state with `mafold state get|set <message id> …` (`mafold msg` lists it). Data that only lives as \
-long as the card — this poll, this game — belongs here, not in an app.\n\
-  SEND — when a tap on your card should reach the chat as the reader's own message: a page can't \
-send, it offers words. Call `mafold.propose(\"I want to make something\")` from a tap on your page: \
-the app asks the reader in a modal of its own, showing those words, and Send there posts them as \
-their own reply to this card, and you hear it like any reply. It resolves `true` if they went out \
-and `false` if the reader said no. Called without a tap, on load or on a timer, it is refused \
-(`no_tap`). `mafold.sent` is what this reader last sent from this card, so repaint on \
-`mafold.on(\"sent\", fn)` to show it answered. Words are at most 2000 characters and must be text \
-the reader can see. Plain options need no page: `{% mafold/ask %}` does this already. Use propose \
-when the choice has to look a certain way.\n\
-  FULL SCREEN — don't count on the app for a full-screen button: a page that wants the whole \
-screen (a game, a map, a long table) draws its own button and calls `mafold.fullscreen.enter()` \
-from a tap on it. It resolves `true` once the page fills the screen and `false` if it didn't; like \
-propose it needs a tap, so on load or on a timer it resolves `false`. `mafold.fullscreen.available` \
-is false in apps too old to have it, so hide your button then, and keep it out of the top-right \
-corner, where the app may still draw its own. The way out is always the app's (a strip above the \
-page with its close button, and Escape), so your page doesn't have to be the exit; \
-`mafold.fullscreen.exit()` and `.active` are there if you want them, and \
-`mafold.on(\"fullscreen\", fn)` fires on the way in and out. On a phone, full screen opens a second \
-copy of your page that starts over with `active` already true: check it on load and draw the \
-full-screen view, rather than counting on what the inline copy had in its variables.\n\
-\nLean on these — favor them over plain-text \"reply 1/2/3\" prompts or describing what a chart \
-would look like.\n\
-\nCARDS ARE THE NATIVE MEDIUM HERE, not a garnish. This is a chat client that renders live \
-components inside the bubble, so anything with STRUCTURE — a comparison, a schedule, a set of \
-numbers, a diff, a layout, a state machine, a board, a piece of music — reads better as a card \
-than as prose or an ASCII table.\n\
-\nAND WRITE YOUR OWN HTML — CONSTANTLY. {% mafold/html %} is NOT the fallback for when no \
-published card fits; it is the card you should reach for most, because it can be anything you \
-are willing to build. Real HTML/CSS/JS runs sandboxed in the bubble, scripts and all: an SVG \
-chart, a sortable table, a side-by-side diff, a timeline, a stepper, a seating plan, a canvas \
-animation, a small playable thing, a whole dashboard. Building the view is usually FASTER than \
-writing the paragraph that describes it, and the reader gets something they can actually poke at. \
-So: describing what a chart would look like, or drawing one in ASCII, when you could have drawn \
-the chart — that is the habit to break. Default to showing; drop to prose only when the answer \
-genuinely is a sentence.",
-    );
-    // The paragraph above is the loudest thing this prompt says about cards,
-    // and a card made for the job (pictures from a page) lost to it: one
-    // sentence, only when there is such a card on the menu.
-    if let Some(rule) = catalog::noted_cards_beat_html(cards) {
-        s.push(' ');
-        s.push_str(rule);
-    }
+    // How to write cards — the one copy a token-driven AI reads too.
+    s.push_str(&mafold_transcript::guide::cards(cards, mafold_transcript::guide::Reader::Computer));
     // Delivering an artifact. Two failure modes, one section. (1) Agents
     // reliably ANNOUNCE a picture they made and then send nothing, because
     // producing the file and delivering it are separate acts and only the first
@@ -8620,6 +8491,15 @@ in this bot's Customize sheet ▸ Working directory (for every chat, or for one 
 `/cwd <path>` in a chat (that chat or channel only; `/cwd default` hands it back; a bare `/cwd` shows \
 it). A `cd` lasts only for the one command it is in. When someone asks you to work in another folder, \
 tell them those two ways — never that it can't be changed.",
+    );
+    // The help library Mafold Cloud agents read (`brains/knowledge`), now
+    // shared: without it a computer agent asked "how does Mafold do X"
+    // answered from memory.
+    s.push_str(
+        "\n\nMAFOLD HELP: for how Mafold itself works — agents, cards, apps, wallet, connections, \
+chats, routines, troubleshooting — look it up before answering: `mafold docs \"<question>\"` \
+searches the help library (English or Chinese), `mafold docs --topic <topic>` reads one article. \
+No match means unverified, not unsupported; never invent a button, setting or page.",
     );
     // Interactive questions + concurrency. The agent over-trusts AskUserQuestion
     // (flaky via the blocking hook) and wrongly concludes parallel sessions have
@@ -9794,13 +9674,6 @@ async fn pick_up(
     // handler ran: a crash, a hard kill, Windows). Give it a moment to go — one
     // turn is never run by two processes at once.
     if let Some(pid) = journal.child {
-        // …except a server of the OpenCode build Mafold Harness used to run,
-        // which never goes by itself (an HTTP server, no stdin to lose): it
-        // is ended, not waited for.
-        let start = journal.child_start;
-        if tokio::task::spawn_blocking(move || crate::harness::opencode::end_orphan(pid, start)).await.unwrap_or(false) {
-            println!("↻ reply {draft}: ended OpenCode server pid {pid}, left running by the previous process");
-        }
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         // Gone, or a zombie nobody has reaped yet: either way at work no more.
         while crate::platform::pid_running(pid) {
@@ -10499,13 +10372,12 @@ async fn handle(
     // What each renderer reads the reply's total for before its result card.
     let wallet_draft = fuel.as_ref().map(|f| f.draft.clone());
     // An agent on its owner's OpenCode Go plan (`fuel::go_step`): the owner's
-    // key, opened here from their Connections — or nothing, for their own
-    // OpenCode already signed in to Go on this computer. Same road as a
-    // refused wallet key: the reply says why and nothing starts. Held to the
-    // turn's end, which is how long the key stays masked.
+    // key, opened here from their Connections. Same road as a refused wallet
+    // key: the reply says why and nothing starts. Held to the turn's end,
+    // which is how long the key stays masked.
     let _go_key = if refused.is_none() && !no_usable_account && !stopped_in_setup && !is_held_draft(&msg_id) && on_go().await {
-        match crate::fuel::go_step(&client.base, bot_owner().await.as_deref(), harness.id(), &mut env).await {
-            Ok(k) => k,
+        match crate::fuel::go_step(&client.base, bot_owner().await.as_deref(), &mut env).await {
+            Ok(k) => Some(k),
             Err(why) => {
                 eprintln!("opencode go: no key for reply {msg_id} — {}", crate::logfile::one_line(&why));
                 refused = Some(why);
@@ -10541,6 +10413,7 @@ async fn handle(
         env: env.clone(),
         mount: mount.clone(),
         skill_plugins: skill_plugins.clone(),
+        client: Some(client.clone()),
         proc: turn_proc.clone(),
     };
 
@@ -10749,6 +10622,7 @@ async fn handle(
             env: env.clone(),
             mount: mount.clone(),
             skill_plugins: skill_plugins.clone(),
+            client: Some(client.clone()),
             proc: turn_proc.clone(),
         };
         result = harness.run(again, ev_keep.clone()).await;
@@ -10838,6 +10712,7 @@ async fn handle(
             env: env.clone(),
             mount: mount.clone(),
             skill_plugins: skill_plugins.clone(),
+            client: Some(client.clone()),
             proc: turn_proc.clone(),
         };
         result = harness.run(again, ev_keep.clone()).await;
@@ -10931,6 +10806,7 @@ async fn handle(
                 env: env.clone(),
                 mount: mount.clone(),
                 skill_plugins: skill_plugins.clone(),
+                client: Some(client.clone()),
                 proc: turn_proc.clone(),
             };
             result = harness.run(retry, ev_tx2).await;
@@ -11013,6 +10889,7 @@ async fn handle(
             env: env.clone(),
             mount: mount.clone(),
             skill_plugins: skill_plugins.clone(),
+            client: Some(client.clone()),
             proc: turn_proc.clone(),
         };
         result = harness.run(fresh, ev_tx3).await;
@@ -15536,20 +15413,20 @@ mod customize_seed_tests {
     /// start would republish it forever.
     #[test]
     fn the_current_claude_sheet_is_recognized_as_ours() {
-        for h in ["claude-code", "codex", "kimi-code", "opencode", "opencode-own"] {
+        for h in ["claude-code", "codex", "kimi-code", crate::harness::MAFOLD_HARNESS] {
             assert!(is_our_stock_seed(&stock(h)), "{h}");
         }
     }
 
-    /// Mafold Harness and your own OpenCode got Claude Code's sheet — Fable,
-    /// Opus, Sonnet and Haiku, an effort, a thinking budget and a Claude
-    /// account, none of which an agent on OpenCode Go can use (ops 10-31).
-    /// Theirs has a model menu (filled from what the machine reports) and the
-    /// fields every agent has, and none of Claude's. The Claude sheet one of
-    /// them was given is ours, so their next start replaces it.
+    /// Mafold Harness got Claude Code's sheet — Fable, Opus, Sonnet and Haiku,
+    /// an effort, a thinking budget and a Claude account, none of which an
+    /// agent on OpenCode Go can use (ops 10-31). Its own has a model menu
+    /// (filled from what the machine reports) and the fields every agent has,
+    /// and none of Claude's. The Claude sheet it was given is ours, so its
+    /// next start replaces it.
     #[test]
-    fn opencode_runtimes_get_their_own_sheet() {
-        for h in ["opencode", "opencode-own"] {
+    fn mafold_harness_gets_its_own_sheet() {
+        for h in [crate::harness::MAFOLD_HARNESS] {
             let s = stock(h);
             let keys: Vec<&str> = s.iter().filter_map(|f| f["key"].as_str()).collect();
             assert_eq!(keys, ["model", "system_prompt", "cwd", "whitelist", "blacklist", "greeting", "access"], "{h}");
@@ -15611,24 +15488,24 @@ mod caps_recheck_tests {
 }
 
 #[cfg(test)]
-mod opencode_command_tests {
-    use super::{is_opencode, model_examples, not_a_go_model, runtime_name};
+mod mafold_harness_command_tests {
+    use super::{is_mafold_harness, model_examples, not_a_go_model};
+    use crate::harness::MAFOLD_HARNESS;
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
 
     /// `/model` on an agent on OpenCode Go: its examples are Go's models as
-    /// its OpenCode lists them, a name Go runs is taken — bare or as
+    /// Mafold Harness knows them, a name Go runs is taken — bare or as
     /// `opencode-go/<id>`, any case — and one it doesn't is refused with the
     /// list instead of failing the next reply. With no list there is nothing
     /// to hold it to, and Go answers for itself.
     #[test]
     fn model_for_an_agent_on_go_is_one_of_gos() {
         let go = ids(&["kimi-k2.7-code", "kimi-k3", "glm-5.3", "deepseek-v4-pro"]);
-        assert_eq!(model_examples("opencode", &go), "e.g. kimi-k2.7-code, kimi-k3, glm-5.3");
-        assert_eq!(model_examples("opencode-own", &go), "e.g. kimi-k2.7-code, kimi-k3, glm-5.3");
-        assert!(!model_examples("opencode", &[]).contains("opus"));
+        assert_eq!(model_examples(MAFOLD_HARNESS, &go), "e.g. kimi-k2.7-code, kimi-k3, glm-5.3");
+        assert!(!model_examples(MAFOLD_HARNESS, &[]).contains("opus"));
         assert_eq!(model_examples("claude-code", &[]), "e.g. opus, sonnet, haiku");
         assert_eq!(model_examples("codex", &[]), "e.g. gpt-5.6-sol");
 
@@ -15640,11 +15517,11 @@ mod opencode_command_tests {
     }
 
     #[test]
-    fn the_opencode_runtimes_are_named_as_people_see_them() {
-        assert!(is_opencode("opencode") && is_opencode("opencode-own"));
-        assert!(!is_opencode("claude-code") && !is_opencode("codex"));
-        assert_eq!(runtime_name("opencode"), "Mafold Harness");
-        assert_eq!(runtime_name("opencode-own"), "OpenCode");
+    fn mafold_harness_is_told_apart_by_its_own_id() {
+        assert!(is_mafold_harness(MAFOLD_HARNESS));
+        for other in ["claude-code", "codex", "kimi-code", "opencode"] {
+            assert!(!is_mafold_harness(other), "{other}: the daemon only ever holds `select`'s id");
+        }
     }
 }
 
@@ -15848,12 +15725,10 @@ mod gate_tests {
         let cx = names("codex");
         // `/think` is a Claude Code budget (MAX_THINKING_TOKENS) — offered to
         // claude-code, hidden from codex (its depth is the owner-set effort)
-        // and from OpenCode, which has neither.
+        // and from Mafold Harness, which has neither.
         assert!(cc.contains(&"think".to_string()));
         assert!(!cx.contains(&"think".to_string()));
-        for h in ["opencode", "opencode-own"] {
-            assert_eq!(names(h), cx, "{h}");
-        }
+        assert_eq!(names(crate::harness::MAFOLD_HARNESS), cx);
         assert!(names("kimi-code").contains(&"think".to_string()));
         // Every other control command is offered to both harnesses.
         for cmd in ["clear", "new", "stop", "model", "status", "cwd", "access", "help"] {
@@ -17056,7 +16931,7 @@ mod intro_tests {
     /// as owner-authored and could never re-seed it again.
     #[test]
     fn every_current_stock_shape_is_still_recognised_as_ours() {
-        for harness in ["claude-code", "codex", "kimi-code", "opencode", "opencode-own", "something-unknown"] {
+        for harness in ["claude-code", "codex", "kimi-code", crate::harness::MAFOLD_HARNESS, "something-unknown"] {
             let (stock, _) = customize_fields(harness);
             let schema = stock.as_array().expect("stock schema is an array");
             assert!(
@@ -17150,7 +17025,7 @@ mod stock_seed_tests {
     /// revision could never re-seed what this one publishes.
     #[test]
     fn current_stock_seeds_fingerprint_as_ours() {
-        for harness in ["claude-code", "codex", "kimi-code", "opencode", "opencode-own"] {
+        for harness in ["claude-code", "codex", "kimi-code", crate::harness::MAFOLD_HARNESS] {
             let (stock, _) = customize_fields(harness);
             assert!(
                 is_our_stock_seed(stock.as_array().unwrap()),
@@ -20292,7 +20167,7 @@ mod journaled_child_tests {
     /// later. By then the pid may have been reaped (a failover between
     /// attempts) and handed to another process (Windows reuses pids soon); a
     /// token read then pairs our pid with that stranger's start, and a
-    /// restart's sweep (`opencode::end_orphan`) would end the stranger. Here
+    /// restart's wait (`pick_up`) would wait on the stranger. Here
     /// the pid is reaped; read again, its start is gone.
     #[cfg(unix)]
     #[test]

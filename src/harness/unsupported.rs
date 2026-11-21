@@ -1,10 +1,10 @@
 //! A runtime this build of mafold can't run.
 //!
 //! An agent's runtime is chosen on the server, and the server takes any id —
-//! `openclaw` among them, which this CLI can't drive (`opencode` was one until
-//! Mafold Harness, `super::opencode`). Until 10-29 [`super::select`] answered
-//! every such id with Claude Code, so an agent created to run OpenCode quietly
-//! ran Claude Code instead: on the machine's
+//! `openclaw` among them, which this CLI can't drive. Until 10-29
+//! [`super::select`] answered every such id with Claude Code, so an agent
+//! created to run another runtime quietly ran Claude Code instead: on the
+//! machine's
 //! Claude login, with Claude's models in its Customize sheet, and nothing but
 //! one stdout line to say so.
 //!
@@ -32,9 +32,8 @@ pub fn display_name(id: &str) -> String {
         "claude-code" => "Claude Code".into(),
         "codex" => "Codex".into(),
         "kimi-code" => "Kimi Code".into(),
-        // The loop that is part of mafold, and your own OpenCode install.
-        "opencode" => "Mafold Harness".into(),
-        "opencode-own" => "OpenCode".into(),
+        // The loop that is part of mafold.
+        mafold_core::mafold_types::agent_setup::MAFOLD_HARNESS => "Mafold Harness".into(),
         "openclaw" => "OpenClaw".into(),
         other => other.into(),
     }

@@ -29,8 +29,8 @@ use crate::client::{Client, ReplyCost, ReplyKey};
 /// `getBot`'s `fuel` for an agent the owner's wallet pays for.
 pub const WALLET: &str = "wallet";
 
-/// The hand-off to the harness (`Turn.env`), named once: the OpenCode harness
-/// reads exactly these and refuses a turn without them.
+/// The hand-off to the harness (`Turn.env`), named once: Mafold Harness reads
+/// exactly these and refuses a turn without them.
 pub const KEY_ENV: &str = "MAFOLD_WALLET_KEY";
 pub const BASE_ENV: &str = "MAFOLD_WALLET_BASE";
 pub const MODELS_ENV: &str = "MAFOLD_WALLET_MODELS";
@@ -50,19 +50,18 @@ pub fn is_wallet(fuel: Option<&str>) -> bool {
 
 // ── OpenCode Go (ops 10-31) ─────────────────────────────────────────────────
 //
-// An agent New Agent signed in with OpenCode Go — Mafold Harness, or the
-// owner's own OpenCode — runs on the owner's Go plan. Its key is the one the
-// owner pasted in Settings ▸ Connections, opened on this computer for each
-// reply (`connection::open_owner_key`) and handed to the harness through the
-// turn's env alone, masked out of everything the turn writes while it holds
-// it. The owner's own OpenCode that is already signed in to Go here needs no
-// key from Mafold at all. Go bills the owner's plan, not the wallet: there is
-// no draft key, no gate on who may start a reply, no total to read back.
+// An agent New Agent signed in with OpenCode Go — Mafold Harness — runs on
+// the owner's Go plan. Its key is the one the owner pasted in Settings ▸
+// Connections, opened on this computer for each reply
+// (`connection::open_owner_key`) and handed to the harness through the turn's
+// env alone, masked out of everything the turn writes while it holds it. Go
+// bills the owner's plan, not the wallet: there is no draft key, no gate on
+// who may start a reply, no total to read back.
 
 /// `getBot`'s `fuel` for an agent on its owner's OpenCode Go plan.
 pub const GO: &str = "opencode-go";
 
-/// The hand-off of the Go key to the OpenCode harnesses (`Turn.env`).
+/// The hand-off of the Go key to Mafold Harness (`Turn.env`).
 pub const GO_KEY_ENV: &str = "MAFOLD_GO_KEY";
 
 /// Is `fuel` OpenCode Go?
@@ -97,20 +96,14 @@ pub fn claude_in(env: &[(String, String)]) -> bool {
     is_claude(env.iter().rev().find(|(k, _)| k == FUEL_ENV).map(|(_, v)| v.as_str()))
 }
 
-/// The turn's Go step, for an agent on OpenCode Go running `harness`: the
-/// owner's key joins `env`, and the guard that masks it comes back for the
-/// turn to hold — or nothing, for the owner's own OpenCode that is signed in
-/// to Go on this computer already. `Err` is the turn's error, in the words
-/// the reply ends with.
+/// The turn's Go step, for an agent on OpenCode Go: the owner's key joins
+/// `env`, and the guard that masks it comes back for the turn to hold. `Err`
+/// is the turn's error, in the words the reply ends with.
 pub async fn go_step(
     base: &str,
     owner: Option<&str>,
-    harness: &str,
     env: &mut Vec<(String, String)>,
-) -> Result<Option<crate::conceal::LiveSecret>, String> {
-    if harness == crate::harness::opencode::OWN && crate::harness::opencode::own_go_login() {
-        return Ok(None);
-    }
+) -> Result<crate::conceal::LiveSecret, String> {
     let Some(owner) = owner.map(crate::agent::norm_user).filter(|o| !o.is_empty()) else {
         return Err("This agent runs on its owner's OpenCode Go plan, and this computer can't tell who its owner \
                     is, so it starts no replies."
@@ -120,7 +113,7 @@ pub async fn go_step(
     let masked = crate::conceal::hide_while_live(&key);
     env.push((GO_KEY_ENV.to_string(), key));
     println!("🔑 OpenCode Go: @{owner}'s key is open for this reply");
-    Ok(Some(masked))
+    Ok(masked)
 }
 
 /// What a reply ends with when its Go key couldn't be opened here.

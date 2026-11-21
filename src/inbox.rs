@@ -2266,6 +2266,7 @@ async fn look(
             skill_plugins: None,
             // …and no generating card whose heartbeat it would keep.
             proc: Default::default(),
+            client: None,
         };
         let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let run = ctx.harness.run(turn, sink);

@@ -66,8 +66,9 @@ pub fn create_body(name: &str, harness: Option<&str>, fuel: &str, model: Option<
     let name = name.trim().trim_start_matches('@');
     let label = name.split_once(':').map_or(name, |(_, l)| l).trim();
     let mut body = serde_json::json!({ "label": label, "sign_in": fuel.trim() });
+    // In today's id: `--harness opencode` is Mafold Harness, as it always was.
     if let Some(h) = harness.map(str::trim).filter(|h| !h.is_empty()) {
-        body["harness"] = serde_json::json!(h);
+        body["harness"] = serde_json::json!(mafold_core::mafold_types::agent_setup::runtime_id(&h.to_lowercase()));
     }
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         body["config"] = serde_json::json!({ "model": m });
@@ -123,14 +124,18 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// `mafold add wallet --harness opencode --fuel wallet --model …` asks
-    /// for exactly what New Agent would — and nothing it didn't say.
+    /// `mafold add wallet --harness mafold-harness --fuel wallet --model …`
+    /// asks for exactly what New Agent would — and nothing it didn't say. The
+    /// id it went by until 11-20 is asked for as today's.
     #[test]
     fn the_arguments_are_the_create_bot_body() {
-        assert_eq!(
-            create_body("wallet", Some("opencode"), "wallet", Some("deepseek-v4-flash")),
-            serde_json::json!({"label":"wallet","harness":"opencode","sign_in":"wallet","config":{"model":"deepseek-v4-flash"}})
-        );
+        for h in ["mafold-harness", "opencode", " OpenCode "] {
+            assert_eq!(
+                create_body("wallet", Some(h), "wallet", Some("deepseek-v4-flash")),
+                serde_json::json!({"label":"wallet","harness":"mafold-harness","sign_in":"wallet","config":{"model":"deepseek-v4-flash"}}),
+                "{h}"
+            );
+        }
         assert_eq!(
             create_body("@ops:helper ", None, " wallet ", Some("  ")),
             serde_json::json!({"label":"helper","sign_in":"wallet"}),
@@ -147,12 +152,12 @@ mod tests {
             r#"{"ok":true,"result":{"bot":{"username":"ops:wallet"},"token":"mb_0000000000000000000000000000beef"}}"#.into(),
         )
         .await;
-        let got = create_if_missing(&base, "wallet", Some("opencode"), "wallet", None, &login("ops")).await.unwrap();
+        let got = create_if_missing(&base, "wallet", Some("mafold-harness"), "wallet", None, &login("ops")).await.unwrap();
         assert_eq!(got, ("ops:wallet".to_string(), Some("mb_0000000000000000000000000000beef".to_string())));
         let req = seen.await.unwrap();
         assert!(req.starts_with("POST /api/createBot"), "{req}");
         assert!(req.to_lowercase().contains("authorization: bearer s_ops"), "{req}");
-        assert!(req.contains(r#""sign_in":"wallet""#) && req.contains(r#""harness":"opencode""#), "{req}");
+        assert!(req.contains(r#""sign_in":"wallet""#) && req.contains(r#""harness":"mafold-harness""#), "{req}");
     }
 
     /// One that exists keeps what it runs on: no error, no token — the

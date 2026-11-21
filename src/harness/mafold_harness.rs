@@ -1,10 +1,11 @@
 //! Mafold Harness on its owner's computer: the loop the official bots and
 //! Cloud agents run on (`mafold-harness`), run in this process.
 //!
-//! Its runtime id is `opencode` — the one New Agent's Mafold Harness tile,
-//! its sign-ins (the wallet, OpenCode Go) and every agent already stored use.
-//! It named the pinned OpenCode build this replaces (ops, 11-02: Mafold
-//! Harness is the house kernel, carried by mafold-cli).
+//! Its runtime id is `mafold-harness` (`agent_setup::MAFOLD_HARNESS`). Until
+//! 11-20 it went by `opencode`, the name of the OpenCode build it took over
+//! from on 11-03 (ops, 11-02: Mafold Harness is the house kernel, carried by
+//! mafold-cli); [`super::select`] still reads that id, and your own OpenCode's,
+//! as this.
 //!
 //! What shapes this impl:
 //! - **Nothing to install.** A turn needs only its fuel — the reply's wallet
@@ -22,8 +23,9 @@
 //! - **Corrected mid-turn.** What someone says while it works is read from the
 //!   turn's steer mailbox at the next tool boundary; the daemon has already
 //!   drawn the seam.
-//! - **Its folder, for the owner's circle** ([`super::computer`]); a guest's
-//!   turn gets no tools at all.
+//! - **Its folder, for the owner's circle** ([`super::computer`]), and the
+//!   server's search and page reading on the owner's wallet
+//!   ([`super::server_tools`]); a guest's turn gets no tools at all.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,8 +45,8 @@ use tokio::sync::watch;
 
 use super::claude_fuel::{self, ClaudeEngine};
 use super::computer::{self, Computer};
-use super::opencode::{self, Fuel};
-use super::{AgentEvent, CommandOutcome, Harness, HarnessProbe, Turn, TurnOutcome};
+use super::server_tools;
+use super::{AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModelCap, Turn, TurnOutcome};
 use crate::client::Client;
 
 pub struct MafoldHarness;
@@ -65,7 +67,7 @@ const GO_BASE: &str = "https://opencode.ai/inference/go/openai/v1";
 const GO_USER_AGENT: &str = concat!("mafold-harness/", env!("CARGO_PKG_VERSION"));
 
 /// The output cap asked for per call on the wallet — what the router holds
-/// besides the input before each call, as the OpenCode build asked.
+/// besides the input before each call.
 const WALLET_OUTPUT_TOKENS: u32 = 32_000;
 
 /// How much of a conversation a turn sends back at most, in characters of its
@@ -79,10 +81,182 @@ const OLD_RESULT_CHARS: usize = 4_000;
 /// How often a working turn says it is alive while nothing streams.
 const PULSE_EVERY: Duration = Duration::from_secs(1);
 
+// ── Fuel ────────────────────────────────────────────────────────────────────
+
+/// What a turn without its fuel answers. The daemon puts the wallet's key, or
+/// the owner's OpenCode Go key, in [`Turn::env`] for a reply and only then;
+/// without either there is nothing this agent may run on.
+pub const NO_WALLET_KEY: &str =
+    "This agent runs on the wallet or OpenCode Go, but the reply has no key for either, so nothing ran.";
+
+/// The router's provider id for the wallet: a picked wallet model may carry
+/// it as a prefix (`mafold/deepseek-v4-pro`).
+const PROVIDER: &str = "mafold";
+
+/// OpenCode Go's provider id (models.dev): a picked Go model may carry it as
+/// a prefix (`opencode-go/glm-5.3`).
+const GO_PROVIDER: &str = "opencode-go";
+
+/// The Go model an agent starts on when it was given none
+/// (`client-shared/newAgent.ts` `GO_MODEL_ORDER`'s first: a coding model).
+const GO_DEFAULT_MODEL: &str = "kimi-k2.7-code";
+
+/// What a turn runs on, as the daemon's fuel step handed it over.
+#[derive(Clone, PartialEq)]
+enum Fuel {
+    /// The owner's wallet, through the router.
+    Wallet(Wallet),
+    /// The owner's OpenCode Go plan: the key from their Connections. `base`
+    /// stands in for Go's address (debug builds, [`dev_base`]).
+    Go { key: String, base: Option<String> },
+}
+
+/// Written by hand for the same reason as [`Wallet`]'s.
+impl std::fmt::Debug for Fuel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fuel::Wallet(w) => w.fmt(f),
+            Fuel::Go { base, .. } => f.debug_struct("Go").field("key", &"<redacted>").field("base", base).finish(),
+        }
+    }
+}
+
+impl Fuel {
+    /// The wallet when its three variables are there; else OpenCode Go when
+    /// its key is. `None` = nothing to run on.
+    fn from_env(env: &[(String, String)]) -> Option<Self> {
+        if let Some(w) = Wallet::from_env(env, dev_base(env, "MAFOLD_DEV_WALLET_BASE")) {
+            return Some(Fuel::Wallet(w));
+        }
+        let key = env
+            .iter()
+            .rev()
+            .find(|(n, _)| n == crate::fuel::GO_KEY_ENV)
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())?;
+        Some(Fuel::Go { key, base: dev_base(env, "MAFOLD_DEV_GO_BASE") })
+    }
+}
+
+/// A Go model as Go names it: what the agent was given (with or without the
+/// `opencode-go/` prefix), else the default.
+fn go_model(wanted: Option<&str>) -> String {
+    wanted
+        .map(|m| m.trim().trim_start_matches("opencode-go/").to_string())
+        .filter(|m| !m.is_empty() && !m.contains('/'))
+        .unwrap_or_else(|| GO_DEFAULT_MODEL.to_string())
+}
+
+/// The wallet a turn runs on, as the daemon's fuel step handed it over.
+#[derive(Clone, PartialEq)]
+struct Wallet {
+    key: String,
+    /// The router's OpenAI-compatible base (ends in `/v1`).
+    base: String,
+    /// What the key may run, in the router's order.
+    models: Vec<String>,
+}
+
+/// Written by hand so the key never reaches a log line: the first `{:?}` of
+/// a wallet (or of something holding one) in a trace or an error would
+/// otherwise print a live key to the owner's wallet — as `client::ReplyKey`
+/// is for the same reason.
+impl std::fmt::Debug for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wallet")
+            .field("key", &"<redacted>")
+            .field("base", &self.base)
+            .field("models", &self.models)
+            .finish()
+    }
+}
+
+impl Wallet {
+    /// All three of key, base and models from `env` — or none. `dev_base`
+    /// stands in for the base when given (debug builds, [`dev_base`]).
+    fn from_env(env: &[(String, String)], dev_base: Option<String>) -> Option<Self> {
+        let get = |k: &str| {
+            env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty())
+        };
+        let key = get(crate::fuel::KEY_ENV)?;
+        let base = get(crate::fuel::BASE_ENV)?;
+        let models: Vec<String> = get(crate::fuel::MODELS_ENV)?
+            .split(',')
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if models.is_empty() {
+            return None;
+        }
+        let base = dev_base.unwrap_or(base).trim_end_matches('/').to_string();
+        Some(Self { key, base, models })
+    }
+}
+
+/// Debug builds only: `MAFOLD_DEV_WALLET_BASE` / `MAFOLD_DEV_GO_BASE` (the
+/// turn's, else the daemon's) point the wallet at a local router, Go at a
+/// local stand-in. A release build never sends a key anywhere but where it
+/// belongs: the base the API minted a reply key for, and Go's own door.
+fn dev_base(env: &[(String, String)], var: &str) -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == var)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(var).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The model this turn runs: the chat's pick when the wallet runs it, the
+/// wallet's first when nothing was picked — and a refusal, not a substitute,
+/// when the pick is a model this reply's key can't run.
+fn pick_model(wanted: Option<&str>, models: &[String]) -> std::result::Result<String, String> {
+    let wanted = wanted.map(str::trim).filter(|m| !m.is_empty());
+    let Some(w) = wanted else {
+        return Ok(models[0].clone());
+    };
+    let w = w.strip_prefix(&format!("{PROVIDER}/")).unwrap_or(w);
+    match models.iter().find(|m| m.eq_ignore_ascii_case(w)) {
+        Some(m) => Ok(m.clone()),
+        None => Err(format!(
+            "This agent is set to `{w}`, which the wallet doesn't run — it runs {}. \
+             Pick one of those (Customize ▸ Model, or `/model` in this chat); nothing ran on another model.",
+            models.join(", ")
+        )),
+    }
+}
+
+/// Go's models ([`go_models`]) as a caps report: the Customize sheet's model
+/// menu, drawn by the server from the models this loop can talk to on Go. No
+/// tiers: Go passes none, so the sheet offers none. `None` when the list came
+/// back empty — a list that failed has learned nothing, and must not empty a
+/// menu.
+fn go_probe(models: Vec<Value>) -> Option<HarnessProbe> {
+    let models: Vec<ModelCap> = models
+        .iter()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?.to_string();
+            Some(ModelCap {
+                // What `go_model` also takes for it.
+                aliases: vec![format!("{GO_PROVIDER}/{id}")],
+                display: m["name"].as_str().unwrap_or(&id).to_string(),
+                id,
+                resolved: None,
+                description: None,
+                efforts: Vec::new(),
+            })
+        })
+        .collect();
+    (!models.is_empty()).then(|| HarnessProbe { source: CapsSource::Handshake, models, ..Default::default() })
+}
+
 #[async_trait]
 impl Harness for MafoldHarness {
     fn id(&self) -> &'static str {
-        "opencode"
+        mafold_core::mafold_types::agent_setup::MAFOLD_HARNESS
     }
 
     /// Always: it is part of this program.
@@ -128,7 +302,7 @@ impl Harness for MafoldHarness {
     /// OpenCode Go's models this loop can talk to — the model menu of an agent
     /// on Go. On the wallet the models are the router's (`agent::report_caps`).
     async fn caps(&self, _env: &[(String, String)], _version: &str) -> Option<HarnessProbe> {
-        opencode::go_probe(go_models().await)
+        go_probe(go_models().await)
     }
 }
 
@@ -179,6 +353,7 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
         mount,
         skill_plugins: _,
         proc,
+        client,
     } = turn;
     if !std::path::Path::new(&workdir).is_dir() {
         bail!("working directory does not exist: {workdir} — check --workdir");
@@ -188,26 +363,22 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
     let engine = if crate::fuel::claude_in(&env) {
         Engine::Claude(claude_fuel::claude_model(model.as_deref()))
     } else {
-        let Some(fuel) = Fuel::from_env(&env, false) else {
-            return Ok(TurnOutcome { error: Some(opencode::NO_WALLET_KEY.into()), ..Default::default() });
+        let Some(fuel) = Fuel::from_env(&env) else {
+            return Ok(TurnOutcome { error: Some(NO_WALLET_KEY.into()), ..Default::default() });
         };
         let runtime = match &fuel {
-            Fuel::Wallet(w) => match opencode::pick_model(model.as_deref(), &w.models) {
+            Fuel::Wallet(w) => match pick_model(model.as_deref(), &w.models) {
                 Ok(m) => OpenAiCompatRuntime::new(w.key.clone(), w.base.clone(), m, None, "the wallet's router")
                     .with_max_tokens(Some(WALLET_OUTPUT_TOKENS)),
                 Err(why) => return Ok(TurnOutcome { error: Some(why), ..Default::default() }),
             },
-            Fuel::Go { key: Some(key), base } => OpenAiCompatRuntime::new(
+            Fuel::Go { key, base } => OpenAiCompatRuntime::new(
                 key.clone(),
                 base.clone().unwrap_or_else(|| GO_BASE.to_string()).trim_end_matches('/').to_string(),
-                opencode::go_model(model.as_deref()),
+                go_model(model.as_deref()),
                 None,
                 "OpenCode Go",
             ),
-            // Only your own OpenCode may run on a Go login of its own.
-            Fuel::Go { key: None, .. } => {
-                return Ok(TurnOutcome { error: Some(opencode::NO_WALLET_KEY.into()), ..Default::default() })
-            }
         }
         .with_reasoning_effort(effort.clone());
         Engine::OpenAi(runtime, fuel)
@@ -242,8 +413,8 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
     }
     if let Some(id) = model.as_deref() {
         let (catalogue, on) = match &engine {
-            Engine::OpenAi(_, Fuel::Go { .. }) => (cached_go_models(), "OpenCode Go"),
-            Engine::OpenAi(_, Fuel::Wallet(_)) => (Vec::new(), "the Mafold wallet"),
+            Engine::OpenAi(_, Fuel::Go { .. }) => (cached_go_models(), "your owner's OpenCode Go plan"),
+            Engine::OpenAi(_, Fuel::Wallet(_)) => (Vec::new(), "your owner's Mafold wallet"),
             Engine::Claude(_) => (Vec::new(), "your owner's Claude Code plan"),
         };
         plugins.push(Arc::new(PersonaPlugin::new(model_line(id, &catalogue, on))));
@@ -254,6 +425,13 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
         extra.push(("MAFOLD_DRAFT".into(), draft.clone()));
         extra.push(("MAFOLD_SURFACE".into(), surface.clone()));
         plugins.push(Arc::new(Computer::new(PathBuf::from(&workdir), computer::shell_env(&env, extra), proc.clone())));
+        // …and what the server adds: searching the web and reading a page, on
+        // the owner's wallet (`server_tools`).
+        if let Some(client) = client.as_ref().filter(|_| uuid::Uuid::parse_str(&draft).is_ok()) {
+            if let Some(server) = server_tools::ServerTools::ask(client, &draft).await {
+                plugins.push(Arc::new(server));
+            }
+        }
     }
     let ctx = TurnCtx {
         bot: agent.clone(),
@@ -684,6 +862,7 @@ mod tests {
             mount: Default::default(),
             skill_plugins: None,
             proc: Default::default(),
+            client: None,
         }
     }
 
@@ -736,7 +915,8 @@ mod tests {
         assert_eq!(tools, ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]);
         let system = first["messages"][0]["content"].as_str().unwrap();
         assert!(system.starts_with("You are Probe."));
-        assert!(system.contains("serving replies with the model `deepseek-v4` on the Mafold wallet. "), "the model is named: {system}");
+        assert!(system.contains("You run on Mafold Harness, Mafold's own agent loop, here on your owner's computer"), "the harness is named: {system}");
+        assert!(system.contains("serving replies with the model `deepseek-v4`, on your owner's Mafold wallet. "), "the model is named: {system}");
 
         // Next turn, same session: the conversation comes back.
         let (out2, _) = drive(turn(&work, &surface(&tag), Some(session.clone()), "and what did I ask?", wallet(&base))).await;
@@ -869,7 +1049,7 @@ sys.stdin.read()
         assert_eq!(lines[0]["api_key"], false, "the login is the fuel, never a key");
         let system = lines[0]["system"].as_str().unwrap();
         assert!(system.starts_with("You are Probe."), "{system}");
-        assert!(system.contains("serving replies with the model `opus` on your owner's Claude Code plan."), "{system}");
+        assert!(system.contains("serving replies with the model `opus`, on your owner's Claude Code plan."), "{system}");
         assert_eq!(lines[1]["opening"]["message"]["content"][0]["text"], "what does echo hi print?");
         assert_eq!(lines[2]["tools"], json!(["Bash", "Read", "Write", "Edit", "Glob", "Grep"]));
         let session = out.session.clone().expect("a session");
@@ -1051,11 +1231,12 @@ sys.stdin.read()
     #[test]
     fn the_model_is_named_by_the_catalogue() {
         let catalogue = [json!({ "id": "beam-free", "name": "Beam Free" })];
-        let said = model_line("beam-free", &catalogue, "OpenCode Go");
-        assert!(said.starts_with("You are currently serving replies with the model `beam-free` (Beam Free) on OpenCode Go."), "{said}");
-        assert!(said.contains("Your owner changes it"), "{said}");
-        let said = model_line("glm-5.3", &catalogue, "OpenCode Go");
-        assert!(said.starts_with("You are currently serving replies with the model `glm-5.3` on OpenCode Go. "), "{said}");
+        let go = "your owner's OpenCode Go plan";
+        let said = model_line("beam-free", &catalogue, go);
+        assert!(said.contains("serving replies with the model `beam-free` (Beam Free), on your owner's OpenCode Go plan."), "{said}");
+        assert!(said.contains("Your owner changes the model"), "{said}");
+        let said = model_line("glm-5.3", &catalogue, go);
+        assert!(said.contains("serving replies with the model `glm-5.3`, on your owner's OpenCode Go plan. "), "{said}");
     }
 
     #[tokio::test]
@@ -1111,11 +1292,129 @@ sys.stdin.read()
         assert!(bodies.lock().unwrap()[0].get("tools").is_none(), "no tools offered");
     }
 
+    /// A stand-in Mafold api for the server's tools: `turnTools` offers
+    /// `web_search` with a prompt line, `turnToolCall` answers what the
+    /// hosted plugin would. Every call it got is kept (method, body).
+    async fn server(fail_calls: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let kept = calls.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 16 * 1024];
+                let at = loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req).to_lowercase();
+                    let Some(head) = text.find("\r\n\r\n") else { continue };
+                    let len = text[..head]
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if req.len() >= head + 4 + len {
+                        break Some(head + 4);
+                    }
+                };
+                let Some(at) = at else { continue };
+                let head = String::from_utf8_lossy(&req[..at]).to_string();
+                let method = head.split_whitespace().nth(1).unwrap_or("").trim_start_matches("/api/").to_string();
+                let body: Value = serde_json::from_slice(&req[at..]).unwrap_or(Value::Null);
+                kept.lock().unwrap().push((method.clone(), body));
+                let answer = match method.as_str() {
+                    "turnTools" => json!({ "ok": true, "result": {
+                        "prompt": ["WEB: web_search(query) is billed to @owner's wallet."],
+                        "tools": [{ "name": "web_search", "description": "Search the web.", "read_only": true,
+                                    "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } }],
+                    } }),
+                    "turnToolCall" if fail_calls => json!({ "ok": false, "error_code": 503, "description": "searching the web isn't set up on this server" }),
+                    "turnToolCall" => json!({ "ok": true, "result": {
+                        "text": "1 results for \"mafold\":\n\n1. Mafold\n   https://mafold.com\n",
+                        "card": { "failed": false, "result": "48 chars" },
+                    } }),
+                    _ => json!({ "ok": false, "error_code": 404, "description": "Not Found" }),
+                };
+                let body = answer.to_string();
+                let _ = sock
+                    .write_all(
+                        format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                            .as_bytes(),
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (base, calls)
+    }
+
+    /// The owner's circle gets the server's search: its words in the prompt,
+    /// its tool offered, a call run on the server for this reply — the
+    /// model reads the server's answer, the card ends as the server says.
+    #[tokio::test]
+    async fn the_servers_search_runs_for_the_owners_circle() {
+        let work = folder("search");
+        let (api, calls) = server(false).await;
+        let (base, bodies) = model(vec![runs("c1", "web_search", json!({ "query": "mafold" })), says("Found it.")]).await;
+        let mut t = turn(&work, &surface("search"), None, "look it up", wallet(&base));
+        t.client = Some(Client::new(api, "mb_probe".into()));
+        let draft = t.draft.clone();
+        let (out, events) = drive(t).await;
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let bodies = bodies.lock().unwrap();
+        let system = bodies[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("WEB: web_search(query) is billed to @owner's wallet."), "the server's words: {system}");
+        let offered: Vec<&str> = bodies[0]["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(offered.contains(&"web_search") && offered.contains(&"Bash"), "{offered:?}");
+        let answered = bodies[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").expect("the tool's answer");
+        assert!(answered["content"].as_str().unwrap().contains("https://mafold.com"), "{answered}");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0].0, "turnTools");
+        assert_eq!(calls[0].1, json!({ "draft": draft }));
+        assert_eq!(calls[1].0, "turnToolCall");
+        assert_eq!(calls[1].1["draft"], json!(draft));
+        assert_eq!(calls[1].1["name"], "web_search");
+        assert_eq!(serde_json::from_str::<Value>(calls[1].1["arguments"].as_str().unwrap()).unwrap(), json!({ "query": "mafold" }));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, input, .. } if name == "web_search" && input["query"] == "mafold")));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, .. } if text == "48 chars")));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolStatus { failed: false, .. })));
+    }
+
+    /// A guest's turn never asks the server (nobody else spends the owner's
+    /// wallet); a call the server can't run is a failed step in words, and
+    /// the turn goes on.
+    #[tokio::test]
+    async fn a_guest_never_asks_the_server_and_a_refused_call_is_a_failed_step() {
+        let work = folder("search-guest");
+        let (api, calls) = server(true).await;
+        let (base, _) = model(vec![says("Hi.")]).await;
+        let mut t = turn(&work, &surface("search-guest"), None, "hi", wallet(&base));
+        t.client = Some(Client::new(api.clone(), "mb_probe".into()));
+        t.mount.guest = true;
+        let (out, _) = drive(t).await;
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(calls.lock().unwrap().is_empty(), "a guest's turn asked the server");
+
+        let (base, bodies) = model(vec![runs("c1", "web_search", json!({ "query": "x" })), says("Couldn't search.")]).await;
+        let mut t = turn(&work, &surface("search-refused"), None, "look it up", wallet(&base));
+        t.client = Some(Client::new(api, "mb_probe".into()));
+        let (out, events) = drive(t).await;
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolStatus { failed: true, .. })), "a failed step");
+        let answered = bodies.lock().unwrap()[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").cloned().unwrap();
+        assert!(answered["content"].as_str().unwrap().contains("error"), "{answered}");
+    }
+
     #[tokio::test]
     async fn no_fuel_no_turn_and_a_model_the_wallet_doesnt_run_is_refused() {
         let work = folder("fuel");
         let (out, _) = drive(turn(&work, &surface("fuel"), None, "hi", vec![])).await;
-        assert_eq!(out.error.as_deref(), Some(opencode::NO_WALLET_KEY));
+        assert_eq!(out.error.as_deref(), Some(NO_WALLET_KEY));
         let mut t = turn(&work, &surface("fuel"), None, "hi", wallet("http://127.0.0.1:9/v1"));
         t.model = Some("gpt-9".into());
         let (out, _) = drive(t).await;
@@ -1200,5 +1499,106 @@ sys.stdin.read()
         }});
         let ids: Vec<String> = chat_models(&go).iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
         assert_eq!(ids, ["glm-5.3", "kimi-k2.7-code"]);
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// Fuel from the turn's env: the wallet's three variables, else the Go
+    /// key. With neither, nothing runs.
+    #[test]
+    fn a_turn_runs_on_the_wallet_or_go_and_nothing_else() {
+        let wallet = env(&[("MAFOLD_WALLET_KEY", "mrk_1"), ("MAFOLD_WALLET_BASE", "https://x/v1"), ("MAFOLD_WALLET_MODELS", "m")]);
+        assert!(matches!(Fuel::from_env(&wallet), Some(Fuel::Wallet(_))));
+        let go = env(&[(crate::fuel::GO_KEY_ENV, "sk-go")]);
+        assert_eq!(Fuel::from_env(&go), Some(Fuel::Go { key: "sk-go".into(), base: None }));
+        assert_eq!(Fuel::from_env(&env(&[(crate::fuel::GO_KEY_ENV, " ")])), None, "an empty key is no key");
+        assert_eq!(Fuel::from_env(&[]), None, "no key runs nothing");
+        assert!(!format!("{:?}", Fuel::Go { key: "sk-go".into(), base: None }).contains("sk-go"));
+        assert_eq!(go_model(Some("opencode-go/glm-5.3")), "glm-5.3");
+        assert_eq!(go_model(Some(" glm-5.3 ")), "glm-5.3");
+        assert_eq!(go_model(None), GO_DEFAULT_MODEL);
+        assert_eq!(go_model(Some("deepseek/deepseek-v4-flash")), GO_DEFAULT_MODEL, "another provider's model isn't Go's");
+    }
+
+    #[test]
+    fn the_wallet_is_all_three_or_nothing() {
+        let full = env(&[
+            ("MAFOLD_WALLET_KEY", "mrk_1"),
+            ("MAFOLD_WALLET_BASE", "https://api.mafold.ai/v1/"),
+            ("MAFOLD_WALLET_MODELS", " deepseek-v4-flash, ,deepseek-v4-pro "),
+        ]);
+        let w = Wallet::from_env(&full, None).unwrap();
+        assert_eq!(w.key, "mrk_1");
+        assert_eq!(w.base, "https://api.mafold.ai/v1");
+        assert_eq!(w.models, ["deepseek-v4-flash", "deepseek-v4-pro"]);
+        assert_eq!(Wallet::from_env(&full, Some("http://127.0.0.1:9/v1".into())).unwrap().base, "http://127.0.0.1:9/v1");
+        for drop in ["MAFOLD_WALLET_KEY", "MAFOLD_WALLET_BASE", "MAFOLD_WALLET_MODELS"] {
+            let some: Vec<_> = full.iter().filter(|(k, _)| k != drop).cloned().collect();
+            assert!(Wallet::from_env(&some, None).is_none(), "without {drop}");
+        }
+        let empty_models = env(&[("MAFOLD_WALLET_KEY", "k"), ("MAFOLD_WALLET_BASE", "b"), ("MAFOLD_WALLET_MODELS", " , ")]);
+        assert!(Wallet::from_env(&empty_models, None).is_none());
+        assert_eq!(dev_base(&env(&[("MAFOLD_DEV_WALLET_BASE", " http://x/v1 ")]), "MAFOLD_DEV_WALLET_BASE").as_deref(), Some("http://x/v1"));
+    }
+
+    /// The first `{wallet:?}` someone adds to a trace must not put the reply's
+    /// live key in the daemon's log (`client::ReplyKey` is redacted for the
+    /// same reason).
+    #[test]
+    fn a_wallets_debug_never_shows_its_key() {
+        let w = Wallet {
+            key: "mrk_live_9f2c1e7a44b0".into(),
+            base: "https://api.mafold.ai/v1".into(),
+            models: vec!["deepseek-v4-flash".into()],
+        };
+        let shown = format!("{w:?} {w:#?}");
+        assert!(!shown.contains("mrk_live_9f2c1e7a44b0"), "{shown}");
+        assert!(shown.contains("<redacted>") && shown.contains("https://api.mafold.ai/v1") && shown.contains("deepseek-v4-flash"), "{shown}");
+    }
+
+    #[test]
+    fn the_model_is_the_picked_one_or_a_refusal() {
+        let models = vec!["deepseek-v4-flash".to_string(), "deepseek-v4-pro".to_string()];
+        assert_eq!(pick_model(None, &models).unwrap(), "deepseek-v4-flash");
+        assert_eq!(pick_model(Some(" "), &models).unwrap(), "deepseek-v4-flash");
+        assert_eq!(pick_model(Some("mafold/deepseek-v4-pro"), &models).unwrap(), "deepseek-v4-pro");
+        assert_eq!(pick_model(Some("DeepSeek-V4-Pro"), &models).unwrap(), "deepseek-v4-pro");
+        let why = pick_model(Some("opus"), &models).unwrap_err();
+        assert!(why.contains("`opus`") && why.contains("deepseek-v4-flash, deepseek-v4-pro") && why.contains("nothing ran"), "{why}");
+    }
+
+    /// The model menu of an agent on Go is Go's models, by Go's own names,
+    /// with no tiers — and a list that came back empty reports nothing rather
+    /// than an empty menu.
+    #[test]
+    fn go_models_become_the_agents_model_menu() {
+        let p = go_probe(vec![
+            json!({ "id": "kimi-k2.7-code", "name": "Kimi K2.7 Code" }),
+            json!({ "id": "glm-5.3", "name": "GLM-5.3" }),
+            json!({ "name": "no id" }),
+        ])
+        .expect("two models");
+        assert_eq!(p.source, CapsSource::Handshake);
+        assert_eq!(p.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["kimi-k2.7-code", "glm-5.3"]);
+        assert_eq!(p.models[0].display, "Kimi K2.7 Code");
+        assert_eq!(p.models[0].aliases, ["opencode-go/kimi-k2.7-code"]);
+        assert!(p.models.iter().all(|m| m.efforts.is_empty()) && p.efforts.is_empty() && p.modes.is_empty());
+        // What the server reads off it: a model menu, and nothing about tiers.
+        let caps = mafold_core::mafold_types::HarnessCaps {
+            harness: mafold_core::mafold_types::agent_setup::MAFOLD_HARNESS.into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            machine: "m".into(),
+            machine_name: None,
+            account: None,
+            probed_at: 0,
+            source: p.source,
+            models: p.models,
+            efforts: p.efforts,
+            modes: p.modes,
+        };
+        assert!(caps.tells_models() && !caps.tells_efforts());
+        assert!(go_probe(Vec::new()).is_none());
     }
 }

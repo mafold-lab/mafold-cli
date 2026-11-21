@@ -449,27 +449,8 @@ pub fn fenced_ranges(s: &str) -> Vec<(usize, usize)> {
 /// CommonMark lets it): in the bubble it sits inside its paragraph, so it must
 /// not end a line in [`visible_lines`].
 fn code_spans(s: &str) -> Vec<(usize, usize, bool)> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    // Fenced blocks: a line whose start (≤3 blanks in) is ``` or ~~~ opens; the
-    // next fence line of the same char and at least as long closes it.
-    let mut open_at: Option<(usize, u8, usize)> = None;
-    let mut pos = 0usize;
-    loop {
-        let end = s[pos..].find('\n').map_or(s.len(), |i| pos + i);
-        match (open_at, fence_mark(&s[pos..end])) {
-            (None, Some(f)) => open_at = Some((pos, f.0, f.1)),
-            (Some((from, ch, len)), Some(f)) if f.0 == ch && f.1 >= len => {
-                ranges.push((from, end));
-                open_at = None;
-            }
-            _ => {}
-        }
-        if end == s.len() {
-            break;
-        }
-        pos = end + 1;
-    }
-    if let Some((from, _, _)) = open_at {
+    let (mut ranges, open_at) = fences(s);
+    if let Some(from) = open_at {
         ranges.push((from, s.len())); // unclosed fence → code to EOF
     }
     // Inline spans outside fenced blocks: a run of N backticks closes at the
@@ -502,6 +483,65 @@ fn code_spans(s: &str) -> Vec<(usize, usize, bool)> {
     }
     let fences = fenced.len();
     ranges.into_iter().enumerate().map(|(k, (a, b))| (a, b, k < fences)).collect()
+}
+
+/// The fenced blocks of `s` that closed, each to the end of its closing line,
+/// and where the one still open at the end starts. A line whose start (≤3
+/// blanks in) is ``` or ~~~ opens; the next fence line of the same char and at
+/// least as long closes it.
+fn fences(s: &str) -> (Vec<(usize, usize)>, Option<usize>) {
+    let mut ranges = Vec::new();
+    let mut open_at: Option<(usize, u8, usize)> = None;
+    let mut pos = 0usize;
+    loop {
+        let end = s[pos..].find('\n').map_or(s.len(), |i| pos + i);
+        match (open_at, fence_mark(&s[pos..end])) {
+            (None, Some(f)) => open_at = Some((pos, f.0, f.1)),
+            (Some((from, ch, len)), Some(f)) if f.0 == ch && f.1 >= len => {
+                ranges.push((from, end));
+                open_at = None;
+            }
+            _ => {}
+        }
+        if end == s.len() {
+            break;
+        }
+        pos = end + 1;
+    }
+    (ranges, open_at.map(|(from, _, _)| from))
+}
+
+/// Where the block still open at the end of `text` starts: a card with no
+/// close yet (it runs to the end of the message, the client's rule) or a fence
+/// with no closing line. Whatever is appended now lands INSIDE it — in the
+/// card's body, in the code — so a line that must stand on its own (a steer
+/// seam, a driver notice) waits for [`block_end`]. `None` when the end of
+/// `text` is outside both.
+pub fn open_block(text: &str) -> Option<usize> {
+    let islands = card_islands(text);
+    let from = match islands.last() {
+        Some(last) if last.body.as_ref().is_some_and(|b| b.end == last.span.end) => return Some(last.span.start),
+        Some(last) => last.span.end,
+        None => 0,
+    };
+    // A card body decides nothing about code after it (see `card_islands`).
+    fences(&text[from..]).1.map(|at| from + at)
+}
+
+/// How far the block that opens `text` ([`open_block`]) runs once it has
+/// closed — a card to the end of its close tag, a fence to the end of its
+/// closing line — or `None` while it is still open.
+pub fn block_end(text: &str) -> Option<usize> {
+    if let Some(card) = card_islands(text).into_iter().next().filter(|c| c.span.start == 0) {
+        return match card.body {
+            Some(body) if body.end == card.span.end => None,
+            _ => Some(card.span.end),
+        };
+    }
+    match fences(text) {
+        (closed, _) if closed.first().is_some_and(|&(from, _)| from == 0) => Some(closed[0].1),
+        _ => None,
+    }
 }
 
 /// `(fence byte, run length)` when the line opens or closes a fence.
@@ -756,5 +796,40 @@ mod tests {
         let seen = prose(reply);
         assert_eq!(seen.trim(), "查完了,@linsky 是卡片体的锅。");
         assert!(!seen.contains("稍等") && !seen.contains("例外") && !seen.contains("@opsdu"), "{seen:?}");
+    }
+
+    /// The end of a reply being written is inside a block exactly when the
+    /// client would draw text added there as part of that block.
+    #[test]
+    fn open_block_is_where_appended_text_would_land_inside() {
+        let card = "Here.\n\n{% mafold/html %}\n<script>go(";
+        assert_eq!(open_block(card), Some(7));
+        assert_eq!(open_block(&format!("{card});</script>\n{{% /mafold/html %}}\n\nDone.")), None);
+        assert_eq!(open_block("Here:\n```rust\nfn main() {"), Some(6));
+        assert_eq!(open_block("Here:\n```rust\nfn main() {}\n```\nDone."), None);
+        // A container holding a card: open until ITS close.
+        let only = "{% mafold/only user=\"ada\" %}\n{% mafold/html %}\n<p>hi</p>\n{% /mafold/html %}\n";
+        assert_eq!(open_block(only), Some(0));
+        // A tag inside an open fence is code: the fence is the block.
+        assert_eq!(open_block("Like this:\n```\n{% mafold/html %}\n"), Some(11));
+        // A fence a card's body left open decides nothing after the card.
+        assert_eq!(open_block("{% mafold/html %}\n```\n{% /mafold/html %}\nDone."), None);
+        // Leaves, closed cards and stray closes leave nothing open.
+        assert_eq!(open_block("{% mafold/cite src=\"https://x.dev\" /%} and {% /mafold/html %}"), None);
+        assert_eq!(open_block(""), None);
+    }
+
+    #[test]
+    fn block_end_is_the_close_of_the_block_that_opens_the_text() {
+        let card = "{% mafold/html %}\n<p>hi</p>\n";
+        assert_eq!(block_end(card), None);
+        let closed = format!("{card}{{% /mafold/html %}}");
+        assert_eq!(block_end(&format!("{closed}\n\nDone.")), Some(closed.len()));
+        let only = "{% mafold/only user=\"ada\" %}\n{% mafold/html %}\n<p>hi</p>\n{% /mafold/html %}\n";
+        assert_eq!(block_end(only), None, "the inner card's close is not the container's");
+        assert_eq!(block_end(&format!("{only}{{% /mafold/only %}}")), Some(only.len() + "{% /mafold/only %}".len()));
+        assert_eq!(block_end("```rust\nfn main() {"), None);
+        assert_eq!(block_end("```rust\nfn main() {}\n```\nDone."), Some("```rust\nfn main() {}\n```".len()));
+        assert_eq!(block_end("~~~\na\n```\nb"), None, "only its own fence closes it");
     }
 }

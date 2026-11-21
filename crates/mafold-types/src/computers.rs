@@ -76,7 +76,10 @@ pub struct AccountSeat {
 /// One coding-agent harness as reported by a logged-in mafold-cli host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessInfo {
-    /// Stable id: `"claude-code" | "opencode" | "codex" | "openclaw"`.
+    /// Stable id: `"claude-code" | "mafold-harness" | "codex" | "kimi-code" |
+    /// "openclaw"` ([`crate::agent_setup::runtime_id`]; an older CLI says
+    /// `opencode` for Mafold Harness, read through
+    /// [`DeviceHarnesses::in_current_ids`]).
     pub id: String,
     /// Installed / runnable on that machine right now.
     pub available: bool,
@@ -115,9 +118,9 @@ pub struct HarnessInfo {
 pub struct HostSignIn {
     /// A New Agent sign-in id (`mafold_types::agent_setup::SIGN_INS`).
     pub id: String,
-    /// The computer holds a login for it of its own — your own OpenCode's
-    /// OpenCode Go login. `None` = it doesn't keep one there (Mafold Harness
-    /// takes OpenCode Go from Connections) or can't tell.
+    /// The computer holds a login for it of its own. `None` = it doesn't keep
+    /// one there (Mafold Harness takes OpenCode Go from Connections) or can't
+    /// tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_in: Option<bool>,
     /// The models it can run on this sign-in there, in the runtime's order.
@@ -136,8 +139,14 @@ pub struct HostModel {
 
 /// What a CLI that predates [`HarnessInfo::sign_ins`] could run each runtime
 /// on: its own login, and Mafold Harness on the wallet alone (cli@0.9.153).
-pub const SIGN_INS_BEFORE_REPORT: &[(&str, &str)] =
-    &[("claude-code", "claude"), ("codex", "codex"), ("kimi-code", "kimi"), ("opencode", "wallet")];
+/// In today's ids: a report is read through [`DeviceHarnesses::in_current_ids`]
+/// before anyone asks.
+pub const SIGN_INS_BEFORE_REPORT: &[(&str, &str)] = &[
+    ("claude-code", "claude"),
+    ("codex", "codex"),
+    ("kimi-code", "kimi"),
+    (crate::agent_setup::MAFOLD_HARNESS, "wallet"),
+];
 
 /// The runtimes every CLI before `HarnessInfo::runs` could drive. An older CLI
 /// reported `opencode` and `openclaw` too, and quietly ran Claude Code for
@@ -193,6 +202,21 @@ pub struct DeviceHarnesses {
 }
 
 impl DeviceHarnesses {
+    /// This report in today's runtime ids, however old the CLI that wrote it
+    /// (or the stored row it was): its `opencode` row is Mafold Harness's, and
+    /// its row for your own OpenCode — gone since 11-20 — is dropped, so
+    /// nothing offers it. One row per runtime: the first one kept.
+    pub fn in_current_ids(mut self) -> Self {
+        use crate::agent_setup::{runtime_id, OWN_OPENCODE};
+        self.harnesses.retain(|h| h.id != OWN_OPENCODE);
+        let mut seen = std::collections::HashSet::new();
+        self.harnesses.retain_mut(|h| {
+            h.id = runtime_id(&h.id).to_string();
+            seen.insert(h.id.clone())
+        });
+        self
+    }
+
     /// Keep what the last report knew that this one doesn't say.
     ///
     /// A cli before C1 reported in two sizes: a full report with each
@@ -342,6 +366,7 @@ mod tests {
     //! (activity center K1), so equality here is "nothing changed for any
     //! client or any stored row".
     use super::*;
+    use crate::agent_setup::MAFOLD_HARNESS;
 
     fn host() -> DeviceHarnesses {
         DeviceHarnesses {
@@ -435,15 +460,42 @@ mod tests {
         for id in ["claude-code", "codex", "kimi-code"] {
             assert!(row(id, None).runs(), "{id} from an older CLI");
         }
-        for id in ["opencode", "openclaw"] {
+        for id in [MAFOLD_HARNESS, "openclaw"] {
             assert!(!row(id, None).runs(), "{id} from an older CLI ran Claude Code instead");
         }
-        assert!(row("opencode", Some(true)).runs(), "once a CLI says it runs it, it does");
+        assert!(row(MAFOLD_HARNESS, Some(true)).runs(), "once a CLI says it runs it, it does");
         assert!(!row("codex", Some(false)).runs(), "and a CLI's no is a no");
-        let wire = r#"{"id":"opencode","available":true,"version":null,"runs":false}"#;
-        assert_eq!(serde_json::to_string(&row("opencode", Some(false))).unwrap(), wire);
+        let wire = r#"{"id":"mafold-harness","available":true,"version":null,"runs":false}"#;
+        assert_eq!(serde_json::to_string(&row(MAFOLD_HARNESS, Some(false))).unwrap(), wire);
         let back: HarnessInfo = serde_json::from_str(wire).unwrap();
         assert_eq!(back.runs, Some(false));
+    }
+
+    /// A report from a CLI before 11-20 (or a row stored then) names Mafold
+    /// Harness `opencode` and may list your own OpenCode: read in today's
+    /// ids, it is one Mafold Harness row and nothing for the runtime that's
+    /// gone — whatever order the rows came in.
+    #[test]
+    fn an_older_report_reads_in_todays_ids() {
+        let row = |id: &str| HarnessInfo { id: id.into(), available: true, version: None, health: None, accounts: vec![], runs: Some(true), sign_ins: None };
+        let report = |ids: &[&str]| DeviceHarnesses {
+            device_id: "d".into(),
+            device_name: "n".into(),
+            harnesses: ids.iter().map(|id| row(id)).collect(),
+            cli_version: Some("0.9.167".into()),
+            reported_at: 1,
+            os: None,
+        };
+        for ids in [&["claude-code", "opencode", "opencode-own"][..], &["opencode-own", "opencode", "claude-code"][..]] {
+            let now = report(ids).in_current_ids();
+            let mut got: Vec<&str> = now.harnesses.iter().map(|h| h.id.as_str()).collect();
+            got.sort();
+            assert_eq!(got, vec!["claude-code", MAFOLD_HARNESS], "{ids:?}");
+        }
+        let new = report(&["claude-code", MAFOLD_HARNESS]).in_current_ids();
+        assert_eq!(new.harnesses.len(), 2, "a report in today's ids stays as it is");
+        let both = report(&[MAFOLD_HARNESS, "opencode"]).in_current_ids();
+        assert_eq!(both.harnesses.len(), 1, "one row per runtime");
     }
 
     #[test]
@@ -471,14 +523,14 @@ mod tests {
             sign_ins,
         };
         assert!(row("claude-code", None).runs_on("claude"));
-        assert!(row("opencode", None).runs_on("wallet"));
-        assert!(!row("opencode", None).runs_on("opencode-go"), "only a CLI that says so runs Go");
-        assert!(row("opencode-own", None).sign_ins().is_empty(), "a runtime an older CLI never had");
+        assert!(row(MAFOLD_HARNESS, None).runs_on("wallet"));
+        assert!(!row(MAFOLD_HARNESS, None).runs_on("opencode-go"), "only a CLI that says so runs Go");
+        assert!(row("openclaw", None).sign_ins().is_empty(), "a runtime an older CLI never had");
         let go = HostSignIn { id: "opencode-go".into(), signed_in: Some(true), models: vec![] };
-        let said = row("opencode", Some(vec![go.clone()]));
+        let said = row(MAFOLD_HARNESS, Some(vec![go.clone()]));
         assert!(said.runs_on("opencode-go") && !said.runs_on("wallet"), "what it says is all it runs");
         let parsed: HarnessInfo = serde_json::from_str(
-            r#"{"id":"opencode-own","available":true,"runs":true,
+            r#"{"id":"mafold-harness","available":true,"runs":true,
                 "sign_ins":[{"id":"opencode-go","signed_in":true,"models":[{"id":"kimi-k2.7-code","name":"Kimi K2.7 Code"}]}]}"#,
         )
         .unwrap();

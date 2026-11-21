@@ -29,8 +29,9 @@ pub enum FlagsCmd {
         #[arg(long, default_value_t = 10)]
         limit: i64,
     },
-    /// Put accounts on a flag's allowlist: `mafold flags add iap opsdu`. The
-    /// rest of the list and the note stay as they are.
+    /// Put accounts on a flag's allowlist: `mafold flags add iap opsdu`. A
+    /// trailing `*` covers every name it starts, made yet or not
+    /// (`opsdutest*`). The rest of the list and the note stay as they are.
     Add {
         key: String,
         #[arg(required = true)]
@@ -46,7 +47,7 @@ pub enum FlagsCmd {
         users: Vec<String>,
     },
     /// Replace a flag's rollout: `on`, `off`, `25%`, or an account list
-    /// `opsdu,linsky`. The note stays unless `--note` gives one (`--note ""`
+    /// `opsdu,linsky,opsdutest*`. The note stays unless `--note` gives one (`--note ""`
     /// clears it).
     Set {
         key: String,
@@ -200,8 +201,13 @@ fn parse_rollout(s: &str) -> Result<Value> {
         .map(|a| a.trim().trim_start_matches('@').to_lowercase())
         .filter(|a| !a.is_empty())
         .collect();
-    if list.is_empty() || list.iter().any(|a| !a.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))) {
-        bail!("`{s}`: say on, off, a percent like 25%, or accounts like opsdu,linsky");
+    // A name, or the start of names with a trailing `*` (`opsdutest*`).
+    let name_ok = |a: &str| {
+        let name = a.strip_suffix('*').unwrap_or(a);
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+    };
+    if list.is_empty() || !list.iter().all(|a| name_ok(a)) {
+        bail!("`{s}`: say on, off, a percent like 25%, or accounts like opsdu,linsky,opsdutest*");
     }
     Ok(json!({ "kind": "accounts", "list": list }))
 }
@@ -296,6 +302,9 @@ mod tests {
         assert!(parse_rollout("-1%").is_err());
         assert!(parse_rollout(" , ").is_err());
         assert!(parse_rollout("not/a name").is_err());
+        assert_eq!(parse_rollout("opsdutest*,linsky").unwrap(), json!({ "kind": "accounts", "list": ["opsdutest*", "linsky"] }));
+        assert!(parse_rollout("*").is_err(), "everyone is `on`");
+        assert!(parse_rollout("ops*du").is_err(), "the star only ends a name");
     }
 
     #[test]

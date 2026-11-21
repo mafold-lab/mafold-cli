@@ -113,8 +113,8 @@ enum Cmd {
         /// directory. An explicit flag always wins over the server config.
         #[arg(long, env = "MAFOLD_WORKDIR")]
         workdir: Option<String>,
-        /// Which agent harness to drive: claude-code (default), opencode, codex,
-        /// openclaw. (Others land as they're implemented.)
+        /// Which agent harness to drive: claude-code (default), mafold-harness,
+        /// codex, kimi-code. (Others land as they're implemented.)
         #[arg(long, env = "MAFOLD_HARNESS", default_value = "claude-code")]
         harness: String,
         /// Run in the background (detached from the terminal) so it keeps
@@ -165,8 +165,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Install a coding-agent runtime (claude-code / codex / kimi-code /
-    /// opencode). No argument lists the runtimes + their install state.
+    /// Install a coding-agent runtime (claude-code / codex / kimi-code; Mafold
+    /// Harness is part of mafold). No argument lists the runtimes + their
+    /// install state.
     Install {
         /// The runtime to install; omit to list all with their state.
         tool: Option<String>,
@@ -363,6 +364,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Mafold's help library — the articles Mafold Cloud agents look things up
+    /// in (agents, cards, apps, wallet, connections, chats, routines,
+    /// troubleshooting). Search it before telling anyone how Mafold works:
+    /// `mafold docs "定时提醒"`, then `mafold docs --topic routines`. No query
+    /// lists the topics.
+    Docs {
+        /// What to look for, in English or Chinese.
+        query: Option<String>,
+        /// Read one topic in full instead.
+        #[arg(long, conflicts_with = "query")]
+        topic: Option<String>,
+        /// Print the raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Draw a live card as a group's cover — one published card's tag,
     /// `{% owner/slug k="v" /%}` — or `--clear` it so the picture shows again.
     /// Needs the group's edit-info permission. Setting it again with new
@@ -509,7 +525,7 @@ enum Cmd {
         /// pins it to one Claude login (see `/login <name>` for adding logins)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// Create the agent first if you have none by this name, signed in with this (e.g. `--harness opencode --fuel wallet` runs it on your wallet); an existing agent keeps its own.
+        /// Create the agent first if you have none by this name, signed in with this (e.g. `--harness mafold-harness --fuel wallet` runs it on your wallet); an existing agent keeps its own.
         #[arg(long)]
         fuel: Option<String>,
         /// With --fuel: the model the new agent starts on.
@@ -682,7 +698,7 @@ enum Cmd {
     #[command(hide = true)]
     HarnessBridge,
     /// (internal, debug builds) One wallet reply through the daemon's own
-    /// wallet steps — mint the draft's key, the OpenCode harness, the reply's
+    /// wallet steps — mint the draft's key, Mafold Harness, the reply's
     /// total onto the result card — printed as one JSON line. What the billing
     /// table (`mafold-api` harness_table_tests) drives. Not for humans.
     #[cfg(debug_assertions)]
@@ -701,7 +717,7 @@ enum Cmd {
         #[arg(long)]
         stop_after_ms: Option<u64>,
         /// The agent's handle and the conversation: the turn's surface, so
-        /// OpenCode runs in that agent's home.
+        /// Mafold Harness keeps that agent's sessions.
         #[arg(long)]
         bot: Option<String>,
         #[arg(long)]
@@ -1097,6 +1113,18 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 print!("{}", unfurl_lines(&v));
+            }
+        }
+        Cmd::Docs { query, topic, json } => {
+            let client = Client::new(cli.base, token?);
+            let v = match &topic {
+                Some(t) => client.call("readHelp", serde_json::json!({ "topic": t })).await?,
+                None => client.call("searchHelp", serde_json::json!({ "query": query.unwrap_or_default() })).await?,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", docs_lines(&v));
             }
         }
         Cmd::Cover { chat, card, clear } => {
@@ -2423,6 +2451,41 @@ mod send_attach_tests {
         assert!(sent[0].get("attachments").is_none(), "{}", sent[0]);
         assert!(sent[0].get("client_msg_id").is_none(), "{}", sent[0]);
     }
+}
+
+/// `mafold docs` as lines: an article in full, search hits with their
+/// excerpts, or the topic list.
+fn docs_lines(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(e) = v["error"].as_str() {
+        out.push_str(&format!("✗ {e}\n"));
+    }
+    if let Some(content) = v["content"].as_str() {
+        out.push_str(&format!("# {}\n\n{}\n", v["title"].as_str().unwrap_or_default(), content.trim_end()));
+        return out;
+    }
+    if let Some(hits) = v["results"].as_array() {
+        if hits.is_empty() {
+            out.push_str("No match. That means unverified, not unsupported: say what needs checking.\n");
+        }
+        for h in hits {
+            out.push_str(&format!(
+                "{} — {}\n  {}\n",
+                h["topic"].as_str().unwrap_or_default(),
+                h["title"].as_str().unwrap_or_default(),
+                h["excerpt"].as_str().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ")
+            ));
+        }
+        if !hits.is_empty() {
+            out.push_str("Read one in full: mafold docs --topic <topic>\n");
+        }
+    }
+    if let Some(topics) = v["topics"].as_array() {
+        for t in topics {
+            out.push_str(&format!("{} — {}\n", t["topic"].as_str().unwrap_or_default(), t["title"].as_str().unwrap_or_default()));
+        }
+    }
+    out
 }
 
 /// `mafold unfurl`'s readable form: one fact per line, images numbered with

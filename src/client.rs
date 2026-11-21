@@ -244,6 +244,14 @@ pub enum TurnEnd {
     Failed,
 }
 
+/// What `getMe` is asked with: this CLI knows Mafold Harness by its own id
+/// (`mafold-harness`), so an agent on it hears that — one from before 11-20
+/// asks with nothing and hears `opencode`, the only id it knows
+/// (`agent_setup::runtime_id_before_1120`).
+fn get_me_body() -> Value {
+    json!({ "knows_mafold_harness": true })
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub http: reqwest::Client,
@@ -348,7 +356,7 @@ impl Client {
     }
 
     pub async fn me(&self) -> Result<Value> {
-        self.post("getMe", json!({})).await
+        self.post("getMe", get_me_body()).await
     }
 
     /// Who message `message_id` is, ultimately, from (`messageOrigin`). An
@@ -397,7 +405,7 @@ impl Client {
             .http
             .post(format!("{}/api/getMe", self.base))
             .bearer_auth(&self.token)
-            .json(&json!({}))
+            .json(&get_me_body())
             .send()
             .await
             .context("getMe request failed")?;
@@ -708,8 +716,19 @@ impl Client {
     // ── forum channels (Telegram-Topics-style; see channels.rs) ──
     /// The forum's channels (`[Channel]`), decorated for the caller. `#all` is
     /// implicit (channel_id NULL) and never in this list.
+    /// A read, so it retries a dropped response: a forum with 72 channels
+    /// answers ~107 KB, and a proxy that cut it half-way failed the turn's
+    /// untitled-channel hint and `channels rename` outright (linsky 11-18).
     pub async fn list_channels(&self, chat_id: &str) -> Result<Value> {
-        self.post("listChannels", json!({ "chat_id": chat_id }))
+        self.post_idempotent("listChannels", json!({ "chat_id": chat_id }))
+            .await
+    }
+    /// The one channel `channel_id`, as the same list shape — `[row]`, `[]`
+    /// when the forum has no such channel, or the whole list from a server
+    /// that predates the field — so every "find it by id" caller reads it
+    /// unchanged. A row is ~1.5 KB where the whole list can be hundreds.
+    pub async fn list_channel(&self, chat_id: &str, channel_id: &str) -> Result<Value> {
+        self.post_idempotent("listChannels", json!({ "chat_id": chat_id, "channel_id": channel_id }))
             .await
     }
     pub async fn create_channel(

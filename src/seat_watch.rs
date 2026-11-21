@@ -591,7 +591,7 @@ mod tests {
     }
 
     /// mafold.cicd's own list: the first Claude Code bot of each person
-    /// signed in here speaks; codex and opencode bots don't run on these
+    /// signed in here speaks; codex and Mafold Harness bots don't run on these
     /// logins, and a person with no Claude Code bot here isn't told.
     #[test]
     fn each_person_hears_it_once_from_their_first_claude_code_bot() {
@@ -599,7 +599,7 @@ mod tests {
             daemon("opsdu:codex", Some("codex")),
             daemon("opsdu:claude-code", Some("claude-code")),
             daemon("opsdu:claude333", Some("claude-code")),
-            daemon("opsdu:mafoldtest", Some("opencode")),
+            daemon("opsdu:mafoldtest", Some("mafold-harness")),
             daemon("fei:helper", None),
         ];
         let got = speakers(&daemons, &["opsdu".into(), "OpsDu".into(), "fei".into(), "linsky".into()]);

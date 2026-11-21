@@ -1,12 +1,12 @@
 //! `mafold install <runtime>` — install a coding-agent runtime the Mafold agent
-//! drives (claude-code / codex / kimi-code / opencode).
+//! drives (claude-code / codex / kimi-code).
 //!
 //! Each runtime: detect an existing install, otherwise run its OFFICIAL
 //! installer (with confirmation; `--yes` for headless), re-verify, and point at
-//! the next onboarding step. Mafold Harness (`opencode`) is the exception: it
-//! is part of mafold itself (`harness::mafold_harness`), so there is nothing
-//! to install, and saying so is all `mafold install opencode` does — your own
-//! OpenCode is `opencode-own`. `mafold install` with no argument lists the
+//! the next onboarding step. Mafold Harness (`mafold-harness`) is the
+//! exception: it is part of mafold itself (`harness::mafold_harness`), so
+//! there is nothing to install, and saying so is all `mafold install
+//! mafold-harness` does. `mafold install` with no argument lists the
 //! runtimes + their install state. The web New-Bot modal's one-click install
 //! rides this too: the supervisor claims a queued install (`claimProvisions`
 //! → `installs`) and calls [`run`] with `yes = true`. @mafold teaches this
@@ -16,7 +16,8 @@
 use anyhow::{bail, Result};
 
 /// One installable runtime. Order = the product's canonical display order
-/// (claude code / codex / kimi / opencode) — the web install page mirrors it.
+/// (claude code / codex / kimi / Mafold Harness) — the web install page
+/// mirrors it.
 struct Tool {
     /// Stable harness id (matches `harness::KNOWN` / the api).
     id: &'static str,
@@ -92,36 +93,21 @@ const TOOLS: &[Tool] = &[
         auth_hint: "run `kimi login` to sign in to Moonshot",
     },
     Tool {
-        id: "opencode",
-        aliases: &["opencode", "open-code"],
+        id: crate::harness::MAFOLD_HARNESS,
+        // Its id until 11-20, and your own OpenCode's (gone): both are it now.
+        aliases: &[crate::harness::MAFOLD_HARNESS, "mafold", "opencode", "open-code", "opencode-own", "own-opencode"],
         name: "Mafold Harness",
         bin: "mafold",
-        // The loop the official bots run on, compiled into mafold — the id
-        // is the one its tile has always had.
+        // The loop the official bots run on, compiled into mafold.
         how: How::Linked,
         fallback: "it is part of mafold — `mafold update` brings the newest",
-        auth_hint: "nothing to sign in to — Mafold runs it on OpenCode Go (your key in Connections) or your Mafold wallet",
-    },
-    Tool {
-        id: "opencode-own",
-        aliases: &["opencode-own", "own-opencode"],
-        name: "OpenCode",
-        bin: "opencode",
-        // Your own OpenCode, as OpenCode installs it: its installer takes the
-        // OpenCode 1 line (npm's `latest`), which is the one Mafold drives.
-        how: How::Official {
-            unix: "curl -fsSL https://opencode.ai/install | bash",
-            windows: Win::PowerShell("npm install -g opencode-ai"),
-        },
-        fallback: "see https://opencode.ai/docs",
-        auth_hint: "sign it in to OpenCode Go with `/connect` in `opencode`, or add your Go key in Mafold ▸ Settings ▸ Connections",
+        auth_hint: "nothing to sign in to — Mafold runs it on OpenCode Go (your key in Connections), your Mafold wallet or your Claude Code login",
     },
 ];
 
 /// Where official installers put a runtime in the user's home, which a
-/// service's PATH predates: Claude Code's native installer's `~/.local/bin`,
-/// and OpenCode's `~/.opencode/bin`.
-pub const HOME_BIN_DIRS: &[&str] = &[".local/bin", ".opencode/bin"];
+/// service's PATH predates: Claude Code's native installer's `~/.local/bin`.
+pub const HOME_BIN_DIRS: &[&str] = &[".local/bin"];
 
 /// A runtime's Windows install.
 #[derive(Clone, Copy)]
@@ -189,7 +175,7 @@ fn powershell_args(cmd: &str) -> Vec<String> {
 
 /// Where an installer that installs into the user's home puts `bin`, as a
 /// launchable file name: `~/.local/bin/<bin>` (Claude Code's native installer,
-/// on every OS), `~/.opencode/bin/<bin>` (OpenCode's) — [`HOME_BIN_DIRS`].
+/// on every OS) — [`HOME_BIN_DIRS`].
 fn home_install(home: &std::path::Path, bin: &str, windows: bool) -> Vec<std::path::PathBuf> {
     HOME_BIN_DIRS
         .iter()
@@ -535,28 +521,21 @@ mod windows_installer_tests {
         let home = std::path::Path::new("/h");
         assert_eq!(
             home_install(home, "claude", true),
-            vec![
-                home.join(".local/bin/claude.exe"),
-                home.join(".local/bin/claude.cmd"),
-                home.join(".opencode/bin/claude.exe"),
-                home.join(".opencode/bin/claude.cmd"),
-            ]
+            vec![home.join(".local/bin/claude.exe"), home.join(".local/bin/claude.cmd")]
         );
-        assert_eq!(home_install(home, "claude", false), vec![home.join(".local/bin/claude"), home.join(".opencode/bin/claude")]);
-        // OpenCode's own installer puts it in ~/.opencode/bin.
-        assert!(home_install(home, "opencode", false).contains(&home.join(".opencode/bin/opencode")));
+        assert_eq!(home_install(home, "claude", false), vec![home.join(".local/bin/claude")]);
     }
 
-    /// Mafold Harness (`opencode`) is part of mafold; `opencode-own` is
-    /// OpenCode's own installer — the OpenCode 1 line it hands out, the one
-    /// Mafold drives.
+    /// Mafold Harness went by `opencode` until 11-20, and your own OpenCode
+    /// (`opencode-own`) is gone: `mafold install` under any of those names is
+    /// Mafold Harness, part of mafold — no OpenCode installer is ever run.
     #[test]
-    fn mafold_harness_and_your_own_opencode_never_install_as_each_other() {
-        let harness = find("opencode").unwrap();
-        assert!(matches!(harness.how, How::Linked));
-        let own = find("opencode-own").unwrap();
-        assert_eq!(own.id, "opencode-own");
-        assert!(matches!(own.how, How::Official { unix, .. } if unix.contains("opencode.ai/install")));
-        assert!(find("own-opencode").is_some_and(|t| t.id == "opencode-own"));
+    fn the_old_names_install_nothing_but_name_mafold_harness() {
+        for name in ["mafold-harness", "opencode", "open-code", "opencode-own", "own-opencode"] {
+            let t = find(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(t.id, crate::harness::MAFOLD_HARNESS, "{name}");
+            assert!(matches!(t.how, How::Linked), "{name}");
+        }
+        assert!(TOOLS.iter().all(|t| !matches!(t.how, How::Official { unix, .. } if unix.contains("opencode"))));
     }
 }

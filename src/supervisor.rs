@@ -339,7 +339,33 @@ fn seen() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, u
 static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 fn load() -> Config {
-    fs::read_to_string(cfg_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    let Ok(text) = fs::read_to_string(cfg_path()) else { return Config::default() };
+    let Ok(mut c) = serde_json::from_str::<Config>(&text) else { return Config::default() };
+    if in_current_ids(&mut c) {
+        // Written back once, unless something else wrote the file meanwhile —
+        // then that write stands, and the next read moves it over.
+        if fs::read_to_string(cfg_path()).is_ok_and(|now| now == text) {
+            let _ = store(&c);
+        }
+    }
+    c
+}
+
+/// Each daemon's runtime in today's id (`agent_setup::runtime_id`): one added
+/// before 11-20 says `opencode` for Mafold Harness — what an agent reading
+/// this file took for its harness (ops 11-20) — or names your own OpenCode,
+/// which is gone and runs on Mafold Harness. True when one moved.
+fn in_current_ids(c: &mut Config) -> bool {
+    let mut moved = false;
+    for d in c.daemons.iter_mut() {
+        let Some(h) = d.harness.as_deref() else { continue };
+        let now = mafold_core::mafold_types::agent_setup::runtime_id(&h.trim().to_lowercase()).to_string();
+        if now != h {
+            d.harness = Some(now);
+            moved = true;
+        }
+    }
+    moved
 }
 
 /// The owner changed `name`'s token (`revokeBotToken`) and the server left the
@@ -3559,6 +3585,26 @@ mod tests {
         // Older daemons.json rows have no `env` — they still load.
         let d: DaemonCfg = serde_json::from_str(r#"{"name":"a:b","token":"mb_x","workdir":"/tmp"}"#).unwrap();
         assert!(d.env.is_empty());
+    }
+
+    /// A daemons.json from before 11-20 says `opencode` for Mafold Harness —
+    /// an agent read that file and said it wasn't on Mafold Harness — and may
+    /// name your own OpenCode, which is gone: both read as Mafold Harness,
+    /// and nothing else moves.
+    #[test]
+    fn old_runtime_ids_in_daemons_json_move_over() {
+        let mut c: Config = serde_json::from_str(
+            r#"{"daemons":[
+                {"name":"a:o","token":"mb_1","workdir":"/tmp","harness":"opencode"},
+                {"name":"a:own","token":"mb_2","workdir":"/tmp","harness":"opencode-own"},
+                {"name":"a:cc","token":"mb_3","workdir":"/tmp","harness":"claude-code"},
+                {"name":"a:none","token":"mb_4","workdir":"/tmp"}]}"#,
+        )
+        .unwrap();
+        assert!(in_current_ids(&mut c));
+        let ids: Vec<Option<&str>> = c.daemons.iter().map(|d| d.harness.as_deref()).collect();
+        assert_eq!(ids, [Some("mafold-harness"), Some("mafold-harness"), Some("claude-code"), None]);
+        assert!(!in_current_ids(&mut c), "already in today's ids");
     }
 
     /// `mafold down claude-code` against a daemon registered as

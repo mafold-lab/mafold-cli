@@ -816,9 +816,15 @@ impl OpenAiCompatRuntime {
             out.stats.provider = Some(label.clone());
             // Tool calls stream as index-keyed fragments: the first one
             // carries the id and the function name, every later one only
-            // appends to `arguments`. Keyed by index, never by arrival order.
-            let mut slots: HashMap<usize, ToolCall> = HashMap::new();
-            let mut order: Vec<usize> = Vec::new();
+            // appends to `arguments`. Keyed by index, never by arrival order —
+            // but a fragment with an id of its own, not the one its index is
+            // feeding, begins a new call. Google's compat endpoint sends
+            // parallel calls with no `index` at all, each whole and with its
+            // own id (Gemma 4, 2026-11-21): read by index alone, "send the tab
+            // a command, then wait for its answer" became ONE call `{…}{…}`,
+            // refused as malformed, and the turn died on the next step.
+            let mut calls: Vec<ToolCall> = Vec::new();
+            let mut feeding: HashMap<usize, usize> = HashMap::new();
             let mut last_pulse = Instant::now();
 
             macro_rules! fold_line {
@@ -891,12 +897,18 @@ impl OpenAiCompatRuntime {
                                         }
                                     }
                                     for tc in ch.delta.tool_calls.unwrap_or_default() {
-                                        let slot = slots.entry(tc.index).or_insert_with(|| {
-                                            order.push(tc.index);
-                                            ToolCall::default()
+                                        let id = tc.id.filter(|id| !id.is_empty());
+                                        let fed = feeding.get(&tc.index).copied().filter(|&at| {
+                                            id.as_ref().is_none_or(|id| calls[at].id.is_empty() || calls[at].id == *id)
                                         });
-                                        if let Some(id) = tc.id {
-                                            if !id.is_empty() { slot.id = id; }
+                                        let at = fed.unwrap_or_else(|| {
+                                            calls.push(ToolCall::default());
+                                            feeding.insert(tc.index, calls.len() - 1);
+                                            calls.len() - 1
+                                        });
+                                        let slot = &mut calls[at];
+                                        if let Some(id) = id {
+                                            slot.id = id;
                                         }
                                         if let Some(n) = tc.function.name {
                                             if !n.is_empty() { slot.name = n; }
@@ -976,11 +988,7 @@ impl OpenAiCompatRuntime {
                 return;
             }
 
-            out.calls = order
-                .into_iter()
-                .filter_map(|i| slots.remove(&i))
-                .filter(|c| !c.name.is_empty())
-                .collect();
+            out.calls = calls.into_iter().filter(|c| !c.name.is_empty()).collect();
             yield Attempt::Event(ChatEvent::Done(out));
         })
     }
@@ -1236,6 +1244,81 @@ mod tests {
         let sent = crate::kernel::assistant_value(&m);
         assert!(sent.get("reasoning_content").is_none(), "{sent}");
         assert_eq!(sent["tool_calls"][0]["function"]["name"], "Bash");
+    }
+
+    /// Gemma 4 on Google's compat endpoint (captured 2026-11-21; the thought,
+    /// signature, ids and names shortened): two calls in one step, each whole
+    /// in a frame of its own, with its own id and NO `index`.
+    const GOOGLE_PARALLEL_CALLS: &str = sse!(
+        r#"{"choices":[{"delta":{"content":"<thought>Scroll down, then look again.","extra_content":{"google":{"thought":true}},"role":"assistant"},"index":0}],"created":1795288853,"id":"FO8B","model":"gemma-4-31b-it","object":"chat.completion.chunk","usage":{"completion_tokens":0,"prompt_tokens":659,"total_tokens":673}}"#,
+        r#"{"choices":[{"delta":{"content":"</thought>","role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"SIG"}},"function":{"arguments":"{\"value\":\"{\\\"id\\\": 2, \\\"steps\\\": [{\\\"scroll\\\": \\\"down\\\"}, {\\\"look\\\": true}]}\",\"message_id\":\"m1\",\"action\":\"set\",\"keys\":[\"mafold/browse/0.cmd\"]}","name":"card_state"},"id":"call_9186493741821937814","type":"function"}]},"index":0}],"created":1795288861,"id":"FO8B","model":"gemma-4-31b-it","object":"chat.completion.chunk","usage":{"completion_tokens":90,"prompt_tokens":659,"total_tokens":957}}"#,
+        r#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"arguments":"{\"keys\":[\"mafold/browse/0.res@ops\"],\"message_id\":\"m1\",\"action\":\"wait\"}","name":"card_state"},"id":"call_9186493741821936609","type":"function"}]},"index":0}],"created":1795288863,"id":"FO8B","model":"gemma-4-31b-it","object":"chat.completion.chunk","usage":{"completion_tokens":158,"prompt_tokens":659,"total_tokens":1025}}"#,
+        r#"{"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}],"created":1795288863,"id":"FO8B","model":"gemma-4-31b-it","object":"chat.completion.chunk","usage":{"completion_tokens":158,"prompt_tokens":659,"total_tokens":1025}}"#,
+    );
+
+    /// ops 11-21 (「我打开了」, then 「?」): read by index alone, both calls
+    /// landed in one slot as ONE call `{…}{…}` — refused as malformed, and
+    /// Google then refused the next step that carried it back, twice in a
+    /// row. A new id is a new call, and each keeps what came with it.
+    #[tokio::test]
+    async fn parallel_calls_without_an_index_stay_two_calls() {
+        let m = tool_step(GOOGLE_PARALLEL_CALLS).await;
+        let got: Vec<(&str, &str, Value)> = m
+            .calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str(), serde_json::from_str(&c.arguments).expect("each call's own JSON")))
+            .collect();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!((got[0].0, got[0].1, &got[0].2["action"]), ("call_9186493741821937814", "card_state", &json!("set")));
+        assert_eq!((got[1].0, got[1].1, &got[1].2["action"]), ("call_9186493741821936609", "card_state", &json!("wait")));
+        assert_eq!(m.calls[0].extra["extra_content"]["google"]["thought_signature"], "SIG");
+        assert!(m.calls[1].extra.get("extra_content").is_none(), "the signature stays on the call it came with");
+        let sent = crate::kernel::assistant_value(&m);
+        assert_eq!(sent["tool_calls"].as_array().map(Vec::len), Some(2), "{sent}");
+        assert_eq!(sent["tool_calls"][0]["extra_content"]["google"]["thought_signature"], "SIG");
+    }
+
+    /// Counter-test, OpenAI's own shape: one call's arguments in pieces under
+    /// its index (the id on the first piece, or repeated on each), a second
+    /// call under another index, interleaved. Still two calls, each whole, in
+    /// the order they began.
+    const INDEXED_PIECES: &str = sse!(
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"{\"comm"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"Bash","arguments":"{\"command\":"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ls\"}"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"arguments":"\"pwd\"}"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+    );
+
+    #[tokio::test]
+    async fn pieces_of_a_call_still_join_by_index() {
+        let m = tool_step(INDEXED_PIECES).await;
+        let got: Vec<(&str, &str)> = m.calls.iter().map(|c| (c.id.as_str(), c.arguments.as_str())).collect();
+        assert_eq!(got, [("call_a", r#"{"command":"ls"}"#), ("call_b", r#"{"command":"pwd"}"#)]);
+    }
+
+    /// A call that never ran — arguments not a JSON object — goes back to the
+    /// model with `{}`: Google refuses a request carrying anything else there
+    /// (400 INVALID_ARGUMENT, `""` included; 2026-11-21). An object goes back
+    /// exactly as written.
+    #[test]
+    fn a_call_always_goes_back_with_a_json_object() {
+        let call = |a: &str| ToolCall { id: "c".into(), name: "card_state".into(), arguments: a.into(), ..Default::default() };
+        let m = TurnMsg {
+            calls: [r#"{"action":"get"}"#, r#"{"a":1}{"b":2}"#, r#"{"source":"cut"#, "[1,2]", "", r#" { "a" : 1 } "#]
+                .into_iter()
+                .map(call)
+                .collect(),
+            ..Default::default()
+        };
+        let sent = crate::kernel::assistant_value(&m);
+        let args: Vec<&str> = sent["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["function"]["arguments"].as_str().unwrap())
+            .collect();
+        assert_eq!(args, [r#"{"action":"get"}"#, "{}", "{}", "{}", "{}", r#" { "a" : 1 } "#]);
     }
 
     async fn events_of(reply: &'static str) -> Vec<ChatEvent> {

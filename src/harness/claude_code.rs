@@ -108,7 +108,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount, skill_plugins, proc } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env, mount, skill_plugins, proc, client: _ } = turn;
         let _ = sink.send(AgentEvent::Stats(RunStats {
             effort: effort.clone(), ..Default::default()
         }));

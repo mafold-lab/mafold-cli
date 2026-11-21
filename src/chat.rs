@@ -117,7 +117,7 @@ pub struct ReadArgs {
 /// main timeline's is on the chat row. None = the room isn't in my list.
 async fn unread_badge(client: &Client, chat_id: &str, channel: Option<&str>) -> Result<Option<usize>> {
     let rows = match channel {
-        Some(_) => client.list_channels(chat_id).await?,
+        Some(id) => client.list_channel(chat_id, id).await?,
         None => client.chats().await?,
     };
     let want = channel.unwrap_or(chat_id);
@@ -1432,7 +1432,7 @@ pub fn shape_of(kind: &str, participants: usize) -> String {
     }
 }
 
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.matches('-').count() == 4
 }
 
@@ -1566,7 +1566,7 @@ fn turn_channel_from(chat_id: &str, conv: Option<&str>, channel: Option<&str>) -
 /// A channel's name for a receipt or a heading; the id when it can't be found.
 pub async fn channel_name(client: &Client, chat: &str, channel_id: &str) -> String {
     client
-        .list_channels(chat)
+        .list_channel(chat, channel_id)
         .await
         .ok()
         .and_then(|v| {
@@ -1602,13 +1602,14 @@ async fn resolve_channel(client: &Client, chat: &str, name: &str) -> Result<Stri
 /// tool (mafold-api `brains/platform.rs`). Both ids are spelled out, so the
 /// command reads the same from every harness with no env expansion involved.
 ///
-/// `None` on `#all`, in a named channel, or when the list can't be fetched: a
-/// hint that fails is silence, never a failed turn. Not cached — a channel is
+/// `None` on `#all`, in a named channel, or when the row can't be fetched: a
+/// hint that fails is silence, never a failed turn. Only this channel's row is
+/// asked for — the whole list, every turn, was what failed in a 72-channel DM. Not cached — a channel is
 /// untitled for one exchange, and a stale "untitled" would send the agent to
 /// rename a channel that already has a name (the server refuses that anyway).
 pub async fn untitled_channel_block(client: &Client, chat: &str, channel_id: Option<&str>) -> Option<String> {
     let channel_id = channel_id?;
-    let list = client.list_channels(chat).await.ok()?;
+    let list = client.list_channel(chat, channel_id).await.ok()?;
     untitled_block_from(&list, chat, channel_id)
 }
 

@@ -87,6 +87,7 @@ impl Harness for Codex {
             // No PreToolUse hook to hold it with (`crate::drive::skill_gate`).
             skill_plugins: _,
             proc,
+            client: _,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");

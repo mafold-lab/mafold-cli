@@ -7,7 +7,7 @@
 //!
 //! What runs, in `agent::handle`'s order: [`fuel::step`] (the draft's key,
 //! into the turn's env — the env starts empty, as a wallet turn has no seat),
-//! Mafold Harness as the daemon selects it (`harness::select("opencode")`,
+//! Mafold Harness as the daemon selects it (`harness::select("mafold-harness")`,
 //! the loop that is part of mafold), and the renderer's wallet steps
 //! ([`fuel::before_done`] / [`fuel::without_done`]) on a transcript built the
 //! way `agent::render_loop` builds it — so the result card printed is the one
@@ -134,6 +134,7 @@ async fn turn(client: &Client, ask: Ask) -> Value {
         mount: Default::default(),
         skill_plugins: None,
         proc: TurnProc::default(),
+        client: None,
     };
 
     // The renderer: `render_loop`'s transcript and its wallet steps, minus
@@ -192,7 +193,7 @@ async fn turn(client: &Client, ask: Ask) -> Value {
         })
     };
 
-    let result = crate::harness::select("opencode").run(turn, ev_tx).await;
+    let result = crate::harness::select(crate::harness::MAFOLD_HARNESS).run(turn, ev_tx).await;
     let harness_ms = ms(started);
     let (md, kinds, text, stop_at) = renderer.await.unwrap_or_default();
     let (card, stats) = result_card(&md);

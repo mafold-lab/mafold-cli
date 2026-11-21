@@ -273,6 +273,20 @@ fn draw_thought(tx: &mut Transcript, thought: &mut String) -> bool {
     true
 }
 
+/// A call's arguments as they go back to the model on the next step: as it
+/// wrote them when they are a JSON object, else `{}`. Such a call never ran
+/// ([`unrunnable_call`]) and the tool message after it says why — but sent
+/// back as written, the whole request is refused: Google 400s
+/// (`INVALID_ARGUMENT`) a request carrying a tool call whose arguments aren't
+/// a JSON object, `""` included. 2026-11-21, Mafold Free on Gemma 4: two turns
+/// in a row ended there, before the model could read why and call again.
+fn replayed_arguments(raw: &str) -> &str {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(_)) => raw,
+        _ => "{}",
+    }
+}
+
 pub(crate) fn assistant_value(m: &TurnMsg) -> Value {
     let mut o = json!({ "role": "assistant", "content": m.content });
     if !m.calls.is_empty() {
@@ -282,7 +296,7 @@ pub(crate) fn assistant_value(m: &TurnMsg) -> Value {
             .map(|c| {
                 let mut call = json!({
                     "id": c.id, "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments }
+                    "function": { "name": c.name, "arguments": replayed_arguments(&c.arguments) }
                 });
                 if let Some(obj) = call.as_object_mut() {
                     for (k, v) in &c.extra {

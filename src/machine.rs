@@ -414,7 +414,7 @@ mod tests {
             runtime("claude-code", true, Some("exhausted")),
             runtime("codex", true, Some("unauthenticated")),
             // Signed out, but no bot here runs on it: it stops nobody.
-            runtime("opencode", true, Some("unauthenticated")),
+            runtime("mafold-harness", true, Some("unauthenticated")),
         ];
         let got = issues(&facts(true, &s, &[], &bots, &rt));
         assert_eq!(

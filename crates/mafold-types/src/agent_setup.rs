@@ -5,12 +5,48 @@
 //!
 //! On Mafold Cloud only the wallet. On a computer a login runs only its own
 //! runtime (a Claude login runs Claude Code, a Codex login runs Codex, …).
-//! OpenCode Go runs Mafold Harness (`opencode`: the loop the official bots run
-//! on, carried by mafold-cli) and your own OpenCode install (`opencode-own`)
-//! where the owner has
-//! `openCodeGo` on; the wallet fuels Mafold Harness alone, where the owner has
+//! OpenCode Go runs Mafold Harness ([`MAFOLD_HARNESS`]: the loop the official
+//! bots run on, carried by mafold-cli) where the owner has `openCodeGo` on;
+//! the wallet fuels Mafold Harness alone, where the owner has
 //! `walletOnComputers` on; and a Claude login runs Mafold Harness too — each
 //! step on the real `claude` there — where the owner has `harnessOnClaude` on.
+//!
+//! Also here: the id a runtime goes by ([`runtime_id`]), for every side that
+//! reads one an older build wrote.
+
+/// Mafold Harness's runtime id. Until 11-20 it went by `opencode`, the name of
+/// the OpenCode build it took over from on 11-03 (#1424): agents stored then,
+/// an older mafold-cli's report and an older client's createBot still say it,
+/// and [`runtime_id`] reads them as this.
+pub const MAFOLD_HARNESS: &str = "mafold-harness";
+
+/// Your own OpenCode install, a runtime until 11-20 (ops: "Remove it"). An
+/// agent stored with it runs on Mafold Harness, on the same OpenCode Go plan
+/// ([`runtime_id`]); a computer's report of it is dropped
+/// (`computers::DeviceHarnesses::in_current_ids`).
+pub const OWN_OPENCODE: &str = "opencode-own";
+
+/// The id a runtime goes by now: Mafold Harness's old one (`opencode`) and
+/// your own OpenCode's ([`OWN_OPENCODE`]) are [`MAFOLD_HARNESS`]; any other
+/// id is itself. Ids come in lowercase (every caller trims and lowercases).
+pub fn runtime_id(id: &str) -> &str {
+    match id {
+        "opencode" | OWN_OPENCODE => MAFOLD_HARNESS,
+        other => other,
+    }
+}
+
+/// The id a mafold-cli from before 11-20 knows a runtime by: Mafold Harness
+/// only as `opencode` — and such a CLI refuses every turn of an agent whose
+/// runtime it has never heard of. What `getMe` tells a daemon that doesn't
+/// say it knows the new id (`knows_mafold_harness`).
+pub fn runtime_id_before_1120(id: &str) -> &str {
+    if id == MAFOLD_HARNESS {
+        "opencode"
+    } else {
+        id
+    }
+}
 
 /// The runtimes New Agent offers on a computer, each with what can sign it in.
 pub const RUNTIME_SIGN_INS: &[(&str, &[&str])] = &[
@@ -21,9 +57,7 @@ pub const RUNTIME_SIGN_INS: &[(&str, &[&str])] = &[
     // (the router serves it on /v1/chat/completions, which its model client
     // speaks), or your Claude Code login, each step run by the real `claude`
     // on that computer.
-    ("opencode", &["opencode-go", "wallet", "claude"]),
-    // Your own OpenCode: on OpenCode Go.
-    ("opencode-own", &["opencode-go"]),
+    (MAFOLD_HARNESS, &["opencode-go", "wallet", "claude"]),
 ];
 
 /// Every sign-in New Agent knows.
@@ -34,7 +68,7 @@ pub const SIGN_INS: &[&str] = &["claude", "codex", "kimi", "opencode-go", "walle
 pub struct Gates {
     /// `walletOnComputers`: the wallet may fuel Mafold Harness.
     pub wallet_on_computers: bool,
-    /// `openCodeGo`: OpenCode Go may sign in Mafold Harness and your own OpenCode.
+    /// `openCodeGo`: OpenCode Go may sign in Mafold Harness.
     pub opencode_go: bool,
     /// `harnessOnClaude`: a Claude login may sign in Mafold Harness. Its own
     /// runtime, Claude Code, needs no flag.
@@ -47,7 +81,7 @@ impl Gates {
         match (runtime, sign_in) {
             (_, "wallet") => self.wallet_on_computers,
             (_, "opencode-go") => self.opencode_go,
-            ("opencode", "claude") => self.harness_on_claude,
+            (MAFOLD_HARNESS, "claude") => self.harness_on_claude,
             _ => true,
         }
     }
@@ -69,7 +103,7 @@ pub fn sign_in_runs(cloud: bool, runtime: Option<&str>, sign_in: &str, gates: Ga
 /// what it was signed in with and nothing else, so it can't be made without
 /// one. The others fall back to the computer's own login, as they always did.
 pub fn needs_sign_in(runtime: &str) -> bool {
-    matches!(runtime, "opencode" | "opencode-own")
+    runtime == MAFOLD_HARNESS
 }
 
 #[cfg(test)]
@@ -112,7 +146,29 @@ mod tests {
 
     #[test]
     fn a_runtime_without_a_login_of_its_own_needs_a_sign_in() {
-        assert!(needs_sign_in("opencode") && needs_sign_in("opencode-own"));
+        assert!(needs_sign_in(MAFOLD_HARNESS));
         assert!(!needs_sign_in("claude-code") && !needs_sign_in("codex") && !needs_sign_in("kimi-code"));
+    }
+
+    /// What older builds wrote reads as today's ids: Mafold Harness's old
+    /// name, and your own OpenCode (gone, its agents on Mafold Harness).
+    #[test]
+    fn old_runtime_ids_read_as_todays() {
+        assert_eq!(runtime_id("opencode"), MAFOLD_HARNESS);
+        assert_eq!(runtime_id(OWN_OPENCODE), MAFOLD_HARNESS);
+        for id in [MAFOLD_HARNESS, "claude-code", "codex", "kimi-code", "openclaw", "something-new"] {
+            assert_eq!(runtime_id(id), id);
+        }
+        assert!(RUNTIME_SIGN_INS.iter().all(|(id, _)| runtime_id(id) == *id), "the table is in today's ids");
+    }
+
+    /// A CLI from before the rename hears the one id it knows; every other
+    /// id goes to it as it is.
+    #[test]
+    fn a_cli_from_before_1120_hears_opencode() {
+        assert_eq!(runtime_id_before_1120(MAFOLD_HARNESS), "opencode");
+        for id in ["claude-code", "codex", "kimi-code", "openclaw"] {
+            assert_eq!(runtime_id_before_1120(id), id);
+        }
     }
 }

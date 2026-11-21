@@ -242,6 +242,17 @@ pub async fn resolve(client: &Client, chat: &str, channel: &str) -> Result<(Stri
     let chat_id = client.resolve_chat(chat).await?;
     // Before its channels are listed back — see `ChannelsCmd::List`.
     crate::chat::ensure_may_open(client, &chat_id).await;
+    // Given an id, ask for that one row: the agent naming an untitled channel
+    // always passes one, and pulling the whole list first is what made that
+    // rename fail in a 72-channel DM (linsky 11-18). The whole list is only
+    // for a name, or for the error that lists what exists.
+    let want = channel.trim().trim_start_matches('#');
+    if crate::chat::is_uuid(want) {
+        let row = client.list_channel(&chat_id, want).await?;
+        if let Some(c) = row.as_array().and_then(|l| find(l, want)) {
+            return Ok((chat_id, c.clone()));
+        }
+    }
     let channels = fetch(client, &chat_id).await?;
     match find(&channels, channel) {
         Some(c) => Ok((chat_id, c.clone())),

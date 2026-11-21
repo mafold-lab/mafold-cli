@@ -1,8 +1,8 @@
 //! Harness abstraction — the pluggable coding-agent backend a daemon drives.
 //!
 //! Implemented harnesses: **Claude Code**, **Codex**, **Kimi Code**, and
-//! **OpenCode** (Mafold Harness, on the wallet); planned: `openclaw`. Each
-//! harness knows how to invoke its CLI headlessly and
+//! **Mafold Harness** (Mafold's own loop, part of this program); planned:
+//! `openclaw`. Each harness knows how to invoke its CLI headlessly and
 //! normalize that CLI's output into [`AgentEvent`]s. The renderer (`crate::render`) turns
 //! those events into chat text + cards, so card rendering is identical across
 //! harnesses — a new harness only has to emit the common event stream.
@@ -22,10 +22,13 @@ pub mod codex_app_server;
 pub mod computer;
 pub mod kimi_code;
 pub mod mafold_harness;
-pub mod opencode;
+pub mod server_tools;
 pub mod unsupported;
 
 use async_trait::async_trait;
+use mafold_core::mafold_types::agent_setup::runtime_id;
+/// Mafold Harness's runtime id (`agent_setup::MAFOLD_HARNESS`).
+pub use mafold_core::mafold_types::agent_setup::MAFOLD_HARNESS;
 use mafold_core::mafold_types::{CapsSource, HarnessCaps, ModeCap, ModelCap};
 use serde::Serialize;
 use serde_json::Value;
@@ -375,6 +378,10 @@ pub struct Turn {
     /// [`TurnProc`]. Every harness must serve from it, or its long tool calls
     /// read as «No signal».
     pub proc: TurnProc,
+    /// The daemon's own client, over its bot token — for a harness that asks
+    /// the server something mid-turn (Mafold Harness's server tools,
+    /// [`server_tools`]). `None` where no daemon's reply is behind the turn.
+    pub client: Option<crate::client::Client>,
 }
 
 /// The seat behind a turn said no: its usage window is full.
@@ -665,7 +672,8 @@ impl SeatHealth {
 /// A pluggable coding-agent backend.
 #[async_trait]
 pub trait Harness: Send + Sync {
-    /// Stable id — `"claude-code"`, `"opencode"`, `"codex"`, `"openclaw"`.
+    /// Stable id — `"claude-code"`, `"mafold-harness"`, `"codex"`,
+    /// `"kimi-code"` (`agent_setup::runtime_id`).
     fn id(&self) -> &'static str;
 
     /// Is the harness CLI installed / runnable on this machine?
@@ -676,14 +684,6 @@ pub trait Harness: Send + Sync {
     /// knows and this CLI doesn't — what `reportHarnesses` sends as `runs`, so
     /// New Agent never offers a runtime the computer would refuse.
     fn runs(&self) -> bool {
-        true
-    }
-
-    /// Can this build drive the version of it installed here (`None` = not
-    /// installed)? Your own OpenCode is driven on its 1 line only; every other
-    /// runtime, whatever is installed.
-    fn runs_version(&self, version: Option<&str>) -> bool {
-        let _ = version;
         true
     }
 
@@ -835,26 +835,27 @@ pub trait Harness: Send + Sync {
 
 /// Every harness id the CLI knows about (installed or not) — what it probes
 /// and reports, whether or not it can drive it ([`Harness::runs`]).
-pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw", "kimi-code", "opencode-own"];
+pub const KNOWN: &[&str] = &["claude-code", MAFOLD_HARNESS, "codex", "openclaw", "kimi-code"];
 
 /// The default when a bot doesn't specify one.
 #[allow(dead_code)]
 pub const DEFAULT: &str = "claude-code";
 
-/// Resolve a harness by id (case/alias tolerant). No id means the default,
+/// Resolve a harness by id (case/alias tolerant), read in today's ids
+/// (`agent_setup::runtime_id`: Mafold Harness's old `opencode`, and your own
+/// OpenCode's, which is gone, are Mafold Harness). No id means the default,
 /// Claude Code. Any other id this build can't drive — `openclaw` today, or a
 /// name it has never heard of — gets [`unsupported::Unsupported`], which
 /// keeps the id and refuses every turn. It used to get Claude Code: an agent
-/// set to OpenCode then answered as Claude Code on the machine's Claude
-/// login, and nobody could tell (10-29).
+/// set to another runtime then answered as Claude Code on the machine's
+/// Claude login, and nobody could tell (10-29).
 pub fn select(id: &str) -> Arc<dyn Harness> {
-    match id.trim().to_lowercase().as_str() {
+    let id = id.trim().to_lowercase();
+    match runtime_id(&id) {
         "claude-code" | "claude" | "claudecode" | "" => Arc::new(claude_code::ClaudeCode),
         "codex" | "codex-cli" => Arc::new(codex::Codex),
         "kimi-code" | "kimi" | "kimi-cli" | "kimicode" => Arc::new(kimi_code::KimiCode),
-        // Mafold Harness, by the id its tile has always had.
-        "opencode" | "open-code" => Arc::new(mafold_harness::MafoldHarness),
-        "opencode-own" | "own-opencode" => Arc::new(opencode::OwnOpenCode),
+        MAFOLD_HARNESS | "mafold" | "open-code" | "own-opencode" => Arc::new(mafold_harness::MafoldHarness),
         other => Arc::new(unsupported::Unsupported { id: intern(other) }),
     }
 }
@@ -884,9 +885,6 @@ enum Bin {
     /// No binary: the runtime is part of this program (Mafold Harness), so it
     /// is here wherever mafold is, at mafold's own version.
     Linked,
-    /// The vendor's own install, found where its installer puts it as well as
-    /// on `$PATH` (your own OpenCode: `~/.opencode/bin`).
-    Found(fn() -> Option<PathBuf>),
 }
 
 impl Bin {
@@ -895,8 +893,6 @@ impl Bin {
         match self {
             Bin::OnPath(bin) => bin.to_string(),
             Bin::Linked => crate::platform::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
-            // Where it was found, else its name (spawning that says it's missing).
-            Bin::Found(find) => find().map_or_else(|| "opencode".to_string(), |p| p.to_string_lossy().into_owned()),
         }
     }
 
@@ -905,7 +901,6 @@ impl Bin {
         match self {
             Bin::OnPath(bin) => bin_version(bin),
             Bin::Linked => Some(env!("CARGO_PKG_VERSION").to_string()),
-            Bin::Found(find) => find().and_then(|p| version_of(&p)),
         }
     }
 }
@@ -913,11 +908,10 @@ impl Bin {
 // (harness id, the CLI binary whose presence signals it's installed)
 const BINS: &[(&str, Bin)] = &[
     ("claude-code", Bin::OnPath("claude")),
-    ("opencode", Bin::Linked),
+    (MAFOLD_HARNESS, Bin::Linked),
     ("codex", Bin::OnPath("codex")),
     ("openclaw", Bin::OnPath("openclaw")),
     ("kimi-code", Bin::OnPath("kimi")),
-    ("opencode-own", Bin::Found(opencode::own_binary)),
 ];
 
 /// Probe which known harnesses are installed on THIS machine (their CLI is on
@@ -928,7 +922,6 @@ pub fn probe() -> Vec<(&'static str, bool)> {
     BINS.iter()
         .map(|(id, bin)| {
             let installed = match bin {
-                Bin::Found(find) => find().is_some(),
                 Bin::Linked => true,
                 other => on_path(&other.program()),
             };
@@ -1000,13 +993,13 @@ pub async fn report_rows() -> Vec<Value> {
         // `null` (not `unknown`) when the harness isn't installed: there is no
         // seat to have an opinion about.
         //
-        // Only a harness this build can drive has a seat to ask about: an
-        // `opencode` row once came back "Max (20x)" with Claude's windows,
+        // Only a harness this build can drive has a seat to ask about: a
+        // Mafold Harness row once came back "Max (20x)" with Claude's windows,
         // when `select()` still answered every unknown id with Claude Code.
         // Ask the harness itself (`runs`) instead of keeping a second list of
         // "ids that are implemented" (§9).
         let h = select(id);
-        let runs = h.runs() && h.runs_version(version.as_deref());
+        let runs = h.runs();
         let implemented = available && runs;
         let (health, accounts) = if implemented {
             // Only Claude Code keys logins by directory today; every other
@@ -1039,7 +1032,7 @@ pub async fn report_rows() -> Vec<Value> {
             "health": health,
             "accounts": accounts,
             // What it can be signed in with here (`HarnessInfo::sign_ins`).
-            "sign_ins": sign_ins_of(id, implemented).await,
+            "sign_ins": sign_ins_of(id).await,
         }));
     }
     rows
@@ -1047,16 +1040,14 @@ pub async fn report_rows() -> Vec<Value> {
 
 /// What Mafold here can run `id` on, as the report says it: each runtime's
 /// own login; Mafold Harness on OpenCode Go, the wallet, and Claude Code where
-/// it is installed; your own OpenCode
-/// on OpenCode Go, saying whether it is signed in to Go here. Go's models are
-/// the ones Mafold Harness can talk to (`mafold_harness::go_model_ids`'s
-/// list), and for your own OpenCode the ones it lists (`opencode::go_models`).
-async fn sign_ins_of(id: &str, installed: bool) -> Value {
+/// it is installed. Go's models are the ones Mafold Harness can talk to
+/// (`mafold_harness::go_model_ids`'s list).
+async fn sign_ins_of(id: &str) -> Value {
     match id {
         "claude-code" => serde_json::json!([{ "id": "claude" }]),
         "codex" => serde_json::json!([{ "id": "codex" }]),
         "kimi-code" => serde_json::json!([{ "id": "kimi" }]),
-        "opencode" => {
+        MAFOLD_HARNESS => {
             let m = mafold_harness::go_models().await;
             let mut ins = vec![serde_json::json!({ "id": crate::fuel::GO, "models": m }), serde_json::json!({ "id": crate::fuel::WALLET })];
             // Claude Code, where Mafold here can drive the `claude` installed
@@ -1067,13 +1058,6 @@ async fn sign_ins_of(id: &str, installed: bool) -> Value {
                 ins.push(serde_json::json!({ "id": crate::fuel::CLAUDE }));
             }
             serde_json::Value::Array(ins)
-        }
-        opencode::OWN => {
-            let m = match opencode::own_binary().filter(|_| installed) {
-                Some(bin) => tokio::task::spawn_blocking(move || opencode::go_models(&bin)).await.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            serde_json::json!([{ "id": crate::fuel::GO, "signed_in": opencode::own_go_login(), "models": m }])
         }
         _ => serde_json::json!([]),
     }
@@ -1348,16 +1332,6 @@ fn bin_version(bin: &str) -> Option<String> {
     (!v.is_empty()).then(|| v.chars().take(32).collect())
 }
 
-/// [`bin_version`] of a binary at a path.
-pub(crate) fn version_of(path: &Path) -> Option<String> {
-    bin_version(&path.to_string_lossy())
-}
-
-/// Could `Command` start the file at `p`?
-pub(crate) fn is_launchable(p: &Path) -> bool {
-    launchable(p)
-}
-
 /// Is `bin` resolvable on `$PATH`? Windows-aware: also tries each `PATHEXT`
 /// extension (`codex.exe` / `claude.cmd` / …) — checking only the bare name made
 /// `probe()` report every harness unavailable on Windows, so this machine never
@@ -1402,6 +1376,9 @@ pub(crate) const CLAUDE_ENTRYPOINT: &str = "claude-mafold";
 pub(crate) fn claude() -> tokio::process::Command {
     let mut cmd = crate::platform::command(program("claude"));
     cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_ENTRYPOINT);
+    if let Some((k, v)) = root_sandbox() {
+        cmd.env(k, v);
+    }
     cmd
 }
 
@@ -1409,7 +1386,27 @@ pub(crate) fn claude() -> tokio::process::Command {
 pub(crate) fn claude_std() -> std::process::Command {
     let mut cmd = crate::platform::std_command(program("claude"));
     cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_ENTRYPOINT);
+    if let Some((k, v)) = root_sandbox() {
+        cmd.env(k, v);
+    }
     cmd
+}
+
+/// `IS_SANDBOX=1` when mafold runs as root and nobody set it. Claude Code
+/// refuses `--dangerously-skip-permissions` under root/sudo unless that
+/// variable says the box is a sandbox, and every turn we start passes that
+/// flag, so a daemon running as root (a server, a container) failed EVERY turn
+/// with "cannot be used with root/sudo privileges" (ops 11-18: a Claude Code
+/// bot set up from the brain card on mafold.cicd failed its first "hello";
+/// the older bots there only worked because `IS_SANDBOX` had been put into
+/// their `env` in daemons.json by hand). Running mafold as root is the owner's
+/// choice of machine, and the turn already runs with everything root can do;
+/// the variable only stops Claude Code refusing to start. An inherited or
+/// per-bot value is left alone (a bot's `env` is applied after this).
+fn root_sandbox() -> Option<(&'static str, &'static str)> {
+    // The refusal is a root/sudo check: Windows has none, elevated or not.
+    (cfg!(unix) && crate::platform::elevated() && std::env::var_os("IS_SANDBOX").is_none())
+        .then_some(("IS_SANDBOX", "1"))
 }
 
 /// First `$PATH` entry for `bin` that we could actually execute.
@@ -1734,7 +1731,7 @@ mod exit_watch_tests {
 mod select_tests {
     use super::*;
 
-    /// 10-29: an agent created with runtime `opencode` answered as Claude Code
+    /// 10-29: an agent created with Mafold Harness answered as Claude Code
     /// — on the machine's Claude login, with Claude's models in its Customize
     /// sheet — because `select` turned every id it didn't implement into
     /// Claude Code, and the only trace was one stdout line. A runtime is run
@@ -1750,7 +1747,7 @@ mod select_tests {
     /// which is what `reportHarnesses` sends as `runs`.
     #[test]
     fn a_runtime_says_whether_mafold_can_run_it() {
-        for id in ["claude-code", "codex", "kimi-code", "opencode"] {
+        for id in ["claude-code", "codex", "kimi-code", MAFOLD_HARNESS] {
             assert!(select(id).runs(), "{id}");
         }
         for id in ["openclaw", "some-new-thing"] {
@@ -1761,18 +1758,32 @@ mod select_tests {
         assert_eq!(select("").id(), "claude-code");
         assert_eq!(select(" Claude ").id(), "claude-code");
         assert_eq!(select("kimi").id(), "kimi-code");
-        assert_eq!(select("open-code").id(), "opencode");
+        assert_eq!(select("mafold").id(), MAFOLD_HARNESS);
     }
 
-    /// Mafold Harness (`opencode`) is part of this program: here wherever
-    /// mafold is, at mafold's version, and no `opencode` anywhere counts.
+    /// Until 11-20 Mafold Harness went by `opencode`, and your own OpenCode
+    /// was a runtime of its own (`opencode-own`, gone): an agent the server or
+    /// this computer's daemons.json still names either way runs on Mafold
+    /// Harness — never on Claude Code, never refused.
+    #[test]
+    fn the_old_ids_run_on_mafold_harness() {
+        for id in ["opencode", "OpenCode", " open-code ", "opencode-own", "own-opencode"] {
+            let h = select(id);
+            assert_eq!(h.id(), MAFOLD_HARNESS, "{id}");
+            assert!(h.runs(), "{id}");
+        }
+        assert!(!KNOWN.contains(&"opencode") && !KNOWN.contains(&"opencode-own"), "what this computer reports is in today's ids");
+    }
+
+    /// Mafold Harness is part of this program: here wherever mafold is, at
+    /// mafold's version.
     #[test]
     fn mafold_harness_is_here_wherever_mafold_is() {
-        let (_, bin) = BINS.iter().find(|(id, _)| *id == "opencode").expect("a row");
+        let (_, bin) = BINS.iter().find(|(id, _)| *id == MAFOLD_HARNESS).expect("a row");
         assert!(matches!(bin, Bin::Linked));
         assert_eq!(bin.version().as_deref(), Some(env!("CARGO_PKG_VERSION")));
-        assert_eq!(probe().iter().find(|(id, _)| *id == "opencode").map(|(_, ok)| *ok), Some(true));
-        assert!(select("opencode").available());
+        assert_eq!(probe().iter().find(|(id, _)| *id == MAFOLD_HARNESS).map(|(_, ok)| *ok), Some(true));
+        assert!(select(MAFOLD_HARNESS).available());
     }
 
     /// The person talking to the agent is told what happened and what to do,
@@ -1782,7 +1793,7 @@ mod select_tests {
         assert_eq!(
             unsupported::refusal("openclaw"),
             "This agent is set to run OpenClaw, which Mafold on this computer can't run, so nothing ran. \
-             Mafold runs Claude Code, Mafold Harness, Codex, Kimi Code and OpenCode: make a new agent on one of them."
+             Mafold runs Claude Code, Mafold Harness, Codex and Kimi Code: make a new agent on one of them."
         );
     }
 

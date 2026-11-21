@@ -102,8 +102,7 @@ pub struct Journal {
     /// worse than a reply cut short.
     pub child: Option<u32>,
     /// [`Self::child`]'s start (`platform::start_token`), so a restart can
-    /// tell that process from a later one handed the same pid before it ends
-    /// one (`harness::opencode::end_orphan`).
+    /// tell that process from a later one handed the same pid.
     pub child_start: Option<u64>,
     /// When the turn began, so the generating card's clock runs on instead of
     /// starting over.
@@ -287,9 +286,6 @@ pub struct Outbox {
     /// What the dead turns this process is now delivering settle — taken
     /// before anything decides whether it still needs saying.
     settled: Mutex<Vec<String>>,
-    /// The processes the dead turns this process took over were running in
-    /// (`Journal::child`, with its start).
-    orphans: Mutex<Vec<(u32, Option<u64>)>>,
     owner_running: OwnerRunning,
     /// Entries already said to be unreadable — said once, not on every look.
     unreadable: Mutex<HashSet<String>>,
@@ -323,7 +319,6 @@ impl Outbox {
             entries: Mutex::default(),
             resumable: Mutex::default(),
             settled: Mutex::default(),
-            orphans: Mutex::default(),
             owner_running: Box::new(owner_running),
             unreadable: Mutex::default(),
         };
@@ -379,11 +374,6 @@ impl Outbox {
             }
             entry.pid = std::process::id();
             entry.pid_start = my_start();
-            // The process it was running in may have outlived its daemon:
-            // handed to the daemon to look at, however the turn is judged.
-            if let Some(child) = entry.turn.as_ref().and_then(|t| t.child.map(|c| (c, t.child_start))) {
-                self.orphans.lock().unwrap().push(child);
-            }
             taken += 1;
             // A finished turn whose delivery didn't get through is just
             // delivered. A turn that was still running is the one to judge.
@@ -522,13 +512,6 @@ impl Outbox {
         std::mem::take(&mut *self.settled.lock().unwrap())
     }
 
-    /// The processes the dead turns this process took over were running in,
-    /// each with its start — whether each turn is picked back up or finalized
-    /// as it stands. Taken once, at startup, by the daemon: one of them may
-    /// have outlived its daemon and still be at work on a reply nobody reads.
-    pub fn take_orphans(&self) -> Vec<(u32, Option<u64>)> {
-        std::mem::take(&mut *self.orphans.lock().unwrap())
-    }
 
     /// The dead turns this process is to pick back up, each with its draft id.
     /// Taken once: a second call returns nothing.
@@ -763,40 +746,6 @@ mod tests {
         settled.sort();
         assert_eq!(settled, vec!["boot".to_string(), "cut".to_string()]);
         assert!(next.take_settled().is_empty(), "taken once");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// The processes a dead daemon's turns were running in are handed to the
-    /// next start, once — whichever way each turn is judged (picked back up,
-    /// or finalized as it stands) — with the start that tells each from a
-    /// later process given the same pid. Another live daemon's are its own.
-    #[test]
-    fn a_dead_processs_journaled_children_are_handed_over_once() {
-        let dir = dir("orphans");
-        let old = Outbox::load(dir.clone(), |_, _| false).unwrap();
-        let resumed = "00000000-0000-0000-0000-000000000011";
-        let cut = "00000000-0000-0000-0000-000000000012";
-        let none = "00000000-0000-0000-0000-000000000013";
-        let live = "00000000-0000-0000-0000-000000000014";
-        for id in [resumed, cut, none, live] {
-            old.track(id).unwrap();
-        }
-        let p = || Some("p".to_string());
-        old.journal(resumed, Journal { prompt: p(), trigger: p(), session_first: true, child: Some(111), child_start: Some(7), ..Default::default() });
-        old.journal(cut, Journal { prompt: p(), produced: true, child: Some(222), child_start: Some(8), ..Default::default() });
-        old.journal(none, Journal { prompt: p(), ..Default::default() });
-        old.journal(live, Journal { prompt: p(), child: Some(444), child_start: Some(9), ..Default::default() });
-        let (dead_owner, live_owner) = (std::process::id() + 1, std::process::id() + 2);
-        for (id, entry) in old.entries.lock().unwrap().iter_mut() {
-            entry.pid = if id == live { live_owner } else { dead_owner };
-            old.persist(id, entry).unwrap();
-        }
-        let next = Outbox::load(dir.clone(), move |pid, _| pid == live_owner).unwrap();
-        assert_eq!(next.take_resumable().len(), 1, "one of them is picked back up");
-        let mut orphans = next.take_orphans();
-        orphans.sort();
-        assert_eq!(orphans, vec![(111, Some(7)), (222, Some(8))]);
-        assert!(next.take_orphans().is_empty(), "taken once");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

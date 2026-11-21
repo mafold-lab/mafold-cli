@@ -71,6 +71,12 @@ pub struct TurnCtx {
     /// that describe the turn must read it rather than re-deriving, or they
     /// describe a different turn than the one being billed.
     pub model: Option<String>,
+    /// Whose wallet this turn's billing charges (lowercase), once the kernel
+    /// has passed the billing gate; `None` when a house key pays, or before
+    /// the gate. A tool that spends money of its own (a web search) bills
+    /// the same person the turn's words are billed to — it reads this rather
+    /// than guessing from `user`, which is set on house turns too.
+    pub payer: Option<String>,
     /// This turn was fired by the bot's OWN arrival in the room (a
     /// `member_joined` notice naming it), not by anything anyone said — the
     /// cue for an introduction, the way a self-hosted agent greets a group it
@@ -91,6 +97,17 @@ pub struct Prepared {
 pub trait HarnessPlugin: Send + Sync {
     /// Stable id, used in logs and tool-routing diagnostics.
     fn id(&self) -> &'static str;
+
+    /// Is the agent still itself without this plugin? `true` = no: who it is
+    /// (the owner's own words), which model it runs on, what Mafold is, how a
+    /// card is written and where Mafold's help is. A turn whose model can't
+    /// take the whole profile in one call — a host that turns away any call
+    /// over a set number of input tokens — keeps only these and leaves every
+    /// other capability out (mafold-api `brains::harness`). A capability is
+    /// `false`: the turn is still an answer without it.
+    fn essential(&self) -> bool {
+        false
+    }
 
     /// Async, per-turn snapshot, after billing and before any provider call.
     /// Ordinary retrieved data is deliberately separate from instructions.
@@ -187,6 +204,9 @@ impl PersonaPlugin {
 impl HarnessPlugin for PersonaPlugin {
     fn id(&self) -> &'static str {
         "persona"
+    }
+    fn essential(&self) -> bool {
+        true
     }
     fn prompt_sections(&self, _ctx: &TurnCtx) -> Vec<String> {
         vec![self.section.clone()]

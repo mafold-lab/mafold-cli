@@ -65,8 +65,9 @@ impl Computer {
     }
 }
 
-/// Environment prefixes another provider's credentials live under, plus any
-/// OpenCode setting and any wallet or Go value the daemon itself inherited:
+/// Environment prefixes another provider's credentials live under — OpenCode
+/// Go's key is `OPENCODE_API_KEY` where its own tools keep it — plus any
+/// wallet or Go value the daemon itself inherited:
 /// none of it reaches the shell, from the daemon's environment or the seat's.
 /// Everything else (PATH, HOME, tool logins) stays, so the agent's tools work.
 const SCRUB: &[&str] =
@@ -347,7 +348,7 @@ impl Computer {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
-        super::opencode::die_with_daemon(&mut cmd);
+        die_with_daemon(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return (format!("couldn't start `{program}`: {e}"), true),
@@ -682,6 +683,42 @@ fn grep(workdir: &Path, input: &Value) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
+/// Linux: a command the shell runs dies with the daemon that started it —
+/// however the daemon dies (kill -9, the OOM killer, a crash), where no
+/// shutdown handler runs to end it and `kill_on_drop` never fires. Left
+/// behind, it would go on working in the folder for a reply nobody reads, and
+/// the next daemon can't pick the turn back up while it lives
+/// (`agent::pick_up`).
+///
+/// SIGKILL, not SIGTERM: nobody is left to follow a SIGTERM up. The kernel
+/// sends this when the THREAD that forked the command ends; that is a tokio
+/// worker, which lives as long as the daemon's runtime (this crate never calls
+/// `block_in_place`, which could retire one).
+#[cfg(target_os = "linux")]
+fn die_with_daemon(cmd: &mut tokio::process::Command) {
+    let daemon = std::process::id();
+    // SAFETY: between fork and exec only async-signal-safe calls are made
+    // (prctl, getppid), and the errors built allocate nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The daemon died between the fork and the line above: the
+            // signal was missed, and this command must not start.
+            if libc::getppid() as u32 != daemon {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Elsewhere there is no such signal: the next daemon waits for a command the
+/// one before it left running (`agent::pick_up`).
+#[cfg(not(target_os = "linux"))]
+fn die_with_daemon(_cmd: &mut tokio::process::Command) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,5 +859,52 @@ mod tests {
         assert!(capped.len() < OUTPUT_CAP + 100);
         assert!(capped.starts_with('a') && capped.ends_with("THE END"));
         assert!(capped.contains("characters cut"));
+    }
+
+    /// Start `program args` from a thread of its own, the way a daemon's
+    /// worker starts a command, and let the thread end — which, for the
+    /// kernel's parent-death signal, is the daemon dying. Its pid.
+    #[cfg(target_os = "linux")]
+    fn start_and_let_the_starter_end(program: &Path, args: &[&str], lifeline: bool) -> u32 {
+        let (program, args) = (program.to_path_buf(), args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let mut cmd = crate::platform::command(&program);
+                cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                if lifeline {
+                    die_with_daemon(&mut cmd);
+                }
+                cmd.spawn().map(|c| c.id().unwrap()).unwrap_or_else(|e| panic!("couldn't start {}: {e}", program.display()))
+            })
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reap(pid: u32) {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+            libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+        }
+    }
+
+    /// Linux: a command dies with the daemon that started it, however the
+    /// daemon dies — kill -9, the OOM killer, a crash — where no shutdown
+    /// handler runs; the kernel's parent-death signal is the lifeline. With
+    /// none, the child of a starter that is gone lives on (the control).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_dies_with_the_daemon_that_started_it() {
+        let sleep = Path::new("sleep");
+        let with = start_and_let_the_starter_end(sleep, &["30"], true);
+        let without = start_and_let_the_starter_end(sleep, &["30"], false);
+        let gone = crate::platform::wait_until(Duration::from_secs(3), || !crate::platform::pid_running(with));
+        let survived = crate::platform::pid_running(without);
+        reap(with);
+        reap(without);
+        assert!(gone, "the command outlived the daemon that started it");
+        assert!(survived, "without the lifeline the child lives on — so it is the lifeline that ended it");
     }
 }

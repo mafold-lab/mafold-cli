@@ -23,6 +23,7 @@ pub mod catalog;
 pub mod event;
 pub mod failure;
 pub mod fold;
+pub mod guide;
 pub mod lint;
 pub mod mention;
 pub mod only;
