@@ -803,6 +803,27 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web],
         server: NotRead,
     },
+    // linsky 11-19 「这个分享页太阳痿了…完全让人没有分享欲」, six versions; opsdu 11-20
+    // 「1 及格了」— the 名片 (business card). opsdu 11-19 in the same thread: Premium
+    // on the phone is a page of its own, like the other Settings rows.
+    FlagMeta {
+        key: "shareCard",
+        default: false,
+        dev_default: true,
+        label: "Share card + Premium page (phone)",
+        description: "The QR button at the top of Settings opens the share card full screen: a \
+                      white card on the homepage's ground — the profile's cover, avatar, name and \
+                      badges, @handle, bio, the Nth-user number, and the profile's code with the \
+                      app icon in its middle. The card leans toward a finger that holds it and \
+                      settles back flat. Below it: Save image, Copy link, Share. On the phone \
+                      layout the Premium row opens a Settings page of its own (back arrow, \
+                      title) instead of a sheet. Off = the small QR sheet and the Premium sheet, \
+                      as before.",
+        owner: "linsky",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: NotRead,
+    },
     // linsky 11-18 (demo v3, msg 8f7ff775): the drawer's cards go into a chat by
     // dragging them there; opsdu 11-18: nothing goes without a confirm.
     FlagMeta {
@@ -1892,6 +1913,82 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // ops 11-22 「DM里面 这中间的 No messages yet / Say hello 完全可以放一个自定义的card」,
+    // 「必须要用户主动设置才行 不要默认覆盖」, then 「可以开始做了」 on the demo.
+    // An account's own card in an empty DM, set on purpose and never put on by
+    // default. The server gates setting it and answering its taps; clients
+    // gate drawing it.
+    FlagMeta {
+        key: "helloCard",
+        default: false,
+        dev_default: false,
+        label: "Chats: a hello card in an empty DM",
+        description: "An account (a person, or an agent through its owner) can pick one published \
+                      card as its hello card. A DM with it and no messages yet draws that card \
+                      where No messages yet / Say hello would be. An agent's card shows its quick \
+                      replies, and its owner also sees usage and the model and folder pill. \
+                      Nobody gets one by default. Off = No messages yet, as before.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-22 「我需要做一个聊天记录分享页 仅开放DM分享」, then on the demo:
+    // either person, messages I pick, 7 days, the words as shown, and kept on
+    // its own (not a Moments post).
+    FlagMeta {
+        key: "chatShare",
+        default: false,
+        dev_default: false,
+        label: "Direct chats: share messages as a page",
+        description: "Selecting messages in a direct chat offers Share link: the picked messages \
+                      become a page at mafold.com/share/…, drawn as the sharer sees the chat, \
+                      that anyone with the link can open for 7 days. Off = no Share link, and \
+                      the api makes no new pages (links already made still open).",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-22 「我想把这一套体系带给Mafold Harness」 (Claude Code's summary +
+    // worklog + layered memory), then on the demo: saving on its own
+    // judgment, a Mac agent's memory kept on Mafold with a copy on the Mac,
+    // "Build it, flag on for you first" (`.docs/harness-memory-v1.md`).
+    FlagMeta {
+        key: "harnessMemory",
+        default: false,
+        dev_default: false,
+        label: "Agents: notes, worklog and summary memory",
+        description: "An agent on Mafold Harness (official bots, Cloud agents, and Mafold Harness \
+                      agents on a computer) keeps its memory of you as notes, one fact each, \
+                      saved on its own judgment unless you switch that off; it reads an index of \
+                      them every turn, and folds messages that fell out of the chat's last 200 \
+                      into a summary. A computer agent's memory is kept on Mafold with a copy on \
+                      that computer. The chat menu gets Memory: notes, worklog, summary and \
+                      rules. Read for the person whose memory it is. Off = memory is written \
+                      only when asked, computer agents keep none, and there is no Memory page.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-22 「所有卡片 包括官方的 都必须在sandbox里面运行」 (after Telegram
+    // pulled its widgets): card code leaves the app's realm. Demo first, on
+    // web, for poll / ask / generating / html (`.docs/card-sandbox-v1.md`).
+    FlagMeta {
+        key: "cardSandbox",
+        default: false,
+        dev_default: false,
+        label: "Cards run in a sandbox",
+        description: "The demo cards (poll, ask, generating, html) run in their publisher's \
+                      sandbox — a hidden frame with no network and no reach into the app — \
+                      and the app draws what they send. Off = they run in the page, as \
+                      every card does today.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[Web],
+        server: NotRead,
+    },
 ];
 
 pub fn meta(key: &str) -> Option<&'static FlagMeta> {
@@ -2246,6 +2343,30 @@ mod tests {
         assert_eq!(m.clients, &[Web], "{k}: only the web reads it");
         assert_eq!(m.server, NotRead, "{k}: read by the client only");
         assert_eq!((m.owner, m.added), ("linsky", "2026-11"), "{k}: owner and month");
+    }
+
+    #[test]
+    fn share_card_ships_dark_on_web_and_phone() {
+        // linsky 11-19 / opsdu 11-20: the QR button's share card, and Premium as
+        // a Settings page of its own on the phone layout.
+        let k = "shareCard";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && m.dev_default, "{k}: off in production, on in dev");
+        assert_eq!(m.clients, &[Web, Phone], "{k}: web and phone read it");
+        assert_eq!(m.server, NotRead, "{k}: read by the clients only");
+        assert_eq!((m.owner, m.added), ("linsky", "2026-11"), "{k}: owner and month");
+    }
+
+    #[test]
+    fn harness_memory_ships_dark_and_the_api_keeps_it_shut() {
+        // ops 11-22: notes, worklog and summary for Mafold Harness, "flag on
+        // for you first" — off everywhere, dev included, until a record opens it.
+        let k = "harnessMemory";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off in production and in dev");
+        assert_eq!(m.clients, &[Web, Phone], "{k}: the Memory page on web and the phone");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates memory on it, shut without a record");
+        assert_eq!((m.owner, m.added), ("ops", "2026-11"), "{k}: owner and month");
     }
 
     #[test]

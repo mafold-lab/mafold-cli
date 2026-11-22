@@ -275,6 +275,13 @@ pub struct Account {
     /// used. None for a cover the account picked itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_by: Option<String>,
+    /// The account's card for an empty DM: one published card's self-closing
+    /// tag (`{% owner/slug … /%}`), drawn where "No messages yet" would be in
+    /// a DM with it that has no messages (flag `helloCard`). Set with
+    /// `updateProfile` by the account, or an agent's by its owner, and only on
+    /// purpose: no account has one by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hello_card: Option<String>,
 }
 
 /// A slash command a bot advertises — shown in the chat's command panel when

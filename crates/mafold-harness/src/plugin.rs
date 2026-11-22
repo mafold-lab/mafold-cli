@@ -100,10 +100,11 @@ pub trait HarnessPlugin: Send + Sync {
 
     /// Is the agent still itself without this plugin? `true` = no: who it is
     /// (the owner's own words), which model it runs on, what Mafold is, how a
-    /// card is written and where Mafold's help is. A turn whose model can't
-    /// take the whole profile in one call — a host that turns away any call
-    /// over a set number of input tokens — keeps only these and leaves every
-    /// other capability out (mafold-api `brains::harness`). A capability is
+    /// card is written, where Mafold's help is, what day it is and how to look
+    /// something up. A turn whose model can't take the whole profile in one
+    /// call — a host that turns away any call over a set number of input
+    /// tokens — keeps these whatever else goes, and of the rest only what fits
+    /// beside the chat (mafold-api `brains::harness`). A capability is
     /// `false`: the turn is still an answer without it.
     fn essential(&self) -> bool {
         false

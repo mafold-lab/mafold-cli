@@ -530,6 +530,17 @@ pub fn classify(err: &str) -> Failure {
     // said «credential rejected, sign in again» and the turn ended unretried.
     } else if matches!(status, Some(401 | 403)) && edge_page(&low) {
         FailureKind::Unavailable
+    // A 429 that says which window refused it, or when it lifts, is a limit
+    // whatever the vendor's sentence. Google words its per-minute quota «You
+    // exceeded your current quota, please check your plan and billing
+    // details» — OpenAI's sentence for an account out of credit, which carries
+    // no window. 2026-11-22: Mafold Free's shared minute read as «out of
+    // credit» on a new user's card.
+    } else if status == Some(429) && {
+        let (window, resets_at) = limit_lifts(&detail);
+        window.is_some() || resets_at.is_some()
+    } {
+        FailureKind::RateLimit
     } else if status == Some(402)
         || has(&[
             "credit balance is too low",
@@ -794,6 +805,8 @@ mod tests {
         assert_eq!(seat.kind, FailureKind::Unavailable, "{seat:?}");
         let byo = classify("provider error: openai 429 Too Many Requests: {\"error\":{\"message\":\"You exceeded your current quota, please check your plan and billing details.\",\"type\":\"insufficient_quota\"}}");
         assert_eq!(byo.kind, FailureKind::Credit, "{byo:?}");
+        let marked = classify(&quota_refused("openai 429 Too Many Requests: You exceeded your current quota, please check your plan and billing details.", "quota", None));
+        assert_eq!(marked.kind, FailureKind::Credit, "a 429 that names no window and no time is still the account: {marked:?}");
         let cc = classify("Credit balance is too low");
         assert_eq!(cc.kind, FailureKind::Credit);
         assert_eq!(classify("anthropic (alice) 402 Payment Required: {}").kind, FailureKind::Credit);
@@ -946,6 +959,19 @@ mod tests {
         // offset is the text's own, never a lowercased copy's (review, 10-10).
         let odd = classify("K İ 中 Claude usage limit reached|1790537400");
         assert_eq!(odd.resets_at, Some(1790537400));
+    }
+
+    /// 2026-11-22 Mafold Free 那张卡:Google 的按分钟配额用的是 OpenAI「账号没钱」那句话
+    /// (「exceeded your current quota … billing details」)。带着窗口和放开时间的 429 是
+    /// 限流:卡片说「Per-minute limit」和几点恢复,不叫人去给账号充钱。两种来路都一样:
+    /// harness 的标记,router 回包里的 `kind` / `resets_at`。
+    #[test]
+    fn a_429_with_its_window_is_a_limit_whatever_the_vendor_says() {
+        let google = "{\"error\":{\"message\":\"Gemini 上游 429 Too Many Requests: [{\\n  \\\"error\\\": {\\n    \\\"code\\\": 429,\\n    \\\"message\\\": \\\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.\",\"type\":\"rate_limit_exceeded\",\"kind\":\"one_minute\",\"resets_at\":1795374240}}";
+        let marked = classify(&quota_refused(&format!("google 429 Too Many Requests: {google}"), "one_minute", Some(1795374240)));
+        assert_eq!((marked.kind, marked.window.as_deref(), marked.resets_at), (FailureKind::RateLimit, Some("one_minute"), Some(1795374240)), "{marked:?}");
+        let router = classify(&format!("provider error: google 429 Too Many Requests: {google}"));
+        assert_eq!((router.kind, router.window.as_deref(), router.resets_at), (FailureKind::RateLimit, Some("one_minute"), Some(1795374240)), "{router:?}");
     }
 
     /// 「rate」也在 generate 里,「402」也可能是一个金额 —— 松散的词不算数。

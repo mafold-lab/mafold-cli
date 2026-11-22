@@ -22,7 +22,7 @@ use mafold_transcript::{Advance, AgentEvent, RunStats, Tap, Transcript};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::plugin::{HarnessPlugin, ToolSpec, TurnCtx};
+use crate::plugin::{HarnessPlugin, Prepared, ToolSpec, TurnCtx};
 use crate::runtime::{
     silence_is_askable, unrunnable_call, ChatEvent, ModelRuntime, TurnMsg, NO_VISIBLE_OUTPUT,
     OUTPUT_CAP_NO_ANSWER, PULSE_EVERY,
@@ -156,10 +156,28 @@ impl Tools {
     /// Ask every plugin. First registration wins; a collision is a wiring bug
     /// worth a log line, not a crash.
     pub async fn of(plugins: &[Arc<dyn HarnessPlugin>], ctx: &TurnCtx, bot: &str) -> Self {
+        Self::from_offers(plugins, Self::offers(plugins, ctx).await, bot)
+    }
+
+    /// What each plugin offers this turn, one entry per plugin in profile
+    /// order — asked once, for a host that weighs the plugins before it
+    /// settles which of them the turn carries.
+    pub async fn offers(plugins: &[Arc<dyn HarnessPlugin>], ctx: &TurnCtx) -> Vec<Vec<ToolSpec>> {
+        let mut offers = Vec::with_capacity(plugins.len());
+        for p in plugins {
+            offers.push(p.tools(ctx).await);
+        }
+        offers
+    }
+
+    /// The turn's tools from what each plugin offered ([`Self::offers`]: one
+    /// entry per plugin, same order). First registration wins, as in
+    /// [`Self::of`].
+    pub fn from_offers(plugins: &[Arc<dyn HarnessPlugin>], offers: Vec<Vec<ToolSpec>>, bot: &str) -> Self {
         let mut specs: Vec<ToolSpec> = Vec::new();
         let mut route: HashMap<String, usize> = HashMap::new();
-        for (idx, p) in plugins.iter().enumerate() {
-            for spec in p.tools(ctx).await {
+        for (idx, (p, offered)) in plugins.iter().zip(offers).enumerate() {
+            for spec in offered {
                 if route.contains_key(&spec.name) {
                     tracing::warn!(
                         "harness({}): duplicate tool '{}' from plugin '{}' ignored",
@@ -199,13 +217,29 @@ pub async fn prepare(
     ctx: &TurnCtx,
     system: &mut String,
 ) -> Result<Vec<String>, String> {
-    let mut prepared_data = Vec::new();
+    Ok(apply_prepared(system, prepare_each(plugins, ctx).await?))
+}
+
+/// Every plugin's per-turn snapshot, one per plugin in profile order — taken
+/// once, for a host that weighs the plugins before it settles which of them
+/// the turn carries ([`apply_prepared`] then lays out the ones it keeps).
+pub async fn prepare_each(plugins: &[Arc<dyn HarnessPlugin>], ctx: &TurnCtx) -> Result<Vec<Prepared>, String> {
+    let mut each = Vec::with_capacity(plugins.len());
     for plugin in plugins {
-        let prepared = plugin.prepare(ctx).await?;
+        each.push(plugin.prepare(ctx).await?);
+    }
+    Ok(each)
+}
+
+/// Snapshots onto the turn ([`prepare`]): instructions onto `system`, the
+/// retrieved data back, to ride ahead of the history.
+pub fn apply_prepared(system: &mut String, each: Vec<Prepared>) -> Vec<String> {
+    let mut prepared_data = Vec::new();
+    for prepared in each {
         for section in prepared.instructions { system.push_str("\n\n"); system.push_str(&section); }
         prepared_data.extend(prepared.data);
     }
-    Ok(prepared_data)
+    prepared_data
 }
 
 /// One turn, everything settled.

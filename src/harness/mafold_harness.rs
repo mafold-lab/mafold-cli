@@ -274,7 +274,7 @@ impl Harness for MafoldHarness {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        run_turn(turn, sink, &home()).await
+        run_turn(turn, sink, &home(), &server_tools::memory_root()).await
     }
 
     fn discover(&self, _workdir: &str) -> Value {
@@ -333,8 +333,9 @@ fn agent_name(surface: &str) -> String {
     std::env::var("MAFOLD_DAEMON_NAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "default".into())
 }
 
-/// One turn, its sessions kept under `home` ([`home`]; a test's own).
-async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::path::Path) -> Result<TurnOutcome> {
+/// One turn, its sessions kept under `home` ([`home`]) and its memory's copy
+/// under `copies` ([`server_tools::memory_root`]) — a test's own, both.
+async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::path::Path, copies: &std::path::Path) -> Result<TurnOutcome> {
     let Turn {
         prompt,
         conv,
@@ -428,7 +429,7 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
         // …and what the server adds: searching the web and reading a page, on
         // the owner's wallet (`server_tools`).
         if let Some(client) = client.as_ref().filter(|_| uuid::Uuid::parse_str(&draft).is_ok()) {
-            if let Some(server) = server_tools::ServerTools::ask(client, &draft).await {
+            if let Some(server) = server_tools::ServerTools::ask(client, &draft, copies.to_path_buf()).await {
                 plugins.push(Arc::new(server));
             }
         }
@@ -871,7 +872,7 @@ mod tests {
     async fn drive(t: Turn) -> (TurnOutcome, Vec<AgentEvent>) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let home = PathBuf::from(&t.workdir).with_extension("home");
-        let out = run_turn(t, tx, &home).await.expect("the turn ran");
+        let out = run_turn(t, tx, &home, &home.join("memory")).await.expect("the turn ran");
         let mut events = Vec::new();
         while let Ok(e) = rx.try_recv() {
             events.push(e);
@@ -1293,9 +1294,15 @@ sys.stdin.read()
     }
 
     /// A stand-in Mafold api for the server's tools: `turnTools` offers
-    /// `web_search` with a prompt line, `turnToolCall` answers what the
-    /// hosted plugin would. Every call it got is kept (method, body).
+    /// `web_search` with a prompt line — or, `memory`, the memory plugin with
+    /// its prepared rules and index — `turnToolCall` answers what the hosted
+    /// plugin would, `turnMemoryCopy` what the copy lacks. Every call it got
+    /// is kept (method, body).
     async fn server(fail_calls: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        serve(fail_calls, false).await
+    }
+
+    async fn serve(fail_calls: bool, memory: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1328,6 +1335,22 @@ sys.stdin.read()
                 let body: Value = serde_json::from_slice(&req[at..]).unwrap_or(Value::Null);
                 kept.lock().unwrap().push((method.clone(), body));
                 let answer = match method.as_str() {
+                    "turnTools" if memory => json!({ "ok": true, "result": {
+                        "prompt": ["MEMORY: You keep a memory of this person."],
+                        "tools": [{ "name": "memory_write", "description": "Save a note.", "read_only": false,
+                                    "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }],
+                        "instructions": ["SAVING: Save on your own judgment."],
+                        "data": ["UNTRUSTED MEMORY INDEX (relationship scope): no notes yet."],
+                        "memory_folder": "with-ops",
+                    } }),
+                    "turnToolCall" if memory => json!({ "ok": true, "result": {
+                        "text": "{\"status\":\"saved\"}",
+                        "card": { "failed": false, "result": "Memory saved with a new revision." },
+                    } }),
+                    "turnMemoryCopy" => json!({ "ok": true, "result": {
+                        "files": [{ "path": "notes/phone.md", "revision": "r1", "content": "Learns on the phone." }],
+                        "keep": ["notes/phone.md"],
+                    } }),
                     "turnTools" => json!({ "ok": true, "result": {
                         "prompt": ["WEB: web_search(query) is billed to @owner's wallet."],
                         "tools": [{ "name": "web_search", "description": "Search the web.", "read_only": true,
@@ -1375,7 +1398,7 @@ sys.stdin.read()
         assert!(answered["content"].as_str().unwrap().contains("https://mafold.com"), "{answered}");
         let calls = calls.lock().unwrap();
         assert_eq!(calls[0].0, "turnTools");
-        assert_eq!(calls[0].1, json!({ "draft": draft }));
+        assert_eq!(calls[0].1, json!({ "draft": draft, "memory": true }));
         assert_eq!(calls[1].0, "turnToolCall");
         assert_eq!(calls[1].1["draft"], json!(draft));
         assert_eq!(calls[1].1["name"], "web_search");
@@ -1383,6 +1406,34 @@ sys.stdin.read()
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, input, .. } if name == "web_search" && input["query"] == "mafold")));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, .. } if text == "48 chars")));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolStatus { failed: false, .. })));
+    }
+
+    /// With memory on for the person, the server's memory plugin rides the
+    /// turn — its saving rule in the instructions, its index ahead of the
+    /// chat, its tool run on the server — and at the end the copy on this
+    /// computer takes what the server says it lacks.
+    #[tokio::test]
+    async fn a_turn_with_memory_reads_it_from_mafold_and_keeps_a_copy() {
+        let work = folder("memory");
+        let (api, calls) = serve(false, true).await;
+        let (base, bodies) = model(vec![runs("c1", "memory_write", json!({ "path": "notes/phone.md" })), says("Saved.")]).await;
+        let tag = surface("memory");
+        let mut t = turn(&work, &tag, None, "I learn on the phone", wallet(&base));
+        t.client = Some(Client::new(api, "mb_probe".into()));
+        let draft = t.draft.clone();
+        let (out, _) = drive(t).await;
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let bodies = bodies.lock().unwrap();
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("SAVING: Save on your own judgment.") && system.contains("MEMORY: You keep"), "{system}");
+        assert!(messages.iter().any(|m| m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.contains("MEMORY INDEX"))), "the index rides ahead of the chat");
+        let calls = calls.lock().unwrap();
+        let names: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(names, ["turnTools", "turnToolCall", "turnMemoryCopy"]);
+        assert_eq!(calls[2].1["draft"], json!(draft));
+        let copy = PathBuf::from(&work).with_extension("home").join("memory").join(agent_name(&tag)).join("with-ops").join("notes").join("phone.md");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "Learns on the phone.");
     }
 
     /// A guest's turn never asks the server (nobody else spends the owner's
