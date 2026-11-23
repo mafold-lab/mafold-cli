@@ -270,13 +270,16 @@ pub struct HarnessHostsResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connected: Vec<String>,
     /// Present where the owner may pay for a Mafold Cloud agent with their own
-    /// model key (`cloudOwnKey`): Pays with offers API key and Connections.
+    /// model key (`cloudOwnKey`), or sign Mafold Harness in with one on a
+    /// computer (`ownKeyOnComputers`): Pays with / Sign in with offer API key
+    /// and Connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_keys: Option<CloudKeys>,
 }
 
 /// What Pays with ▸ Connections lists: the owner's connections that hold a
-/// model key Mafold Cloud can run on. Read off the rows; nothing is opened.
+/// model key Mafold Harness can run on, on Mafold Cloud or a computer. Read
+/// off the rows; nothing is opened.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudKeys {
     pub connections: Vec<ModelKeyConnection>,

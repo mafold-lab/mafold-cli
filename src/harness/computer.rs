@@ -67,15 +67,15 @@ impl Computer {
 
 /// Environment prefixes another provider's credentials live under — OpenCode
 /// Go's key is `OPENCODE_API_KEY` where its own tools keep it — plus any
-/// wallet or Go value the daemon itself inherited:
+/// wallet, Go or Codex value the daemon itself inherited:
 /// none of it reaches the shell, from the daemon's environment or the seat's.
 /// Everything else (PATH, HOME, tool logins) stays, so the agent's tools work.
 const SCRUB: &[&str] =
-    &["OPENAI_", "ANTHROPIC_", "DEEPSEEK_", "GEMINI_", "OPENROUTER_", "OPENCODE_", "MAFOLD_WALLET_", "MAFOLD_GO_"];
+    &["OPENAI_", "ANTHROPIC_", "DEEPSEEK_", "GEMINI_", "OPENROUTER_", "OPENCODE_", "MAFOLD_WALLET_", "MAFOLD_GO_", "MAFOLD_CODEX_"];
 
 /// What the shell's environment adds to the daemon's: `seat` (the turn's env)
-/// without the fuel — the wallet's reply key and the Go key the loop pays with
-/// — and anything else under a [`SCRUB`] prefix.
+/// without the fuel — the wallet's reply key, the Go key and the Codex login
+/// the loop pays with — and anything else under a [`SCRUB`] prefix.
 pub fn shell_env(seat: &[(String, String)], extra: Vec<(String, String)>) -> Vec<(String, String)> {
     seat.iter()
         .filter(|(k, _)| !SCRUB.iter().any(|p| k.starts_with(p)))
@@ -774,6 +774,7 @@ mod tests {
         let seat = vec![
             ("MAFOLD_WALLET_KEY".to_string(), "k".to_string()),
             ("MAFOLD_GO_KEY".to_string(), "g".to_string()),
+            ("MAFOLD_CODEX_TOKEN".to_string(), "c".to_string()),
             ("OPENAI_API_KEY".to_string(), "o".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string()),
         ];

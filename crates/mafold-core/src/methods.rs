@@ -326,6 +326,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "oauth/revoke",
     "oauth/token",
     "oauth/userinfo",
+    "openModelKey",
     "pinApp",
     "pinChat",
     "pinMessage",

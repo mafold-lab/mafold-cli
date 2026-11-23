@@ -526,9 +526,10 @@ pub(crate) struct KeyNotHandedOver;
 impl std::fmt::Display for KeyNotHandedOver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "this machine doesn't have your vault key yet.\n\n  \
-             open Mafold on a device that already has it (web, mac or iOS) and it \
-             will hand the key over — then run this again.\n  \
+            "this machine hasn't been handed your vault key yet.\n\n  \
+             open Settings → Connections on a device that already has it (the web, \
+             or your phone) and it passes the key to this machine by itself — then \
+             run this again.\n  \
              no other device? recover with your passphrase:  mafold connection recover",
         )
     }
@@ -2083,9 +2084,17 @@ async fn listener_session(base: &str, client: &Client, sess: &session::Session, 
             };
             match frame {
                 WsMsg::Text(t) => {
-                    let reset = serde_json::from_str::<Value>(&t).ok()
-                        .is_some_and(|v| v["method"] == "events.vaultReset");
-                    if reset { runtime = None; }
+                    let method = serde_json::from_str::<Value>(&t).ok()
+                        .and_then(|v| v["method"].as_str().map(str::to_string));
+                    if method.as_deref() == Some("events.vaultReset") { runtime = None; }
+                    // Another device of the owner's is waiting for the key: a
+                    // computer that holds it passes it on, the way an open
+                    // Connections page does, instead of leaving it to the web.
+                    if method.as_deref() == Some("events.vaultDevicePending") {
+                        if let Some((_, umk, key_id)) = runtime.as_ref() {
+                            auto_approve_pending(client, umk, key_id).await;
+                        }
+                    }
                     if key_refresh_event(&t, &sess.device_id, runtime.is_none()) {
                         // Preserve the runtime and MCP tool cache on ordinary calls.
                         // Reconnect, reset and local approval revalidate the key.
@@ -2322,23 +2331,20 @@ pub(crate) enum OwnerKeyIssue {
 /// opened on this machine. The newest row of that provider wins, so a pasted
 /// replacement takes over from the next reply. Never prints.
 pub(crate) async fn open_owner_key(base: &str, owner: &str, provider: &str) -> std::result::Result<String, OwnerKeyIssue> {
-    let Some(sess) = session::load_named(owner) else {
-        return Err(OwnerKeyIssue::NotHere);
-    };
-    let human = Client::new(base.to_string(), sess.token.clone());
-    let listed = human.call("listConnections", json!({})).await.map_err(|e| OwnerKeyIssue::Failed(format!("{e:#}")))?;
-    let mut rows: Vec<Value> = as_array(&listed, "items").into_iter().filter(|c| s(c, "provider") == provider).collect();
-    rows.sort_by_key(|c| std::cmp::Reverse(c.get("updated_at").and_then(Value::as_i64).unwrap_or(0)));
-    let Some(conn) = rows.into_iter().next() else {
-        return Err(OwnerKeyIssue::None);
-    };
-    let (umk, key_id, _) = open_vault(&human, &sess, false).await.map_err(|e| {
-        if e.downcast_ref::<KeyNotHandedOver>().is_some() {
-            OwnerKeyIssue::NoVaultKey
-        } else {
-            OwnerKeyIssue::Failed(format!("{e:#}"))
-        }
-    })?;
+    open_owner_key_where(base, owner, |c| s(c, "provider") == provider).await
+}
+
+/// The owner's own key in the connection called `name` — the one Sign in
+/// with ▸ Connections picked for a Mafold Harness agent (ops 11-23,
+/// `fuel::key_step`) — opened on this machine. Never prints.
+pub(crate) async fn open_owner_key_named(base: &str, owner: &str, name: &str) -> std::result::Result<String, OwnerKeyIssue> {
+    open_owner_key_where(base, owner, |c| s(c, "name").eq_ignore_ascii_case(name)).await
+}
+
+/// The newest of the owner's connections `pick` takes, its key opened here.
+async fn open_owner_key_where(base: &str, owner: &str, pick: impl Fn(&Value) -> bool) -> std::result::Result<String, OwnerKeyIssue> {
+    let (human, sess, conn) = owner_row(base, owner, pick).await?;
+    let (umk, key_id) = owner_vault(&human, &sess).await?;
     let fields = open_payload(&umk, &key_id, &conn).map_err(|e| OwnerKeyIssue::Failed(format!("{e:#}")))?;
     fields
         .get("api_key")
@@ -2347,6 +2353,49 @@ pub(crate) async fn open_owner_key(base: &str, owner: &str, provider: &str) -> s
         .filter(|k| !k.is_empty())
         .map(str::to_string)
         .ok_or_else(|| OwnerKeyIssue::Failed(format!("`{}` holds no key", s(&conn, "name"))))
+}
+
+/// The newest of the owner's rows `pick` takes, listed on their own session
+/// here, with the client and session that listed it.
+async fn owner_row(base: &str, owner: &str, pick: impl Fn(&Value) -> bool) -> std::result::Result<(Client, session::Session, Value), OwnerKeyIssue> {
+    let Some(sess) = session::load_named(owner) else {
+        return Err(OwnerKeyIssue::NotHere);
+    };
+    let human = Client::new(base.to_string(), sess.token.clone());
+    let listed = human.call("listConnections", json!({})).await.map_err(|e| OwnerKeyIssue::Failed(format!("{e:#}")))?;
+    let mut rows: Vec<Value> = as_array(&listed, "items").into_iter().filter(|c| pick(c)).collect();
+    rows.sort_by_key(|c| std::cmp::Reverse(c.get("updated_at").and_then(Value::as_i64).unwrap_or(0)));
+    let Some(conn) = rows.into_iter().next() else {
+        return Err(OwnerKeyIssue::None);
+    };
+    Ok((human, sess, conn))
+}
+
+/// The owner's vault key on this machine — never by starting one.
+async fn owner_vault(human: &Client, sess: &session::Session) -> std::result::Result<(Key, String), OwnerKeyIssue> {
+    let (umk, key_id, _) = open_vault(human, sess, false).await.map_err(|e| {
+        if e.downcast_ref::<KeyNotHandedOver>().is_some() {
+            OwnerKeyIssue::NoVaultKey
+        } else {
+            OwnerKeyIssue::Failed(format!("{e:#}"))
+        }
+    })?;
+    Ok((umk, key_id))
+}
+
+/// The owner's newest connection of `provider`, by name, and mafold-core's
+/// runtime on their vault here — for a fuel that is a login rather than a key:
+/// a Codex connection (ops 11-23), opened and renewed by mafold-core
+/// (`codex::Opened`), the renewed grant written back for every device. Same
+/// rules as [`open_owner_key`]; never prints.
+pub(crate) async fn open_owner_login(
+    base: &str,
+    owner: &str,
+    provider: &str,
+) -> std::result::Result<(mafold_core::connections::Runtime, String), OwnerKeyIssue> {
+    let (human, sess, conn) = owner_row(base, owner, |c| s(c, "provider") == provider).await?;
+    let (umk, _) = owner_vault(&human, &sess).await?;
+    Ok((core_runtime(base, &sess, umk), s(&conn, "name")))
 }
 
 // ── the owner's own video key (`mafold video`) ─────────────────────────────

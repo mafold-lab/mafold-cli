@@ -90,6 +90,33 @@ impl std::fmt::Debug for ReplyKey {
     }
 }
 
+/// The key a Mafold Harness agent signs in with on its owner's computer, for
+/// one reply (`openModelKey`, ops 11-23): its format and Base URL, and the key
+/// itself when it was typed in — or the connection of the owner's that holds
+/// it, opened here (`connection::open_owner_key_named`). Written by hand for
+/// [`ReplyKey`]'s reason.
+#[derive(Clone, serde::Deserialize)]
+pub struct ModelKey {
+    /// `anthropic` / `openai`.
+    pub format: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub connection: Option<String>,
+}
+
+impl std::fmt::Debug for ModelKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelKey")
+            .field("format", &self.format)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("connection", &self.connection)
+            .finish()
+    }
+}
+
 /// What a reply has charged its owner's wallet so far (`getReplyCost`).
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(default)]
@@ -382,6 +409,23 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("mintReplyKey answered in a shape this client can't read"))?;
         if key.key.trim().is_empty() || key.base_url.trim().is_empty() {
             anyhow::bail!("mintReplyKey answered without a key or a router base");
+        }
+        Ok(key)
+    }
+
+    /// The key `draft`'s reply runs on, for an agent signed in with its
+    /// owner's own key ([`ModelKey`]). `Err` is in the server's words when it
+    /// refused (flag / fuel / owner-only).
+    pub async fn open_model_key(&self, draft: &str) -> Result<ModelKey> {
+        let v = self
+            .post_idempotent("openModelKey", json!({ "message_id": draft }))
+            .await
+            .map_err(server_words)?;
+        // Not serde's message, for mint_reply_key's reason.
+        let key: ModelKey = serde_json::from_value(v)
+            .map_err(|_| anyhow::anyhow!("openModelKey answered in a shape this client can't read"))?;
+        if key.base_url.trim().is_empty() || (key.api_key.as_deref().unwrap_or("").trim().is_empty() && key.connection.is_none()) {
+            anyhow::bail!("openModelKey answered without a key or a Base URL");
         }
         Ok(key)
     }

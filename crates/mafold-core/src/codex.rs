@@ -22,11 +22,9 @@ use crate::connections::{RenewError, Runtime};
 use crate::net;
 use mafold_types::connections::{codex, ProviderInfo};
 
-const ORIGINATOR: &str = "codex-tui";
-/// Track the shipping Codex CLI. Falling several releases behind moves every
-/// call into the first-to-shed bucket under load (HTTP 200 + in-stream
-/// `server_is_overloaded`), which reads as flakiness rather than as this line.
-const CLIENT_VERSION: &str = "0.146.0";
+// The identity, pinned version included, is mafold-types' — Mafold Harness on
+// a computer wears the same one.
+use mafold_types::connections::codex::{CLIENT_VERSION, ORIGINATOR};
 
 /// Abort a call when the upstream goes silent for this long. The brain holds
 /// its own (shorter) idle deadline; this one only exists so a dead TCP peer
@@ -42,16 +40,7 @@ const FLUSH_EVERY_MS: u64 = 150;
 const FLUSH_BYTES: usize = 8 * 1024;
 
 fn ua() -> String {
-    let os = match std::env::consts::OS {
-        "macos" => "Mac OS 26.0",
-        "windows" => "Windows 11",
-        _ => "Ubuntu 22.4.0",
-    };
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        a => a,
-    };
-    format!("{ORIGINATOR}/{CLIENT_VERSION} ({os}; {arch}) xterm-256color")
+    codex::user_agent()
 }
 
 fn headers(payload: &Map<String, Value>, session: &str) -> Result<Vec<(String, String)>, String> {
@@ -68,18 +57,7 @@ fn headers(payload: &Map<String, Value>, session: &str) -> Result<Vec<(String, S
                 .into(),
         );
     }
-    Ok(vec![
-        ("authorization".into(), format!("Bearer {access}")),
-        ("chatgpt-account-id".into(), account),
-        ("content-type".into(), "application/json".into()),
-        ("accept".into(), "text/event-stream".into()),
-        ("openai-beta".into(), "responses=experimental".into()),
-        ("originator".into(), ORIGINATOR.into()),
-        ("version".into(), CLIENT_VERSION.into()),
-        ("user-agent".into(), ua()),
-        ("session_id".into(), session.into()),
-        ("conversation_id".into(), session.into()),
-    ])
+    Ok(codex::responses_headers(&access, &account, session))
 }
 
 /// Run one relayed Codex call. `stream=true` posts SSE lines back as
@@ -163,6 +141,67 @@ async fn run_at(
         return relay_body(rt, call_id, reply, stream).await;
     }
     unreachable!("the 401 arm either returned or retried");
+}
+
+/// A Codex connection opened on this device for a caller that speaks the
+/// protocol itself: Mafold Harness on its owner's computer (mafold-cli
+/// `fuel::codex_step`), whose model steps run on the subscription. The split
+/// above still holds — credentials are this module's job: the same renewal
+/// ahead of expiry and on a refusal [`run`] does, the renewed grant written
+/// back to the vault for every other device.
+pub struct Opened {
+    name: String,
+    conn: Value,
+    spec: ProviderInfo,
+    payload: Map<String, Value>,
+}
+
+/// Written by hand so a token never reaches a log line.
+impl std::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opened").field("name", &self.name).field("payload", &"<redacted>").finish()
+    }
+}
+
+impl Opened {
+    /// The connection called `name`, renewed first when it is at or near
+    /// expiry.
+    pub async fn open(rt: &Runtime, name: &str) -> Result<Self, String> {
+        let conn = rt.get(name).await?;
+        let spec = rt.descriptor_of(&conn).await?;
+        let payload = rt.refreshed_payload(name, &conn, &spec).await?;
+        Ok(Self { name: name.to_string(), conn, spec, payload })
+    }
+
+    fn field(&self, k: &str) -> &str {
+        self.payload.get(k).and_then(Value::as_str).unwrap_or("")
+    }
+
+    pub fn access_token(&self) -> &str {
+        self.field("access_token")
+    }
+
+    /// The ChatGPT account the login is for (`chatgpt-account-id`).
+    pub fn account_id(&self) -> &str {
+        self.field("account_id")
+    }
+
+    /// Codex refused the access token: renew once, as [`run`] does on a 401 —
+    /// a dead grant marks the row for reconnecting, unless another device has
+    /// already healed it.
+    pub async fn renew(&mut self, rt: &Runtime) -> Result<(), String> {
+        self.payload = match rt.renew(&self.name, &self.conn, &self.spec, &self.payload).await {
+            Ok(fresh) => fresh,
+            Err(RenewError::Refused(why)) => rt.settle_refusal(&self.name, &self.conn, &self.spec, &why).await?,
+            Err(RenewError::Failed(e)) => {
+                return Err(format!(
+                    "Codex refused this credential and it couldn't be refreshed here ({e}) — \
+                     reconnect it in Settings ▸ Connections"
+                ))
+            }
+        };
+        Ok(())
+    }
 }
 
 /// A generated image travelling back through the relay as base64 — bounded so

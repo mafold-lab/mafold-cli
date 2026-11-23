@@ -14,6 +14,7 @@ pub mod cc_conn;
 pub mod claude_code;
 pub mod claude_fuel;
 pub mod codex;
+pub mod codex_fuel;
 mod codex_stats;
 // Codex uses this transport for native control data, the live thread/turn path,
 // and reply-scoped server-request approvals.
@@ -1039,9 +1040,10 @@ pub async fn report_rows() -> Vec<Value> {
 }
 
 /// What Mafold here can run `id` on, as the report says it: each runtime's
-/// own login; Mafold Harness on OpenCode Go, the wallet, and Claude Code where
-/// it is installed. Go's models are the ones Mafold Harness can talk to
-/// (`mafold_harness::go_model_ids`'s list).
+/// own login; Mafold Harness on OpenCode Go, the wallet, the owner's own model
+/// key, Claude Code where it is installed, and Codex. Go's models are the ones
+/// Mafold Harness can talk to (`mafold_harness::go_model_ids`'s list); Codex's,
+/// the codex-oauth provider's.
 async fn sign_ins_of(id: &str) -> Value {
     match id {
         "claude-code" => serde_json::json!([{ "id": "claude" }]),
@@ -1049,7 +1051,12 @@ async fn sign_ins_of(id: &str) -> Value {
         "kimi-code" => serde_json::json!([{ "id": "kimi" }]),
         MAFOLD_HARNESS => {
             let m = mafold_harness::go_models().await;
-            let mut ins = vec![serde_json::json!({ "id": crate::fuel::GO, "models": m }), serde_json::json!({ "id": crate::fuel::WALLET })];
+            let mut ins = vec![
+                serde_json::json!({ "id": crate::fuel::GO, "models": m }),
+                serde_json::json!({ "id": crate::fuel::WALLET }),
+                // Your own key, typed in or from Connections (`fuel::key_step`).
+                serde_json::json!({ "id": crate::fuel::KEY }),
+            ];
             // Claude Code, where Mafold here can drive the `claude` installed
             // here: each step runs on it (`claude_fuel`), on the login its
             // own row reports.
@@ -1057,6 +1064,14 @@ async fn sign_ins_of(id: &str) -> Value {
             if claude.available() && claude.runs() {
                 ins.push(serde_json::json!({ "id": crate::fuel::CLAUDE }));
             }
+            // Codex, always: each step goes to Codex's API on the owner's
+            // Codex connection, which New Agent knows of from Connections, or
+            // on Codex's own login here, which only this computer can say.
+            ins.push(serde_json::json!({
+                "id": crate::fuel::CODEX,
+                "signed_in": codex_fuel::signed_in_here(),
+                "models": codex_fuel::models(),
+            }));
             serde_json::Value::Array(ins)
         }
         _ => serde_json::json!([]),

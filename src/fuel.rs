@@ -96,6 +96,52 @@ pub fn claude_in(env: &[(String, String)]) -> bool {
     is_claude(env.iter().rev().find(|(k, _)| k == FUEL_ENV).map(|(_, v)| v.as_str()))
 }
 
+// ── Codex (ops 11-23) ───────────────────────────────────────────────────────
+//
+// Mafold Harness signed in with Codex runs each model step on the Codex
+// Responses API, on its owner's ChatGPT plan (`harness::codex_fuel`): their
+// Codex connection when this computer can open it, else Codex's own login
+// here. Like Go there is a credential to open per reply and hand over in the
+// env alone; like Claude Code it is a login, renewed where it lives.
+
+/// `getBot`'s `fuel` for an agent signed in with Codex — a Codex agent's, and
+/// a Mafold Harness agent's on Codex.
+pub const CODEX: &str = "codex";
+
+/// Is `fuel` Codex?
+pub fn is_codex(fuel: Option<&str>) -> bool {
+    fuel.is_some_and(|f| f.trim().eq_ignore_ascii_case(CODEX))
+}
+
+/// Does this turn's env say it runs on Codex?
+pub fn codex_in(env: &[(String, String)]) -> bool {
+    is_codex(env.iter().rev().find(|(k, _)| k == FUEL_ENV).map(|(_, v)| v.as_str()))
+}
+
+/// The turn's Codex step, for Mafold Harness on Codex: the owner's Codex login
+/// joins `env`, and the guard that masks it comes back for the turn to hold.
+/// `Err` is the turn's error, in the words the reply ends with.
+pub async fn codex_step(
+    base: &str,
+    owner: Option<&str>,
+    env: &mut Vec<(String, String)>,
+) -> Result<crate::conceal::LiveSecret, String> {
+    let Some(owner) = owner.map(crate::agent::norm_user).filter(|o| !o.is_empty()) else {
+        return Err("This agent runs on its owner's Codex login, and this computer can't tell who its owner is, so \
+                    it starts no replies."
+            .into());
+    };
+    let (source, auth) = crate::harness::codex_fuel::open(base, &owner).await?;
+    let masked = crate::conceal::hide_while_live(&auth.access_token);
+    env.push((FUEL_ENV.to_string(), CODEX.to_string()));
+    env.extend(source.env(&auth));
+    match source {
+        crate::harness::codex_fuel::Source::Connection { .. } => println!("🔑 Codex: @{owner}'s connection is open for this reply"),
+        crate::harness::codex_fuel::Source::Local { .. } => println!("🔑 Codex: this computer's Codex login runs this reply"),
+    }
+    Ok(masked)
+}
+
 /// The turn's Go step, for an agent on OpenCode Go: the owner's key joins
 /// `env`, and the guard that masks it comes back for the turn to hold. `Err`
 /// is the turn's error, in the words the reply ends with.
@@ -125,38 +171,141 @@ pub fn go_issue(owner: &str, issue: crate::connection::OwnerKeyIssue) -> String 
             "This agent runs on @{owner}'s OpenCode Go key, which opens only on a computer where @{owner} is signed \
              in to Mafold, and @{owner} isn't signed in on this one."
         ),
-        I::NoVaultKey => "This computer doesn't hold your Connections key yet, so it can't open your OpenCode Go key. \
-                          Open Mafold on a device that has it (the web, or your phone) and it hands the key over by \
-                          itself, then send this again."
+        I::NoVaultKey => "Your OpenCode Go key is in your Connections, but this computer hasn't been handed the key \
+                          that opens them yet. Open Settings ▸ Connections on a device that already has it (the web, \
+                          or your phone) and it passes the key to this computer by itself, then send this again."
             .into(),
         I::Failed(why) => format!("Couldn't open your OpenCode Go key on this computer: {why}"),
     }
 }
 
-/// May this turn start a reply on the owner's wallet? Only a message the
+// ── Your own model key (ops 11-23) ──────────────────────────────────────────
+//
+// Mafold Harness signed in with its owner's own model key — Sign in with ▸
+// API key or ▸ Connections, the two Pays with offers on Mafold Cloud (ops
+// 11-23 「这里的Sign in with 也要Mafold Cloud的同款选项 用apikey / connections」).
+// For each reply its owner starts the api says which (`openModelKey`): a
+// typed key comes back from the agent's sealed secrets; a key in Connections
+// is opened here, on the owner's own computer, by its name, the way Go's is.
+// Either reaches the harness through the turn's env alone, masked while the
+// turn holds it. It bills the owner's key — no draft key, no total to read
+// back — but like the wallet only the owner's own message spends it
+// ([`gate`]).
+
+/// `getBot`'s `fuel` for an agent on its owner's own model key.
+pub const KEY: &str = "key";
+
+/// The hand-off of the owner's own key to Mafold Harness (`Turn.env`): the
+/// key, its format (`anthropic` / `openai`) and its Base URL.
+pub const OWN_KEY_ENV: &str = "MAFOLD_OWN_KEY";
+pub const OWN_KEY_FORMAT_ENV: &str = "MAFOLD_OWN_KEY_FORMAT";
+pub const OWN_KEY_BASE_ENV: &str = "MAFOLD_OWN_KEY_BASE";
+
+/// Is `fuel` the owner's own key?
+pub fn is_key(fuel: Option<&str>) -> bool {
+    fuel.is_some_and(|f| f.trim().eq_ignore_ascii_case(KEY))
+}
+
+/// The turn's key step, for an agent on its owner's own key, once `draft`
+/// exists: the key, its format and Base URL join `env`, and the guard that
+/// masks the key comes back for the turn to hold. `Err` is the turn's error,
+/// in the server's words when it refused (flag / fuel / owner-only).
+pub async fn key_step(
+    client: &Client,
+    owner: Option<&str>,
+    draft: &str,
+    env: &mut Vec<(String, String)>,
+) -> Result<crate::conceal::LiveSecret, String> {
+    let opened = client.open_model_key(draft).await.map_err(|e| format!("{e:#}"))?;
+    let key = match (opened.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()), opened.connection.as_deref()) {
+        (Some(k), _) => k.to_string(),
+        (None, Some(name)) => {
+            let Some(owner) = owner.map(crate::agent::norm_user).filter(|o| !o.is_empty()) else {
+                return Err("This agent runs on its owner's own key, and this computer can't tell who its owner is, \
+                            so it starts no replies."
+                    .into());
+            };
+            crate::connection::open_owner_key_named(&client.base, &owner, name).await.map_err(|issue| key_issue(&owner, name, issue))?
+        }
+        (None, None) => return Err("openModelKey answered without a key".into()),
+    };
+    let masked = crate::conceal::hide_while_live(&key);
+    println!("🔑 own key: reply {draft} has its {} key", opened.format);
+    env.push((OWN_KEY_FORMAT_ENV.to_string(), opened.format));
+    env.push((OWN_KEY_BASE_ENV.to_string(), opened.base_url.trim_end_matches('/').to_string()));
+    env.push((OWN_KEY_ENV.to_string(), key));
+    Ok(masked)
+}
+
+/// What a reply ends with when the key in the connection `name` couldn't be
+/// opened here.
+pub fn key_issue(owner: &str, name: &str, issue: crate::connection::OwnerKeyIssue) -> String {
+    use crate::connection::OwnerKeyIssue as I;
+    match issue {
+        I::None => format!(
+            "`{name}` isn't in your Connections any more. Add the key again in Settings ▸ Connections, or give this \
+             agent another key, then send this again."
+        ),
+        I::NotHere => format!(
+            "This agent runs on the key in @{owner}'s Connections, which opens only on a computer where @{owner} is \
+             signed in to Mafold, and @{owner} isn't signed in on this one."
+        ),
+        I::NoVaultKey => format!(
+            "`{name}` is in your Connections, but this computer hasn't been handed the key that opens them yet. Open \
+             Settings ▸ Connections on a device that already has it (the web, or your phone) and it passes the key \
+             to this computer by itself, then send this again."
+        ),
+        I::Failed(why) => format!("Couldn't open `{name}` from your Connections on this computer: {why}"),
+    }
+}
+
+/// Whose money a reply spends, for [`gate`]'s words: the owner's wallet,
+/// or the owner's own model key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pays {
+    Wallet,
+    OwnKey,
+}
+
+impl Pays {
+    /// What a reply runs on, as a sentence names it.
+    fn what(self) -> &'static str {
+        match self {
+            Pays::Wallet => "wallet",
+            Pays::OwnKey => "own model key",
+        }
+    }
+}
+
+/// May this turn start a reply on what the owner pays with? Only a message the
 /// owner sent: not a guest's, not someone else's relayed by a bot (the owner's
 /// own bots included — whose words they carry is theirs to say, and the api
 /// checks the trigger's sender, not the chain), and not a turn nobody's
 /// message started (an introduction, a background-task update, words queued
 /// behind a running reply whose message wasn't recorded — [`Queued`]) — the
-/// api mints a key only for a draft whose trigger the owner sent. `Err` is
-/// the refusal, worded for the error card.
-pub fn gate(owner: Option<&str>, sender: &str, relayed_for: Option<&str>, triggered: bool) -> Result<(), String> {
+/// api hands over a key only for a draft whose trigger the owner sent. `Err`
+/// is the refusal, worded for the error card.
+pub fn gate(pays: Pays, owner: Option<&str>, sender: &str, relayed_for: Option<&str>, triggered: bool) -> Result<(), String> {
     let norm = crate::agent::norm_user;
+    let what = pays.what();
     let Some(owner) = owner.map(norm).filter(|o| !o.is_empty()) else {
-        return Err("wallet_owner_only: This agent runs on its owner's wallet, and this computer can't tell who \
-                    its owner is, so it starts no replies."
-            .into());
+        return Err(format!(
+            "wallet_owner_only: This agent runs on its owner's {what}, and this computer can't tell who \
+             its owner is, so it starts no replies."
+        ));
     };
     let relayed_other = relayed_for.is_some_and(|p| norm(p) != owner);
     if norm(sender) != owner || relayed_other {
-        return Err(failure::wallet_owner_only(&owner));
+        return Err(match pays {
+            Pays::Wallet => failure::wallet_owner_only(&owner),
+            Pays::OwnKey => failure::key_owner_only(&owner),
+        });
     }
     if !triggered {
         // The owner's own turn, but no message of theirs to answer. Their
         // card, not a guest's: in words that say what to do about it.
         return Err(format!(
-            "This agent runs on @{owner}'s wallet, which pays only for a reply to a message @{owner} sent it. \
+            "This agent runs on @{owner}'s {what}, which pays only for a reply to a message @{owner} sent it. \
              This one had no message of its own (one sent while it was busy, or a background update) — send it \
              as a new message."
         ));
@@ -377,6 +526,18 @@ mod tests {
     }
 
     #[test]
+    fn only_codex_is_codex_and_the_turn_env_says_it() {
+        assert!(is_codex(Some("codex")) && is_codex(Some(" Codex ")));
+        for other in [None, Some(""), Some("wallet"), Some("claude"), Some("codex-oauth")] {
+            assert!(!is_codex(other), "{other:?}");
+        }
+        let env = |v: &str| vec![(FUEL_ENV.to_string(), v.to_string())];
+        assert!(codex_in(&env("codex")) && !claude_in(&env("codex")));
+        assert!(!codex_in(&env("claude")));
+        assert!(!codex_in(&[]));
+    }
+
+    #[test]
     fn only_opencode_go_is_go() {
         assert!(is_go(Some("opencode-go")) && is_go(Some(" OpenCode-Go ")));
         for other in [None, Some(""), Some("wallet"), Some("claude"), Some("opencode")] {
@@ -392,7 +553,7 @@ mod tests {
         use crate::connection::OwnerKeyIssue as I;
         assert!(go_issue("ops", I::None).contains("Settings ▸ Connections ▸ OpenCode Go"));
         assert!(go_issue("ops", I::NotHere).contains("@ops isn't signed in on this one"));
-        assert!(go_issue("ops", I::NoVaultKey).contains("hands the key over by itself"));
+        assert!(go_issue("ops", I::NoVaultKey).contains("passes the key to this computer by itself"));
         assert!(go_issue("ops", I::Failed("boom".into())).ends_with("boom"));
     }
 
@@ -401,8 +562,8 @@ mod tests {
     #[test]
     fn only_the_owners_own_message_starts_a_wallet_reply() {
         let owner = Some("ops");
-        assert_eq!(gate(owner, "ops", None, true), Ok(()));
-        assert_eq!(gate(owner, "@OPS ", Some("ops"), true), Ok(()), "relayed for the owner, by the owner");
+        assert_eq!(gate(Pays::Wallet, owner, "ops", None, true), Ok(()));
+        assert_eq!(gate(Pays::Wallet, owner, "@OPS ", Some("ops"), true), Ok(()), "relayed for the owner, by the owner");
         let refused = failure::wallet_owner_only("ops");
         assert_eq!(
             refused,
@@ -410,20 +571,52 @@ mod tests {
         );
         // A guest, whitelisted or not, and the owner's own bot.
         for sender in ["alice", "ops:helper", ""] {
-            assert_eq!(gate(owner, sender, None, true), Err(refused.clone()), "{sender:?}");
+            assert_eq!(gate(Pays::Wallet, owner, sender, None, true), Err(refused.clone()), "{sender:?}");
         }
         // A bot relaying someone else, or nobody in particular, to the owner.
-        assert_eq!(gate(owner, "ops", Some("alice"), true), Err(refused.clone()));
-        assert_eq!(gate(owner, "ops", Some(""), true), Err(refused.clone()));
+        assert_eq!(gate(Pays::Wallet, owner, "ops", Some("alice"), true), Err(refused.clone()));
+        assert_eq!(gate(Pays::Wallet, owner, "ops", Some(""), true), Err(refused.clone()));
         // No trigger: a guest's still reads as a guest's…
-        assert_eq!(gate(owner, "alice", None, false), Err(refused.clone()));
+        assert_eq!(gate(Pays::Wallet, owner, "alice", None, false), Err(refused.clone()));
         // …the owner's says what happened, and is no guest's card.
-        let none = gate(owner, "ops", None, false).unwrap_err();
+        let none = gate(Pays::Wallet, owner, "ops", None, false).unwrap_err();
         assert!(none.contains("@ops's wallet") && none.contains("send it as a new message"), "{none}");
         assert_eq!(failure::classify(&none).kind, failure::FailureKind::Unknown, "the owner reads it whole");
         assert_eq!(failure::classify(&refused).kind, failure::FailureKind::OwnerOnly);
         // An ownerless bot can't be on anyone's wallet.
-        assert!(gate(None, "ops", None, true).is_err());
+        assert!(gate(Pays::Wallet, None, "ops", None, true).is_err());
+    }
+
+    #[test]
+    fn only_key_is_your_own_key() {
+        assert!(is_key(Some("key")) && is_key(Some(" Key ")));
+        for other in [None, Some(""), Some("wallet"), Some("opencode-go"), Some("keys")] {
+            assert!(!is_key(other), "{other:?}");
+        }
+    }
+
+    /// Your own key answers its owner alone, as the wallet does — in words
+    /// that name the key, read back as the same owner-only card.
+    #[test]
+    fn only_the_owners_own_message_starts_a_reply_on_their_own_key() {
+        let owner = Some("ops");
+        assert_eq!(gate(Pays::OwnKey, owner, "ops", None, true), Ok(()));
+        let refused = gate(Pays::OwnKey, owner, "alice", None, true).unwrap_err();
+        assert_eq!(refused, failure::key_owner_only("ops"));
+        assert_eq!(failure::classify(&refused).kind, failure::FailureKind::OwnerOnly);
+        let none = gate(Pays::OwnKey, owner, "ops", None, false).unwrap_err();
+        assert!(none.contains("@ops's own model key") && none.contains("send it as a new message"), "{none}");
+        assert_eq!(gate(Pays::Wallet, owner, "alice", None, true), Err(failure::wallet_owner_only("ops")), "the wallet's words stay its own");
+    }
+
+    /// A Connections key that can't be opened here says what to do, by its name.
+    #[test]
+    fn a_connections_key_that_cant_be_opened_says_what_to_do() {
+        use crate::connection::OwnerKeyIssue as I;
+        assert!(key_issue("ops", "work", I::None).contains("`work` isn't in your Connections"));
+        assert!(key_issue("ops", "work", I::NotHere).contains("@ops isn't signed in on this one"));
+        assert!(key_issue("ops", "work", I::NoVaultKey).contains("passes the key to this computer by itself"));
+        assert!(key_issue("ops", "work", I::Failed("boom".into())).ends_with("boom"));
     }
 
     #[test]
@@ -580,6 +773,46 @@ mod tests {
         assert_eq!(why, "wallet_grant_required: @ops no longer lets @ops:wallet spend from their wallet");
         assert!(env.is_empty());
         assert_eq!(failure::classify(&why).kind, failure::FailureKind::Grant);
+    }
+
+    /// A typed key comes back from the api for the draft and joins the turn's
+    /// env with its format and Base URL — masked while held.
+    #[tokio::test]
+    async fn a_typed_key_joins_the_turn_env_with_its_format_and_base() {
+        let (client, seen) = api(
+            "200 OK",
+            r#"{"ok":true,"result":{"format":"anthropic","base_url":"https://proxy.example/","api_key":"sk-ant-own-key-value-0042"}}"#,
+        )
+        .await;
+        let mut env = Vec::new();
+        let masked = key_step(&client, Some("ops"), "d-9", &mut env).await.expect("opened");
+        assert_eq!(
+            env,
+            vec![
+                (OWN_KEY_FORMAT_ENV.to_string(), "anthropic".to_string()),
+                (OWN_KEY_BASE_ENV.to_string(), "https://proxy.example".to_string()),
+                (OWN_KEY_ENV.to_string(), "sk-ant-own-key-value-0042".to_string()),
+            ]
+        );
+        let req = seen.lock().unwrap()[0].clone();
+        assert!(req.starts_with("POST /api/openModelKey") && req.contains(r#""message_id":"d-9""#), "{req}");
+        let mut body = serde_json::json!({"content": "MAFOLD_OWN_KEY=sk-ant-own-key-value-0042"});
+        assert_eq!(crate::conceal::scrub_outgoing("botEditDraft", &mut body, "mb_x"), 1);
+        drop(masked);
+    }
+
+    /// The api's refusal is the turn's error in its own words.
+    #[tokio::test]
+    async fn a_refused_key_is_the_turns_error_in_the_servers_words() {
+        let (client, _) = api(
+            "403 Forbidden",
+            r#"{"ok":false,"error_code":403,"description":"wallet_owner_only: This agent runs on @ops's own model key. Only @ops can start its replies."}"#,
+        )
+        .await;
+        let mut env = Vec::new();
+        let why = key_step(&client, Some("ops"), "d-8", &mut env).await.err().expect("refused");
+        assert_eq!(why, failure::key_owner_only("ops"));
+        assert!(env.is_empty());
     }
 
     /// A reply that charged nothing (a refusal, a failure before the first

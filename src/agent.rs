@@ -1808,6 +1808,29 @@ impl OwnerConfig {
     fn on_claude(&self) -> bool {
         crate::fuel::is_claude(self.fuel.as_deref())
     }
+
+    /// The agent runs on its owner's own model key (`fuel::key_step`).
+    fn on_key(&self) -> bool {
+        crate::fuel::is_key(self.fuel.as_deref())
+    }
+
+    /// What its replies spend answers its owner alone (`fuel::gate`): the
+    /// wallet, or the owner's own key. None for a login of this computer's.
+    fn owner_pays(&self) -> Option<crate::fuel::Pays> {
+        if self.on_wallet() {
+            Some(crate::fuel::Pays::Wallet)
+        } else if self.on_key() {
+            Some(crate::fuel::Pays::OwnKey)
+        } else {
+            None
+        }
+    }
+
+    /// The agent was signed in with Codex — which, for Mafold Harness, makes
+    /// its owner's Codex login its fuel (`harness::codex_fuel`).
+    fn on_codex(&self) -> bool {
+        crate::fuel::is_codex(self.fuel.as_deref())
+    }
 }
 
 /// The owner config this daemon runs under — the one `botConfigUpdated` and a
@@ -1832,6 +1855,23 @@ async fn on_go() -> bool {
     }
 }
 
+/// Does this agent run on its owner's own model key right now?
+async fn on_key() -> bool {
+    match OWNER_CONFIG.get() {
+        Some(c) => c.read().await.on_key(),
+        None => false,
+    }
+}
+
+/// What this agent's replies spend that answers its owner alone, right now
+/// ([`OwnerConfig::owner_pays`]).
+async fn owner_pays() -> Option<crate::fuel::Pays> {
+    match OWNER_CONFIG.get() {
+        Some(c) => c.read().await.owner_pays(),
+        None => None,
+    }
+}
+
 /// Does this agent run Mafold Harness on its owner's Claude Code login right
 /// now? A Claude Code agent's fuel says `claude` too; only Mafold Harness
 /// runs on it as fuel.
@@ -1839,6 +1879,17 @@ async fn harness_on_claude(harness_id: &str) -> bool {
     harness_id == crate::harness::MAFOLD_HARNESS
         && match OWNER_CONFIG.get() {
             Some(c) => c.read().await.on_claude(),
+            None => false,
+        }
+}
+
+/// Does this agent run Mafold Harness on its owner's Codex login right now?
+/// A Codex agent's fuel says `codex` too; only Mafold Harness runs on it as
+/// fuel.
+async fn harness_on_codex(harness_id: &str) -> bool {
+    harness_id == crate::harness::MAFOLD_HARNESS
+        && match OWNER_CONFIG.get() {
+            Some(c) => c.read().await.on_codex(),
             None => false,
         }
 }
@@ -2847,8 +2898,14 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
     if owner.on_go() {
         println!("fuel: @{my_username} runs on its owner's OpenCode Go plan — the key from their Connections, opened per reply");
     }
+    if owner.on_key() {
+        println!("fuel: @{my_username} runs on its owner's own model key — opened per reply, replies to its owner only");
+    }
     if owner.on_claude() && harness.id() == crate::harness::MAFOLD_HARNESS {
         println!("fuel: @{my_username} runs Mafold Harness on its owner's Claude Code login here — a real `claude` makes each step");
+    }
+    if owner.on_codex() && harness.id() == crate::harness::MAFOLD_HARNESS {
+        println!("fuel: @{my_username} runs Mafold Harness on its owner's Codex login — their connection, else Codex's own login here, per reply");
     }
     let owner = Arc::new(RwLock::new(owner));
     let _ = OWNER_CONFIG.set(owner.clone());
@@ -3431,6 +3488,11 @@ async fn machine_caps(harness: &dyn Harness, preferred: Option<String>, fuel: Op
         let claude = crate::harness::select("claude-code");
         let env = crate::accounts::choose(preferred.as_deref(), None).await.account?.env();
         return crate::harness::caps_report(claude.as_ref(), &env).await;
+    }
+    // …and on Codex, what a Codex login runs (the codex-oauth provider's list).
+    if harness.id() == crate::harness::MAFOLD_HARNESS && crate::fuel::is_codex(fuel) {
+        let version = harness.cli_version().await;
+        return crate::harness::codex_fuel::probe().map(|p| p.report(harness.id(), &version));
     }
     if harness.id() == crate::harness::MAFOLD_HARNESS && !crate::fuel::is_go(fuel) {
         return None;
@@ -4402,15 +4464,15 @@ async fn connect_and_run(
     if !intro_done(my_username, "boot") {
         let oc = owner.read().await;
         let quiet = matches!(greeting_mode(oc.greeting.as_deref()), Greeting::Off);
-        let wallet = oc.on_wallet();
+        let wallet = oc.owner_pays().is_some();
         drop(oc);
         match (quiet, allow.read().await.owner.clone()) {
             (true, _) => println!("intro: greeting is off — skipping the first-boot report"),
-            // Nobody's message asks for it, and the owner's wallet pays only
-            // for a reply to one of theirs (`fuel::gate`): run, it could only
-            // put a refusal in the owner's DM. Not marked — off the wallet,
-            // it is still owed.
-            _ if wallet => println!("intro: this agent runs on its owner's wallet — no first-boot report"),
+            // Nobody's message asks for it, and the owner's wallet (or own
+            // key) pays only for a reply to one of theirs (`fuel::gate`): run,
+            // it could only put a refusal in the owner's DM. Not marked — off
+            // the wallet, it is still owed.
+            _ if wallet => println!("intro: this agent runs on what its owner pays with — no first-boot report"),
             // Claimed BEFORE arming (see `IntrosLive`): the mark below only
             // lands when the turn does, so without this every reconnect during
             // that minute armed another copy of the same report.
@@ -5012,10 +5074,11 @@ async fn connect_and_run(
                     Greeting::Default => None,
                     Greeting::Brief(b) => Some(b),
                 };
-                // The owner's wallet pays only for a reply to the owner's own
-                // message (`fuel::gate`) — an introduction answers nobody's.
-                if owner.read().await.on_wallet() {
-                    println!("← added to {chat_id} (runs on its owner's wallet → no introduction)");
+                // The owner's wallet (or own key) pays only for a reply to the
+                // owner's own message (`fuel::gate`) — an introduction answers
+                // nobody's.
+                if owner.read().await.owner_pays().is_some() {
+                    println!("← added to {chat_id} (runs on what its owner pays with → no introduction)");
                     continue;
                 }
                 // Removed and re-added is somebody changing their mind, not a
@@ -5716,9 +5779,13 @@ async fn connect_and_run(
             // there, they come back as its follow-up round, which answers on
             // the owner's message. Anyone else's is a turn of its own, which
             // the fuel gate turns away with the owner-only sentence.
-            let wallet_here = on_wallet().await;
-            let not_the_wallets = wallet_here
-                && crate::fuel::gate(bot_owner().await.as_deref(), &turn_sender, relayed_for.as_deref(), true).is_err();
+            // The same for the owner's own key.
+            let pays_here = owner_pays().await;
+            let wallet_here = pays_here.is_some();
+            let not_the_wallets = match pays_here {
+                Some(pays) => crate::fuel::gate(pays, bot_owner().await.as_deref(), &turn_sender, relayed_for.as_deref(), true).is_err(),
+                None => false,
+            };
             // Everything below opens a reply — so first, the one running here.
             // Not the wallet's refusal: that is a sentence, not a reply, and it
             // is owed now.
@@ -5953,7 +6020,8 @@ async fn connect_and_run(
             // on this round's trigger, whose draft may still be open
             // (`fuel::Queued`). Unbilled as ever — the owner never pays as a
             // stranger.
-            let followup_answers = on_wallet().await && !sender_pays;
+            // The same on the owner's own key (`openModelKey` asks it too).
+            let followup_answers = owner_pays().await.is_some() && !sender_pays;
             let mut next = Some(prompt);
             let mut round = 0usize;
             while let Some(p) = next.take() {
@@ -7292,8 +7360,15 @@ async fn handle_control(
             let st = states.entry(chat_id.to_string()).or_default();
             if arg.is_empty() {
                 let cur = st.model.clone().unwrap_or_else(|| "default".into());
-                // On Claude Code, Claude's names: it is Claude Code that runs them.
-                let names_from = if harness_on_claude(harness.id()).await { "claude-code" } else { harness.id() };
+                // On Claude Code, Claude's names: it is Claude Code that runs
+                // them; on Codex, Codex's.
+                let names_from = if harness_on_claude(harness.id()).await {
+                    "claude-code"
+                } else if harness_on_codex(harness.id()).await {
+                    "codex"
+                } else {
+                    harness.id()
+                };
                 let example = model_examples(names_from, &go_ids);
                 let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Model for this chat: {cur}\nSet with `/model <name>` ({example}) or `/model reset`.")).await;
             } else if arg.eq_ignore_ascii_case("reset") || arg.eq_ignore_ascii_case("default") {
@@ -9634,7 +9709,7 @@ fn resume_turns(
                 let queued = (round > 1)
                     .then(|| crate::fuel::queued().take(&j.chat, j.channel.as_deref(), j.thread.as_deref()))
                     .flatten();
-                let queued = if on_wallet().await && !j.pays { queued } else { None };
+                let queued = if owner_pays().await.is_some() && !j.pays { queued } else { None };
                 match handle(
                     &client, &j.workdir, j.workdir_ns, None, &bot, &j.chat, j.thread.as_deref(),
                     j.channel.as_deref(), &prompt, &[], &sessions, &coord, &chat_states, &harness,
@@ -9981,10 +10056,11 @@ async fn handle(
     // Code (no such pairing is created yet) gets no seat either, and ends as
     // `no_usable_account` rather than on a login the wallet doesn't pay for.
     let wallet = on_wallet().await;
-    let wallet_refused = if wallet {
+    // The owner's own key answers its owner alone too (`fuel::key_step`).
+    let wallet_refused = if let Some(pays) = owner_pays().await {
         // A reply picked up after a restart answers what the killed one did.
         let answers = trigger_id.or(resumed.as_ref().and_then(|r| r.journal.trigger.as_deref()));
-        crate::fuel::gate(bot_owner().await.as_deref(), turn_sender, relayed_for, answers.is_some()).err()
+        crate::fuel::gate(pays, bot_owner().await.as_deref(), turn_sender, relayed_for, answers.is_some()).err()
     } else {
         None
     };
@@ -10380,6 +10456,41 @@ async fn handle(
             Ok(k) => Some(k),
             Err(why) => {
                 eprintln!("opencode go: no key for reply {msg_id} — {}", crate::logfile::one_line(&why));
+                refused = Some(why);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // An agent on its owner's own model key (`fuel::key_step`): the key for
+    // this draft, from the api — or from the owner's Connections, opened here.
+    // Same road as Go's: the reply says why and nothing starts. Held to the
+    // turn's end, which is how long the key stays masked.
+    let _own_key = if refused.is_none() && !no_usable_account && !stopped_in_setup && !is_held_draft(&msg_id) && on_key().await {
+        match crate::fuel::key_step(client, bot_owner().await.as_deref(), &msg_id, &mut env).await {
+            Ok(k) => Some(k),
+            Err(why) => {
+                eprintln!("own key: no key for reply {msg_id} — {}", crate::logfile::one_line(&why));
+                refused = Some(why);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Mafold Harness on its owner's Codex login (`fuel::codex_step`): their
+    // Codex connection, else Codex's own login here. Same road as Go's key.
+    let _codex_login = if refused.is_none()
+        && !no_usable_account
+        && !stopped_in_setup
+        && !is_held_draft(&msg_id)
+        && harness_on_codex(harness.id()).await
+    {
+        match crate::fuel::codex_step(&client.base, bot_owner().await.as_deref(), &mut env).await {
+            Ok(k) => Some(k),
+            Err(why) => {
+                eprintln!("codex: no login for reply {msg_id} — {}", crate::logfile::one_line(&why));
                 refused = Some(why);
                 None
             }

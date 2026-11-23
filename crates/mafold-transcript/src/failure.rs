@@ -100,6 +100,19 @@ pub fn wallet_fuel_off(bot: &str, why: &str) -> String {
     format!("wallet_fuel_off: @{bot} can't spend from the wallet here — {why}")
 }
 
+/// [`wallet_owner_only`] for an agent on its owner's own model key, on their
+/// computer (ops 11-23): the key is theirs, so only they start its replies.
+/// Read back as the same kind.
+pub fn key_owner_only(owner: &str) -> String {
+    format!("wallet_owner_only: This agent runs on @{owner}'s own model key. Only @{owner} can start its replies.")
+}
+
+/// [`wallet_fuel_off`] for an agent's own model key: asked for where the key
+/// doesn't sign it in (`why`: `ownKeyOnComputers` is off, or another fuel).
+pub fn key_fuel_off(bot: &str, why: &str) -> String {
+    format!("wallet_fuel_off: @{bot} can't open its owner's own model key here — {why}")
+}
+
 /// The wallet's price table hasn't loaded, so no turn can be metered yet.
 pub fn price_table_unavailable() -> String {
     "billing_unavailable: the official price table hasn't loaded yet".into()
@@ -858,6 +871,8 @@ mod tests {
             // As the api's 403 reaches the daemon, envelope description and all.
             (format!("403 Forbidden: {}", wallet_owner_only("ops")), FailureKind::OwnerOnly),
             (wallet_fuel_off("ops:oc", "walletOnComputers is off for @ops"), FailureKind::FuelOff),
+            (key_owner_only("ops"), FailureKind::OwnerOnly),
+            (format!("permission denied: {}", key_fuel_off("ops:oc", "ownKeyOnComputers is off for @ops")), FailureKind::FuelOff),
             (agent_paused("ann:c", "ann", 2), FailureKind::Paused),
             (format!("permission denied: {}", agent_paused("ann:c", "ann", 2)), FailureKind::Paused),
             // As mintReplyKey's 403 reaches the daemon (ApiError's prefix).

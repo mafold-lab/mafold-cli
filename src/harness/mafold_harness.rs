@@ -9,10 +9,13 @@
 //!
 //! What shapes this impl:
 //! - **Nothing to install.** A turn needs only its fuel — the reply's wallet
-//!   key, or the owner's OpenCode Go key, handed over in [`Turn::env`] as they
-//!   always were — and the OpenAI-compatible door it is spent at. On Claude
+//!   key, the owner's OpenCode Go key, or the owner's own model key, handed
+//!   over in [`Turn::env`] as they always were — and the door it is spent at
+//!   (OpenAI-compatible, or Anthropic's own for an Anthropic-format key). On Claude
 //!   Code ([`super::claude_fuel`]) the fuel is the owner's login here, and the
-//!   `claude` installed beside it makes each step.
+//!   `claude` installed beside it makes each step; on Codex
+//!   ([`super::codex_fuel`]) it is the owner's Codex login, each step on the
+//!   Codex Responses API.
 //! - **The daemon draws the reply.** Every event the loop writes reaches the
 //!   daemon's sink through the transcript tap (`kernel::Turn::tap`), so a turn
 //!   renders as the same cards every other runtime's do; the loop's frames
@@ -37,13 +40,14 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use mafold_core::mafold_types::steer::{mailbox, Part};
 use mafold_harness::kernel::{self, Keep, Live};
-use mafold_harness::{HarnessPlugin, OpenAiCompatRuntime, PersonaPlugin, Tools, TurnCtx};
+use mafold_harness::{AnthropicRuntime, HarnessPlugin, OpenAiCompatRuntime, PersonaPlugin, Tools, TurnCtx};
 use mafold_transcript::Tap;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 
 use super::claude_fuel::{self, ClaudeEngine};
+use super::codex_fuel::{self, CodexFuel};
 use super::computer::{self, Computer};
 use super::server_tools;
 use super::{AgentEvent, CapsSource, CommandOutcome, Harness, HarnessProbe, ModelCap, Turn, TurnOutcome};
@@ -52,11 +56,15 @@ use crate::client::Client;
 pub struct MafoldHarness;
 
 /// What a turn's model steps run on: an OpenAI-compatible door (the wallet's
-/// router, OpenCode Go) with its fuel, or the owner's Claude Code here, with
-/// the model `claude` is told (none: its own default).
+/// router, OpenCode Go, an OpenAI-format key of the owner's) with its fuel,
+/// Anthropic's own door for an Anthropic-format key of the owner's, the
+/// owner's Claude Code here, with the model `claude` is told (none: its own
+/// default), or the owner's Codex login, with the model asked of it.
 enum Engine {
     OpenAi(OpenAiCompatRuntime, Fuel),
+    Anthropic(AnthropicRuntime),
     Claude(Option<String>),
+    Codex(Arc<CodexFuel>, String),
 }
 
 /// OpenCode Go's OpenAI-compatible door (models.dev, provider `opencode-go`).
@@ -83,11 +91,15 @@ const PULSE_EVERY: Duration = Duration::from_secs(1);
 
 // ── Fuel ────────────────────────────────────────────────────────────────────
 
-/// What a turn without its fuel answers. The daemon puts the wallet's key, or
-/// the owner's OpenCode Go key, in [`Turn::env`] for a reply and only then;
-/// without either there is nothing this agent may run on.
+/// What a turn without its fuel answers. The daemon puts the wallet's key, the
+/// owner's OpenCode Go key or the owner's own key in [`Turn::env`] for a reply
+/// and only then; without one there is nothing this agent may run on.
 pub const NO_WALLET_KEY: &str =
-    "This agent runs on the wallet or OpenCode Go, but the reply has no key for either, so nothing ran.";
+    "This agent runs on the wallet, OpenCode Go or its owner's own key, but the reply has no key for any of them, so nothing ran.";
+
+/// What a turn on Codex answers without its login — the daemon's Codex step
+/// hands it over in [`Turn::env`] for a reply, and only then.
+pub const NO_CODEX_LOGIN: &str = "This agent runs on its owner's Codex login, but the reply has none, so nothing ran.";
 
 /// The router's provider id for the wallet: a picked wallet model may carry
 /// it as a prefix (`mafold/deepseek-v4-pro`).
@@ -109,6 +121,16 @@ enum Fuel {
     /// The owner's OpenCode Go plan: the key from their Connections. `base`
     /// stands in for Go's address (debug builds, [`dev_base`]).
     Go { key: String, base: Option<String> },
+    /// The owner's own model key (ops 11-23): typed in, or from their
+    /// Connections, at the Base URL it's for, in the format it speaks.
+    Key { format: KeyFormat, key: String, base: String },
+}
+
+/// The two formats an owner's own key speaks (`fuel::OWN_KEY_FORMAT_ENV`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyFormat {
+    Anthropic,
+    OpenAi,
 }
 
 /// Written by hand for the same reason as [`Wallet`]'s.
@@ -117,16 +139,27 @@ impl std::fmt::Debug for Fuel {
         match self {
             Fuel::Wallet(w) => w.fmt(f),
             Fuel::Go { base, .. } => f.debug_struct("Go").field("key", &"<redacted>").field("base", base).finish(),
+            Fuel::Key { format, base, .. } => {
+                f.debug_struct("Key").field("format", format).field("key", &"<redacted>").field("base", base).finish()
+            }
         }
     }
 }
 
 impl Fuel {
-    /// The wallet when its three variables are there; else OpenCode Go when
-    /// its key is. `None` = nothing to run on.
+    /// The wallet when its three variables are there; else the owner's own
+    /// key when its three are; else OpenCode Go when its key is. `None` =
+    /// nothing to run on.
     fn from_env(env: &[(String, String)]) -> Option<Self> {
         if let Some(w) = Wallet::from_env(env, dev_base(env, "MAFOLD_DEV_WALLET_BASE")) {
             return Some(Fuel::Wallet(w));
+        }
+        let get = |k: &str| env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty());
+        if let (Some(key), Some(base), Some(format)) =
+            (get(crate::fuel::OWN_KEY_ENV), get(crate::fuel::OWN_KEY_BASE_ENV), get(crate::fuel::OWN_KEY_FORMAT_ENV))
+        {
+            let format = if format.eq_ignore_ascii_case("anthropic") { KeyFormat::Anthropic } else { KeyFormat::OpenAi };
+            return Some(Fuel::Key { format, key, base: base.trim_end_matches('/').to_string() });
         }
         let key = env
             .iter()
@@ -145,6 +178,16 @@ fn go_model(wanted: Option<&str>) -> String {
         .map(|m| m.trim().trim_start_matches("opencode-go/").to_string())
         .filter(|m| !m.is_empty() && !m.contains('/'))
         .unwrap_or_else(|| GO_DEFAULT_MODEL.to_string())
+}
+
+/// The model a turn on the owner's own key runs: the one it was given — one
+/// of the key's own models, picked when it was made — never a guess.
+fn key_model(wanted: Option<&str>) -> std::result::Result<String, String> {
+    wanted.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string).ok_or_else(|| {
+        "This agent runs on your own key, and no model is picked for it. Pick one of the key's models \
+         (Customize ▸ Model), then send this again."
+            .to_string()
+    })
 }
 
 /// The wallet a turn runs on, as the daemon's fuel step handed it over.
@@ -359,34 +402,57 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
     if !std::path::Path::new(&workdir).is_dir() {
         bail!("working directory does not exist: {workdir} — check --workdir");
     }
-    // What the turn runs on: the owner's Claude Code login here, when the
-    // daemon says so; else the wallet's key or the owner's Go key.
+    // What the turn runs on: the owner's Claude Code login here, or their
+    // Codex login, when the daemon says so; else the wallet's key, the owner's
+    // Go key or their own.
     let engine = if crate::fuel::claude_in(&env) {
         Engine::Claude(claude_fuel::claude_model(model.as_deref()))
+    } else if crate::fuel::codex_in(&env) {
+        let Some(login) = CodexFuel::from_env(&env) else {
+            return Ok(TurnOutcome { error: Some(NO_CODEX_LOGIN.into()), ..Default::default() });
+        };
+        Engine::Codex(Arc::new(login), codex_fuel::codex_model(model.as_deref()))
     } else {
         let Some(fuel) = Fuel::from_env(&env) else {
             return Ok(TurnOutcome { error: Some(NO_WALLET_KEY.into()), ..Default::default() });
         };
-        let runtime = match &fuel {
-            Fuel::Wallet(w) => match pick_model(model.as_deref(), &w.models) {
-                Ok(m) => OpenAiCompatRuntime::new(w.key.clone(), w.base.clone(), m, None, "the wallet's router")
-                    .with_max_tokens(Some(WALLET_OUTPUT_TOKENS)),
-                Err(why) => return Ok(TurnOutcome { error: Some(why), ..Default::default() }),
+        let own_key = |model: Option<&str>| key_model(model).map_err(|why| TurnOutcome { error: Some(why), ..Default::default() });
+        match fuel {
+            // The owner's own key in Anthropic's format goes to `/v1/messages`
+            // (runtime #2); in OpenAI's, to the same door as the others.
+            Fuel::Key { format: KeyFormat::Anthropic, key, base } => match own_key(model.as_deref()) {
+                Ok(m) => Engine::Anthropic(AnthropicRuntime::new(key, base, m).with_reasoning_effort(effort.clone())),
+                Err(out) => return Ok(out),
             },
-            Fuel::Go { key, base } => OpenAiCompatRuntime::new(
-                key.clone(),
-                base.clone().unwrap_or_else(|| GO_BASE.to_string()).trim_end_matches('/').to_string(),
-                go_model(model.as_deref()),
-                None,
-                "OpenCode Go",
-            ),
+            fuel => {
+                let runtime = match &fuel {
+                    Fuel::Wallet(w) => match pick_model(model.as_deref(), &w.models) {
+                        Ok(m) => OpenAiCompatRuntime::new(w.key.clone(), w.base.clone(), m, None, "the wallet's router")
+                            .with_max_tokens(Some(WALLET_OUTPUT_TOKENS)),
+                        Err(why) => return Ok(TurnOutcome { error: Some(why), ..Default::default() }),
+                    },
+                    Fuel::Go { key, base } => OpenAiCompatRuntime::new(
+                        key.clone(),
+                        base.clone().unwrap_or_else(|| GO_BASE.to_string()).trim_end_matches('/').to_string(),
+                        go_model(model.as_deref()),
+                        None,
+                        "OpenCode Go",
+                    ),
+                    Fuel::Key { key, base, .. } => match own_key(model.as_deref()) {
+                        Ok(m) => OpenAiCompatRuntime::new(key.clone(), base.clone(), m, None, "your own key"),
+                        Err(out) => return Ok(out),
+                    },
+                }
+                .with_reasoning_effort(effort.clone());
+                Engine::OpenAi(runtime, fuel)
+            }
         }
-        .with_reasoning_effort(effort.clone());
-        Engine::OpenAi(runtime, fuel)
     };
     let model = match &engine {
         Engine::OpenAi(runtime, _) => mafold_harness::ModelRuntime::configured_model(runtime).map(str::to_string),
+        Engine::Anthropic(runtime) => mafold_harness::ModelRuntime::configured_model(runtime).map(str::to_string),
         Engine::Claude(m) => m.clone(),
+        Engine::Codex(_, m) => Some(m.clone()),
     };
 
     let agent = agent_name(&surface);
@@ -416,7 +482,9 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
         let (catalogue, on) = match &engine {
             Engine::OpenAi(_, Fuel::Go { .. }) => (cached_go_models(), "your owner's OpenCode Go plan"),
             Engine::OpenAi(_, Fuel::Wallet(_)) => (Vec::new(), "your owner's Mafold wallet"),
+            Engine::OpenAi(_, Fuel::Key { .. }) | Engine::Anthropic(_) => (Vec::new(), "your owner's own model key"),
             Engine::Claude(_) => (Vec::new(), "your owner's Claude Code plan"),
+            Engine::Codex(..) => (codex_fuel::models(), "your owner's ChatGPT Codex plan"),
         };
         plugins.push(Arc::new(PersonaPlugin::new(model_line(id, &catalogue, on))));
     }
@@ -460,6 +528,11 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
     let mut on_claude: Option<Arc<ClaudeEngine>> = None;
     let runtime: Arc<dyn mafold_harness::ModelRuntime> = match engine {
         Engine::OpenAi(runtime, _) => Arc::new(runtime),
+        Engine::Anthropic(runtime) => Arc::new(runtime),
+        // The conversation's session keys Codex's prompt cache.
+        Engine::Codex(login, model) => Arc::new(
+            mafold_harness::CodexResponsesRuntime::new(login, model, session.clone()).with_reasoning_effort(effort.clone()),
+        ),
         Engine::Claude(model) => {
             let engine = Arc::new(ClaudeEngine::new(claude_fuel::Spawn {
                 workdir: PathBuf::from(&workdir),
@@ -511,7 +584,7 @@ async fn run_turn(turn: Turn, sink: UnboundedSender<AgentEvent>, home: &std::pat
         // The daemon says a stopped reply was stopped, in its own words.
         stopped_line: String::new(),
         // The wallet is metered by the router's ledger (`fuel::settle`), and
-        // OpenCode Go and Claude Code are the owner's own plans.
+        // OpenCode Go, Claude Code and Codex are the owner's own plans.
         bill: None,
         tap: Some(tap),
         keep: Some(keep),
@@ -1571,6 +1644,39 @@ sys.stdin.read()
         assert_eq!(go_model(Some(" glm-5.3 ")), "glm-5.3");
         assert_eq!(go_model(None), GO_DEFAULT_MODEL);
         assert_eq!(go_model(Some("deepseek/deepseek-v4-flash")), GO_DEFAULT_MODEL, "another provider's model isn't Go's");
+    }
+
+    fn own_key(format: &str, base: &str) -> Vec<(String, String)> {
+        env(&[(crate::fuel::OWN_KEY_FORMAT_ENV, format), (crate::fuel::OWN_KEY_BASE_ENV, base), (crate::fuel::OWN_KEY_ENV, "sk-own-1")])
+    }
+
+    /// The owner's own key: all three of format, Base URL and key, in the
+    /// format it speaks — and never debug-printed.
+    #[test]
+    fn your_own_key_is_all_three_in_its_format() {
+        assert_eq!(
+            Fuel::from_env(&own_key("anthropic", "https://proxy.example/")),
+            Some(Fuel::Key { format: KeyFormat::Anthropic, key: "sk-own-1".into(), base: "https://proxy.example".into() })
+        );
+        assert!(matches!(Fuel::from_env(&own_key("openai", "https://api.openai.com/v1")), Some(Fuel::Key { format: KeyFormat::OpenAi, .. })));
+        assert_eq!(Fuel::from_env(&env(&[(crate::fuel::OWN_KEY_ENV, "sk-own-1")])), None, "a key with no Base URL runs nothing");
+        assert!(!format!("{:?}", Fuel::from_env(&own_key("openai", "https://x/v1")).unwrap()).contains("sk-own-1"));
+    }
+
+    /// An OpenAI-format key of the owner's: the turn goes to its Base URL on
+    /// the model it was given — and with none given, nothing runs.
+    #[tokio::test]
+    async fn an_openai_format_key_runs_the_turn_at_its_base_on_its_model() {
+        let work = folder("own-key");
+        let (base, bodies) = model(vec![says("Hello from your key.")]).await;
+        let mut t = turn(&work, &surface("own-key"), None, "hi", own_key("openai", &base));
+        t.model = Some("gpt-6-astra".into());
+        let (out, events) = drive(t).await;
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(t) if t.contains("Hello from your key"))));
+        assert_eq!(bodies.lock().unwrap()[0]["model"], "gpt-6-astra");
+        let (out, _) = drive(turn(&work, &surface("own-key-none"), None, "hi", own_key("openai", &base))).await;
+        assert!(out.error.unwrap().contains("no model is picked"));
     }
 
     #[test]

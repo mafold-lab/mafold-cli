@@ -9,8 +9,12 @@
 //! OpenCode Go runs Mafold Harness ([`MAFOLD_HARNESS`]: the loop the official
 //! bots run on, carried by mafold-cli) where the owner has `openCodeGo` on;
 //! the wallet fuels Mafold Harness alone, where the owner has
-//! `walletOnComputers` on; and a Claude login runs Mafold Harness too — each
-//! step on the real `claude` there — where the owner has `harnessOnClaude` on.
+//! `walletOnComputers` on; a Claude login runs Mafold Harness too — each
+//! step on the real `claude` there — where the owner has `harnessOnClaude` on;
+//! so does a Codex login — each step on the Codex Responses API, on the
+//! owner's Codex connection or that computer's own Codex login — where the
+//! owner has `harnessOnCodex` on; and your own model key runs Mafold Harness
+//! there as it pays for a Cloud agent, where the owner has `ownKeyOnComputers` on.
 //!
 //! Also here: the id a runtime goes by ([`runtime_id`]), for every side that
 //! reads one an older build wrote.
@@ -56,16 +60,19 @@ pub const RUNTIME_SIGN_INS: &[(&str, &[&str])] = &[
     ("kimi-code", &["kimi"]),
     // Mafold Harness: no login of its own — your OpenCode Go plan, the wallet
     // (the router serves it on /v1/chat/completions, which its model client
-    // speaks), or your Claude Code login, each step run by the real `claude`
-    // on that computer.
-    (MAFOLD_HARNESS, &["opencode-go", "wallet", "claude"]),
+    // speaks), your Claude Code login, each step run by the real `claude`
+    // on that computer, your own model key, as on Mafold Cloud, or your Codex
+    // login, each step on Codex's own API.
+    (MAFOLD_HARNESS, &["opencode-go", "wallet", "claude", KEY, "codex"]),
 ];
 
 /// Every sign-in New Agent knows.
 pub const SIGN_INS: &[&str] = &["claude", "codex", "kimi", "opencode-go", "wallet", KEY];
 
-/// Your own model key on Mafold Cloud: an Anthropic- or OpenAI-format key and
-/// the Base URL it's for, sealed on the server (`mafold-api` `own_key`).
+/// Your own model key: an Anthropic- or OpenAI-format key and the Base URL
+/// it's for (`mafold-api` `own_key`). It pays for a Mafold Cloud agent, and
+/// signs in Mafold Harness on a computer (ops 11-23 「这里的Sign in with 也要Mafold
+/// Cloud的同款选项 用apikey / connections」).
 pub const KEY: &str = "key";
 
 /// The owner's flags that open a sign-in on a computer.
@@ -78,8 +85,12 @@ pub struct Gates {
     /// `harnessOnClaude`: a Claude login may sign in Mafold Harness. Its own
     /// runtime, Claude Code, needs no flag.
     pub harness_on_claude: bool,
+    /// `harnessOnCodex`: a Codex login may sign in Mafold Harness.
+    pub harness_on_codex: bool,
     /// `cloudOwnKey`: your own model key may pay for a Mafold Cloud agent.
     pub cloud_own_key: bool,
+    /// `ownKeyOnComputers`: your own model key may sign in Mafold Harness.
+    pub own_key_on_computers: bool,
 }
 
 impl Gates {
@@ -89,6 +100,8 @@ impl Gates {
             (_, "wallet") => self.wallet_on_computers,
             (_, "opencode-go") => self.opencode_go,
             (MAFOLD_HARNESS, "claude") => self.harness_on_claude,
+            (_, KEY) => self.own_key_on_computers,
+            (MAFOLD_HARNESS, "codex") => self.harness_on_codex,
             _ => true,
         }
     }
@@ -135,8 +148,12 @@ mod tests {
                 opencode_go: c["opencode_go"].as_bool().unwrap_or(false),
                 // …nor the ones from before Mafold Harness on Claude Code.
                 harness_on_claude: c["harness_on_claude"].as_bool().unwrap_or(false),
+                // …nor the ones from before Mafold Harness on Codex.
+                harness_on_codex: c["harness_on_codex"].as_bool().unwrap_or(false),
                 // …nor the ones from before your own key on Mafold Cloud.
                 cloud_own_key: c["cloud_own_key"].as_bool().unwrap_or(false),
+                // …nor the ones from before your own key on a computer.
+                own_key_on_computers: c["own_key_on_computers"].as_bool().unwrap_or(false),
             };
             assert_eq!(sign_in_runs(cloud, runtime, sign_in, gates), c["ok"].as_bool().unwrap(), "{c}");
         }

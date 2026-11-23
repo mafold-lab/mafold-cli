@@ -18,7 +18,9 @@ mod i18n;
 pub mod flags;
 pub mod connections;
 pub mod providers;
-mod codex;
+/// Public for [`codex::Opened`]: Mafold Harness on a computer runs its model
+/// steps on the owner's Codex connection, opened and renewed here.
+pub mod codex;
 /// Public for its [`ark::DRIVER`] id: `mafold video` picks the owner's own
 /// ModelArk connection by the driver its provider row names, the same way
 /// `computer::DRIVER` / `google::DRIVER` are read — never by provider slug.

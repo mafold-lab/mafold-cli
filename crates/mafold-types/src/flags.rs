@@ -1016,6 +1016,28 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[Web, Phone],
         server: ClosedWithoutRecord,
     },
+    // Mafold Harness on Codex (ops 11-23, 「codex as fuel也补充一下(connection 和
+    // 本地复用)」): New Agent offers Codex as Mafold Harness's sign-in on a
+    // computer, and each model step runs on the Codex Responses API, on the
+    // owner's Codex connection or that computer's own Codex login (mafold-cli
+    // harness/codex_fuel.rs). Server-read on the owner: createBot takes
+    // `sign_in: codex` with Mafold Harness only where this is on, and New
+    // Agent's panel learns it from the api's `gates` answer — no client reads it.
+    FlagMeta {
+        key: "harnessOnCodex",
+        default: false,
+        dev_default: false,
+        label: "New Agent: Mafold Harness on Codex",
+        description: "New Agent on one of your computers offers Codex as the sign-in for Mafold \
+                      Harness. The harness keeps its own prompt, tools and sessions, and each model \
+                      step runs on your ChatGPT Codex plan: the Codex login in your Connections, \
+                      else the one Codex keeps on that computer. The api takes createBot with \
+                      Mafold Harness on Codex only where this is on for the owner.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     // The python tool (ops 10-30 plan, "build first, start it" 11-01): one
     // Cloudflare Container per reply, network off, billed at cost in the
     // `sandbox` currency. The api reads it on the PAYER — the agent's owner —
@@ -1953,6 +1975,26 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // ops 11-23 「Mafold harness要放在左边 然后mafold wallet是默认 并且也要有mafold
+    // wallet 也要有mafold cloud的那个model picker 这里的Sign in with 也要Mafold
+    // Cloud的同款选项 用apikey / connections」.
+    FlagMeta {
+        key: "ownKeyOnComputers",
+        default: false,
+        dev_default: false,
+        label: "Computers: Mafold Harness signs in with your own model key",
+        description: "Sign in with for Mafold Harness on a computer offers what Pays with offers \
+                      on Mafold Cloud: an API key (Anthropic or OpenAI format, with its Base URL) \
+                      or a key from Connections, checked against its own model list. A typed key \
+                      is sealed on the server and opened for each reply the owner starts \
+                      (openModelKey); a Connections key is opened by the computer itself. The \
+                      api answers listHarnessHosts with cloud_keys and takes checkModelKey / \
+                      createBot with sign_in `key` on a computer only where this is on.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     // ops 11-22 「DM里面 这中间的 No messages yet / Say hello 完全可以放一个自定义的card」,
     // 「必须要用户主动设置才行 不要默认覆盖」, then 「可以开始做了」 on the demo.
     // An account's own card in an empty DM, set on purpose and never put on by
@@ -2468,6 +2510,34 @@ mod tests {
         let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
         assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
         assert!(m.clients.contains(&Web) && m.clients.contains(&Phone), "{k}: web and phone read it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn own_key_on_computers_is_a_server_gate_that_ships_dark() {
+        // createBot and openModelKey read it on the owner; the panel learns it
+        // from the api's `gates` answer, not from a client registry. Dev stays
+        // off too until a record opens it.
+        let k = "ownKeyOnComputers";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.is_empty(), "{k}: only the api reads it");
+        assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
+        assert!(!server_default(k), "{k}: shut without a record");
+        assert_eq!(server_key(k), k);
+    }
+
+    #[test]
+    fn harness_on_codex_is_a_server_gate_that_ships_dark() {
+        // createBot, listHarnessHosts and New Agent's `gates` read it on the
+        // owner; dev stays off too until a record opens it, since a turn on it
+        // spends a real ChatGPT plan.
+        let k = "harnessOnCodex";
+        let m = meta(k).unwrap_or_else(|| panic!("{k} registered"));
+        assert!(!m.default && !m.dev_default, "{k}: off until a record opens it, dev included");
+        assert!(m.clients.is_empty(), "{k}: the panel hears it from the api");
         assert_eq!(m.server, ClosedWithoutRecord, "{k}: the api gates on it");
         assert!(!server_default(k), "{k}: shut without a record");
         assert_eq!(server_key(k), k);

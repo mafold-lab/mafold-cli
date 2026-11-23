@@ -210,7 +210,7 @@ impl Runtime {
     /// It used to be a lookup in a compiled-in table, which made "this binary
     /// is older than your account" the answer to all three — including for a
     /// connection the user had just successfully linked.
-    async fn descriptor_of(&self, conn: &Value) -> Result<ProviderInfo> {
+    pub(crate) async fn descriptor_of(&self, conn: &Value) -> Result<ProviderInfo> {
         let id = conn.get("provider").and_then(Value::as_str).unwrap_or("");
         crate::providers::ensure(&self.base, &self.token, now_ms()).await?;
         crate::providers::get(id).ok_or_else(|| {

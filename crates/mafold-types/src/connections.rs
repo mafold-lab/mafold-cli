@@ -326,6 +326,50 @@ pub mod codex {
     /// `ImagesClient` posts to (`images/generations` relative to the codex
     /// provider base; gpt-image on the subscription credential).
     pub const IMAGES_URL: &str = "https://chatgpt.com/backend-api/codex/images/generations";
+
+    /// The Codex CLI's own identity, which every call on a ChatGPT login
+    /// wears: the endpoint serves exactly that client family and checks that
+    /// `originator` matches the User-Agent's first segment. Here once for the
+    /// two callers that speak to it — the vault device's relay (mafold-core
+    /// `codex`) and Mafold Harness on a computer (mafold-harness `codex`).
+    pub const ORIGINATOR: &str = "codex-tui";
+    /// Track the shipping Codex CLI. Falling several releases behind moves
+    /// every call into the first-to-shed bucket under load (HTTP 200 +
+    /// in-stream `server_is_overloaded`), which reads as flakiness rather than
+    /// as this line.
+    pub const CLIENT_VERSION: &str = "0.146.0";
+
+    /// The Codex CLI's User-Agent for this machine's OS and arch.
+    pub fn user_agent() -> String {
+        let os = match std::env::consts::OS {
+            "macos" => "Mac OS 26.0",
+            "windows" => "Windows 11",
+            _ => "Ubuntu 22.4.0",
+        };
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            a => a,
+        };
+        format!("{ORIGINATOR}/{CLIENT_VERSION} ({os}; {arch}) xterm-256color")
+    }
+
+    /// Everything a streamed `responses` call sends besides its body: the
+    /// login (`access` + the ChatGPT `account`), the identity, and `session`
+    /// pinned as both session and conversation (it keys the prompt cache).
+    pub fn responses_headers(access: &str, account: &str, session: &str) -> Vec<(String, String)> {
+        vec![
+            ("authorization".into(), format!("Bearer {access}")),
+            ("chatgpt-account-id".into(), account.into()),
+            ("content-type".into(), "application/json".into()),
+            ("accept".into(), "text/event-stream".into()),
+            ("openai-beta".into(), "responses=experimental".into()),
+            ("originator".into(), ORIGINATOR.into()),
+            ("version".into(), CLIENT_VERSION.into()),
+            ("user-agent".into(), user_agent()),
+            ("session_id".into(), session.into()),
+            ("conversation_id".into(), session.into()),
+        ]
+    }
 }
 
 // MARK: - Figma OAuth constants
