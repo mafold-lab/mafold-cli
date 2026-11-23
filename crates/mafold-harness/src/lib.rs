@@ -14,11 +14,13 @@
 //! mid-turn messages come from ([`kernel::Live`]), who settles the bill
 //! ([`kernel::Settle`]) — never the loop itself.
 
+pub mod anthropic;
 pub mod fields;
 pub mod kernel;
 pub mod plugin;
 pub mod runtime;
 
+pub use anthropic::AnthropicRuntime;
 pub use fields::{FieldOption, FieldSpec};
 pub use kernel::{Bill, Frame, Live, Settle, TokenUsage, Tools, Turn};
 pub use plugin::{HarnessPlugin, PersonaPlugin, Prepared, ToolSpec, TurnCtx};

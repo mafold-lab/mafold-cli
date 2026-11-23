@@ -119,6 +119,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "chatShareCreate",
     "chatShareGet",
     "checkAgentUsername",
+    "checkModelKey",
     "checkSiteDomain",
     "checkUsername",
     "claimConnectionCall",

@@ -123,7 +123,7 @@ const TOOL_CALL_OWN_KEYS: [&str; 4] = ["index", "id", "type", "function"];
 /// mafold-router hands it over) or a summary (`reasoning.summary`). An
 /// encrypted block, or one that came back empty (Claude's `display:
 /// "omitted"`), has nothing to show.
-fn readable_thought(detail: &Value) -> Option<&str> {
+pub(crate) fn readable_thought(detail: &Value) -> Option<&str> {
     let text = match detail["type"].as_str()? {
         "reasoning.text" => detail["text"].as_str(),
         "reasoning.summary" => detail["summary"].as_str(),
@@ -259,7 +259,7 @@ pub fn default_reasoning_effort(model: &str) -> &'static str {
 }
 
 /// The effort a request on `model` asks for, given what the profile carries.
-fn effort_for(configured: Option<&str>, model: &str) -> Option<String> {
+pub(crate) fn effort_for(configured: Option<&str>, model: &str) -> Option<String> {
     configured.map(|e| {
         if e.eq_ignore_ascii_case(EFFORT_BY_MODEL) {
             default_reasoning_effort(model).to_string()
@@ -272,7 +272,7 @@ fn effort_for(configured: Option<&str>, model: &str) -> Option<String> {
 /// `claude-opus-5-5` → ("opus", (5, 5)); `claude-sonnet-4-6` → ("sonnet",
 /// (4, 6)); a dated id keeps only its first two numbers. Same reading as the
 /// router's, so the two never disagree about what a model is.
-fn claude_family(model: &str) -> Option<(&str, (u32, u32))> {
+pub(crate) fn claude_family(model: &str) -> Option<(&str, (u32, u32))> {
     let rest = model.strip_prefix("claude-")?;
     let mut parts = rest.split('-');
     let family = parts.next()?;
@@ -287,7 +287,7 @@ fn claude_family(model: &str) -> Option<(&str, (u32, u32))> {
 
 /// Keep the transport cause (DNS/TLS/connect/reset), like the CLI error
 /// chain, without reflecting a credential-bearing endpoint URL into chat.
-fn transport_error(error: reqwest::Error) -> String {
+pub(crate) fn transport_error(error: reqwest::Error) -> String {
     let host = error.url().and_then(|u| u.host_str()).unwrap_or("provider").to_owned();
     format!("{host}: {:#}", anyhow::Error::new(error.without_url()))
 }
@@ -310,14 +310,21 @@ async fn post_step(
     http: &reqwest::Client,
     url: &str,
     key: &str,
+    headers: &reqwest::header::HeaderMap,
     body: &Value,
 ) -> reqwest::Result<reqwest::Response> {
-    match http.post(url).bearer_auth(key).json(body).send().await {
+    send_once_more(|| http.post(url).headers(headers.clone()).bearer_auth(key).json(body)).await
+}
+
+/// [`post_step`]'s one resend, for any request a runtime builds — the
+/// Anthropic runtime signs with `x-api-key`, not a bearer.
+pub(crate) async fn send_once_more(build: impl Fn() -> reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    match build().send().await {
         Err(e) if e.is_request() && !e.is_timeout() => {
             let host = e.url().and_then(|u| u.host_str()).unwrap_or("provider").to_owned();
             tracing::warn!("harness: {host} dropped the connection before replying ({}) — sending once more", causes(&e));
             tokio::time::sleep(Duration::from_millis(500)).await;
-            http.post(url).bearer_auth(key).json(body).send().await
+            build().send().await
         }
         sent => sent,
     }
@@ -352,14 +359,52 @@ fn causes(e: &(dyn std::error::Error + 'static)) -> String {
 /// only; a broken attempt costs the seat. Two things stay as they were: a
 /// status is an answer, and a link that drops before ANY status gets
 /// [`post_step`]'s one quick resend and then fails fast.
-const STREAM_RETRY_AFTER: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
+pub(crate) const STREAM_RETRY_AFTER: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 
 /// One attempt at a step: the step's own events, or the word that its stream
 /// broke before the reply was whole — which [`OpenAiCompatRuntime::step`]
 /// answers by asking again, and only fails once it has run out of retries.
-enum Attempt {
+pub(crate) enum Attempt {
     Event(ChatEvent),
     Broke(String),
+}
+
+/// A step made of attempts: asked again from the top each time an attempt
+/// broke, after the waits in [`STREAM_RETRY_AFTER`], what it had shown taken
+/// back first ([`ChatEvent::Restart`]). Fails only once the last one broke too.
+pub(crate) fn retrying(attempt: impl Fn() -> BoxStream<'static, Attempt> + Send + 'static) -> BoxStream<'static, ChatEvent> {
+    Box::pin(async_stream::stream! {
+        let mut waits = STREAM_RETRY_AFTER.iter();
+        loop {
+            let mut this = attempt();
+            let mut shown = false;
+            let mut broke = None;
+            while let Some(item) = this.next().await {
+                match item {
+                    Attempt::Event(ev) => {
+                        shown |= matches!(ev, ChatEvent::Text(_) | ChatEvent::Thinking(_));
+                        yield ev;
+                    }
+                    Attempt::Broke(why) => {
+                        broke = Some(why);
+                        break;
+                    }
+                }
+            }
+            let Some(why) = broke else { return };
+            let Some(wait) = waits.next() else {
+                yield ChatEvent::Failed(format!("{why} (asked {} times)", STREAM_RETRY_AFTER.len() + 1));
+                return;
+            };
+            tracing::warn!("harness: {why} — asking the step again in {wait:?}");
+            // What the broken attempt showed goes before the next one
+            // starts — never two answers run together in one bubble.
+            if shown {
+                yield ChatEvent::Restart;
+            }
+            tokio::time::sleep(*wait).await;
+        }
+    })
 }
 
 /// Does this 400 body refuse the MODEL rather than the request? mafold-router
@@ -382,7 +427,7 @@ fn refuses_the_model(body: &str) -> bool {
 /// (`error.resets_at`, unix seconds, the window it just observed) and falls
 /// back to a `retry-after` header in seconds; neither ⇒ `None`, never a
 /// guessed time. `kind` is the window's name when the body carries one.
-fn quota_signal(status: u16, retry_after: Option<&str>, body: &str, now: i64) -> Option<(String, Option<i64>)> {
+pub(crate) fn quota_signal(status: u16, retry_after: Option<&str>, body: &str, now: i64) -> Option<(String, Option<i64>)> {
     if status != 429 {
         return None;
     }
@@ -531,6 +576,10 @@ pub struct OpenAiCompatRuntime {
     /// runs (a sender's pick can change it mid-profile).
     /// Rejected (400) ⇒ dropped and retried, like the other optional fields.
     reasoning_effort: Option<String>,
+    /// [`OpenAiCompatRuntime::with_headers`]'s, put on each request rather
+    /// than baked into `http`, so a host's own client ([`Self::with_http`])
+    /// and the headers can come in either order.
+    headers: reqwest::header::HeaderMap,
 }
 
 impl OpenAiCompatRuntime {
@@ -553,7 +602,16 @@ impl OpenAiCompatRuntime {
             provider_of_model: None,
             max_tokens: None,
             reasoning_effort: None,
+            headers: reqwest::header::HeaderMap::new(),
         }
+    }
+
+    /// Send through this client instead of a plain one — mafold-api hands in
+    /// one that won't connect inside its own network when the endpoint is an
+    /// address its owner typed. Give it no timeout, for `new`'s reason.
+    pub fn with_http(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
     }
 
     /// Ask for a larger output cap per completion. See
@@ -587,17 +645,12 @@ impl OpenAiCompatRuntime {
     /// first real Mafold Harness run on Go, 11-02, failed every call on it.
     /// A name or value that can't be a header is left out.
     pub fn with_headers(mut self, headers: &[(&str, &str)]) -> Self {
-        let mut map = reqwest::header::HeaderMap::new();
         for (name, value) in headers {
             if let (Ok(n), Ok(v)) =
                 (reqwest::header::HeaderName::from_bytes(name.as_bytes()), reqwest::header::HeaderValue::from_str(value))
             {
-                map.insert(n, v);
+                self.headers.insert(n, v);
             }
-        }
-        // The same client `new` makes (no timeout), with the headers on it.
-        if let Ok(http) = reqwest::Client::builder().default_headers(map).build() {
-            self.http = http;
         }
         self
     }
@@ -641,38 +694,7 @@ impl ModelRuntime for OpenAiCompatRuntime {
         model: Option<String>,
     ) -> BoxStream<'static, ChatEvent> {
         let runtime = self.clone();
-        Box::pin(async_stream::stream! {
-            let mut waits = STREAM_RETRY_AFTER.iter();
-            loop {
-                let mut attempt = runtime.attempt(messages.clone(), tools.clone(), want_usage, model.clone());
-                let mut shown = false;
-                let mut broke = None;
-                while let Some(item) = attempt.next().await {
-                    match item {
-                        Attempt::Event(ev) => {
-                            shown |= matches!(ev, ChatEvent::Text(_) | ChatEvent::Thinking(_));
-                            yield ev;
-                        }
-                        Attempt::Broke(why) => {
-                            broke = Some(why);
-                            break;
-                        }
-                    }
-                }
-                let Some(why) = broke else { return };
-                let Some(wait) = waits.next() else {
-                    yield ChatEvent::Failed(format!("{why} (asked {} times)", STREAM_RETRY_AFTER.len() + 1));
-                    return;
-                };
-                tracing::warn!("harness: {why} — asking the step again in {wait:?}");
-                // What the broken attempt showed goes before the next one
-                // starts — never two answers run together in one bubble.
-                if shown {
-                    yield ChatEvent::Restart;
-                }
-                tokio::time::sleep(*wait).await;
-            }
-        })
+        retrying(move || runtime.attempt(messages.clone(), tools.clone(), want_usage, model.clone()))
     }
 }
 
@@ -692,6 +714,7 @@ impl OpenAiCompatRuntime {
         model: Option<String>,
     ) -> BoxStream<'static, Attempt> {
         let http = self.http.clone();
+        let headers = self.headers.clone();
         let url = format!("{}/chat/completions", self.base_url);
         let key = self.api_key.clone();
         let model = model.unwrap_or_else(|| self.model.clone());
@@ -728,7 +751,7 @@ impl OpenAiCompatRuntime {
             // is really down (or the endpoint is wrong) and the step fails fast,
             // as #880 settled. Only a stream that broke AFTER its status is
             // asked again.
-            let mut resp = match post_step(&http, &url, &key, &body).await {
+            let mut resp = match post_step(&http, &url, &key, &headers, &body).await {
                 Ok(r) => r,
                 Err(e) => { yield Attempt::Event(ChatEvent::Failed(format!("{label}: {}", transport_error(e)))); return; }
             };
@@ -758,7 +781,7 @@ impl OpenAiCompatRuntime {
             {
                 tracing::warn!("harness: 400 with stream_options — retrying without it");
                 body.as_object_mut().map(|o| o.remove("stream_options"));
-                resp = match post_step(&http, &url, &key, &body).await {
+                resp = match post_step(&http, &url, &key, &headers, &body).await {
                     Ok(r) => r,
                     Err(e) => { yield Attempt::Event(ChatEvent::Failed(format!("{label}: {}", transport_error(e)))); return; }
                 };
@@ -768,7 +791,7 @@ impl OpenAiCompatRuntime {
             if resp.status() == reqwest::StatusCode::BAD_REQUEST && body.get("reasoning_effort").is_some() {
                 tracing::warn!("harness: 400 with reasoning_effort — retrying without it");
                 body.as_object_mut().map(|o| o.remove("reasoning_effort"));
-                resp = match post_step(&http, &url, &key, &body).await {
+                resp = match post_step(&http, &url, &key, &headers, &body).await {
                     Ok(r) => r,
                     Err(e) => { yield Attempt::Event(ChatEvent::Failed(format!("{label}: {}", transport_error(e)))); return; }
                 };
@@ -779,7 +802,7 @@ impl OpenAiCompatRuntime {
             if resp.status() == reqwest::StatusCode::BAD_REQUEST && body.get("max_tokens").is_some() {
                 tracing::warn!("harness: 400 with max_tokens — retrying on the provider default");
                 body.as_object_mut().map(|o| o.remove("max_tokens"));
-                resp = match post_step(&http, &url, &key, &body).await {
+                resp = match post_step(&http, &url, &key, &headers, &body).await {
                     Ok(r) => r,
                     Err(e) => { yield Attempt::Event(ChatEvent::Failed(format!("{label}: {}", transport_error(e)))); return; }
                 };
@@ -1115,7 +1138,7 @@ mod tests {
     async fn a_connection_dropped_before_any_reply_is_sent_once_more() {
         let (url, hits) = scripted_upstream(vec![None, Some(OK_REPLY)]).await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = post_step(&http, &url, "k", &json!({"model": "m"})).await.expect("second attempt answers");
+        let resp = post_step(&http, &url, "k", &Default::default(), &json!({"model": "m"})).await.expect("second attempt answers");
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -1125,7 +1148,7 @@ mod tests {
     async fn a_second_drop_is_reported_not_retried_again() {
         let (url, hits) = scripted_upstream(vec![None, None, Some(OK_REPLY)]).await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let err = post_step(&http, &url, "k", &json!({})).await.expect_err("gives up after two");
+        let err = post_step(&http, &url, "k", &Default::default(), &json!({})).await.expect_err("gives up after two");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(transport_error(err).matches(':').count() >= 2, "keeps the cause");
     }
@@ -1139,7 +1162,7 @@ mod tests {
         ])
         .await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = post_step(&http, &url, "k", &json!({})).await.unwrap();
+        let resp = post_step(&http, &url, "k", &Default::default(), &json!({})).await.unwrap();
         assert_eq!(resp.status(), 502);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

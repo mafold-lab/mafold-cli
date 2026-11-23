@@ -1307,6 +1307,28 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     },
 ];
 
+/// The server's own ask of a device: hand the API key of a connection over to
+/// Mafold Cloud, which its owner picked to pay for an agent there (ops 11-23
+/// "Hand over once"). A tool name can't contain `/`, so no provider can
+/// shadow it — the same reason `tools/list` is spelled that way.
+pub const HANDOVER_METHOD: &str = "credential/handover";
+
+/// Methods only the server itself asks a device to run. `callConnection`
+/// refuses them from everyone, the connection's owner included.
+pub fn server_only_method(method: &str) -> bool {
+    method.trim().starts_with("credential/")
+}
+
+/// The request format a provider's key speaks, for the providers whose key a
+/// Mafold Cloud agent can run on — and the only ones a device hands over.
+pub fn model_key_format(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic-api" => Some("anthropic"),
+        "openai-api" => Some("openai"),
+        _ => None,
+    }
+}
+
 pub fn provider(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|p| p.id == id)
 }

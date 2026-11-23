@@ -1913,6 +1913,46 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         clients: &[],
         server: ClosedWithoutRecord,
     },
+    // ops 11-23 「这个初识消息太差劲了 zhenchendu的这个样式是不错的 尤其下面的气泡组
+    // 要复用」, 「Make me an Agent of my own 这个换成Try Different Model」, 「如果用户
+    // 通过气泡组来回复了这个HTML, 需要在回复完以后 最后补发一条新的气泡组」, then
+    // 「Build it」 on the demo.
+    FlagMeta {
+        key: "agentStarters",
+        default: false,
+        dev_default: false,
+        label: "New agent: starter bubbles",
+        description: "A new Mafold Cloud agent opens its DM with a short hello and a group of \
+                      starter bubbles (Try a different model, A new avatar, Make me a toy, Meet \
+                      the Agents on Mafold, New colours, What is Mafold?, How did Mafold begin?, \
+                      Why Mafold?). A tap sends that line as your reply to the group; the agent \
+                      answers it, and a fresh group of the ones not asked yet follows the answer. \
+                      Read for the OWNER when the agent is created. Off = the old ready message.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    // ops 11-23 「Mafold Cloud的harness的pays with 需要[ mafold wallet ] [ API Key ]
+    // [ pick from connections ] apikey需要支持anthropic 和 openai两种格式」, then
+    // 「anthropic format 也需要base url」 + "Hand over once".
+    FlagMeta {
+        key: "cloudOwnKey",
+        default: false,
+        dev_default: false,
+        label: "Mafold Cloud: pay with your own model key",
+        description: "Pays with on a Mafold Cloud agent offers Mafold wallet, API key and \
+                      Connections. An API key is Anthropic or OpenAI format with its Base URL; \
+                      Check key lists the models it can use. A key from Connections is handed \
+                      to Mafold Cloud once, by one of your devices that's on, when you pick it. \
+                      The key is sealed on the server and replies are billed on it, not the \
+                      wallet. The api answers listHarnessHosts with cloud_keys and takes \
+                      checkModelKey / createBot with sign_in `key` only where this is on.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
     // ops 11-22 「DM里面 这中间的 No messages yet / Say hello 完全可以放一个自定义的card」,
     // 「必须要用户主动设置才行 不要默认覆盖」, then 「可以开始做了」 on the demo.
     // An account's own card in an empty DM, set on purpose and never put on by

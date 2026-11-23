@@ -3,7 +3,8 @@
 //! so a combo the New Agent panel offers is one `createBot` takes, and the
 //! other way round.
 //!
-//! On Mafold Cloud only the wallet. On a computer a login runs only its own
+//! On Mafold Cloud the wallet, or your own model key where the owner has
+//! `cloudOwnKey` on (typed in, or handed over from Connections). On a computer a login runs only its own
 //! runtime (a Claude login runs Claude Code, a Codex login runs Codex, …).
 //! OpenCode Go runs Mafold Harness ([`MAFOLD_HARNESS`]: the loop the official
 //! bots run on, carried by mafold-cli) where the owner has `openCodeGo` on;
@@ -61,7 +62,11 @@ pub const RUNTIME_SIGN_INS: &[(&str, &[&str])] = &[
 ];
 
 /// Every sign-in New Agent knows.
-pub const SIGN_INS: &[&str] = &["claude", "codex", "kimi", "opencode-go", "wallet"];
+pub const SIGN_INS: &[&str] = &["claude", "codex", "kimi", "opencode-go", "wallet", KEY];
+
+/// Your own model key on Mafold Cloud: an Anthropic- or OpenAI-format key and
+/// the Base URL it's for, sealed on the server (`mafold-api` `own_key`).
+pub const KEY: &str = "key";
 
 /// The owner's flags that open a sign-in on a computer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,6 +78,8 @@ pub struct Gates {
     /// `harnessOnClaude`: a Claude login may sign in Mafold Harness. Its own
     /// runtime, Claude Code, needs no flag.
     pub harness_on_claude: bool,
+    /// `cloudOwnKey`: your own model key may pay for a Mafold Cloud agent.
+    pub cloud_own_key: bool,
 }
 
 impl Gates {
@@ -91,7 +98,7 @@ impl Gates {
 /// or on a computer with `runtime`.
 pub fn sign_in_runs(cloud: bool, runtime: Option<&str>, sign_in: &str, gates: Gates) -> bool {
     if cloud {
-        return sign_in == "wallet";
+        return sign_in == "wallet" || (sign_in == KEY && gates.cloud_own_key);
     }
     let Some((id, ins)) = runtime.and_then(|r| RUNTIME_SIGN_INS.iter().find(|(id, _)| *id == r)) else {
         return false;
@@ -128,6 +135,8 @@ mod tests {
                 opencode_go: c["opencode_go"].as_bool().unwrap_or(false),
                 // …nor the ones from before Mafold Harness on Claude Code.
                 harness_on_claude: c["harness_on_claude"].as_bool().unwrap_or(false),
+                // …nor the ones from before your own key on Mafold Cloud.
+                cloud_own_key: c["cloud_own_key"].as_bool().unwrap_or(false),
             };
             assert_eq!(sign_in_runs(cloud, runtime, sign_in, gates), c["ok"].as_bool().unwrap(), "{c}");
         }

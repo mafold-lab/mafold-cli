@@ -269,6 +269,30 @@ pub struct HarnessHostsResult {
     /// runtime that takes one from there is signed in on every computer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connected: Vec<String>,
+    /// Present where the owner may pay for a Mafold Cloud agent with their own
+    /// model key (`cloudOwnKey`): Pays with offers API key and Connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_keys: Option<CloudKeys>,
+}
+
+/// What Pays with ▸ Connections lists: the owner's connections that hold a
+/// model key Mafold Cloud can run on. Read off the rows; nothing is opened.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloudKeys {
+    pub connections: Vec<ModelKeyConnection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelKeyConnection {
+    /// The connection's name, as `listConnections` reports it.
+    pub name: String,
+    /// `anthropic-api` / `openai-api`.
+    pub provider: String,
+    /// The request format its key speaks: `anthropic` / `openai`.
+    pub format: String,
+    /// The label its owner gave it, if any ("work key").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 // ───────────────── presence (`getUserStatus`) ─────────────────
@@ -547,6 +571,7 @@ mod tests {
                 HarnessHost { device_id: "dev-2".into(), device_name: "PC".into(), harnesses: vec![], cli_version: None, online: false, reported_at: 5, os: None },
             ],
             connected: vec![],
+            cloud_keys: None,
         };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),

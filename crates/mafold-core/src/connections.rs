@@ -442,6 +442,21 @@ impl Runtime {
                     .collect::<Vec<_>>()
             }));
         }
+        // Reserved method: the key itself, handed to Mafold Cloud — asked
+        // only by the server, where the owner picked this connection to pay
+        // for an agent there (ops 11-23 "Hand over once"; `callConnection`
+        // refuses it from everyone). Only a model key a Cloud agent can run on
+        // ever leaves: a Notion grant or a password never answers this.
+        if method == mafold_types::connections::HANDOVER_METHOD {
+            if mafold_types::connections::model_key_format(&spec.id).is_none() {
+                return Err(format!("`{name}` ({}) isn't a model key Mafold Cloud runs on", spec.display));
+            }
+            let key = credential(&spec, &self.open(&conn)?);
+            if key.trim().is_empty() {
+                return Err(format!("`{name}` holds no key — reconnect it in Settings ▸ Connections"));
+            }
+            return Ok(serde_json::json!({ "api_key": key.trim() }));
+        }
         match spec.native_api.as_deref() {
             Some("codex-responses") => match method {
                 "responses" => {
