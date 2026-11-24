@@ -870,10 +870,14 @@ impl Client {
     /// own Customize settings were stored, shown, and never read. Asking is both
     /// shorter and the only way this stays in step with the other clients.
     ///
-    /// Returns `{ bot, fields: {key: value}, sources: {key: {conv, user}} }`
-    /// with every layer already merged per key.
-    pub async fn resolved_config(&self, chat_id: &str, user: Option<&str>) -> Result<Value> {
+    /// Returns `{ bot, fields: {key: value}, sources: {key: {conv, user, channel}} }`
+    /// with every layer already merged per key. `channel` is the forum channel
+    /// the turn is in: its own model and effort outrank the chat's.
+    pub async fn resolved_config(&self, chat_id: &str, channel: Option<&str>, user: Option<&str>) -> Result<Value> {
         let mut body = json!({ "chat_id": chat_id });
+        if let Some(ch) = channel {
+            body["channel_id"] = json!(ch);
+        }
         if let Some(u) = user {
             body["user"] = json!(u);
         }

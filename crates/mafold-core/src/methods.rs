@@ -483,6 +483,8 @@ pub static KNOWN_METHODS: &[&str] = &[
     "uploadChunk",
     "uploadDriveBlob",
     "uploadFile",
+    "uploadTicket",
+    "uploadTicketKey",
     "usernameStatus",
     "verifyEmailBind",
     "videoCancel",

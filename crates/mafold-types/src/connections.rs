@@ -287,7 +287,14 @@ pub mod codex {
         /// Whether models.dev has an official price for this id, making it
         /// eligible for wallet-metered resale. Self-use does not need a price.
         pub wallet_metered: bool,
+        /// The thinking efforts Codex takes for this model, as its own
+        /// `model/list` names them (codex-cli 0.165). Empty = the model keeps
+        /// its own and the sheet offers no effort dial.
+        pub efforts: &'static [&'static str],
     }
+
+    const FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+    const NO_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
     pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
     pub const SUBSCRIPTION_MODELS: &[SubscriptionModel] = &[
@@ -295,21 +302,25 @@ pub mod codex {
             id: "gpt-5.6-sol",
             label: "GPT-5.6 Sol",
             wallet_metered: true,
+            efforts: FULL,
         },
         SubscriptionModel {
             id: "gpt-5.6-luna",
             label: "GPT-5.6 Luna",
             wallet_metered: true,
+            efforts: NO_ULTRA,
         },
         SubscriptionModel {
             id: "gpt-5.6-terra",
             label: "GPT-5.6 Terra",
             wallet_metered: true,
+            efforts: FULL,
         },
         SubscriptionModel {
             id: "gpt-5.6-pro",
             label: "GPT-5.6 Pro",
             wallet_metered: false,
+            efforts: &[],
         },
     ];
 

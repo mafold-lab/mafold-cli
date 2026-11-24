@@ -1900,22 +1900,31 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
     // content: 「必须的两步是: (1) 设置我的display name 还有头像 (2) 必须创建一个agent」,
     // "Build it"). Read at the door, with the new account's token, before
     // Continue to Mafold.
+    // For everyone (ops 11-23 「现在准备给新版onboarding开全量 … 如果没有看过
+    // onboardingModal的 都需要体验一次 … @ mafold … 退化原本的model能力 对于之前
+    // 有chat过的 都需要补充一个通知」, then 「@ mafold 不发欢迎内容」): the account's
+    // `onboarding.seen` mark (`tutorial.rs`) is what "seen" means, and the api
+    // reads the flag for @mafold's part (`brains/steward.rs`, `seed_onboarding`).
     FlagMeta {
         key: "onboardingModal",
         default: false,
         dev_default: false,
-        label: "Sign-up: onboarding modal",
-        description: "Continue to Mafold on a new account grows the door's card into a big \
-                      modal over the chat list (no loading screen in between): welcome, your \
-                      name / username / photo (required), what you use AI for, make your own AI \
-                      on Mafold Cloud (required), say hi to it, and who to start with. Finishing \
-                      tucks the card into the chat list. The old \"Welcome to Mafold / Start \
-                      first steps\" pop-up doesn't show. Off = the door goes straight to the \
-                      chat list, as before. ?onboarding opens it as a dry run on any account.",
+        label: "Onboarding modal, once per account",
+        description: "An account that has never been through the onboarding modal gets it \
+                      once: at sign-up Continue to Mafold grows the door's card into it, and \
+                      an account that was already here meets it the next time it opens the \
+                      app. Welcome, your name / username / photo (required), what you use AI \
+                      for, make your own AI on Mafold Cloud (required; left out for someone \
+                      who has one), say hi to it, and who to start with. For the same \
+                      accounts @mafold has no model: a new account gets no welcome from it, \
+                      a message to it is answered with one line and the person's own AI, and \
+                      someone who chatted with it before is told once, when the modal \
+                      closes. Off = no modal, and @mafold welcomes and answers as before. \
+                      ?onboarding opens the modal as a dry run on any account.",
         owner: "ops",
         added: "2026-11",
-        clients: &[Web],
-        server: NotRead,
+        clients: &[Web, Phone],
+        server: ClosedWithoutRecord,
     },
     // ops 11-21 「personal agent的接入体验 现在太过粗糙」 + 「知识库可以共享」:
     // an AI you already use (Muse, ChatGPT…) connects through a link and your

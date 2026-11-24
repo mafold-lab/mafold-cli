@@ -1992,16 +1992,17 @@ struct TurnConfig {
 }
 
 impl TurnConfig {
-    /// Resolve for `chat_id`, as answered to `user` (None = no particular
-    /// asker, e.g. an unprompted introduction).
+    /// Resolve for `chat_id` (and its `channel`, when the turn is in one), as
+    /// answered to `user` (None = no particular asker, e.g. an unprompted
+    /// introduction).
     ///
     /// **Stale beats empty.** One failed round-trip must not drop the owner's
     /// model and system prompt on the floor — a bot that quietly reverts to the
     /// harness defaults mid-conversation is worse than one that keeps using what
     /// it last knew. So a failure falls back to the held owner config, which is
     /// exactly the bottom rung of the ladder we were asking for.
-    async fn fetch(client: &Client, chat_id: &str, user: Option<&str>, owner: &OwnerConfig) -> Self {
-        let Ok(r) = client.resolved_config(chat_id, user).await else {
+    async fn fetch(client: &Client, chat_id: &str, channel: Option<&str>, user: Option<&str>, owner: &OwnerConfig) -> Self {
+        let Ok(r) = client.resolved_config(chat_id, channel, user).await else {
             eprintln!("note: resolveBotConfig failed — falling back to the owner defaults held here");
             return Self {
                 model: owner.model.clone(),
@@ -3979,7 +3980,7 @@ async fn intro_turn(
     // Same layering a message-driven turn gets, resolved server-side. There is
     // no triggering sender (nobody has spoken yet), so no per-user layer — and
     // no live `/model` chat-state either.
-    let cc = TurnConfig::fetch(client, chat_id, None, &oc).await;
+    let cc = TurnConfig::fetch(client, chat_id, None, None, &oc).await;
     let model = cc.model.clone();
     let thinking = cc.thinking;
     let effort = cc.effort.clone();
@@ -5899,7 +5900,7 @@ async fn connect_and_run(
             // its own opinion about which layer beats which. Live chat-state
             // (`/model`, `/think`) still wins over all of it: it belongs to the
             // turn, not to stored configuration.
-            let cc = TurnConfig::fetch(&client, &chat_id, Some(&turn_sender), &oc).await;
+            let cc = TurnConfig::fetch(&client, &chat_id, channel_id.as_deref(), Some(&turn_sender), &oc).await;
             let model = st_model.or(cc.model.clone());
             let thinking = st_thinking.or(cc.thinking);
             let effort = cc.effort.clone();
@@ -7269,7 +7270,7 @@ async fn handle_control(
         // the sheet inside a chat is that person's in that chat, and resolving
         // the room's answer instead showed — and cleared the session of — a
         // directory their replies don't run in (ops 10-31).
-        let cc = TurnConfig::fetch(client, chat_id, Some(sender), &owner).await;
+        let cc = TurnConfig::fetch(client, chat_id, channel_id, Some(sender), &owner).await;
         let surface_cwd = workdirs.lock().await.get(&base_key).cloned();
         let (dir, ns, miss) = resolve_turn_workdir(surface_cwd.as_deref(), cc.cwd.as_deref(), None, workdir);
         // A guest's `/clear` or `/compact` is of their own session (`guest_key`).

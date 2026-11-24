@@ -390,7 +390,8 @@ pub fn codex_model(wanted: Option<&str>) -> String {
 }
 
 /// [`models`] as a caps report: the Customize sheet's model menu for an agent
-/// on Codex. No tiers in the report — the Codex plan takes the model's own.
+/// on Codex, with each model's efforts so the sheet can offer the dial (the
+/// runtime already sends the one picked as `reasoning.effort`).
 pub fn probe() -> Option<HarnessProbe> {
     let models: Vec<ModelCap> = codex::SUBSCRIPTION_MODELS
         .iter()
@@ -400,7 +401,7 @@ pub fn probe() -> Option<HarnessProbe> {
             display: m.label.to_string(),
             resolved: None,
             description: None,
-            efforts: Vec::new(),
+            efforts: m.efforts.iter().map(|e| e.to_string()).collect(),
         })
         .collect();
     (!models.is_empty()).then(|| HarnessProbe { source: CapsSource::Handshake, models, ..Default::default() })
@@ -565,5 +566,16 @@ mod tests {
         assert_eq!(codex_model(None), codex::DEFAULT_MODEL);
         assert_eq!(codex_model(Some("codex/gpt-5.6-luna")), "gpt-5.6-luna");
         assert_eq!(probe().unwrap().models.len(), ids.len());
+    }
+
+    /// 11-24 ops: 「mafold harness codex的effort无法切换」 — the report carried
+    /// no efforts, so the sheet had no dial to offer.
+    #[test]
+    fn the_report_carries_each_models_efforts() {
+        let caps = probe().unwrap();
+        let sol = caps.models.iter().find(|m| m.id == "gpt-5.6-sol").unwrap();
+        assert_eq!(sol.efforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+        let luna = caps.models.iter().find(|m| m.id == "gpt-5.6-luna").unwrap();
+        assert!(luna.efforts.contains(&"xhigh".to_string()) && !luna.efforts.contains(&"ultra".to_string()));
     }
 }

@@ -5,6 +5,7 @@
 //!   mafold apps publish             # bundle + upload to Mafold
 //!   mafold apps list                # the apps you can manage
 //!   mafold apps remove <owner/slug> # take down an app (all versions)
+//!   mafold apps grant-request <user> # ask someone to let you build for them
 //!
 //! Apps are the interactive counterpart to cards: full React Native screens,
 //! launched from a chat, talking to the host through the `useApp()` bridge.
@@ -138,6 +139,27 @@ pub enum AppsCmd {
         /// App id, `owner/slug`.
         id: String,
     },
+    /// Ask someone to let you build for them — deploy sites and register or
+    /// install apps in THEIR name. Mafold posts the request card into this
+    /// conversation; once they tap Approve, `sites deploy` / `apps register`
+    /// for them go through. Already allowed ⇒ says so and posts nothing.
+    GrantRequest {
+        /// Whose namespace you want to build in (they must be in the conversation).
+        user: String,
+        /// What to ask for, comma-separated: `site.deploy`, `app.register`,
+        /// `app.install` (default: all three).
+        #[arg(long, value_delimiter = ',')]
+        scopes: Vec<String>,
+        /// How many days it lasts once approved (1–90, default 7).
+        #[arg(long)]
+        days: Option<i64>,
+        /// Why, in your own words — shown on the card.
+        #[arg(long)]
+        why: Option<String>,
+        /// The conversation to ask in (default `$MAFOLD_CONV`, this turn's).
+        #[arg(long)]
+        conv: Option<String>,
+    },
     /// Rotate a webview app's initData signing secret (old one stops working).
     RotateSecret {
         /// App id, `owner/slug`.
@@ -216,10 +238,50 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
         AppsCmd::Call { app, method, params, conv } => cmd_call(&app, &method, params, conv, base, token).await,
         AppsCmd::List => cmd_list(base, token).await,
         AppsCmd::Remove { id } => cmd_remove(&id, base, token).await,
+        AppsCmd::GrantRequest { user, scopes, days, why, conv } => {
+            cmd_grant_request(&user, scopes, days, why, conv, base, token).await
+        }
         AppsCmd::RotateSecret { id } => cmd_rotate_secret(&id, base, token).await,
         AppsCmd::Sites => cmd_sites(base, token).await,
         AppsCmd::RemoveSite { site } => cmd_remove_site(&site, base, token).await,
     }
+}
+
+/// `mafold apps grant-request <user>`: `requestBuilderGrant`, which posts the
+/// card the person approves. The only way to that card — one written into a
+/// reply by hand is not a request and its Approve grants nothing.
+async fn cmd_grant_request(
+    user: &str,
+    scopes: Vec<String>,
+    days: Option<i64>,
+    why: Option<String>,
+    conv: Option<String>,
+    base: String,
+    token: Option<String>,
+) -> Result<()> {
+    let token = token.context("grant-request needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let user = user.trim().trim_start_matches('@');
+    let conv = conv
+        .or_else(|| std::env::var("MAFOLD_CONV").ok())
+        .filter(|c| !c.trim().is_empty())
+        .context("the request is a card in a conversation they are in — pass --conv")?;
+    let client = Client::new(base, token);
+    let r = client
+        .call(
+            "requestBuilderGrant",
+            json!({
+                "user": user, "conversation_id": conv,
+                "scopes": (!scopes.is_empty()).then_some(scopes),
+                "ttl_days": days, "why": why,
+            }),
+        )
+        .await?;
+    if r["granted"].as_bool() == Some(true) {
+        println!("✓ @{user} already lets you build for them — go ahead");
+    } else {
+        println!("✓ asked @{user} — the card is in the chat; once they tap Approve, run the command again");
+    }
+    Ok(())
 }
 
 async fn cmd_rotate_secret(id: &str, base: String, token: Option<String>) -> Result<()> {

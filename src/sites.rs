@@ -23,7 +23,7 @@ pub enum SitesCmd {
         /// The site to update (yours).
         #[arg(long)]
         site: Option<String>,
-        /// Naming hint for a new site.
+        /// A new site's name, which is its address (<name>.mafold.app).
         #[arg(long)]
         name: Option<String>,
     },
