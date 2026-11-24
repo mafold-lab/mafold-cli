@@ -273,10 +273,11 @@ fn pick_model(wanted: Option<&str>, models: &[String]) -> std::result::Result<St
 }
 
 /// Go's models ([`go_models`]) as a caps report: the Customize sheet's model
-/// menu, drawn by the server from the models this loop can talk to on Go. No
-/// tiers: Go passes none, so the sheet offers none. `None` when the list came
-/// back empty — a list that failed has learned nothing, and must not empty a
-/// menu.
+/// menu, drawn by the server from the models this loop can talk to on Go, each
+/// with the effort tiers the catalogue says it takes — the loop sends the one
+/// picked as `reasoning_effort` (tplog 11-24: DeepSeek on Go thought too long
+/// and had no dial). `None` when the list came back empty — a list that failed
+/// has learned nothing, and must not empty a menu.
 fn go_probe(models: Vec<Value>) -> Option<HarnessProbe> {
     let models: Vec<ModelCap> = models
         .iter()
@@ -289,7 +290,13 @@ fn go_probe(models: Vec<Value>) -> Option<HarnessProbe> {
                 id,
                 resolved: None,
                 description: None,
-                efforts: Vec::new(),
+                efforts: m["efforts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
             })
         })
         .collect();
@@ -819,7 +826,7 @@ async fn fetch_go_models() -> Option<Vec<Value>> {
 
 /// A provider's models from the catalogue that speak chat completions at the
 /// provider's own door — those with no other door of their own, or one of the
-/// same kind — as `{id, name}`, by id.
+/// same kind — as `{id, name, efforts}`, by id.
 fn chat_models(provider: &Value) -> Vec<Value> {
     let Some(models) = provider["models"].as_object() else { return Vec::new() };
     models
@@ -829,7 +836,7 @@ fn chat_models(provider: &Value) -> Vec<Value> {
                 && m["status"].as_str() != Some("deprecated")
                 && matches!(m["provider"]["npm"].as_str(), None | Some("@ai-sdk/openai-compatible"))
         })
-        .map(|(id, m)| json!({ "id": id, "name": m["name"].as_str().unwrap_or(id) }))
+        .map(|(id, m)| json!({ "id": id, "name": m["name"].as_str().unwrap_or(id), "efforts": mafold_harness::catalogue_efforts(m) }))
         .collect()
 }
 
@@ -1618,11 +1625,15 @@ sys.stdin.read()
         let go = json!({ "models": {
             "kimi-k2.7-code": { "name": "Kimi K2.7 Code", "tool_call": true },
             "minimax-m3": { "name": "MiniMax M3", "provider": { "npm": "@ai-sdk/anthropic" } },
-            "glm-5.3": { "name": "GLM 5.3", "provider": { "npm": "@ai-sdk/openai-compatible" } },
+            "glm-5.3": { "name": "GLM 5.3", "provider": { "npm": "@ai-sdk/openai-compatible" },
+                         "reasoning_options": [{ "type": "effort", "values": ["low", "high", "max"] }] },
             "no-tools": { "name": "No tools", "tool_call": false }
         }});
-        let ids: Vec<String> = chat_models(&go).iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
+        let got = chat_models(&go);
+        let ids: Vec<String> = got.iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
         assert_eq!(ids, ["glm-5.3", "kimi-k2.7-code"]);
+        assert_eq!(got[0]["efforts"], json!(["low", "high", "max"]));
+        assert_eq!(got[1]["efforts"], json!([]));
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -1727,22 +1738,25 @@ sys.stdin.read()
     }
 
     /// The model menu of an agent on Go is Go's models, by Go's own names,
-    /// with no tiers — and a list that came back empty reports nothing rather
-    /// than an empty menu.
+    /// each with the tiers the catalogue gave it — and a list that came back
+    /// empty reports nothing rather than an empty menu.
     #[test]
     fn go_models_become_the_agents_model_menu() {
         let p = go_probe(vec![
             json!({ "id": "kimi-k2.7-code", "name": "Kimi K2.7 Code" }),
-            json!({ "id": "glm-5.3", "name": "GLM-5.3" }),
+            json!({ "id": "glm-5.3", "name": "GLM-5.3", "efforts": [] }),
+            json!({ "id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash", "efforts": ["low", "high", "max"] }),
             json!({ "name": "no id" }),
         ])
         .expect("two models");
         assert_eq!(p.source, CapsSource::Handshake);
-        assert_eq!(p.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["kimi-k2.7-code", "glm-5.3"]);
+        assert_eq!(p.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["kimi-k2.7-code", "glm-5.3", "deepseek-v4.1-flash"]);
         assert_eq!(p.models[0].display, "Kimi K2.7 Code");
         assert_eq!(p.models[0].aliases, ["opencode-go/kimi-k2.7-code"]);
-        assert!(p.models.iter().all(|m| m.efforts.is_empty()) && p.efforts.is_empty() && p.modes.is_empty());
-        // What the server reads off it: a model menu, and nothing about tiers.
+        assert!(p.models[0].efforts.is_empty() && p.models[1].efforts.is_empty());
+        assert_eq!(p.models[2].efforts, ["low", "high", "max"]);
+        assert!(p.efforts.is_empty() && p.modes.is_empty());
+        // What the server reads off it: a model menu, and each model's dial.
         let caps = mafold_core::mafold_types::HarnessCaps {
             harness: mafold_core::mafold_types::agent_setup::MAFOLD_HARNESS.into(),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -1755,7 +1769,7 @@ sys.stdin.read()
             efforts: p.efforts,
             modes: p.modes,
         };
-        assert!(caps.tells_models() && !caps.tells_efforts());
+        assert!(caps.tells_models() && caps.tells_efforts());
         assert!(go_probe(Vec::new()).is_none());
     }
 }

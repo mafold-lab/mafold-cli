@@ -258,6 +258,29 @@ pub fn default_reasoning_effort(model: &str) -> &'static str {
     }
 }
 
+/// The effort tiers a models.dev row says its model takes, as listed
+/// (`reasoning_options: [{"type": "effort", "values": ["low", "high", "max"]}]`).
+/// The `reasoning_effort` field [`OpenAiCompatRuntime`] sends carries one of
+/// these words. Empty when the row lists none — a model that only toggles its
+/// thinking, or takes a token budget, has no tier to offer.
+pub fn catalogue_efforts(row: &Value) -> Vec<String> {
+    row["reasoning_options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["type"] == "effort")
+        .flat_map(|o| o["values"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .fold(Vec::new(), |mut out, e| {
+            if !out.iter().any(|o: &String| o == e) {
+                out.push(e.to_string());
+            }
+            out
+        })
+}
+
 /// The effort a request on `model` asks for, given what the profile carries.
 pub(crate) fn effort_for(configured: Option<&str>, model: &str) -> Option<String> {
     configured.map(|e| {
@@ -1020,6 +1043,16 @@ impl OpenAiCompatRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A models.dev row's effort tiers, in its order, once each — and none
+    /// from a row that only toggles thinking or takes a budget.
+    #[test]
+    fn a_catalogue_row_names_its_effort_tiers() {
+        let row = json!({ "reasoning_options": [{ "type": "toggle" }, { "type": "effort", "values": ["low", "high", "max", "high"] }] });
+        assert_eq!(catalogue_efforts(&row), ["low", "high", "max"]);
+        assert!(catalogue_efforts(&json!({ "reasoning_options": [{ "type": "toggle" }, { "type": "budget_tokens", "max": 1024 }] })).is_empty());
+        assert!(catalogue_efforts(&json!({ "reasoning": true })).is_empty());
+    }
 
     /// 没人选档位时按型号给:4.6 系(Sonnet/Opus)low,其余 high。按 id
     /// 机械地读,带日期后缀的老 id 也认得;一个真档位永远压过 `auto`。

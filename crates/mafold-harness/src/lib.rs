@@ -27,6 +27,6 @@ pub use fields::{FieldOption, FieldSpec};
 pub use kernel::{Bill, Frame, Live, Settle, TokenUsage, Tools, Turn};
 pub use plugin::{HarnessPlugin, PersonaPlugin, Prepared, ToolSpec, TurnCtx};
 pub use runtime::{
-    default_reasoning_effort, unrunnable_call, ChatEvent, ModelRuntime, OpenAiCompatRuntime, ToolCall,
+    catalogue_efforts, default_reasoning_effort, unrunnable_call, ChatEvent, ModelRuntime, OpenAiCompatRuntime, ToolCall,
     TurnMsg, EFFORT_BY_MODEL, NO_VISIBLE_OUTPUT, OUTPUT_CAP_NO_ANSWER,
 };

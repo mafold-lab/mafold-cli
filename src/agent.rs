@@ -10121,10 +10121,23 @@ async fn handle(
     let requested_effort = effort.clone();
     // On Claude Code the tiers are Claude Code's: it is what runs the step.
     let tiers_from = if claude_fuel { crate::harness::select("claude-code") } else { harness.clone() };
+    // Mafold Harness's own answer is OpenCode Go's models: it holds a turn on
+    // Go and no other. On the wallet, a key or Codex the tiers are the
+    // server's menu (the router's, the key's, Codex's catalogue), and the
+    // step's API answers for itself.
+    let judged_here = harness.id() != crate::harness::MAFOLD_HARNESS || claude_fuel || {
+        let fuel = match OWNER_CONFIG.get() {
+            Some(c) => c.read().await.fuel.clone(),
+            None => None,
+        };
+        crate::fuel::is_go(fuel.as_deref())
+    };
     // `mut`: a wallet reply whose key the server refuses (below) ends the
     // same way, once its draft exists.
     let (effort, effort_note, mut refused) = if no_usable_account || wallet_refused.is_some() {
         (effort, None, wallet_refused)
+    } else if !judged_here {
+        (effort, None, None)
     } else { effort_verdict(
         client,
         &tiers_from,
