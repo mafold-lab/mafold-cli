@@ -379,6 +379,11 @@ async fn local_current(path: &Path, endpoint: &str) -> Result<CodexAuth, String>
 /// Codex refused `refused`: the file's login when `codex` already renewed it,
 /// else a renewal spent here and written back.
 async fn local_renew(path: &Path, refused: &str, endpoint: &str) -> Result<CodexAuth, String> {
+    // One renewal at a time on this computer: the daemon (the catalog read)
+    // and each turn renew the same file, and a refresh token spends once —
+    // the second to spend it would be refused. Whoever waited reads the
+    // login the first one wrote back, below.
+    let _turn = renew_lock().await;
     let Some((mut file, auth)) = read_local(path)? else {
         return Err("Codex isn't signed in on this computer any more — sign in again, or connect Codex in Settings ▸ Connections.".into());
     };
@@ -399,6 +404,25 @@ async fn local_renew(path: &Path, refused: &str, endpoint: &str) -> Result<Codex
     file["last_refresh"] = json!(now_rfc3339());
     write_back(path, &file).map_err(|e| format!("couldn't save the renewed Codex login ({}): {e}", path.display()))?;
     read_local(path)?.map(|(_, a)| a).ok_or_else(|| "the renewed Codex login didn't keep".into())
+}
+
+/// Held while this computer renews its Codex login: an OS lock on a file of
+/// Mafold's own (never one in Codex's folder), so it holds across the daemon
+/// and its turns. `None` where it can't be taken: the renewal runs as it did
+/// before the lock.
+async fn renew_lock() -> Option<std::fs::File> {
+    let lock = catalog_path().with_file_name("codex-renew.lock");
+    tokio::task::spawn_blocking(move || {
+        if let Some(dir) = lock.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock).ok()?;
+        file.lock().ok()?;
+        Some(file)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Spend `refresh` at Codex's token endpoint, the way `codex` does. A refused
@@ -513,13 +537,24 @@ fn catalog_path() -> PathBuf {
         .join("codex-models.json")
 }
 
-/// The catalog as last read here, else the roster.
+/// The catalog as last read here, else the roster. Codex picks the models
+/// by the client version that asks, so a read made as another version isn't
+/// this one's: one kept as a bare list predates the version being kept
+/// (ops 11-24: cli 0.9.173 asked as Codex 0.146 and got only GPT-5.6).
 fn known() -> Vec<CodexModel> {
     std::fs::read(catalog_path())
         .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<CodexModel>>(&b).ok())
-        .filter(|m| !m.is_empty())
+        .and_then(|b| serde_json::from_slice::<KeptCatalog>(&b).ok())
+        .filter(|k| k.client_version == codex::CLIENT_VERSION && !k.models.is_empty())
+        .map(|k| k.models)
         .unwrap_or_else(roster)
+}
+
+/// The catalog as kept here, with the Codex version it was asked as.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeptCatalog {
+    client_version: String,
+    models: Vec<CodexModel>,
 }
 
 fn keep(models: &[CodexModel]) {
@@ -527,7 +562,8 @@ fn keep(models: &[CodexModel]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(bytes) = serde_json::to_vec(models) {
+    let kept = KeptCatalog { client_version: codex::CLIENT_VERSION.to_string(), models: models.to_vec() };
+    if let Ok(bytes) = serde_json::to_vec(&kept) {
         let _ = std::fs::write(&path, bytes);
     }
 }
@@ -562,11 +598,16 @@ pub fn refresh_if_stale() {
 
 /// The login the catalog is read with: the one a turn would run on — the
 /// owner's Codex connection, else this computer's own login (with no owner
-/// known yet, this computer's own) — as it is stored, never renewed. A
-/// renewal spends the refresh token, and a reply renewing at that moment
-/// would then be refused (ops 11-24: tester4's first reply failed so). A
-/// login at or near expiry is `None`: the menu keeps the last read, and the
-/// next reply renews it.
+/// known yet, this computer's own).
+///
+/// The connection as it is stored, never renewed: a renewal spends its
+/// refresh token, and a reply on another device renewing at that moment
+/// would then be refused (ops 11-24: tester4's first reply failed so); at or
+/// near expiry it is `None`, and the next reply renews it. This computer's
+/// own login is renewed as a turn renews it, one renewal at a time here
+/// ([`renew_lock`]): left as it was, a login nothing here had used for a
+/// while kept the menu on its last read for good (ops 11-24, tester5: only
+/// GPT-5.6, from a read made as an older Codex).
 async fn catalog_login(base: &str, owner: Option<&str>) -> Option<CodexAuth> {
     // No connection this computer can open: a turn runs on the computer's
     // own login then, and so does the read.
@@ -576,8 +617,13 @@ async fn catalog_login(base: &str, owner: Option<&str>) -> Option<CodexAuth> {
             return connection_auth(&opened).ok().filter(|a| !expiring(&a.access_token));
         }
     }
-    let (_, auth) = read_local(&auth_path()).ok().flatten()?;
-    (!expiring(&auth.access_token)).then_some(auth)
+    match local_current(&auth_path(), codex::TOKEN_ENDPOINT).await {
+        Ok(auth) => Some(auth),
+        Err(why) => {
+            println!("⚠️ Codex's model list couldn't be read with this computer's Codex login ({why}); the menu keeps the last one known here");
+            None
+        }
+    }
 }
 
 /// The model a turn runs: the one it was given (with or without a `codex/`
@@ -744,6 +790,19 @@ mod tests {
         }
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().flatten().filter(|e| e.file_name() != "auth.json").collect();
         assert!(leftovers.is_empty(), "no temp file left behind");
+    }
+
+    /// Two renewals at once here (the catalog read and a turn): one spends
+    /// the refresh token, the other takes what it wrote back. The stand-in
+    /// endpoint answers once; a second spend would find nobody there.
+    #[tokio::test]
+    async fn two_renewals_at_once_spend_the_refresh_token_once() {
+        let path = home("twice");
+        let old = jwt(json!({ "exp": now() + 60 }));
+        std::fs::write(&path, json!({ "tokens": { "access_token": old, "refresh_token": "rt-fake", "account_id": "a" } }).to_string()).unwrap();
+        let (url, _) = token_endpoint("200 OK", r#"{"access_token":"at-fake-new","refresh_token":"rt-fake-new"}"#).await;
+        let (a, b) = tokio::join!(local_renew(&path, &old, &url), local_renew(&path, &old, &url));
+        assert_eq!((a.unwrap().access_token, b.unwrap().access_token), ("at-fake-new".to_string(), "at-fake-new".to_string()));
     }
 
     /// `codex` renewed it already: that one, and nothing spent.
