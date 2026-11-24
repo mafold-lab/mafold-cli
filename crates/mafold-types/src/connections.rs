@@ -349,8 +349,11 @@ pub mod codex {
     /// Track the shipping Codex CLI. Falling several releases behind moves
     /// every call into the first-to-shed bucket under load (HTTP 200 +
     /// in-stream `server_is_overloaded`), which reads as flakiness rather than
-    /// as this line.
-    pub const CLIENT_VERSION: &str = "0.146.0";
+    /// as this line. It also decides the model list: the catalog answers
+    /// each version with the models that version runs (ops 11-24: computers
+    /// on Codex 0.145 listed GPT-5.6 only, 0.153 added GPT-6, 0.164 GPT-6.1,
+    /// 0.171 GPT-6.2), so a version behind is a menu behind.
+    pub const CLIENT_VERSION: &str = "0.171.0";
 
     /// The Codex CLI's User-Agent for this machine's OS and arch.
     pub fn user_agent() -> String {

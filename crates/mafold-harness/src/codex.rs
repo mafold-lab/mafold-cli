@@ -84,7 +84,7 @@ pub fn billable_chars(body: &Value) -> usize {
         n += t.to_string().len();
     }
     for item in body.get("input").and_then(Value::as_array).into_iter().flatten() {
-        match item.get("content").and_then(Value::as_array) {
+        match item.get("content").or_else(|| item.get("output")).and_then(Value::as_array) {
             Some(parts) => {
                 for p in parts {
                     match p.get("type").and_then(Value::as_str) {
@@ -201,10 +201,18 @@ pub fn build_request_from_chat(model: &str, messages: &[Value], tools: Option<&V
                 }
             }
             "tool" => {
+                // A tool that handed back a picture (`Read` on a photo) keeps
+                // it: `output` may be content parts, the same `input_image`
+                // the official client sends for its own `view_image`. Text
+                // alone stays the plain string it always was.
+                let pictured = raw
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p.get("type").and_then(Value::as_str) == Some("image_url")));
+                let output = if pictured { json!(content_parts(raw, "input_text")) } else { json!(text_of(raw)) };
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("")),
-                    "output": text_of(raw),
+                    "output": output,
                 }));
             }
             _ => {}
@@ -833,6 +841,34 @@ mod tests {
         assert!(billable < 10_000, "an image must count as a flat allowance, not its base64 length: {billable}");
         // …and the text still counts as text.
         assert!(billable > "who is this?".len());
+    }
+
+    /// A tool that handed back a picture (`Read` on a photo) keeps it on the
+    /// way out — before, `function_call_output` was the text parts alone, so
+    /// the model was told "<image …>" and shown nothing — and the picture
+    /// counts as the flat allowance, not its base64.
+    #[test]
+    fn a_picture_a_tool_handed_back_reaches_the_model() {
+        let big = format!("data:image/png;base64,{}", "A".repeat(1_400_000));
+        let messages = vec![
+            json!({ "role": "user", "content": "look at it" }),
+            json!({ "role": "assistant", "content": "", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "Read", "arguments": "{}" } }] }),
+            json!({ "role": "tool", "tool_call_id": "c1", "content": [
+                { "type": "text", "text": "<image name=\"a.png\">" },
+                { "type": "image_url", "image_url": { "url": big } },
+                { "type": "text", "text": "</image>" },
+            ]}),
+            json!({ "role": "tool", "tool_call_id": "c2", "content": "plain words" }),
+        ];
+        let body = build_request_from_chat("gpt-5.6-sol", &messages, None);
+        let items = body["input"].as_array().unwrap();
+        let output = |id: &str| items.iter().find(|i| i["type"] == "function_call_output" && i["call_id"] == id).unwrap()["output"].clone();
+        let out = output("c1");
+        assert_eq!(out[1]["type"], "input_image");
+        assert_eq!(out[1]["image_url"], json!(big));
+        assert_eq!(out[0], json!({ "type": "input_text", "text": "<image name=\"a.png\">" }));
+        assert_eq!(output("c2"), "plain words", "text stays a string");
+        assert!(billable_chars(&body) < 10_000, "{}", billable_chars(&body));
     }
 
     /// The kernel's chat transcript → the endpoint's items: system rides as

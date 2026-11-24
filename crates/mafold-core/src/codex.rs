@@ -173,6 +173,21 @@ impl Opened {
         Ok(Self { name: name.to_string(), conn, spec, payload })
     }
 
+    /// The connection called `name` as it is stored, never renewed — for a
+    /// read that can wait, like the model menu. A renewal spends the refresh
+    /// token, and a reply renewing the same row at that moment would then be
+    /// refused (ops 11-24, tester4's first reply). `None` when the login is at
+    /// or near expiry: the next reply renews it, and the read after that runs.
+    pub async fn peek(rt: &Runtime, name: &str) -> Result<Option<Self>, String> {
+        let conn = rt.get(name).await?;
+        let spec = rt.descriptor_of(&conn).await?;
+        let payload = rt.open_payload(&conn)?;
+        if crate::connections::needs_renewal(&payload) {
+            return Ok(None);
+        }
+        Ok(Some(Self { name: name.to_string(), conn, spec, payload }))
+    }
+
     fn field(&self, k: &str) -> &str {
         self.payload.get(k).and_then(Value::as_str).unwrap_or("")
     }

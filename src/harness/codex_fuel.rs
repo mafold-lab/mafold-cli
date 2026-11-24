@@ -7,13 +7,17 @@
 //! its shell and patch tools can't be reliably switched off, and the harness
 //! brings its own.
 //!
-//! Which login, in this order ([`open`]):
-//! - **Connections first** — the owner's newest Codex connection, opened from
-//!   their vault on this computer and renewed by mafold-core
-//!   (`codex::Opened`), the renewed grant written back for every device.
-//! - **Else this computer's own Codex login** — `$CODEX_HOME/auth.json`
+//! Which login: the one the owner picked in Sign in with ([`Pick`], ops 11-24
+//! 「我选的是local login的 … 没有任何connection应该涉足的可能」), and no other:
+//! - **This computer's own Codex login** — `$CODEX_HOME/auth.json`
 //!   (`~/.codex`), renewed here when it runs out and written back in Codex's
 //!   own format, so `codex` itself carries on with the new one.
+//! - **Their Codex connection** — the owner's newest Codex connection, opened
+//!   from their vault on this computer and renewed by mafold-core
+//!   (`codex::Opened`), the renewed grant written back for every device.
+//!
+//! An agent picked before the pick was kept runs the connection, else this
+//! computer's own login, as it did then ([`Pick::Either`]).
 //!
 //! The daemon's fuel step (`fuel::codex_step`) opens it and hands it over in
 //! the turn's env alone ([`Source::env`]), masked out of everything the turn
@@ -48,17 +52,44 @@ const CONNECTION_ENV: &str = "MAFOLD_CODEX_CONNECTION";
 const OWNER_ENV: &str = "MAFOLD_CODEX_OWNER";
 const BASE_ENV: &str = "MAFOLD_CODEX_BASE";
 const AUTH_ENV: &str = "MAFOLD_CODEX_AUTH";
+/// Set on a connection that may give way to this computer's own login
+/// ([`Pick::Either`]); a connection picked as such never does.
+const GIVE_WAY_ENV: &str = "MAFOLD_CODEX_GIVE_WAY";
 
 /// How long before its expiry a local access token is renewed instead of sent.
 const RENEW_MARGIN_SECS: i64 = 5 * 60;
 
 // ── where the login comes from ──────────────────────────────────────────────
 
+/// Which Codex login the owner picked (`getBot`'s `fuel_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    /// This computer's own Codex login, and never a connection.
+    Local,
+    /// Their Codex connection, and never this computer's login.
+    Connection,
+    /// Picked before the pick was kept: the connection, else this computer's.
+    Either,
+}
+
+impl Pick {
+    pub fn of(from: Option<&str>) -> Self {
+        use mafold_core::mafold_types::agent_setup::{FROM_CONNECTION, FROM_LOCAL};
+        match from.map(str::trim) {
+            Some(FROM_LOCAL) => Pick::Local,
+            Some(FROM_CONNECTION) => Pick::Connection,
+            _ => Pick::Either,
+        }
+    }
+}
+
 /// Where a turn's Codex login lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// The owner's Codex connection `name`, listed on `base` (the api origin).
-    Connection { base: String, owner: String, name: String },
+    /// `give_way`: when it can't be renewed, this computer's own login runs
+    /// instead — only for an agent that didn't pick ([`Pick::Either`]).
+    Connection { base: String, owner: String, name: String, give_way: bool },
     /// This computer's own Codex login, at `auth`.
     Local { auth: PathBuf },
 }
@@ -71,12 +102,17 @@ impl Source {
             (ACCOUNT_ENV.to_string(), auth.account_id.clone()),
         ];
         match self {
-            Source::Connection { base, owner, name } => env.extend([
-                (FROM_ENV.to_string(), "connection".to_string()),
-                (CONNECTION_ENV.to_string(), name.clone()),
-                (OWNER_ENV.to_string(), owner.clone()),
-                (BASE_ENV.to_string(), base.clone()),
-            ]),
+            Source::Connection { base, owner, name, give_way } => {
+                env.extend([
+                    (FROM_ENV.to_string(), "connection".to_string()),
+                    (CONNECTION_ENV.to_string(), name.clone()),
+                    (OWNER_ENV.to_string(), owner.clone()),
+                    (BASE_ENV.to_string(), base.clone()),
+                ]);
+                if *give_way {
+                    env.push((GIVE_WAY_ENV.to_string(), "1".to_string()));
+                }
+            }
             Source::Local { auth } => env.extend([
                 (FROM_ENV.to_string(), "local".to_string()),
                 (AUTH_ENV.to_string(), auth.display().to_string()),
@@ -90,7 +126,12 @@ impl Source {
         let get = |k: &str| env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty());
         let auth = CodexAuth { access_token: get(TOKEN_ENV)?, account_id: get(ACCOUNT_ENV)? };
         let source = match get(FROM_ENV)?.as_str() {
-            "connection" => Source::Connection { base: get(BASE_ENV)?, owner: get(OWNER_ENV)?, name: get(CONNECTION_ENV)? },
+            "connection" => Source::Connection {
+                base: get(BASE_ENV)?,
+                owner: get(OWNER_ENV)?,
+                name: get(CONNECTION_ENV)?,
+                give_way: get(GIVE_WAY_ENV).as_deref() == Some("1"),
+            },
             "local" => Source::Local { auth: PathBuf::from(get(AUTH_ENV)?) },
             _ => return None,
         };
@@ -98,30 +139,55 @@ impl Source {
     }
 }
 
-/// The turn's Codex login, opened: the owner's Codex connection when they
-/// have one this computer can open, else this computer's own Codex login.
-/// `Err` is the turn's error, in the words the reply ends with.
-pub async fn open(base: &str, owner: &str) -> Result<(Source, CodexAuth), String> {
-    let issue = match open_connection(base, owner).await {
+/// The turn's Codex login, opened: the one `pick` names and no other — this
+/// computer's own Codex login, or the owner's Codex connection. An agent that
+/// didn't pick ([`Pick::Either`]) runs the connection when this computer can
+/// open it and it isn't known dead, else this computer's own login. `Err` is
+/// the turn's error, in the words the reply ends with.
+pub async fn open(base: &str, owner: &str, pick: Pick) -> Result<(Source, CodexAuth), String> {
+    if pick == Pick::Local {
+        return open_local().await?.ok_or_else(|| {
+            "This agent runs on this computer's own Codex login, and Codex isn't signed in here. Sign in to Codex on \
+             this computer, then send this again."
+                .to_string()
+        });
+    }
+    let issue = match open_connection(base, owner, pick == Pick::Either).await {
         Ok(opened) => return Ok(opened),
         Err(issue) => issue,
     };
+    if pick == Pick::Connection {
+        return Err(no_login(owner, issue, false));
+    }
+    open_local().await?.ok_or_else(|| no_login(owner, issue, true))
+}
+
+/// This computer's own Codex login, renewed if it is about to run out;
+/// `None` when Codex isn't signed in here.
+async fn open_local() -> Result<Option<(Source, CodexAuth)>, String> {
     let auth = auth_path();
     match read_local(&auth) {
         Ok(Some(_)) => {
             let login = local_current(&auth, codex::TOKEN_ENDPOINT).await?;
-            Ok((Source::Local { auth }, login))
+            Ok(Some((Source::Local { auth }, login)))
         }
-        Ok(None) => Err(no_login(owner, issue)),
+        Ok(None) => Ok(None),
         Err(why) => Err(format!("Couldn't read the Codex login on this computer ({}): {why}", auth.display())),
     }
 }
 
-async fn open_connection(base: &str, owner: &str) -> Result<(Source, CodexAuth), OwnerKeyIssue> {
-    let (rt, name) = crate::connection::open_owner_login(base, owner, PROVIDER).await?;
+async fn open_connection(base: &str, owner: &str, give_way: bool) -> Result<(Source, CodexAuth), OwnerKeyIssue> {
+    let (rt, name, relink) = crate::connection::open_owner_login(base, owner, PROVIDER).await?;
+    // Its grant is known dead (a renewal was refused and the row marked):
+    // every reply would be refused and fail the same way, while the Codex
+    // login this computer keeps alive runs (ops 11-24: tester4, signed in
+    // with the Mac's own login, failed on a spent connection every time).
+    if relink {
+        return Err(OwnerKeyIssue::Failed("it needs reconnecting in Settings ▸ Connections".into()));
+    }
     let opened = mafold_core::codex::Opened::open(&rt, &name).await.map_err(OwnerKeyIssue::Failed)?;
     let auth = connection_auth(&opened).map_err(OwnerKeyIssue::Failed)?;
-    Ok((Source::Connection { base: base.to_string(), owner: owner.to_string(), name }, auth))
+    Ok((Source::Connection { base: base.to_string(), owner: owner.to_string(), name, give_way }, auth))
 }
 
 fn connection_auth(opened: &mafold_core::codex::Opened) -> Result<CodexAuth, String> {
@@ -133,9 +199,27 @@ fn connection_auth(opened: &mafold_core::codex::Opened) -> Result<CodexAuth, Str
 }
 
 /// What a reply ends with when there was no Codex login to run on: why the
-/// connection didn't open, and that this computer has none of its own either.
-fn no_login(owner: &str, issue: OwnerKeyIssue) -> String {
+/// connection didn't open, and — `here_too`, for an agent that would have run
+/// this computer's own login instead — that this computer has none either.
+fn no_login(owner: &str, issue: OwnerKeyIssue, here_too: bool) -> String {
     use OwnerKeyIssue as I;
+    if !here_too {
+        return match issue {
+            I::None => "This agent runs on your Codex connection, and there's none yet: connect Codex in Settings ▸ \
+                        Connections, then send this again."
+                .into(),
+            I::NotHere => format!(
+                "This agent runs on @{owner}'s Codex connection, which opens only on a computer where @{owner} is \
+                 signed in to Mafold, and this isn't one."
+            ),
+            I::NoVaultKey => "Your Codex connection is in your Connections, but this computer hasn't been handed the \
+                              key that opens them yet. Open Settings ▸ Connections on a device that already has it \
+                              (the web, or your phone) and it passes the key to this computer by itself, then send \
+                              this again."
+                .into(),
+            I::Failed(why) => format!("Couldn't open your Codex connection on this computer ({why})."),
+        };
+    }
     let neither = "and Codex isn't signed in on this computer either";
     match issue {
         I::None => "No Codex login yet: connect Codex in Settings ▸ Connections (or sign in to Codex on this computer), \
@@ -159,7 +243,7 @@ fn no_login(owner: &str, issue: OwnerKeyIssue) -> String {
 /// The login a turn's model steps send, renewed where it lives when Codex
 /// refuses it. Every token it holds stays masked until the turn ends.
 pub struct CodexFuel {
-    source: Source,
+    source: Mutex<Source>,
     current: Mutex<CodexAuth>,
     masked: Mutex<Vec<crate::conceal::LiveSecret>>,
     token_endpoint: String,
@@ -169,7 +253,7 @@ impl CodexFuel {
     /// The login the daemon handed this turn, or `None` without one.
     pub fn from_env(env: &[(String, String)]) -> Option<Self> {
         let (source, auth) = Source::from_env(env)?;
-        Some(Self { source, current: Mutex::new(auth), masked: Mutex::new(Vec::new()), token_endpoint: codex::TOKEN_ENDPOINT.to_string() })
+        Some(Self { source: Mutex::new(source), current: Mutex::new(auth), masked: Mutex::new(Vec::new()), token_endpoint: codex::TOKEN_ENDPOINT.to_string() })
     }
 
     fn take(&self, auth: CodexAuth) -> CodexAuth {
@@ -185,31 +269,53 @@ impl CodexCredentials for CodexFuel {
         let held = self.current.lock().unwrap().clone();
         // A local token can run out mid-conversation: renewed before a step
         // is sent on it, as `codex` itself would.
-        if let Source::Local { auth } = &self.source {
+        let source = self.source.lock().unwrap().clone();
+        if let Source::Local { auth } = source {
             if expiring(&held.access_token) {
-                return local_current(auth, &self.token_endpoint).await.map(|a| self.take(a));
+                return local_current(&auth, &self.token_endpoint).await.map(|a| self.take(a));
             }
         }
         Ok(held)
     }
 
     async fn renew(&self, refused: &CodexAuth) -> Result<CodexAuth, String> {
-        let fresh = match &self.source {
-            Source::Connection { base, owner, name } => {
-                let (rt, _) = crate::connection::open_owner_login(base, owner, PROVIDER)
-                    .await
-                    .map_err(|issue| no_login(owner, issue))?;
-                let mut opened = mafold_core::codex::Opened::open(&rt, name).await?;
-                // Another device may have renewed it already: that one, as it is.
-                if opened.access_token() == refused.access_token {
-                    opened.renew(&rt).await?;
+        let source = self.source.lock().unwrap().clone();
+        let fresh = match source {
+            Source::Connection { base, owner, name, give_way } => match renew_connection(&base, &owner, &name, refused).await {
+                Ok(fresh) => fresh,
+                // Picked as the connection: it fails as itself, never on
+                // another login.
+                Err(why) if !give_way => return Err(why),
+                // The connection's grant is dead, on an agent that didn't
+                // pick: this computer's own Codex login, when it has one,
+                // rather than a failed reply — the same order `open` takes.
+                // Said where the daemon logs it.
+                Err(why) => {
+                    let auth = auth_path();
+                    if !matches!(read_local(&auth), Ok(Some(_))) {
+                        return Err(why);
+                    }
+                    let login = local_current(&auth, &self.token_endpoint).await.map_err(|_| why.clone())?;
+                    println!("🔑 Codex: @{owner}'s connection couldn't be renewed ({why}); this computer's Codex login runs this reply");
+                    *self.source.lock().unwrap() = Source::Local { auth };
+                    login
                 }
-                connection_auth(&opened)?
-            }
-            Source::Local { auth } => local_renew(auth, &refused.access_token, &self.token_endpoint).await?,
+            },
+            Source::Local { auth } => local_renew(&auth, &refused.access_token, &self.token_endpoint).await?,
         };
         Ok(self.take(fresh))
     }
+}
+
+/// The owner's connection renewed where it lives — or, when another device
+/// renewed it already, that login as it is.
+async fn renew_connection(base: &str, owner: &str, name: &str, refused: &CodexAuth) -> Result<CodexAuth, String> {
+    let (rt, _, _) = crate::connection::open_owner_login(base, owner, PROVIDER).await.map_err(|issue| no_login(owner, issue, false))?;
+    let mut opened = mafold_core::codex::Opened::open(&rt, name).await?;
+    if opened.access_token() == refused.access_token {
+        opened.renew(&rt).await?;
+    }
+    connection_auth(&opened)
 }
 
 // ── this computer's own Codex login ─────────────────────────────────────────
@@ -455,17 +561,23 @@ pub fn refresh_if_stale() {
 }
 
 /// The login the catalog is read with: the one a turn would run on — the
-/// owner's Codex connection, else this computer's own login. With no owner
-/// known yet, this computer's own.
+/// owner's Codex connection, else this computer's own login (with no owner
+/// known yet, this computer's own) — as it is stored, never renewed. A
+/// renewal spends the refresh token, and a reply renewing at that moment
+/// would then be refused (ops 11-24: tester4's first reply failed so). A
+/// login at or near expiry is `None`: the menu keeps the last read, and the
+/// next reply renews it.
 async fn catalog_login(base: &str, owner: Option<&str>) -> Option<CodexAuth> {
-    match owner.filter(|o| !o.is_empty()) {
-        Some(owner) => open(base, owner).await.ok().map(|(_, auth)| auth),
-        None => {
-            let auth = auth_path();
-            read_local(&auth).ok().flatten()?;
-            local_current(&auth, codex::TOKEN_ENDPOINT).await.ok()
+    // No connection this computer can open: a turn runs on the computer's
+    // own login then, and so does the read.
+    if let Some(owner) = owner.filter(|o| !o.is_empty()) {
+        if let Ok((rt, name, false)) = crate::connection::open_owner_login(base, owner, PROVIDER).await {
+            let opened = mafold_core::codex::Opened::peek(&rt, &name).await.ok()??;
+            return connection_auth(&opened).ok().filter(|a| !expiring(&a.access_token));
         }
     }
+    let (_, auth) = read_local(&auth_path()).ok().flatten()?;
+    (!expiring(&auth.access_token)).then_some(auth)
 }
 
 /// The model a turn runs: the one it was given (with or without a `codex/`
@@ -654,18 +766,29 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("at-fake"), "the file is left as it was");
     }
 
+    /// ops 11-24 「我选的是local login的」: what was picked is what runs; only
+    /// an agent from before the pick was kept may use either.
+    #[test]
+    fn the_pick_is_read_as_picked() {
+        assert_eq!(Pick::of(Some("local")), Pick::Local);
+        assert_eq!(Pick::of(Some("connection")), Pick::Connection);
+        assert_eq!(Pick::of(None), Pick::Either);
+        assert_eq!(Pick::of(Some("vault")), Pick::Either);
+    }
+
     /// The hand-off survives the trip through the turn's env, both ways.
     #[test]
     fn the_login_rides_in_the_turns_env_and_back() {
         let auth = CodexAuth { access_token: "at-fake".into(), account_id: "acct-1".into() };
         for source in [
-            Source::Connection { base: "https://api.example".into(), owner: "opsdu".into(), name: "codex".into() },
+            Source::Connection { base: "https://api.example".into(), owner: "opsdu".into(), name: "codex".into(), give_way: false },
+            Source::Connection { base: "https://api.example".into(), owner: "opsdu".into(), name: "codex".into(), give_way: true },
             Source::Local { auth: PathBuf::from("/home/x/.codex/auth.json") },
         ] {
             let env = source.env(&auth);
             assert!(env.iter().all(|(k, _)| k.starts_with("MAFOLD_CODEX_")), "the shell never sees any of it");
             let fuel = CodexFuel::from_env(&env).expect("read back");
-            assert_eq!(fuel.source, source);
+            assert_eq!(*fuel.source.lock().unwrap(), source);
             assert_eq!(*fuel.current.lock().unwrap(), auth);
         }
         assert!(CodexFuel::from_env(&[(TOKEN_ENV.into(), "at".into())]).is_none(), "half a hand-off is none");

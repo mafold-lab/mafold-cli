@@ -152,7 +152,7 @@ pub fn derive(bytes: &[u8], mime: &str, original: bool) -> Option<Derived> {
 }
 
 /// Decode with the EXIF orientation applied, so w×h are as displayed.
-fn decode_oriented(bytes: &[u8]) -> Option<DynamicImage> {
+pub(crate) fn decode_oriented(bytes: &[u8]) -> Option<DynamicImage> {
     let mut decoder = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
     let orientation = decoder.orientation().ok();
     let mut img = DynamicImage::from_decoder(decoder).ok()?;
@@ -162,7 +162,7 @@ fn decode_oriented(bytes: &[u8]) -> Option<DynamicImage> {
     Some(img)
 }
 
-fn encode_jpeg(img: &DynamicImage, quality: f64) -> Option<Vec<u8>> {
+pub(crate) fn encode_jpeg(img: &DynamicImage, quality: f64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let q = (quality * 100.0).round().clamp(1.0, 100.0) as u8;
     let rgb = img.to_rgb8();

@@ -2387,15 +2387,18 @@ async fn owner_vault(human: &Client, sess: &session::Session) -> std::result::Re
 /// runtime on their vault here — for a fuel that is a login rather than a key:
 /// a Codex connection (ops 11-23), opened and renewed by mafold-core
 /// (`codex::Opened`), the renewed grant written back for every device. Same
-/// rules as [`open_owner_key`]; never prints.
+/// rules as [`open_owner_key`]; never prints. The third value says the row is
+/// marked for reconnecting (`relink_at`): its grant is known dead, so a caller
+/// with another login to run on can go straight to that one.
 pub(crate) async fn open_owner_login(
     base: &str,
     owner: &str,
     provider: &str,
-) -> std::result::Result<(mafold_core::connections::Runtime, String), OwnerKeyIssue> {
+) -> std::result::Result<(mafold_core::connections::Runtime, String, bool), OwnerKeyIssue> {
     let (human, sess, conn) = owner_row(base, owner, |c| s(c, "provider") == provider).await?;
     let (umk, _) = owner_vault(&human, &sess).await?;
-    Ok((core_runtime(base, &sess, umk), s(&conn, "name")))
+    let relink = conn.get("relink_at").is_some_and(|v| !v.is_null());
+    Ok((core_runtime(base, &sess, umk), s(&conn, "name"), relink))
 }
 
 // ── the owner's own video key (`mafold video`) ─────────────────────────────

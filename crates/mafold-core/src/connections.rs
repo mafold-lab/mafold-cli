@@ -777,21 +777,24 @@ impl Runtime {
         // GRANT — expired, revoked, already spent — rather than about this
         // request. Google's 7-day testing grants, a user pressing "remove
         // access", a refresh token another device consumed: all arrive as
-        // exactly this. Everything else (`invalid_client`, a broker that is
-        // missing its secret, a 5xx) is ours to fix, not the person's.
-        if grant.get("error").and_then(Value::as_str) == Some("invalid_grant") {
-            let why = grant
-                .get("error_description")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("invalid_grant");
+        // exactly this — and OpenAI's own spellings of it ([`is_spent_grant`]).
+        // Everything else (`invalid_client`, a broker that is missing its
+        // secret, a 5xx) is ours to fix, not the person's.
+        let (code, said) = grant_error(&grant);
+        if is_spent_grant(&code) {
+            let why = if said.is_empty() { code } else { said };
             return Err(RenewError::Refused(why.chars().take(200).collect()));
         }
-        let access = grant
-            .get("access_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Failed("the token endpoint returned no access token".to_string()))?;
+        let access = grant.get("access_token").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
+            // Say what the provider said, never "no access token": that
+            // sentence hid a spent refresh token on 11-24 (tester4).
+            let why = [code.as_str(), said.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(": ");
+            Failed(if why.is_empty() {
+                format!("the token endpoint answered HTTP {} with no access token", reply.status)
+            } else {
+                format!("the token endpoint answered HTTP {}: {}", reply.status, why.chars().take(200).collect::<String>())
+            })
+        })?;
 
         let mut fresh = payload.clone();
         fresh.insert("access_token".into(), Value::String(access.to_string()));
@@ -961,6 +964,31 @@ fn credential(spec: &ProviderInfo, payload: &Map<String, Value>) -> String {
 /// renew** — Figma's personal access tokens carry no expiry at all, and
 /// treating an absent field as expired would spend a refresh token that
 /// doesn't exist on every single call.
+/// A token endpoint's error: its code and its own words. RFC 6749 puts them
+/// in `error` / `error_description`; OpenAI's endpoint (Codex) nests them as
+/// `error: { code, message }`.
+fn grant_error(grant: &Value) -> (String, String) {
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+    match grant.get("error") {
+        Some(Value::Object(e)) => {
+            let code = text(e.get("code"));
+            let code = if code.is_empty() { text(e.get("type")) } else { code };
+            (code, text(e.get("message")))
+        }
+        e => (text(e), text(grant.get("error_description"))),
+    }
+}
+
+/// Codes that say the GRANT is gone — expired, revoked, already spent — so
+/// the row is settled ([`Runtime::settle_refusal`]): re-read when another
+/// device renewed it meanwhile, else marked for reconnecting. `invalid_grant`
+/// is RFC 6749's; the `refresh_token_*` three are OpenAI's, the ones the Codex
+/// CLI itself treats as a sign-in to do again. A refresh token spent by a
+/// second renewal at the same moment arrives as `refresh_token_reused`.
+fn is_spent_grant(code: &str) -> bool {
+    matches!(code, "invalid_grant" | "refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated")
+}
+
 pub fn needs_renewal(payload: &Map<String, Value>) -> bool {
     let Some(at) = payload.get("expires_at") else {
         return false;
@@ -1969,9 +1997,10 @@ mod tests {
         .to_string()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    const INVALID_GRANT: &str =
+    const INVALID_GRANT_TEXT: &str =
         r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+    #[cfg(not(target_arch = "wasm32"))]
+    const INVALID_GRANT: &str = INVALID_GRANT_TEXT;
 
     /// The 7-day case: the access token is due, the refresh answers
     /// `invalid_grant`. The row is marked (with the version the device saw, so
@@ -2001,6 +2030,44 @@ mod tests {
         assert_eq!(body["updated_at"], 100, "the version this device saw");
         assert!(body["reason"].as_str().unwrap().contains("expired or revoked"));
         assert!(seen.lock().unwrap().is_empty(), "no call with a token known to be dead");
+    }
+
+    /// OpenAI's endpoint (Codex) says a spent refresh token its own way —
+    /// `error: { code: "refresh_token_reused" }` — and that is the same
+    /// answer as `invalid_grant`: settled, not "no access token" (ops 11-24,
+    /// tester4's first reply).
+    #[test]
+    fn openai_s_spent_refresh_token_is_a_refusal() {
+        let reused = json!({ "error": { "message": "Your refresh token has already been used.", "type": "invalid_request_error", "code": "refresh_token_reused" } });
+        let (code, said) = grant_error(&reused);
+        assert!(is_spent_grant(&code), "{code}");
+        assert_eq!(said, "Your refresh token has already been used.");
+        let rfc: Value = serde_json::from_str(INVALID_GRANT_TEXT).unwrap();
+        assert_eq!(grant_error(&rfc), ("invalid_grant".to_string(), "Token has been expired or revoked.".to_string()));
+        let other = json!({ "error": { "type": "server_error" } });
+        let (code, _) = grant_error(&other);
+        assert!(!is_spent_grant(&code), "ours to fix, not the person's: {code}");
+    }
+
+    /// A renewal that fails for any other reason says what the endpoint said.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_failed_renewal_says_the_provider_s_words() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let (endpoint, _seen) = fake_mcp_server().await;
+        let umk = Key::random();
+        let tok = spawn_mock(vec![(400, r#"{"error":{"code":"unsupported_client","message":"Upgrade your client."}}"#.into())]);
+        let row = renewable_row(&umk, &endpoint, &format!("{}/token", tok.base), "old", 1, 100);
+        let mock = spawn_mock(vec![ok(&row)]);
+        let rt = Runtime::new(&mock.base, "s_token", umk);
+        let conn = rt.get("stripe").await.unwrap();
+        let spec = rt.descriptor_of(&conn).await.unwrap();
+        let payload = rt.open_payload(&conn).unwrap();
+        let Err(RenewError::Failed(why)) = rt.renew("stripe", &conn, &spec, &payload).await else {
+            panic!("not a refusal of the grant");
+        };
+        assert!(why.contains("unsupported_client") && why.contains("Upgrade your client."), "{why}");
     }
 
     /// A token endpoint that is merely DOWN says nothing about the grant. No

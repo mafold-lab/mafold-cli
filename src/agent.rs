@@ -1785,6 +1785,10 @@ struct OwnerConfig {
     /// (`crate::fuel`). Not in `config` — the owner's settings bag — but on
     /// the detail itself; None for an agent created before it was stored.
     fuel: Option<String>,
+    /// Which login `fuel` is where it can be two (`getBot`'s `fuel_from`):
+    /// `local` = this computer's own, `connection` = the one in the owner's
+    /// Connections. None = picked before this: the connection, else here.
+    fuel_from: Option<String>,
 }
 
 impl OwnerConfig {
@@ -1894,6 +1898,14 @@ async fn harness_on_codex(harness_id: &str) -> bool {
         }
 }
 
+/// Which Codex login the owner picked for it (`OwnerConfig::fuel_from`).
+async fn codex_from() -> Option<String> {
+    match OWNER_CONFIG.get() {
+        Some(c) => c.read().await.fuel_from.clone(),
+        None => None,
+    }
+}
+
 /// A turn's env on Claude Code: the seat's, and the word that tells Mafold
 /// Harness its fuel (`fuel::FUEL_ENV`).
 fn claude_fuel_env(mut env: Vec<(String, String)>, on_claude: bool) -> Vec<(String, String)> {
@@ -1956,6 +1968,7 @@ impl OwnerConfig {
             blacklist: parse_user_list(get("blacklist")),
             access: get("access"),
             fuel: detail["fuel"].as_str().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()),
+            fuel_from: detail["fuel_from"].as_str().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()),
         })
     }
 
@@ -2906,7 +2919,12 @@ pub async fn run(mut client: Client, workdir: Option<String>, harness_id: String
         println!("fuel: @{my_username} runs Mafold Harness on its owner's Claude Code login here — a real `claude` makes each step");
     }
     if owner.on_codex() && harness.id() == crate::harness::MAFOLD_HARNESS {
-        println!("fuel: @{my_username} runs Mafold Harness on its owner's Codex login — their connection, else Codex's own login here, per reply");
+        let from = match owner.fuel_from.as_deref() {
+            Some(mafold_core::mafold_types::agent_setup::FROM_LOCAL) => "this computer's own Codex login, never a connection",
+            Some(mafold_core::mafold_types::agent_setup::FROM_CONNECTION) => "their Codex connection, never this computer's login",
+            _ => "their connection, else Codex's own login here",
+        };
+        println!("fuel: @{my_username} runs Mafold Harness on its owner's Codex login — {from}, per reply");
     }
     let owner = Arc::new(RwLock::new(owner));
     let _ = OWNER_CONFIG.set(owner.clone());
@@ -3491,10 +3509,12 @@ async fn machine_caps(client: &Client, harness: &dyn Harness, preferred: Option<
         return crate::harness::caps_report(claude.as_ref(), &env).await;
     }
     // …and on Codex, what the Codex login a turn would run on runs: Codex's
-    // own catalog for it.
+    // own catalog for it. Picked as this computer's own, the connection isn't
+    // opened for it either.
     if harness.id() == crate::harness::MAFOLD_HARNESS && crate::fuel::is_codex(fuel) {
         let version = harness.cli_version().await;
-        let owner = bot_owner().await.map(|o| norm_user(&o));
+        let local = codex_from().await.as_deref() == Some(mafold_core::mafold_types::agent_setup::FROM_LOCAL);
+        let owner = if local { None } else { bot_owner().await.map(|o| norm_user(&o)) };
         return crate::harness::codex_fuel::probe(&client.base, owner.as_deref()).await.map(|p| p.report(harness.id(), &version));
     }
     if harness.id() == crate::harness::MAFOLD_HARNESS && !crate::fuel::is_go(fuel) {
@@ -10482,15 +10502,15 @@ async fn handle(
     } else {
         None
     };
-    // Mafold Harness on its owner's Codex login (`fuel::codex_step`): their
-    // Codex connection, else Codex's own login here. Same road as Go's key.
+    // Mafold Harness on its owner's Codex login (`fuel::codex_step`): the one
+    // they picked, this computer's or their connection. Same road as Go's key.
     let _codex_login = if refused.is_none()
         && !no_usable_account
         && !stopped_in_setup
         && !is_held_draft(&msg_id)
         && harness_on_codex(harness.id()).await
     {
-        match crate::fuel::codex_step(&client.base, bot_owner().await.as_deref(), &mut env).await {
+        match crate::fuel::codex_step(&client.base, bot_owner().await.as_deref(), codex_from().await.as_deref(), &mut env).await {
             Ok(k) => Some(k),
             Err(why) => {
                 eprintln!("codex: no login for reply {msg_id} — {}", crate::logfile::one_line(&why));

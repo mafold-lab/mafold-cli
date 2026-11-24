@@ -99,9 +99,9 @@ pub fn claude_in(env: &[(String, String)]) -> bool {
 // ── Codex (ops 11-23) ───────────────────────────────────────────────────────
 //
 // Mafold Harness signed in with Codex runs each model step on the Codex
-// Responses API, on its owner's ChatGPT plan (`harness::codex_fuel`): their
-// Codex connection when this computer can open it, else Codex's own login
-// here. Like Go there is a credential to open per reply and hand over in the
+// Responses API, on its owner's ChatGPT plan (`harness::codex_fuel`): the
+// login they picked — this computer's own Codex login, or their Codex
+// connection — and that one alone. Like Go there is a credential to open per reply and hand over in the
 // env alone; like Claude Code it is a login, renewed where it lives.
 
 /// `getBot`'s `fuel` for an agent signed in with Codex — a Codex agent's, and
@@ -120,18 +120,27 @@ pub fn codex_in(env: &[(String, String)]) -> bool {
 
 /// The turn's Codex step, for Mafold Harness on Codex: the owner's Codex login
 /// joins `env`, and the guard that masks it comes back for the turn to hold.
-/// `Err` is the turn's error, in the words the reply ends with.
+/// `from`: which login they picked (`getBot`'s `fuel_from`). `Err` is the
+/// turn's error, in the words the reply ends with.
 pub async fn codex_step(
     base: &str,
     owner: Option<&str>,
+    from: Option<&str>,
     env: &mut Vec<(String, String)>,
 ) -> Result<crate::conceal::LiveSecret, String> {
-    let Some(owner) = owner.map(crate::agent::norm_user).filter(|o| !o.is_empty()) else {
-        return Err("This agent runs on its owner's Codex login, and this computer can't tell who its owner is, so \
-                    it starts no replies."
-            .into());
+    use crate::harness::codex_fuel::Pick;
+    let pick = Pick::of(from);
+    // This computer's own login needs no owner to open it.
+    let owner = match owner.map(crate::agent::norm_user).filter(|o| !o.is_empty()) {
+        Some(owner) => owner,
+        None if pick == Pick::Local => String::new(),
+        None => {
+            return Err("This agent runs on its owner's Codex login, and this computer can't tell who its owner is, \
+                        so it starts no replies."
+                .into())
+        }
     };
-    let (source, auth) = crate::harness::codex_fuel::open(base, &owner).await?;
+    let (source, auth) = crate::harness::codex_fuel::open(base, &owner, pick).await?;
     let masked = crate::conceal::hide_while_live(&auth.access_token);
     env.push((FUEL_ENV.to_string(), CODEX.to_string()));
     env.extend(source.env(&auth));

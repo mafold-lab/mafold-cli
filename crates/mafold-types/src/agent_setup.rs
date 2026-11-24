@@ -75,6 +75,19 @@ pub const SIGN_INS: &[&str] = &["claude", "codex", "kimi", "opencode-go", "walle
 /// Cloud的同款选项 用apikey / connections」).
 pub const KEY: &str = "key";
 
+/// Which Codex login signs in Mafold Harness on a computer, as Sign in with's
+/// tile picked it (ops 11-24 「我选的是local login的 … 没有任何connection应该
+/// 涉足的可能」): that computer's own login, or the one in Connections. The
+/// computer runs the one picked and never the other.
+pub const FROM_LOCAL: &str = "local";
+pub const FROM_CONNECTION: &str = "connection";
+
+/// Whether `from` is a pick `sign_in` can carry: only a Codex login on
+/// Mafold Harness has two places to come from.
+pub fn from_fits(runtime: Option<&str>, sign_in: Option<&str>, from: &str) -> bool {
+    runtime == Some(MAFOLD_HARNESS) && sign_in == Some("codex") && (from == FROM_LOCAL || from == FROM_CONNECTION)
+}
+
 /// The owner's flags that open a sign-in on a computer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gates {
@@ -168,6 +181,15 @@ mod tests {
         for (_, ins) in RUNTIME_SIGN_INS {
             assert!(ins.iter().all(|s| SIGN_INS.contains(s)), "{ins:?}");
         }
+    }
+
+    #[test]
+    fn only_a_codex_login_on_mafold_harness_says_where_it_comes_from() {
+        let h = Some(MAFOLD_HARNESS);
+        assert!(from_fits(h, Some("codex"), FROM_LOCAL) && from_fits(h, Some("codex"), FROM_CONNECTION));
+        assert!(!from_fits(h, Some("codex"), "vault"));
+        assert!(!from_fits(h, Some("claude"), FROM_LOCAL) && !from_fits(h, Some(KEY), FROM_CONNECTION));
+        assert!(!from_fits(Some("codex"), Some("codex"), FROM_LOCAL) && !from_fits(None, Some("codex"), FROM_LOCAL));
     }
 
     #[test]

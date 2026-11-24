@@ -758,9 +758,7 @@ fn opening(messages: &[Value], history: &Range<usize>, resumed: bool) -> Vec<Val
     let data_end = history.start.clamp(1, messages.len().max(1));
     let mut blocks = users(messages.get(1..data_end).unwrap_or(&[]));
     if !resumed {
-        if let Some(t) = transcript(messages.get(history.clone()).unwrap_or(&[])) {
-            blocks.push(json!({ "type": "text", "text": t }));
-        }
+        blocks.extend(transcript(messages.get(history.clone()).unwrap_or(&[])));
     }
     blocks.extend(users(messages.get(history.end.min(messages.len())..).unwrap_or(&[])));
     if blocks.is_empty() {
@@ -769,21 +767,56 @@ fn opening(messages: &[Value], history: &Range<usize>, resumed: bool) -> Vec<Val
     blocks
 }
 
-/// The kept conversation as text, for a `claude` that starts without it.
-fn transcript(history: &[Value]) -> Option<String> {
+/// The most pictures a replayed conversation shows again — the newest; an
+/// older one is named where it was. Anthropic takes 100 in a request, and
+/// past 20 refuses any over 2000px, which a `Read` picture may be.
+const REPLAY_PICTURES: usize = 20;
+
+/// The kept conversation, for a `claude` that starts without it: text, with
+/// the pictures people sent and tools handed back shown where they were.
+/// Flattened to words, as it was, a fresh `claude` heard "<image …>" and
+/// never saw the photo it had already looked at.
+fn transcript(history: &[Value]) -> Vec<Value> {
+    let shown = |m: &Value| matches!(m["role"].as_str(), Some("user" | "tool"));
+    let pictures: usize = history.iter().filter(|m| shown(m)).map(|m| pictured(&m["content"]).filter(|p| matches!(p, Part::Image { .. })).count()).sum();
+    let mut unshown = pictures.saturating_sub(REPLAY_PICTURES);
+    let mut blocks = Vec::new();
     let mut out = String::new();
+    let mut said = |content: &Value, out: &mut String, blocks: &mut Vec<Value>| {
+        for (i, p) in pictured(content).enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            match p {
+                Part::Text(t) => out.push_str(&t),
+                Part::Image { .. } if unshown > 0 => {
+                    unshown -= 1;
+                    out.push_str("(a picture, not shown again)");
+                }
+                Part::Image { mime, data } => {
+                    blocks.push(json!({ "type": "text", "text": std::mem::take(out) }));
+                    blocks.push(json!({ "type": "image", "source": { "type": "base64", "media_type": mime, "data": data } }));
+                }
+            }
+        }
+    };
     for m in history {
-        let text = |c: &Value| match c {
-            Value::String(s) => s.clone(),
-            Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
-            _ => String::new(),
-        };
         match m["role"].as_str() {
-            Some("user") => out.push_str(&format!("<user>\n{}\n</user>\n", text(&m["content"]))),
+            Some("user") => {
+                out.push_str("<user>\n");
+                said(&m["content"], &mut out, &mut blocks);
+                out.push_str("\n</user>\n");
+            }
             Some("assistant") => {
-                let said = text(&m["content"]);
-                if !said.trim().is_empty() {
-                    out.push_str(&format!("<assistant>\n{said}\n</assistant>\n"));
+                let words: Vec<String> = pictured(&m["content"])
+                    .filter_map(|p| match p {
+                        Part::Text(t) => Some(t),
+                        Part::Image { .. } => None,
+                    })
+                    .collect();
+                let words = words.join("\n");
+                if !words.trim().is_empty() {
+                    out.push_str(&format!("<assistant>\n{words}\n</assistant>\n"));
                 }
                 for c in m["tool_calls"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
                     out.push_str(&format!(
@@ -793,13 +826,35 @@ fn transcript(history: &[Value]) -> Option<String> {
                     ));
                 }
             }
-            Some("tool") => out.push_str(&format!("<tool_result>\n{}\n</tool_result>\n", text(&m["content"]))),
+            Some("tool") => {
+                out.push_str("<tool_result>\n");
+                said(&m["content"], &mut out, &mut blocks);
+                out.push_str("\n</tool_result>\n");
+            }
             _ => {}
         }
     }
-    (!out.trim().is_empty()).then(|| {
-        format!("This conversation so far, as Mafold kept it (you are the assistant in it):\n<conversation>\n{out}</conversation>")
-    })
+    let Some(first) = blocks.first_mut() else {
+        if out.trim().is_empty() {
+            return Vec::new();
+        }
+        return vec![json!({ "type": "text", "text": format!("{HEAD}{out}</conversation>") })];
+    };
+    first["text"] = json!(format!("{HEAD}{}", first["text"].as_str().unwrap_or("")));
+    blocks.push(json!({ "type": "text", "text": format!("{out}</conversation>") }));
+    blocks
+}
+
+const HEAD: &str = "This conversation so far, as Mafold kept it (you are the assistant in it):\n<conversation>\n";
+
+/// `content`'s text and pictures, and nothing else it carries.
+fn pictured(content: &Value) -> impl Iterator<Item = Part> {
+    let kept = match content {
+        Value::Array(items) => Value::Array(items.iter().filter(|p| matches!(p["type"].as_str(), Some("text" | "image_url"))).cloned().collect()),
+        Value::String(_) => content.clone(),
+        _ => Value::Null,
+    };
+    parts(&kept).into_iter()
 }
 
 /// A kernel message's content as Anthropic content blocks: text as text, a
@@ -1058,6 +1113,38 @@ mod tests {
         assert!(fresh[1].contains("<tool_result>\na.txt\n</tool_result>"), "{}", fresh[1]);
         assert!(fresh[1].contains("<assistant>\nThere is a.txt.\n</assistant>"), "{}", fresh[1]);
         assert_eq!(fresh[2], "now this");
+    }
+
+    /// A `claude` that starts without the conversation is shown its pictures
+    /// again where they were — a photo someone sent, one `Read` handed back —
+    /// not told "<image …>" about them; past [`REPLAY_PICTURES`], only the
+    /// newest.
+    #[test]
+    fn a_fresh_claude_sees_the_pictures_already_in_the_conversation() {
+        let pic = |d: &str| json!({ "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{d}") } });
+        let messages = vec![
+            json!({ "role": "system", "content": "persona" }),
+            json!({ "role": "user", "content": [{ "type": "text", "text": "看这个" }, pic("SENT")] }),
+            json!({ "role": "assistant", "content": "", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "Read", "arguments": "{}" } }] }),
+            json!({ "role": "tool", "tool_call_id": "c1", "content": [{ "type": "text", "text": "<image name=\"a.png\">" }, pic("READ"), { "type": "text", "text": "</image>" }] }),
+            json!({ "role": "assistant", "content": "A cat." }),
+            json!({ "role": "user", "content": "now this" }),
+        ];
+        let fresh = opening(&messages, &(1..5), false);
+        let images: Vec<&str> = fresh.iter().filter(|b| b["type"] == "image").map(|b| b["source"]["data"].as_str().unwrap()).collect();
+        assert_eq!(images, ["SENT", "READ"]);
+        let text: String = fresh.iter().map(|b| b["text"].as_str().unwrap_or("[pic]")).collect();
+        assert!(text.starts_with("This conversation so far"), "{text}");
+        assert!(text.contains("<user>\n看这个\n[pic]\n</user>"), "{text}");
+        assert!(text.contains("<tool_result>\n<image name=\"a.png\">\n[pic]\n</image>\n</tool_result>"), "{text}");
+        assert!(text.contains("<assistant>\nA cat.\n</assistant>\n</conversation>now this"), "{text}");
+
+        let many: Vec<Value> = (0..REPLAY_PICTURES + 2).map(|i| json!({ "role": "user", "content": [pic(&format!("P{i}"))] })).collect();
+        let blocks = transcript(&many);
+        let shown: Vec<&str> = blocks.iter().filter(|b| b["type"] == "image").map(|b| b["source"]["data"].as_str().unwrap()).collect();
+        assert_eq!(shown.len(), REPLAY_PICTURES);
+        assert_eq!(shown[0], "P2", "the oldest go first");
+        assert!(blocks[0]["text"].as_str().unwrap().contains("(a picture, not shown again)"));
     }
 
     /// A picture a tool hands back reaches Claude as a picture.

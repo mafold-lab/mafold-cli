@@ -44,6 +44,12 @@ const LINE_CAP: usize = 2000;
 /// `Read` refuses a file larger than this rather than load it.
 const READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
+/// A picture `Read` shows the model: its long edge at most this (what
+/// Anthropic scales anything larger down to anyway), and its bytes at most
+/// this many, so the base64 stays under the 5 MB a provider takes per image.
+const PICTURE_EDGE: u32 = 1568;
+const PICTURE_MAX_BYTES: usize = 3_500_000;
+
 /// `Grep` skips a file larger than this.
 const GREP_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -107,7 +113,8 @@ impl HarnessPlugin for Computer {
             "## This computer\n\
              You are working on your owner's computer ({os}), in the folder `{dir}`.\n\
              - `Bash` runs a command there in `{sh}`: up to 10 minutes (`timeout`, in milliseconds; 2 minutes when not given).\n\
-             - `Read`, `Write` and `Edit` work on files inside that folder; `Glob` finds files in it by name and `Grep` searches what they say. Paths are relative to the folder, and anything outside it is refused.\n\
+             - `Read`, `Write` and `Edit` work on files inside that folder; `Glob` finds files in it by name and `Grep` searches what they say. Paths are relative to the folder, and anything outside it is refused — except that `Read` also opens the files people send you, at the paths their message names.\n\
+             - `Read` on a picture (PNG, JPEG, GIF, WebP, BMP) shows it to you: look at it yourself rather than working around it with OCR or pixel counts.\n\
              - Read a file before you edit it. `Edit` replaces `old_string` with `new_string` exactly, and refuses when `old_string` is missing or appears more than once (unless `replace_all`).",
             os = std::env::consts::OS,
             dir = self.workdir.display(),
@@ -139,7 +146,7 @@ impl HarnessPlugin for Computer {
             ),
             spec(
                 "Read",
-                "Read a file in the working folder, with line numbers.",
+                "Read a file in the working folder, with line numbers. A picture is shown to you as a picture.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -224,20 +231,32 @@ impl HarnessPlugin for Computer {
             name: call.name.clone(),
             input: super::model_tool_input(&call.name, &input),
         });
-        let (text, failed) = match call.name.as_str() {
-            "Bash" => self.bash(&input).await,
+        let (said, failed) = match call.name.as_str() {
+            "Bash" => {
+                let (text, failed) = self.bash(&input).await;
+                (Said::Text(text), failed)
+            }
             name @ ("Read" | "Write" | "Edit" | "Glob" | "Grep") => {
                 let (name, dir) = (name.to_string(), self.workdir.clone());
                 tokio::task::spawn_blocking(move || files(&name, &dir, &input))
                     .await
-                    .unwrap_or_else(|e| (format!("the tool stopped: {e}"), true))
+                    .unwrap_or_else(|e| (Said::Text(format!("the tool stopped: {e}")), true))
             }
-            other => (format!("unknown tool: {other}"), true),
+            other => (Said::Text(format!("unknown tool: {other}")), true),
         };
-        let text = cap(text);
-        tx.push(&AgentEvent::ToolResult { id: call.id.clone(), text: text.clone() });
+        // The card says what happened; the model gets the words — or, for a
+        // picture, the picture itself (the kernel's `mafold_content`), never
+        // capped: cutting the middle out of a data URL is no picture at all.
+        let (shown, back) = match said {
+            Said::Text(text) => {
+                let text = cap(text);
+                (text.clone(), text)
+            }
+            Said::Picture { note, parts } => (note, json!({ "mafold_content": parts }).to_string()),
+        };
+        tx.push(&AgentEvent::ToolResult { id: call.id.clone(), text: shown });
         tx.push(&AgentEvent::ToolStatus { id: call.id.clone(), failed });
-        text
+        back
     }
 }
 
@@ -462,19 +481,26 @@ fn shown(workdir: &Path, path: &Path) -> String {
     path.strip_prefix(normalize(workdir)).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
+/// What a tool hands back: words, or a picture the model is shown — `note`
+/// for the step's card, `parts` (OpenAI content parts) for the model.
+enum Said {
+    Text(String),
+    Picture { note: String, parts: Value },
+}
+
 /// One of the file tools, run off the async runtime.
-fn files(name: &str, workdir: &Path, input: &Value) -> (String, bool) {
+fn files(name: &str, workdir: &Path, input: &Value) -> (Said, bool) {
     let r = match name {
-        "Read" => read(workdir, input),
-        "Write" => write(workdir, input),
-        "Edit" => edit(workdir, input),
-        "Glob" => glob(workdir, input),
-        "Grep" => grep(workdir, input),
+        "Read" => read(workdir, &crate::agent::attachments_dir(), input),
+        "Write" => write(workdir, input).map(Said::Text),
+        "Edit" => edit(workdir, input).map(Said::Text),
+        "Glob" => glob(workdir, input).map(Said::Text),
+        "Grep" => grep(workdir, input).map(Said::Text),
         other => Err(format!("unknown tool: {other}")),
     };
     match r {
-        Ok(text) => (text, false),
-        Err(why) => (why, true),
+        Ok(said) => (said, false),
+        Err(why) => (Said::Text(why), true),
     }
 }
 
@@ -486,9 +512,20 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
 
-fn read(workdir: &Path, input: &Value) -> Result<String, String> {
+/// `received`: where the files people send this agent are saved
+/// (`~/.mafold/attachments`) — the one place outside the folder `Read` may
+/// open, by the absolute path the message named. The prompt sends the model
+/// there; refusing it, the agent could only reach a photo it was sent through
+/// `Bash`.
+fn read(workdir: &Path, received: &Path, input: &Value) -> Result<Said, String> {
     let raw = arg(input, "file_path")?;
-    let path = resolve(workdir, raw)?;
+    let path = resolve(workdir, raw).or_else(|outside| {
+        if Path::new(raw.trim()).is_absolute() {
+            resolve(received, raw).map_err(|_| outside)
+        } else {
+            Err(outside)
+        }
+    })?;
     let meta = std::fs::metadata(&path).map_err(|e| format!("can't read `{raw}`: {e}"))?;
     if meta.is_dir() {
         return Err(format!("`{raw}` is a folder — `Glob` lists what is in it."));
@@ -497,12 +534,15 @@ fn read(workdir: &Path, input: &Value) -> Result<String, String> {
         return Err(format!("`{raw}` is {} bytes — too large to read whole; `Grep` it, or read part of it with `Bash`.", meta.len()));
     }
     let bytes = std::fs::read(&path).map_err(|e| format!("can't read `{raw}`: {e}"))?;
+    if let Some(said) = picture(raw, &bytes) {
+        return Ok(said);
+    }
     if looks_binary(&bytes) {
-        return Ok(format!("`{raw}` is a binary file ({} bytes), not shown.", bytes.len()));
+        return Ok(Said::Text(format!("`{raw}` is a binary file ({} bytes), not shown.", bytes.len())));
     }
     let text = String::from_utf8_lossy(&bytes);
     if text.is_empty() {
-        return Ok(format!("`{raw}` is empty."));
+        return Ok(Said::Text(format!("`{raw}` is empty.")));
     }
     let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = input["limit"].as_u64().map(|n| n as usize).filter(|n| *n > 0).unwrap_or(READ_LINES);
@@ -513,13 +553,65 @@ fn read(workdir: &Path, input: &Value) -> Result<String, String> {
         out.push_str(&format!("{:>6}\t{line}\n", i + 1));
     }
     if out.is_empty() {
-        return Ok(format!("`{raw}` has {total} lines; nothing from line {offset}."));
+        return Ok(Said::Text(format!("`{raw}` has {total} lines; nothing from line {offset}.")));
     }
     let last = (offset - 1 + limit).min(total);
     if last < total {
         out.push_str(&format!("… {} more lines (from line {}).\n", total - last, last + 1));
     }
-    Ok(out)
+    Ok(Said::Text(out))
+}
+
+/// `bytes` as a picture the model can look at, when they are one: as they
+/// are when a provider takes them that way, else fitted into
+/// [`PICTURE_EDGE`] (orientation applied) and re-encoded — PNG stays PNG
+/// when that fits, so a screenshot's text stays sharp. `None` for anything
+/// that isn't a picture this build decodes (HEIC included).
+fn picture(raw: &str, bytes: &[u8]) -> Option<Said> {
+    use image::ImageFormat;
+    let format = image::guess_format(bytes).ok()?;
+    let mime = match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::Gif => "image/gif",
+        ImageFormat::WebP => "image/webp",
+        ImageFormat::Bmp => "image/bmp",
+        _ => return None,
+    };
+    let (w, h) = image::ImageReader::with_format(std::io::Cursor::new(bytes), format).into_dimensions().ok()?;
+    let as_is = mime != "image/bmp" && w.max(h) <= PICTURE_EDGE && bytes.len() <= PICTURE_MAX_BYTES;
+    let (data, mime, size) = if as_is {
+        (bytes.to_vec(), mime, crate::thumb::Size { w, h })
+    } else {
+        let img = crate::thumb::decode_oriented(bytes)?;
+        let size = crate::thumb::fit(img.width(), img.height(), PICTURE_EDGE);
+        let img = img.thumbnail(size.w, size.h);
+        let png = (format == ImageFormat::Png || format == ImageFormat::Bmp)
+            .then(|| {
+                let mut out = Vec::new();
+                img.write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png).ok()?;
+                Some(out)
+            })
+            .flatten()
+            .filter(|b| b.len() <= PICTURE_MAX_BYTES);
+        match png {
+            Some(b) => (b, "image/png", size),
+            None => (crate::thumb::encode_jpeg(&img, crate::thumb::PHOTO_QUALITY)?, "image/jpeg", size),
+        }
+    };
+    use base64::Engine as _;
+    let url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&data));
+    let name = Path::new(raw).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw.to_string());
+    let scaled = if (size.w, size.h) == (w, h) { String::new() } else { format!(", shown at {}×{}", size.w, size.h) };
+    Some(Said::Picture {
+        note: format!("Looked at {name} ({w}×{h}{scaled})."),
+        // The same `<image …>` markers the hosted `view_image` uses.
+        parts: json!([
+            { "type": "text", "text": format!("<image name=\"{name}\" width=\"{w}\" height=\"{h}\">") },
+            { "type": "image_url", "image_url": { "url": url } },
+            { "type": "text", "text": "</image>" },
+        ]),
+    })
 }
 
 fn write(workdir: &Path, input: &Value) -> Result<String, String> {
@@ -807,6 +899,65 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10), "it did not wait the 30 s out");
         assert!(failed);
         assert!(text.contains("first") && text.contains("timeout"), "{text}");
+    }
+
+    /// tplog 11-24: a photo sent to a Mafold Harness agent came back from
+    /// `Read` as "binary file, not shown", and the agent fell back to OCR and
+    /// pixel counts. A picture is now the picture, for the model; the card
+    /// says what was looked at, never the base64.
+    #[tokio::test]
+    async fn read_shows_a_picture_to_the_model() {
+        let dir = folder("picture");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        std::fs::write(dir.join("shot.png"), &png).unwrap();
+        let c = computer(&dir);
+        let (back, failed, events) = run(&c, "Read", json!({ "file_path": "shot.png" })).await;
+        assert!(!failed);
+        let parts: Value = serde_json::from_str(&back).expect("the kernel's shape");
+        let parts = parts["mafold_content"].as_array().expect("mafold_content");
+        assert_eq!(parts[0]["text"], "<image name=\"shot.png\" width=\"40\" height=\"30\">");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        use base64::Engine as _;
+        assert_eq!(url, format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&png)), "small enough: as it is");
+        let card = events.iter().find_map(|e| match e { AgentEvent::ToolResult { text, .. } => Some(text.clone()), _ => None }).unwrap();
+        assert_eq!(card, "Looked at shot.png (40×30).");
+    }
+
+    /// Too big to send as it is: fitted into the edge, re-encoded.
+    #[test]
+    fn a_large_picture_is_fitted_before_the_model_sees_it() {
+        let dir = folder("big-picture");
+        let mut jpg = Vec::new();
+        image::DynamicImage::new_rgb8(4000, 1000).write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg).unwrap();
+        std::fs::write(dir.join("wide.jpg"), &jpg).unwrap();
+        let Ok(Said::Picture { note, parts }) = read(&dir, &dir, &json!({ "file_path": "wide.jpg" })) else { panic!("a picture") };
+        assert_eq!(note, "Looked at wide.jpg (4000×1000, shown at 1568×392).");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"), "{}", &url[..40]);
+        use base64::Engine as _;
+        let b = base64::engine::general_purpose::STANDARD.decode(&url["data:image/jpeg;base64,".len()..]).unwrap();
+        assert_eq!(image::load_from_memory(&b).unwrap().width(), 1568);
+    }
+
+    /// The photos people send land outside the folder; `Read` opens them by
+    /// the absolute path the message named — and only those, and only so.
+    #[test]
+    fn read_opens_what_people_sent_and_nothing_else_outside() {
+        let dir = folder("sent-work");
+        let sent = folder("sent-inbox");
+        std::fs::write(sent.join("note.txt"), "hello").unwrap();
+        let elsewhere = folder("sent-elsewhere");
+        std::fs::write(elsewhere.join("secret.txt"), "no").unwrap();
+        let path = sent.join("note.txt");
+        let Ok(Said::Text(t)) = read(&dir, &sent, &json!({ "file_path": path.to_string_lossy() })) else { panic!("opened") };
+        assert_eq!(t, "     1\thello\n");
+        let Err(why) = read(&dir, &sent, &json!({ "file_path": "note.txt" })) else { panic!("relative is the folder's") };
+        assert!(why.contains("can't read"), "{why}");
+        let Err(why) = read(&dir, &sent, &json!({ "file_path": elsewhere.join("secret.txt").to_string_lossy() })) else { panic!("refused") };
+        assert!(why.contains("outside the working folder"), "{why}");
+        let up = format!("{}/../{}/secret.txt", sent.display(), elsewhere.file_name().unwrap().to_string_lossy());
+        assert!(read(&dir, &sent, &json!({ "file_path": up })).is_err(), "`..` never climbs out of it");
     }
 
     #[tokio::test]
