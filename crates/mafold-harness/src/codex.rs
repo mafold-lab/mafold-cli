@@ -395,6 +395,88 @@ pub trait CodexCredentials: Send + Sync {
     async fn renew(&self, refused: &CodexAuth) -> Result<CodexAuth, String>;
 }
 
+// ───────────────────────────── the catalog ─────────────────────────────
+
+/// One model a Codex login runs, as its catalog says.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodexModel {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The efforts it takes, as the catalog lists them. Empty: no dial.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+}
+
+/// How long a catalog read may take: it is a menu, never a reply's wait.
+const CATALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The models `auth`'s login runs, from Codex's own catalog
+/// (`codex::models_url`) — what the Codex CLI's picker lists for it, rather
+/// than a roster written here that the next release leaves behind (ops 11-24:
+/// an agent on Codex offered only GPT-5.6 while Codex itself listed GPT-6.x).
+pub async fn list_models(auth: &CodexAuth) -> Result<Vec<CodexModel>, String> {
+    list_models_at(&codex::models_url(), auth).await
+}
+
+/// [`list_models`] from `url` — a test's stand-in.
+pub async fn list_models_at(url: &str, auth: &CodexAuth) -> Result<Vec<CodexModel>, String> {
+    let req = codex::models_headers(&auth.access_token, &auth.account_id)
+        .iter()
+        .fold(reqwest::Client::new().get(url), |r, (k, v)| r.header(k.as_str(), v.as_str()))
+        .timeout(CATALOG_WAIT);
+    let resp = req.send().await.map_err(|e| format!("codex models: {}", transport_error(e)))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("codex models answered {}", status.as_u16()));
+    }
+    let v: Value = serde_json::from_str(&body).map_err(|_| "codex models: not a model list".to_string())?;
+    let models = parse_catalog(&v);
+    if models.is_empty() {
+        return Err("codex models: the list is empty".into());
+    }
+    Ok(models)
+}
+
+/// The catalog's answer: the models its picker shows (`visibility: list`), in
+/// its own order (`priority`, lowest first), each with its efforts
+/// (`supported_reasoning_levels`). The same reading as mafold-router's
+/// (`catalog::from_codex`), which leaves the efforts out only because its
+/// Codex calls send none.
+pub fn parse_catalog(body: &Value) -> Vec<CodexModel> {
+    let mut rows: Vec<(i64, CodexModel)> = Vec::new();
+    for m in body.get("models").and_then(Value::as_array).into_iter().flatten() {
+        if m.get("visibility").and_then(Value::as_str) != Some("list") {
+            continue;
+        }
+        let Some(slug) = m.get("slug").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if rows.iter().any(|(_, o)| o.id == slug) {
+            continue;
+        }
+        let text = |k: &str| m.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let efforts = m
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.get("effort").and_then(Value::as_str).or_else(|| l.as_str()))
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect();
+        rows.push((
+            m.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX),
+            CodexModel { id: slug.to_string(), label: text("display_name").unwrap_or_else(|| slug.to_string()), description: text("description"), efforts },
+        ));
+    }
+    rows.sort_by_key(|(p, _)| *p);
+    rows.into_iter().map(|(_, m)| m).collect()
+}
+
 /// Runtime #4 — see the module docs. `Clone` for [`retrying`], like the others.
 #[derive(Clone)]
 pub struct CodexResponsesRuntime {
@@ -619,6 +701,59 @@ fn refusal(body: &str, token: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // ── the catalog ──
+
+    /// What the picker lists, in its order, each with its efforts; hidden
+    /// models and repeats left out.
+    #[test]
+    fn the_catalog_lists_what_codex_s_picker_does() {
+        let body = json!({ "models": [
+            { "slug": "gpt-5.6-sol", "display_name": "GPT-5.6 Sol", "visibility": "list", "priority": 5,
+              "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "high" }] },
+            { "slug": "gpt-6.2-sol", "display_name": "GPT-6.2 Sol", "description": "Newest", "visibility": "list", "priority": 1,
+              "supported_reasoning_levels": [{ "effort": "low", "description": "x" }, { "effort": "max" }, { "effort": "ultra" }] },
+            { "slug": "codex-auto-review", "visibility": "hide", "priority": 0 },
+            { "slug": "gpt-6.2-sol", "visibility": "list", "priority": 9 },
+            { "slug": "gpt-5.6-pro", "visibility": "list" }
+        ]});
+        let got = parse_catalog(&body);
+        assert_eq!(got.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gpt-6.2-sol", "gpt-5.6-sol", "gpt-5.6-pro"]);
+        assert_eq!(got[0].efforts, ["low", "max", "ultra"]);
+        assert_eq!((got[0].label.as_str(), got[0].description.as_deref()), ("GPT-6.2 Sol", Some("Newest")));
+        assert_eq!(got[2].label, "gpt-5.6-pro", "no name: its id");
+        assert!(got[2].efforts.is_empty());
+    }
+
+    /// The read wears Codex's identity and the login, and a refusal is said,
+    /// never the token.
+    #[tokio::test]
+    async fn the_catalog_is_read_with_the_login() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/codex/models", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            for status in ["200 OK", "401 Unauthorized"] {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                log.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = json!({ "models": [{ "slug": "gpt-6.2-sol", "visibility": "list" }] }).to_string();
+                let reply = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        let auth = CodexAuth { access_token: "tok-fake".into(), account_id: "acct-fake".into() };
+        let got = list_models_at(&url, &auth).await.unwrap();
+        assert_eq!(got.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gpt-6.2-sol"]);
+        let req = seen.lock().unwrap()[0].to_lowercase();
+        assert!(req.contains("authorization: bearer tok-fake") && req.contains("chatgpt-account-id: acct-fake"), "{req}");
+        assert!(req.contains(&format!("originator: {}", codex::ORIGINATOR)), "{req}");
+        let err = list_models_at(&url, &auth).await.unwrap_err();
+        assert!(err.contains("401") && !err.contains("tok-fake"), "{err}");
+    }
 
     // ── the request ──
 

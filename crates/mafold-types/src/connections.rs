@@ -297,6 +297,8 @@ pub mod codex {
     const NO_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
     pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+    /// What a login runs when its own catalog ([`models_url`]) can't be read:
+    /// Mafold Harness on a computer asks the catalog and falls back to this.
     pub const SUBSCRIPTION_MODELS: &[SubscriptionModel] = &[
         SubscriptionModel {
             id: "gpt-5.6-sol",
@@ -362,6 +364,26 @@ pub mod codex {
             a => a,
         };
         format!("{ORIGINATOR}/{CLIENT_VERSION} ({os}; {arch}) xterm-256color")
+    }
+
+    /// Codex's own model catalog for a login — what the Codex CLI's picker
+    /// lists, each model with the efforts it takes. Asked as the client
+    /// version we wear: it decides which models come back (an old client
+    /// isn't shown new ones).
+    pub fn models_url() -> String {
+        format!("https://chatgpt.com/backend-api/codex/models?client_version={CLIENT_VERSION}")
+    }
+
+    /// What a catalog read ([`models_url`]) sends: the login and the identity.
+    pub fn models_headers(access: &str, account: &str) -> Vec<(String, String)> {
+        vec![
+            ("authorization".into(), format!("Bearer {access}")),
+            ("chatgpt-account-id".into(), account.into()),
+            ("accept".into(), "application/json".into()),
+            ("originator".into(), ORIGINATOR.into()),
+            ("version".into(), CLIENT_VERSION.into()),
+            ("user-agent".into(), user_agent()),
+        ]
     }
 
     /// Everything a streamed `responses` call sends besides its body: the

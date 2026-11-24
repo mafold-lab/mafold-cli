@@ -1067,6 +1067,8 @@ async fn sign_ins_of(id: &str) -> Value {
             // Codex, always: each step goes to Codex's API on the owner's
             // Codex connection, which New Agent knows of from Connections, or
             // on Codex's own login here, which only this computer can say.
+            // Its models are Codex's catalog as last read here.
+            codex_fuel::refresh_if_stale();
             ins.push(serde_json::json!({
                 "id": crate::fuel::CODEX,
                 "signed_in": codex_fuel::signed_in_here(),

@@ -443,6 +443,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "setNotificationPrefs",
     "setSiteAllowance",
     "setSiteExample",
+    "setSiteName",
     "setSiteSearch",
     "setSiteVerification",
     "signIn",

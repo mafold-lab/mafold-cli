@@ -1427,6 +1427,20 @@ pub const KNOWN_FLAGS: &[FlagMeta] = &[
         server: ClosedWithoutRecord,
     },
     FlagMeta {
+        key: "siteNames",
+        default: false,
+        dev_default: false,
+        label: "Rename a hosted site's free address",
+        description: "A site's owner renames its address in Domains (`skyclock-8732.mafold.app` \
+                      → `skyclock.mafold.app`); the old address stops answering. Needs the \
+                      sites Worker that reads renames (sites@0.1.3) first. Off = no pencil on \
+                      the address, and setSiteName refuses.",
+        owner: "ops",
+        added: "2026-11",
+        clients: &[],
+        server: ClosedWithoutRecord,
+    },
+    FlagMeta {
         key: "siteSearch",
         default: false,
         dev_default: false,
@@ -2338,7 +2352,7 @@ mod tests {
         // Each stands on something released apart from the api (the sites
         // Worker, the zone's setup, Mafold's Search Console), so each opens on
         // its own, dev builds included. The api reads them; no client does.
-        for key in ["siteStats", "siteDomains", "siteSearch"] {
+        for key in ["siteStats", "siteDomains", "siteSearch", "siteNames"] {
             let m = meta(key).unwrap_or_else(|| panic!("{key} registered"));
             assert!(!m.default && !m.dev_default, "{key}: off in production and in dev builds");
             assert!(m.clients.is_empty(), "{key}: listSites says what a page shows");

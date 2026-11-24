@@ -26,6 +26,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use base64::Engine as _;
 use mafold_core::mafold_types::connections::codex;
+use mafold_harness::codex::CodexModel;
 use mafold_harness::{CodexAuth, CodexCredentials};
 use serde_json::{json, Value};
 
@@ -375,9 +376,96 @@ fn expiring(access: &str) -> bool {
 
 // ── models ──────────────────────────────────────────────────────────────────
 
-/// The models a Codex login runs, as the codex-oauth provider lists them.
+/// The models a Codex login runs, for New Agent's picker and the turn's own
+/// line about its model: the catalog as last read here ([`probe`]), else the
+/// roster built in.
 pub fn models() -> Vec<Value> {
-    codex::SUBSCRIPTION_MODELS.iter().map(|m| json!({ "id": m.id, "name": m.label })).collect()
+    known().iter().map(|m| json!({ "id": m.id, "name": m.label })).collect()
+}
+
+/// The roster built in, for a computer that hasn't read the catalog yet.
+fn roster() -> Vec<CodexModel> {
+    codex::SUBSCRIPTION_MODELS
+        .iter()
+        .map(|m| CodexModel {
+            id: m.id.to_string(),
+            label: m.label.to_string(),
+            description: None,
+            efforts: m.efforts.iter().map(|e| e.to_string()).collect(),
+        })
+        .collect()
+}
+
+/// Where the last catalog read is kept on this computer: one file, since the
+/// catalog is the login's and every agent here on Codex shares it.
+fn catalog_path() -> PathBuf {
+    crate::platform::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mafold")
+        .join("runtimes")
+        .join("mafold-harness")
+        .join("codex-models.json")
+}
+
+/// The catalog as last read here, else the roster.
+fn known() -> Vec<CodexModel> {
+    std::fs::read(catalog_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<CodexModel>>(&b).ok())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(roster)
+}
+
+fn keep(models: &[CodexModel]) {
+    let path = catalog_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(bytes) = serde_json::to_vec(models) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// How long a catalog read here stands before New Agent's report reads it
+/// again ([`refresh_if_stale`]).
+const CATALOG_STALE_SECS: u64 = 3600;
+
+/// Read the catalog again in the background with this computer's own Codex
+/// login, when the last read here is missing or old: New Agent's picker
+/// ([`models`]) comes from this computer's report before any agent here runs
+/// on Codex to read it. One read at a time.
+pub fn refresh_if_stale() {
+    static READING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let fresh = std::fs::metadata(catalog_path())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < CATALOG_STALE_SECS);
+    if fresh || !signed_in_here() || READING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async {
+        if let Some(auth) = catalog_login("", None).await {
+            if let Ok(m) = mafold_harness::codex::list_models(&auth).await {
+                keep(&m);
+            }
+        }
+        READING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// The login the catalog is read with: the one a turn would run on — the
+/// owner's Codex connection, else this computer's own login. With no owner
+/// known yet, this computer's own.
+async fn catalog_login(base: &str, owner: Option<&str>) -> Option<CodexAuth> {
+    match owner.filter(|o| !o.is_empty()) {
+        Some(owner) => open(base, owner).await.ok().map(|(_, auth)| auth),
+        None => {
+            let auth = auth_path();
+            read_local(&auth).ok().flatten()?;
+            local_current(&auth, codex::TOKEN_ENDPOINT).await.ok()
+        }
+    }
 }
 
 /// The model a turn runs: the one it was given (with or without a `codex/`
@@ -389,22 +477,46 @@ pub fn codex_model(wanted: Option<&str>) -> String {
         .unwrap_or_else(|| codex::DEFAULT_MODEL.to_string())
 }
 
-/// [`models`] as a caps report: the Customize sheet's model menu for an agent
-/// on Codex, with each model's efforts so the sheet can offer the dial (the
-/// runtime already sends the one picked as `reasoning.effort`).
-pub fn probe() -> Option<HarnessProbe> {
-    let models: Vec<ModelCap> = codex::SUBSCRIPTION_MODELS
-        .iter()
+/// The Customize sheet's model menu for an agent on Codex: Codex's own
+/// catalog for the login a turn would use, each model with its efforts (the
+/// runtime sends the one picked as `reasoning.effort`) — kept here for the
+/// next time it can't be read. Unread, the last read here or the roster
+/// built in, said as `Cached`: a menu, never the claim that this is all the
+/// login runs.
+pub async fn probe(base: &str, owner: Option<&str>) -> Option<HarnessProbe> {
+    let read = match catalog_login(base, owner).await {
+        Some(auth) => match mafold_harness::codex::list_models(&auth).await {
+            Ok(m) => Some(m),
+            Err(why) => {
+                println!("⚠️ Codex's model list couldn't be read ({why}); the menu keeps the last one known here");
+                None
+            }
+        },
+        None => None,
+    };
+    match read {
+        Some(m) => {
+            keep(&m);
+            report(m, CapsSource::Handshake)
+        }
+        None => report(known(), CapsSource::Cached),
+    }
+}
+
+/// `models` as a caps report, each answering to its `codex/` spelling too.
+fn report(models: Vec<CodexModel>, source: CapsSource) -> Option<HarnessProbe> {
+    let models: Vec<ModelCap> = models
+        .into_iter()
         .map(|m| ModelCap {
-            id: m.id.to_string(),
             aliases: vec![format!("codex/{}", m.id)],
-            display: m.label.to_string(),
+            id: m.id,
+            display: m.label,
             resolved: None,
-            description: None,
-            efforts: m.efforts.iter().map(|e| e.to_string()).collect(),
+            description: m.description,
+            efforts: m.efforts,
         })
         .collect();
-    (!models.is_empty()).then(|| HarnessProbe { source: CapsSource::Handshake, models, ..Default::default() })
+    (!models.is_empty()).then(|| HarnessProbe { source, models, ..Default::default() })
 }
 
 #[cfg(test)]
@@ -560,19 +672,33 @@ mod tests {
     }
 
     #[test]
-    fn the_model_menu_is_the_codex_providers() {
-        let ids: Vec<String> = models().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
+    fn the_roster_holds_the_default_model() {
+        let ids: Vec<String> = roster().into_iter().map(|m| m.id).collect();
         assert!(ids.contains(&codex::DEFAULT_MODEL.to_string()));
         assert_eq!(codex_model(None), codex::DEFAULT_MODEL);
         assert_eq!(codex_model(Some("codex/gpt-5.6-luna")), "gpt-5.6-luna");
-        assert_eq!(probe().unwrap().models.len(), ids.len());
+        assert_eq!(report(roster(), CapsSource::Cached).unwrap().models.len(), ids.len());
+    }
+
+    /// What the catalog said goes up as it said it — models the roster never
+    /// had among them (ops 11-24: 「有反馈是只有5.6的」) — each answering to its
+    /// `codex/` spelling.
+    #[test]
+    fn the_report_is_the_catalog_s() {
+        let read = vec![CodexModel { id: "gpt-6.2-sol".into(), label: "GPT-6.2 Sol".into(), description: None, efforts: vec!["low".into(), "ultra".into()] }];
+        let caps = report(read, CapsSource::Handshake).unwrap();
+        assert_eq!(caps.source, CapsSource::Handshake);
+        assert_eq!(caps.models[0].id, "gpt-6.2-sol");
+        assert_eq!(caps.models[0].aliases, ["codex/gpt-6.2-sol"]);
+        assert_eq!(caps.models[0].efforts, ["low", "ultra"]);
+        assert!(report(Vec::new(), CapsSource::Cached).is_none(), "nothing read, nothing claimed");
     }
 
     /// 11-24 ops: 「mafold harness codex的effort无法切换」 — the report carried
     /// no efforts, so the sheet had no dial to offer.
     #[test]
     fn the_report_carries_each_models_efforts() {
-        let caps = probe().unwrap();
+        let caps = report(roster(), CapsSource::Cached).unwrap();
         let sol = caps.models.iter().find(|m| m.id == "gpt-5.6-sol").unwrap();
         assert_eq!(sol.efforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
         let luna = caps.models.iter().find(|m| m.id == "gpt-5.6-luna").unwrap();

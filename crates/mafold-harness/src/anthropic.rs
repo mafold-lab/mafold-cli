@@ -542,6 +542,19 @@ fn mark_cache_breakpoints(body: &mut Value) {
     }
 }
 
+/// The tiers [`apply_reasoning`] sends for `model`, ascending — what an
+/// effort menu for it offers (an agent on its owner's Anthropic key). Empty:
+/// the model takes no dial, and nothing is sent for one.
+pub fn efforts(model: &str) -> &'static [&'static str] {
+    let Some((family, version)) = claude_family(model) else { return &[] };
+    match family {
+        "fable" | "mythos" => &["low", "medium", "high", "xhigh", "max"],
+        "opus" | "sonnet" if version == (4, 6) => &["low", "medium", "high", "max"],
+        "opus" | "sonnet" if version > (4, 6) => &["low", "medium", "high", "xhigh", "max"],
+        _ => &[],
+    }
+}
+
 /// OpenAI's `reasoning_effort` → Anthropic's adaptive thinking + effort, the
 /// router's reading (`anthropic::apply_reasoning`): by family and version,
 /// no list. Opus/Sonnet from 4.6 and Fable/Mythos take it; 4.6 has no xhigh;
@@ -552,15 +565,7 @@ fn apply_reasoning(body: &mut Value, model: &str, effort: Option<&str>) {
     let Some(effort) = effort.map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty() && e != "none") else {
         return;
     };
-    let Some((family, version)) = claude_family(model) else { return };
-    let adaptive = match family {
-        "fable" | "mythos" => true,
-        "opus" | "sonnet" => version >= (4, 6),
-        _ => false,
-    };
-    if !adaptive {
-        return;
-    }
+    let Some((family, version)) = claude_family(model).filter(|_| !efforts(model).is_empty()) else { return };
     let effort = match effort.as_str() {
         "minimal" | "low" => "low",
         "medium" => "medium",
@@ -897,6 +902,16 @@ mod tests {
         assert_eq!(msgs[1]["content"], json!([{ "type": "text", "text": "[picture left out: this message can't carry one]" }]));
         assert_eq!(msgs[2]["content"], json!(""), "an empty user message stays a bare empty string, no breakpoint on it");
         assert!(body.get("system").is_none() && body.get("tools").is_none());
+    }
+
+    #[test]
+    fn the_menu_offers_the_tiers_a_model_is_sent() {
+        assert_eq!(efforts("claude-opus-5-5"), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(efforts("claude-fable-5-2"), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(efforts("claude-sonnet-4-6"), ["low", "medium", "high", "max"], "4.6 has no xhigh");
+        assert!(efforts("claude-haiku-4-5-20251001").is_empty());
+        assert!(efforts("claude-opus-4-5-20251101").is_empty());
+        assert!(efforts("deepseek-v4-pro").is_empty());
     }
 
     #[test]

@@ -3441,7 +3441,7 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
 /// router's, handed over with each reply's key, and a menu of Go's would offer
 /// models no reply of it can run.
 async fn report_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>, fuel: Option<String>) {
-    if let Some(caps) = machine_caps(harness, preferred, fuel.as_deref()).await {
+    if let Some(caps) = machine_caps(client, harness, preferred, fuel.as_deref()).await {
         send_caps(client, harness, &caps).await;
     }
 }
@@ -3461,7 +3461,7 @@ const CAPS_RECHECK: Duration = Duration::from_secs(3600);
 async fn keep_caps_reported(client: Client, harness: Arc<dyn Harness>, mut preferred: Option<String>, mut fuel: Option<String>) {
     let mut sent: Option<HarnessCaps> = None;
     loop {
-        if let Some(caps) = machine_caps(harness.as_ref(), preferred.clone(), fuel.as_deref()).await {
+        if let Some(caps) = machine_caps(&client, harness.as_ref(), preferred.clone(), fuel.as_deref()).await {
             let moved = !sent.as_ref().is_some_and(|s| same_answer(s, &caps));
             if moved && send_caps(&client, harness.as_ref(), &caps).await {
                 sent = Some(caps);
@@ -3482,7 +3482,7 @@ fn same_answer(a: &HarnessCaps, b: &HarnessCaps) -> bool {
 
 /// What the harness here takes, for the seat a turn would choose
 /// ([`crate::harness::caps_report`]) — `None` when there is nothing to say.
-async fn machine_caps(harness: &dyn Harness, preferred: Option<String>, fuel: Option<&str>) -> Option<HarnessCaps> {
+async fn machine_caps(client: &Client, harness: &dyn Harness, preferred: Option<String>, fuel: Option<&str>) -> Option<HarnessCaps> {
     // Mafold Harness on Claude Code runs what Claude Code here runs, for the
     // seat a turn would choose — its menu is Claude Code's, said as such.
     if harness.id() == crate::harness::MAFOLD_HARNESS && crate::fuel::is_claude(fuel) {
@@ -3490,10 +3490,12 @@ async fn machine_caps(harness: &dyn Harness, preferred: Option<String>, fuel: Op
         let env = crate::accounts::choose(preferred.as_deref(), None).await.account?.env();
         return crate::harness::caps_report(claude.as_ref(), &env).await;
     }
-    // …and on Codex, what a Codex login runs (the codex-oauth provider's list).
+    // …and on Codex, what the Codex login a turn would run on runs: Codex's
+    // own catalog for it.
     if harness.id() == crate::harness::MAFOLD_HARNESS && crate::fuel::is_codex(fuel) {
         let version = harness.cli_version().await;
-        return crate::harness::codex_fuel::probe().map(|p| p.report(harness.id(), &version));
+        let owner = bot_owner().await.map(|o| norm_user(&o));
+        return crate::harness::codex_fuel::probe(&client.base, owner.as_deref()).await.map(|p| p.report(harness.id(), &version));
     }
     if harness.id() == crate::harness::MAFOLD_HARNESS && !crate::fuel::is_go(fuel) {
         return None;
