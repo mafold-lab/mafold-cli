@@ -891,11 +891,15 @@ pub struct Sidecar {
     /// (`chatLinkCards`): absent = the first link in the text gets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_preview: Option<LinkPreviewOptions>,
+    /// The words picked out of the replied-to message: a quote, not a plain
+    /// reply. The reply's header shows these instead of that message's start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_quote: Option<String>,
 }
 
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
-        self.state.is_empty() && !self.state_more && !self.by_agent && self.link_preview.is_none()
+        self.state.is_empty() && !self.state_more && !self.by_agent && self.link_preview.is_none() && self.reply_quote.is_none()
     }
 }
 

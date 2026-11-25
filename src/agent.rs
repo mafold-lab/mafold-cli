@@ -107,6 +107,11 @@ struct InRecordEntry {
     #[serde(default)]
     attachments: Vec<InAttachment>,
 }
+#[derive(Deserialize, Default)]
+struct InSidecar {
+    #[serde(default)]
+    reply_quote: Option<String>,
+}
 #[derive(Deserialize)]
 struct IncomingMessage {
     #[serde(default)]
@@ -136,6 +141,10 @@ struct IncomingMessage {
     /// in-memory recent-ids set forgot everything on every self-update.
     #[serde(default)]
     reply_to_sender: Option<String>,
+    /// What rides beside the text; read here only for `reply_quote`, the words
+    /// the sender picked out of the `reply_to_id` message.
+    #[serde(default)]
+    sidecar: InSidecar,
     /// Server-stamped (api ≥ the one that shipped it): this message is the
     /// server's receipt of the sender's action on card `receipt_of` — e.g. the
     /// 🔒 line a filled-in secure input sends. The access gate reads it through
@@ -465,6 +474,15 @@ not be loaded and ask them to paste it.",
         ),
     };
     format!("[REPLY CONTEXT — {inner}\n[END REPLY CONTEXT]")
+}
+
+/// A quote-reply that picked words out of its target says which: they go
+/// last in the block, so "this"/"这个" points at them, not the whole message.
+fn with_reply_quote(block: String, quote: Option<&str>) -> String {
+    let Some(q) = quote.map(str::trim).filter(|q| !q.is_empty()) else { return block };
+    let end = "\n[END REPLY CONTEXT]";
+    let Some(head) = block.strip_suffix(end) else { return block };
+    format!("{head}\n[The sender quoted only these words from it — \"this\"/\"这个\" means these:]\n{q}{end}")
 }
 
 /// Bytes as a person reads them — for the one line the agent sees about a file
@@ -5326,16 +5344,17 @@ async fn connect_and_run(
             // Answer where the sign-in is happening — the channel `/login` was
             // started in, not wherever the code happened to be pasted.
             let dest = Dest::chat(&m.conversation_id).channel(login_channel.as_deref());
+            let lang = intro_lang_for(client, &sender_lc).await;
             if trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel") {
                 if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) {
                     s.login_code_tx = None;
                     s.login_owner = None;
                     s.login_channel = None;
                 }
-                let _ = client.send_to(dest, "Cancelled sign-in.").await;
+                let _ = client.send_to(dest, login_relay_line(lang, false)).await;
             } else {
                 let _ = tx.send(trimmed.to_string()).await;
-                let _ = client.send_to(dest, "🔑 Got the code — finishing sign-in…").await;
+                let _ = client.send_to(dest, login_relay_line(lang, true)).await;
             }
             continue;
         }
@@ -5579,6 +5598,8 @@ async fn connect_and_run(
         // Server-stamped author of the replied-to message — names the quoted
         // party even when the target itself could not be fetched.
         let reply_to_sender = m.reply_to_sender.clone();
+        // The words picked out of it, when the reply is a quote.
+        let reply_quote = m.sidecar.reply_quote.clone();
         // The (lowercased) sender that triggered this turn — only they may answer
         // its AskUserQuestion (bound into the per-chat state by `handle`).
         let turn_sender = sender_lc.clone();
@@ -5962,6 +5983,7 @@ async fn connect_and_run(
             let mut lookback_photos: Vec<String> = vec![];
             let mut reply_context: Option<String> = None;
             let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref(), channel_id.as_deref(), &mut lookback_photos, reply_to_id.as_deref(), reply_to_sender.as_deref(), &mut reply_context, false).await;
+            let reply_context = reply_context.map(|b| with_reply_quote(b, reply_quote.as_deref()));
             // a2a: frame an AI-authored trigger so the model knows the peer is an
             // authorized AI account and how the exchange terminates — an @ hands
             // the mic back, no @ lets it end (`.docs/a2a-v0.md` §3). Prompt-only:
@@ -8082,6 +8104,10 @@ async fn login_flow(
     owner_username: Option<String>,
 ) {
     let dest = || Dest::chat(&chat_id).channel(channel_id.as_deref());
+    // Every line of the flow is for whoever typed `/login` — said in the
+    // language their own account is set to, like the daemon's other words to
+    // a person (`intro_lang`).
+    let lang = intro_lang_for(&client, &login_owner).await;
     // `console` picks the Anthropic Console door; any OTHER word is the name
     // of the account being signed in.
     let console = arg.split_whitespace().any(|w| w == "console");
@@ -8091,8 +8117,11 @@ async fn login_flow(
         .map(|w| w.trim().to_ascii_lowercase())
         .filter(|n| n != crate::accounts::DEFAULT);
     if name.is_some() && harness.id() != "claude-code" {
-        let _ = client.send_to(dest(),
-            "Only the Claude Code agent can hold several logins on one machine — signing in without a name instead.").await;
+        let only = match lang {
+            IntroLang::Zh => "只有 Claude Code agent 能在一台机器上挂多个登录——这次按不带名字登录。",
+            IntroLang::En => "Only the Claude Code agent can hold several logins on one machine — signing in without a name instead.",
+        };
+        let _ = client.send_to(dest(), only).await;
         name = None;
     }
     // Register the code channel so a pasted message reaches this flow — bound to
@@ -8112,7 +8141,7 @@ async fn login_flow(
         let (client, chat_id, channel_id) = (client.clone(), chat_id.clone(), channel_id.clone());
         tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
-                let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id.as_deref()), &login_line(&ev)).await;
+                let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id.as_deref()), &login_line(&ev, lang)).await;
             }
         })
     };
@@ -8124,7 +8153,7 @@ async fn login_flow(
     let o = match res {
         Ok(o) => o,
         Err(f) => {
-            if let Some(line) = login_failure_line(&f) {
+            if let Some(line) = login_failure_line(&f, lang) {
                 let _ = client.send_to(dest(), &line).await;
             }
             return;
@@ -8141,6 +8170,7 @@ async fn login_flow(
         ensure_customize_fields(&client, &my_username, owner_username.as_deref(), harness.id()).await;
     }
     let receipt = login_receipt(&LoginOutcome {
+        lang,
         named: o.named.as_deref(),
         added: o.added,
         before: &o.before,
@@ -8152,29 +8182,58 @@ async fn login_flow(
     let _ = client.send_to(dest(), &receipt).await;
 }
 
+/// What the daemon says when the code is pasted (`got`) or the sign-in is
+/// called off with `/stop`.
+fn login_relay_line(lang: IntroLang, got: bool) -> &'static str {
+    match (lang, got) {
+        (IntroLang::Zh, true) => "🔑 收到授权码——正在完成登录……",
+        (IntroLang::Zh, false) => "已取消登录。",
+        (IntroLang::En, true) => "🔑 Got the code — finishing sign-in…",
+        (IntroLang::En, false) => "Cancelled sign-in.",
+    }
+}
+
 /// A step of the shared sign-in, as `/login` says it in the chat.
-fn login_line(ev: &crate::runtime_login::Event) -> String {
+fn login_line(ev: &crate::runtime_login::Event, lang: IntroLang) -> String {
     use crate::runtime_login::Event;
-    match ev {
-        Event::Started { account, .. } if account == crate::accounts::DEFAULT => {
+    match (ev, lang) {
+        (Event::Started { account, .. }, IntroLang::Zh) if account == crate::accounts::DEFAULT => {
+            "🔐 开始登录 Anthropic……链接马上发在这里；打开批准后，把授权码（Authentication Code）贴回给我。（这也会让这个 agent 自己的 `claude` 重新登录。）".to_string()
+        }
+        (Event::Started { account, .. }, IntroLang::En) if account == crate::accounts::DEFAULT => {
             "🔐 Starting Anthropic sign-in… I'll post the link here; approve it, then paste the Authentication Code back to me. (This also re-authenticates the agent's own `claude`.)".to_string()
         }
-        Event::Started { account, .. } => format!(
+        (Event::Started { account, .. }, IntroLang::Zh) => format!(
+            "🔐 开始给**第二个**账号 `{account}` 登录 Anthropic……链接马上发在这里；打开批准后，把授权码（Authentication Code）贴回给我。\n⚠️ 要用**另一个** Anthropic 账号登录——浏览器多半还登着第一个，用无痕窗口打开。\n这台机器原来的登录不动，记忆、技能和会话也都不动：分开的只是订阅。"
+        ),
+        (Event::Started { account, .. }, IntroLang::En) => format!(
             "🔐 Starting Anthropic sign-in for a SECOND account, `{account}`… I'll post the link here; approve it, then paste the Authentication Code back to me.\n⚠️ Sign in with the OTHER Anthropic account — your browser is probably still holding the first one, so use a private window.\nThis machine's existing login is untouched, and so are memory, skills and sessions: only the subscription is separate."
         ),
-        Event::Link { url } => {
+        (Event::Link { url }, IntroLang::Zh) => {
+            format!("🔗 打开这个链接登录（哪台设备都行）：\n{url}\n\n批准之后，把授权码贴到这里。")
+        }
+        (Event::Link { url }, IntroLang::En) => {
             format!("🔗 Open this to sign in (any device works):\n{url}\n\nAfter you approve, paste the Authentication Code here.")
         }
     }
 }
 
 /// Why the shared sign-in stopped, as `/login` says it — nothing when the code
-/// channel went away (the flow was cancelled).
-fn login_failure_line(f: &crate::runtime_login::Failure) -> Option<String> {
+/// channel went away (the flow was cancelled). What only the engine can say
+/// (a name it couldn't record, `claude` not starting) is its own words; in
+/// Chinese they follow a lead saying the sign-in didn't start.
+fn login_failure_line(f: &crate::runtime_login::Failure, lang: IntroLang) -> Option<String> {
+    let zh = lang == IntroLang::Zh;
     match f.code {
         "cancelled" => None,
+        "no_code" if zh => Some("登录超时——5 分钟内没收到授权码。再发一次 `/login` 试试。".into()),
         "no_code" => Some("Sign-in timed out — no code within 5 min. Try `/login` again.".into()),
+        "rejected" if zh => Some("登录没完成——授权码可能贴错了或者过期了。再发一次 `/login` 试试。".into()),
         "rejected" => Some("Sign-in didn't complete — the code may have been wrong or expired. Try `/login` again.".into()),
+        "no_link" if zh => {
+            Some("拿不到登录链接——这个环境可能需要终端（TTY）。请在这台机器上直接运行 `claude auth login`。".into())
+        }
+        _ if zh => Some(format!("登录没能开始：{}", f.detail)),
         _ => Some(f.detail.clone()),
     }
 }
@@ -8393,6 +8452,8 @@ pub(crate) fn failure_card_with_accounts(
 
 /// What a finished `/login` changed.
 struct LoginOutcome<'a> {
+    /// The language of whoever typed `/login`.
+    lang: IntroLang,
     /// The named slot that was signed in; None = the machine's own login.
     named: Option<&'a str>,
     /// The name was new — this sign-in ADDED a login to the machine.
@@ -8415,6 +8476,13 @@ struct LoginOutcome<'a> {
 /// they had added a second one (2026-09-25: a Windows bot, one login, sat on a
 /// full five-hour window with "no other Claude account could take over").
 fn login_receipt(o: &LoginOutcome) -> String {
+    match o.lang {
+        IntroLang::Zh => login_receipt_zh(o),
+        IntroLang::En => login_receipt_en(o),
+    }
+}
+
+fn login_receipt_en(o: &LoginOutcome) -> String {
     use crate::commands::WhoProbe;
     let now = match o.after {
         WhoProbe::Known(id) => format!("**{}**", id.label()),
@@ -8468,6 +8536,58 @@ fn login_receipt(o: &LoginOutcome) -> String {
         )),
         None => out.push_str(
             "Bare `/login` always signs in THIS slot. To keep it and ADD another subscription next to it — turns then move between them by themselves when a window fills up — use `/login <name>`.",
+        ),
+    }
+    out
+}
+
+/// The same receipt, the same facts, in Chinese.
+fn login_receipt_zh(o: &LoginOutcome) -> String {
+    use crate::commands::WhoProbe;
+    let now = match o.after {
+        WhoProbe::Known(id) => format!("**{}**", id.label()),
+        _ if !o.status.is_empty() => format!("一个我认不出的登录（{}）", o.status),
+        _ => "一个我认不出的登录（账号资料接口没回应）".to_string(),
+    };
+    let mut out = match (o.named, o.added) {
+        (Some(n), true) => format!("✓ 已添加账号 `{n}`——{now}。"),
+        (Some(n), false) => format!("✓ 账号 `{n}` 已重新登录——现在是 {now}。"),
+        (None, _) => format!("✓ 已登录——这台机器自己的登录（`default`）现在是 {now}。"),
+    };
+    if !o.added {
+        let was = match (o.before, o.after) {
+            (WhoProbe::Known(b), WhoProbe::Known(a)) if b.same_as(a) => "和之前是同一个账号，只是刷新了登录。".to_string(),
+            (WhoProbe::Known(b), WhoProbe::Known(_)) => format!("它**顶替**了 {}，这个位置不再是那个账号了。", b.label()),
+            (WhoProbe::Known(b), _) => format!("之前这里是 {}。", b.label()),
+            (WhoProbe::SignedOut, _) => "之前这里没登录（或者登录已过期）。".to_string(),
+            (WhoProbe::Unknown, _) => "读不到之前登录的是谁，所以说不准有没有顶替掉谁。".to_string(),
+        };
+        out.push_str(&was);
+    }
+    let n = o.names.len();
+    let list = o.names.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join("、");
+    out.push_str("\n\n");
+    if o.added {
+        out.push_str(&format!("这台机器现在有 {n} 个 Claude 登录：{list}。"));
+    } else {
+        out.push_str(&format!("**没有新增账号**——这台机器还是 {n} 个 Claude 登录：{list}。"));
+    }
+    if let Some(t) = o.twin {
+        let again = match o.named {
+            Some(n) => format!("`/login {n}`"),
+            None => "`/login`".to_string(),
+        };
+        out.push_str(&format!(
+            "\n⚠️ 这和 `{t}` 是同一个订阅——两个位置、一个账号，额度用满时没有可切的。再发一次 {again}，用**另一个** Anthropic 账号登录（用无痕窗口，免得浏览器又用回这个账号）。"
+        ));
+    }
+    out.push_str("\n\n");
+    match o.named {
+        Some(n) => out.push_str(&format!(
+            "平时还是用原来的登录，额度满了会自己切到这里。想让**这个**聊天现在就用它：`/account {n}`——或者在定制里给整个 bot 设定。"
+        )),
+        None => out.push_str(
+            "只发 `/login` 登录的永远是**这个**位置。想保留它、再**加**一个订阅（额度满了会在它们之间自动切换），用 `/login <名字>`。",
         ),
     }
     out
@@ -14669,7 +14789,7 @@ mod registration_claim_tests {
 
 #[cfg(test)]
 mod reply_context_tests {
-    use super::{excerpt, model_view, quoted_message, reply_context_block};
+    use super::{excerpt, model_view, quoted_message, reply_context_block, with_reply_quote};
     use mafold_transcript::{AgentEvent, RunStats, Transcript};
     use serde_json::json;
 
@@ -14839,6 +14959,19 @@ mod reply_context_tests {
         assert!(b.contains("NOT the message's age"));
         assert!(b.ends_with("[END REPLY CONTEXT]"));
         assert!(reply_context_block(None, None).contains("@someone"));
+    }
+
+    /// A quote names the words picked, last in the block, and the END marker
+    /// the `/resume` preview strips by stays the block's last line.
+    #[test]
+    fn a_quote_reply_says_which_words_it_picked() {
+        let q = ("lin".to_string(), "The route is deleted. wrangler.jsonc still lists it.".to_string());
+        let b = with_reply_quote(reply_context_block(Some("lin"), Some(&q)), Some(" wrangler.jsonc still lists it "));
+        assert!(b.ends_with("[END REPLY CONTEXT]"));
+        assert!(b.contains("these:]\nwrangler.jsonc still lists it\n[END REPLY CONTEXT]"), "{b}");
+        let plain = reply_context_block(Some("lin"), Some(&q));
+        assert_eq!(with_reply_quote(plain.clone(), None), plain);
+        assert_eq!(with_reply_quote(plain.clone(), Some("  ")), plain);
     }
 }
 
@@ -18555,18 +18688,18 @@ mod steer_tests {
 
 #[cfg(test)]
 mod login_chat_door_tests {
-    use super::{login_failure_line, login_line};
+    use super::{login_failure_line, login_line, login_relay_line, IntroLang};
     use crate::runtime_login::{Event, Failure};
 
     /// `/login` says each step of the shared sign-in in the chat, the words it
     /// always used: the opening (own login / a second one), then the link.
     #[test]
     fn each_step_of_the_shared_sign_in_is_said_in_the_chat() {
-        let own = login_line(&Event::Started { account: "default".into(), adding: false });
+        let own = login_line(&Event::Started { account: "default".into(), adding: false }, IntroLang::En);
         assert!(own.starts_with("🔐 Starting Anthropic sign-in…") && own.contains("re-authenticates the agent's own `claude`"), "{own}");
-        let second = login_line(&Event::Started { account: "work".into(), adding: true });
+        let second = login_line(&Event::Started { account: "work".into(), adding: true }, IntroLang::En);
         assert!(second.contains("for a SECOND account, `work`") && second.contains("use a private window"), "{second}");
-        let link = login_line(&Event::Link { url: "https://claude.ai/oauth/authorize?x=1".into() });
+        let link = login_line(&Event::Link { url: "https://claude.ai/oauth/authorize?x=1".into() }, IntroLang::En);
         assert_eq!(
             link,
             "🔗 Open this to sign in (any device works):\nhttps://claude.ai/oauth/authorize?x=1\n\nAfter you approve, paste the Authentication Code here."
@@ -18576,18 +18709,44 @@ mod login_chat_door_tests {
     #[test]
     fn a_stopped_sign_in_says_try_login_again_and_a_cancelled_one_says_nothing() {
         let f = |code: &'static str| Failure { code, detail: format!("detail of {code}") };
-        assert_eq!(login_failure_line(&f("cancelled")), None);
-        assert!(login_failure_line(&f("no_code")).unwrap().ends_with("Try `/login` again."));
-        assert!(login_failure_line(&f("rejected")).unwrap().ends_with("Try `/login` again."));
+        assert_eq!(login_failure_line(&f("cancelled"), IntroLang::En), None);
+        assert!(login_failure_line(&f("no_code"), IntroLang::En).unwrap().ends_with("Try `/login` again."));
+        assert!(login_failure_line(&f("rejected"), IntroLang::En).unwrap().ends_with("Try `/login` again."));
         // What the engine says itself is what the chat says.
-        assert_eq!(login_failure_line(&f("no_link")).as_deref(), Some("detail of no_link"));
-        assert_eq!(login_failure_line(&f("account")).as_deref(), Some("detail of account"));
+        assert_eq!(login_failure_line(&f("no_link"), IntroLang::En).as_deref(), Some("detail of no_link"));
+        assert_eq!(login_failure_line(&f("account"), IntroLang::En).as_deref(), Some("detail of account"));
+    }
+
+    /// 2026-11-24 (linsky): a Chinese owner's `/login` answered every step in
+    /// English. Every line of the flow follows the language of whoever typed it.
+    #[test]
+    fn a_chinese_speaker_hears_the_whole_sign_in_in_chinese() {
+        let has_latin_prose = |t: &str| {
+            // Code spans, the URL and product names aside, no English sentence is left.
+            let bare = t.split('`').step_by(2).collect::<String>();
+            ["Sign", "sign-in", "paste", "Open this", "Try", "approve"].iter().any(|w| bare.contains(w))
+        };
+        let own = login_line(&Event::Started { account: "default".into(), adding: false }, IntroLang::Zh);
+        assert!(own.starts_with("🔐 开始登录 Anthropic") && !has_latin_prose(&own), "{own}");
+        let second = login_line(&Event::Started { account: "work".into(), adding: true }, IntroLang::Zh);
+        assert!(second.contains("`work`") && second.contains("无痕窗口") && !has_latin_prose(&second), "{second}");
+        let link = login_line(&Event::Link { url: "https://claude.ai/oauth/authorize?x=1".into() }, IntroLang::Zh);
+        assert!(link.contains("\nhttps://claude.ai/oauth/authorize?x=1\n") && !has_latin_prose(&link), "{link}");
+        assert_eq!(login_relay_line(IntroLang::Zh, true), "🔑 收到授权码——正在完成登录……");
+        assert_eq!(login_relay_line(IntroLang::Zh, false), "已取消登录。");
+        let f = |code: &'static str| Failure { code, detail: format!("detail of {code}") };
+        for code in ["no_code", "rejected", "no_link"] {
+            let line = login_failure_line(&f(code), IntroLang::Zh).unwrap();
+            assert!(!has_latin_prose(&line), "{code}: {line}");
+        }
+        assert_eq!(login_failure_line(&f("cancelled"), IntroLang::Zh), None);
+        assert_eq!(login_failure_line(&f("spawn"), IntroLang::Zh).as_deref(), Some("登录没能开始：detail of spawn"));
     }
 }
 
 #[cfg(test)]
 mod login_receipt_tests {
-    use super::{login_receipt, LoginOutcome};
+    use super::{login_receipt, IntroLang, LoginOutcome};
     use crate::commands::{LoginIdentity, WhoProbe};
 
     fn id(email: &str, org: &str) -> WhoProbe {
@@ -18606,7 +18765,29 @@ mod login_receipt_tests {
     }
 
     fn receipt(named: Option<&str>, added: bool, before: &WhoProbe, after: &WhoProbe, all: &[String], twin: Option<&str>) -> String {
-        login_receipt(&LoginOutcome { named, added, before, after, names: all, twin, status: "" })
+        login_receipt(&LoginOutcome { lang: IntroLang::En, named, added, before, after, names: all, twin, status: "" })
+    }
+
+    fn receipt_zh(named: Option<&str>, added: bool, before: &WhoProbe, after: &WhoProbe, all: &[String], twin: Option<&str>) -> String {
+        login_receipt(&LoginOutcome { lang: IntroLang::Zh, named, added, before, after, names: all, twin, status: "" })
+    }
+
+    /// linsky's screenshot, 11-24: bare `/login` on a machine whose two slots
+    /// hold one subscription — the same facts as the English receipt, in Chinese.
+    #[test]
+    fn the_receipt_speaks_chinese_to_a_chinese_speaker() {
+        let all = names(&["default", "new5x"]);
+        let r = receipt_zh(None, false, &WhoProbe::SignedOut, &id("a@x.com", "A"), &all, Some("new5x"));
+        assert!(r.starts_with("✓ 已登录——这台机器自己的登录（`default`）现在是 **a@x.com — A · Team · Max (5x)**。"), "{r}");
+        assert!(r.contains("之前这里没登录（或者登录已过期）。"), "{r}");
+        assert!(r.contains("**没有新增账号**——这台机器还是 2 个 Claude 登录：`default`、`new5x`。"), "{r}");
+        assert!(r.contains("⚠️ 这和 `new5x` 是同一个订阅") && r.contains("再发一次 `/login`"), "{r}");
+        assert!(r.contains("`/login <名字>`"), "{r}");
+        let added = receipt_zh(Some("team"), true, &WhoProbe::SignedOut, &id("b@x.com", "B"), &names(&["default", "team"]), None);
+        assert!(added.starts_with("✓ 已添加账号 `team`——**b@x.com"), "{added}");
+        assert!(added.contains("这台机器现在有 2 个 Claude 登录") && added.contains("`/account team`"), "{added}");
+        let replaced = receipt_zh(None, false, &id("old@x.com", "Old"), &id("new@x.com", "New"), &names(&["default"]), None);
+        assert!(replaced.contains("它**顶替**了 old@x.com"), "{replaced}");
     }
 
     /// 2026-09-25, the case that started this: bare `/login` on a one-login
@@ -18664,6 +18845,7 @@ mod login_receipt_tests {
     fn an_unreadable_profile_falls_back_to_the_cli_status_and_says_so() {
         let all = names(&["default"]);
         let r = login_receipt(&LoginOutcome {
+            lang: IntroLang::En,
             named: None,
             added: false,
             before: &WhoProbe::Unknown,
