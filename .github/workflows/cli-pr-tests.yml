@@ -1,0 +1,82 @@
+# THIS FILE RUNS IN THE PUBLIC REPO mafold-lab/mafold-cli, not in the monorepo.
+#
+# .github/workflows/cli-public-tests.yml (monorepo) copies it in as the only
+# workflow of the tree it pushes to the public branch `pr-test/<PR>`: the cli's
+# integration tests on macOS and Windows, for one monorepo PR. GitHub's standard
+# runners are free on a public repo; in the private monorepo these same jobs ate
+# the month's free minutes by 10-23 and were refused from then on.
+#
+# The tree is the monorepo's own layout, cut to the five directories every
+# release already publishes (mafold-cli, mafold-core, mafold-types,
+# mafold-transcript, mafold-harness), so `../` paths resolve as they do at home.
+#
+# Integration tests only: `cargo test --test <name>` builds the binary without
+# cfg(test), so nothing outside those directories is needed. A unit-level
+# filter would compile the crate's test build, which include_str!s files that
+# stay private — those run on Linux in the monorepo (rust-tests.yml).
+#
+# Adding a test file: one step below, and its path in cli-public-tests.yml.
+name: cli pr tests
+
+on:
+  push:
+    branches: ["pr-test/**"]
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mafold-cli
+
+      # The real binary in a throwaway HOME: `logs` with and without a name,
+      # `-f` across a rotation, `--json`; a real `supervise` whose stdout and
+      # stderr are pipes writing its own file; a `diagnose` bundle without
+      # the tokens it was handed.
+      - name: logs, supervise, diagnose end to end
+        run: cargo test --manifest-path mafold-cli/Cargo.toml --test logs_cli
+
+      # The real binary, a real supervisor and daemon in a throwaway HOME:
+      # restarted and read back from the new pid; an unknown name, no
+      # supervisor, one from before the requests, one that doesn't take it —
+      # each said, none a success.
+      - name: restart end to end
+        run: cargo test --manifest-path mafold-cli/Cargo.toml --test restart_cli
+
+      # The real binary copied into a throwaway HOME, a stand-in api offering
+      # a release: a check that downloads nothing; off as a setting with the
+      # registration untouched; a supervisor that reads it every pass; an
+      # install it moves onto once the reply in progress is written.
+      - name: update end to end
+        run: cargo test --manifest-path mafold-cli/Cargo.toml --test update_cli
+
+      # Windows only: `mafold install claude-code --yes` for real — Anthropic's
+      # own PowerShell installer into a throwaway USERPROFILE on this throwaway
+      # runner (ignored everywhere else: it installs Claude Code); Kimi refused
+      # before anything runs.
+      - name: install on Windows end to end
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path mafold-cli/Cargo.toml --test install_cli -- --include-ignored
+
+      # The real binary in a throwaway HOME: `up --adopt --check` says whose
+      # the service is (another install's, started by hand, the old update
+      # flag) and which bots adopting restarts — and changes nothing.
+      - name: adopt check end to end
+        run: cargo test --manifest-path mafold-cli/Cargo.toml --test adopt_cli
